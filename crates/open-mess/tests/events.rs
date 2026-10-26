@@ -42,8 +42,12 @@ async fn message_events_reach_subscribers() {
     // test-echo's `message` tool reports account "a" online, then a message that mentions the user.
     echo.call("a", "message", r#"{"text":"m-42"}"#).await.unwrap();
     assert_eq!(next(&mut subscriber).await, Event::Session { account: "test-echo:a".into(), state: SessionState::Online });
+    let event = next(&mut subscriber).await;
+    // A `{:?}` of the event, as a log line would print it, has no conversation or message id.
+    let debug = format!("{event:?}");
+    assert!(debug.contains("test-echo:a") && !debug.contains("m-42") && !debug.contains("conversation"), "{debug}");
     assert_eq!(
-        next(&mut subscriber).await,
+        event,
         Event::Message {
             account: "test-echo:a".into(),
             conversation: "c".into(),
