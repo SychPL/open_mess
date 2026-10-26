@@ -35,6 +35,10 @@ enum Action {
     Tool(Vec<String>),
 }
 
+/// The longest a script waits for one answer from the daemon.
+// ponytail: one limit for every tool; a tool that legitimately runs longer needs its own.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Why `om` stopped, with its exit code.
 struct Failure {
     code: u8,
@@ -52,12 +56,17 @@ fn bad_usage(message: impl Into<String>) -> Failure {
 
 fn not_running() -> Failure {
     let mut message = String::from("open_mess daemon is not running - start it with: om daemon");
-    let reason = paths::data_dir().ok().and_then(|dir| std::fs::read_to_string(dir.join(LAST_START_ERROR_FILE)).ok());
-    if let Some(reason) = reason.as_deref().and_then(|reason| reason.lines().next()).filter(|line| !line.trim().is_empty()) {
+    if let Some(reason) = last_start_error() {
         message.push_str("\nlast start failed: ");
-        message.push_str(reason.trim());
+        message.push_str(&reason);
     }
     Failure { code: 2, message }
+}
+
+/// Why the daemon's last start failed, if it did. A successful start deletes the file.
+fn last_start_error() -> Option<String> {
+    let text = std::fs::read_to_string(paths::data_dir().ok()?.join(LAST_START_ERROR_FILE)).ok()?;
+    text.lines().next().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned)
 }
 
 /// Runs the `om` command line and returns its exit code.
@@ -165,6 +174,11 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
         return Err(bad_usage("missing tool name"));
     };
     let ToolArgs { args, json_output } = parse_tool_args(rest)?;
+    // The last start failed and none has succeeded since, so whatever holds the port now is not
+    // the daemon: don't send it the token.
+    if last_start_error().is_some() {
+        return Err(not_running());
+    }
     let port = port()?;
     let token = token()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?;
@@ -175,7 +189,13 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
 }
 
 async fn call(port: u16, token: &str, tool: &str, args: &Value) -> Result<Value, Failure> {
-    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build().map_err(|err| failed(err.to_string()))?;
+    let client = reqwest::Client::builder()
+        // HTTP_PROXY and friends would hand the token to a proxy.
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|err| failed(err.to_string()))?;
     let base = format!("http://127.0.0.1:{port}/api");
 
     let response = client.get(format!("{base}/tools")).bearer_auth(token).send().await.map_err(request_failed)?;
@@ -191,7 +211,13 @@ async fn call(port: u16, token: &str, tool: &str, args: &Value) -> Result<Value,
 }
 
 fn request_failed(err: reqwest::Error) -> Failure {
-    if err.is_connect() || err.is_timeout() { not_running() } else { failed(format!("cannot reach the daemon: {err}")) }
+    if err.is_connect() {
+        not_running()
+    } else if err.is_timeout() {
+        failed(format!("the daemon did not answer within {} s", REQUEST_TIMEOUT.as_secs()))
+    } else {
+        failed(format!("cannot reach the daemon: {err}"))
+    }
 }
 
 /// Turns an error status into a failure with the API's message.

@@ -26,15 +26,15 @@ async fn start() -> (u16, oneshot::Sender<()>) {
     (port, stop)
 }
 
-/// Runs `om` with its own data folder, port and token.
+/// `om` with its own data folder, port and token.
+fn om_command(data_dir: &Path, port: u16, token: &str, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_om"));
+    command.args(args).env("OPEN_MESS_DATA_DIR", data_dir).env("OPEN_MESS_PORT", port.to_string()).env("OPEN_MESS_TOKEN", token);
+    command
+}
+
 fn om(data_dir: &Path, port: u16, token: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_om"))
-        .args(args)
-        .env("OPEN_MESS_DATA_DIR", data_dir)
-        .env("OPEN_MESS_PORT", port.to_string())
-        .env("OPEN_MESS_TOKEN", token)
-        .output()
-        .unwrap()
+    om_command(data_dir, port, token, args).output().unwrap()
 }
 
 fn stderr(output: &Output) -> String {
@@ -113,13 +113,45 @@ fn cli_without_daemon_shows_the_last_start_error() {
     let dir = data_dir();
     let reason = "port 7341 is already in use - change it in the configuration window or set another port";
     std::fs::write(dir.path().join("last-start-error.txt"), format!("{reason}\n")).unwrap();
-    let output = om(dir.path(), free_port(), TOKEN, &["status"]);
+    // The program that took the daemon's port: it must never see a request, nor the token.
+    let other_program = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = other_program.local_addr().unwrap().port();
+    let output = om(dir.path(), port, TOKEN, &["status"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(
         stderr(&output).contains(&format!("open_mess daemon is not running - start it with: om daemon\nlast start failed: {reason}")),
         "{}",
         stderr(&output)
     );
+    other_program.set_nonblocking(true).unwrap();
+    assert!(other_program.accept().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_ignores_proxy_settings() {
+    let (port, _stop) = start().await;
+    let dir = data_dir();
+    // A proxy would get the token; this one doesn't even exist.
+    let proxy = format!("http://127.0.0.1:{}", free_port());
+    let mut command = om_command(dir.path(), port, TOKEN, &["status"]);
+    for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        command.env(name, &proxy);
+    }
+    command.env_remove("NO_PROXY").env_remove("no_proxy");
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+#[test]
+fn cli_gives_up_on_a_port_that_never_answers() {
+    let dir = data_dir();
+    // Takes connections (into the backlog) and never answers.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let started = Instant::now();
+    let output = om(dir.path(), silent.local_addr().unwrap().port(), TOKEN, &["status"]);
+    assert!(started.elapsed() < Duration::from_secs(45));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("did not answer"), "{}", stderr(&output));
 }
 
 #[tokio::test(flavor = "multi_thread")]
