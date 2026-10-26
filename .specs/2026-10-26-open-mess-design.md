@@ -1,7 +1,7 @@
 # open_mess - dokument projektowy
 
 Data: 2026-10-26
-Status: do akceptacji
+Status: zatwierdzony przez Codex i GLM w rundzie R10 (2026-10-26)
 Zakres szczegółowy: etap 1 (rdzeń + moduł Teams). Etapy 2 i 3 tylko jako kierunek.
 
 ## 1. Po co
@@ -83,7 +83,7 @@ Jeden plik `om.exe`:
 - `om daemon` - uruchamiany automatycznie przy logowaniu do Windows. Zawiera: środowisko modułów WASM, sesje kont, połączenia na żywo, lokalne API (MCP + API dla CLI), wyzwalacze, ikonę w zasobniku i okno konfiguracji otwierane na żądanie. Zawsze działa co najwyżej jedna instancja demona na użytkownika Windows (blokada pojedynczej instancji, np. nazwany mutex): drugie uruchomienie kończy się komunikatem, że demon już działa, a równoczesne uruchomienia z CLI nie tworzą drugiej instancji (recenzja R4).
 - `om <polecenie>` - krótko żyjące wywołanie CLI, które łączy się z działającym demonem przez lokalne API. Jeśli demon nie działa, CLI go uruchamia albo zwraca czytelny błąd (wybór budującego).
 
-Lokalne API nasłuchuje wyłącznie na `127.0.0.1`, wymaga losowego tokenu Bearer (generowanego przy pierwszym uruchomieniu demona) i nigdy nie jest wystawiane w sieci. Port jest stały (domyślna wartość ustalona przez budującego, zmienialna w oknie) i zapisany w konfiguracji, żeby adres `http://127.0.0.1:<port>/mcp` dodany do Claude Code i Codexa działał po każdym restarcie; zajęty port to błąd widoczny w oknie i `om status`, nie losowanie nowego (recenzja R6).
+Lokalne API nasłuchuje wyłącznie na `127.0.0.1`, wymaga losowego tokenu Bearer (generowanego przy pierwszym uruchomieniu demona) i nigdy nie jest wystawiane w sieci. Port jest stały (domyślna wartość ustalona przez budującego, zmienialna w oknie) i zapisany w konfiguracji, żeby adres `http://127.0.0.1:<port>/mcp` dodany do Claude Code i Codexa działał po każdym restarcie; zajęty port to błąd, nie losowanie nowego (recenzja R6): demon kończy działanie, zapisuje przyczynę w folderze danych, a CLI, które nie może połączyć się z demonem, pokazuje tę ostatnią przyczynę startu obok komunikatu "demon nie działa"; okno pokazuje ją tak samo (recenzja R10).
 
 ### 8.2 Wejścia: MCP, CLI, okno
 
@@ -104,7 +104,7 @@ Podział odpowiedzialności:
   - trwałe przechowywanie danych modułu (klucz-wartość) z limitem rozmiaru per moduł; zapis ponad limit zwraca błąd,
   - sekrety (tokeny odświeżania itp.) w Menedżerze poświadczeń Windows - moduł nigdy nie dostaje dostępu do sekretów innego modułu,
   - zegar i timery, kryptograficznie bezpieczne liczby losowe (weryfikatory PKCE, identyfikatory urządzeń),
-  - "prymitywy logowania" wyświetlane w oknie konfiguracji: pokaż kod urządzenia, pokaż kod QR, otwórz stronę logowania w osadzonym oknie przeglądarki i zwróć adres, na który nastąpiło przekierowanie, użyj konta Windows (WAM) - szczegóły w sekcji 9.1. Tożsamość logowania jest częścią manifestu i zgody przy instalacji (recenzja R3): moduł deklaruje hosty stron logowania, a dla WAM identyfikator aplikacji i zasoby/zakresy, o które prosi. Okno pokazuje to użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie. Rdzeń otwiera w osadzonym oknie tylko adresy HTTPS z zatwierdzonych hostów logowania, zawsze pokazuje w oknie aktualny host strony i przerywa logowanie, gdy strona przejdzie na host spoza listy; WAM dostaje wyłącznie zatwierdzony identyfikator aplikacji i zakresy,
+  - "prymitywy logowania" wyświetlane w oknie konfiguracji: pokaż kod urządzenia, pokaż kod QR, otwórz stronę logowania w osadzonym oknie przeglądarki i zwróć adres, na który nastąpiło przekierowanie, użyj konta Windows (WAM) - szczegóły w sekcji 9.1. Tożsamość logowania jest częścią manifestu i zgody przy instalacji (recenzja R3): moduł deklaruje hosty stron logowania, a dla WAM identyfikator aplikacji i zasoby/zakresy, o które prosi. Okno pokazuje to użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie. Rdzeń otwiera w osadzonym oknie tylko adresy HTTPS z zatwierdzonych hostów logowania, zawsze pokazuje w oknie aktualny host strony i wstrzymuje logowanie, gdy strona przejdzie na host spoza listy: okno pyta użytkownika, czy zezwolić na ten host (np. firmowy serwer logowania przy sfederowanym tenancie, nieznany w chwili budowy modułu); zgoda dopisuje go do zatwierdzonych hostów logowania tego modułu, odmowa przerywa logowanie (recenzja R10); WAM dostaje wyłącznie zatwierdzony identyfikator aplikacji i zakresy,
   - emisja zdarzeń (nowa wiadomość, zmiana stanu sesji) do rdzenia, który obsługuje wyzwalacze.
 - **Konto należy do dokładnie jednego modułu** (recenzja R4): kilka modułów może deklarować tę samą platformę, ale każde konto jest przypięte do modułu, który je zalogował; narzędzia i zdarzenia konta obsługuje tylko ten moduł.
 - **Moduł eksportuje**: manifest (nazwa, wersja, platforma, dozwolone hosty, obsługiwane operacje, dodatkowe narzędzia), logowanie i przywracanie sesji, operacje ze wspólnego zestawu (8.5), obsługę zdarzeń na żywo.
@@ -368,3 +368,4 @@ Pozostałe zgłoszenia R1-R9 przyjęto.
 - R7 (Codex REJECT, GLM APPROVE): wyzwalacze respektują uprawnienie czytania (Codex P2); stan "niepewne" dla akcji bez potwierdzenia i identyfikator klienta zamiast automatycznego ponawiania (Codex P2); kontrola celu obejmuje odpowiedź na konkretną wiadomość (Codex P2); minimalna głębokość wzorców hostów, jeden plik na nazwę modułu, własne wiadomości nie odpalają reguł, zbiorcze powiadomienie bez zatwierdzania naraz, połączenia na żywo po stronie rdzenia, dodatkowe narzędzia czytające pod uprawnieniem czytania (GLM P3).
 - R8 (Codex REJECT, GLM APPROVE): zamrożona zasada zasobów - limit równoczesnych uruchomień agentów z akcji 2 i liczby trwałych połączeń modułu, oraz ogólna reguła dla każdego mnożonego zasobu (Codex P2 x2); `pending` obejmuje akcje samodzielne, rozstrzyganie niepewnych edycji i reakcji (GLM P3).
 - R9 (Codex REJECT, GLM APPROVE): dozwolone tylko globalnie routowalne adresy unicast, w tym blokada CGNAT `100.64.0.0/10` (Codex P2); trwały zapis wszystkich stanów `pending` (GLM P3); most stdio ponawia połączenie z demonem (GLM P3). Sekcja 9 przepisana na podstawie analizy statycznej REA (`docs/protocols/teams.md`).
+- R10 (Codex APPROVE, GLM APPROVE): koniec pętli recenzji. Dwie uwagi P3 GLM wdrożone: zgoda na nowy host logowania w trakcie logowania (sfederowany tenant) i przyczyna nieudanego startu demona widoczna w CLI.
