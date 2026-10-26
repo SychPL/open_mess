@@ -5,8 +5,9 @@ members = ["crates/*", "modules/*", "xtask"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-# 1.88: the wit-bindgen toolchain the wasm modules build with (wit-parser, wasm-encoder) needs it.
-rust-version = "1.88"
+# 1.89: std::fs::File::try_lock (the daemon's instance lock); 1.88 is also needed by the
+# wit-bindgen toolchain the wasm modules build with.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -23,3 +24,6 @@ todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
 indexing_slicing = "deny"
+# println!/eprintln! panic when stdout/stderr is closed; write with writeln! and ignore the error.
+print_stdout = "deny"
+print_stderr = "deny"

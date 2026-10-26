@@ -7,8 +7,36 @@ others to follow), signs in the way the official apps do, and gives agents one s
 MCP. The same tools work from the command line. There is no chat window for people: agents read
 and write, you configure.
 
-**Status: design phase.** Nothing works yet. The design is
+**Status: early development.** The daemon, MCP and the CLI run, with one tool (`status`); no
+messenger is connected yet. The design is
 [`.specs/2026-10-26-open-mess-design.md`](.specs/2026-10-26-open-mess-design.md) (in Polish).
+
+## Try it
+
+On Windows, with Rust 1.89 or newer:
+
+```bash
+cargo run -p open-mess -- daemon
+```
+
+The daemon listens on `http://127.0.0.1:7341/mcp` and keeps running until Ctrl+C. Only one runs
+per Windows user. In another terminal (`cargo install --path crates/open-mess` puts `om` on your
+`PATH`):
+
+```bash
+om status           # the same tools agents get over MCP
+om status --json    # JSON for scripts
+om mcp-command      # prints the ready `claude mcp add ...` command
+```
+
+`om mcp-command` prints the command that adds open_mess to Claude Code for every project:
+
+```bash
+claude mcp add --transport http --scope user open_mess http://127.0.0.1:7341/mcp --header "Authorization: Bearer <token>"
+```
+
+The token is generated at the daemon's first start and kept in Windows Credential Manager. It is
+shown only by `om mcp-command`; keep it to yourself, since anything holding it can use the tools.
 
 ## Why
 
