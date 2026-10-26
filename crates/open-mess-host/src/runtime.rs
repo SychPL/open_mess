@@ -197,13 +197,22 @@ impl Engine {
         Ok(Engine { engine, linker, limits })
     }
 
-    /// Compiles a module, reads its manifest (under the call limits) and starts its actor.
+    /// Compiles a module file, reads its manifest (under the call limits) and starts its actor.
     pub async fn load(&self, wasm: &Path, ctx: ModuleContext) -> Result<ModuleHandle, HostError> {
-        let engine = self.engine.clone();
         let path = wasm.to_path_buf();
+        let bytes =
+            tokio::task::spawn_blocking(move || std::fs::read(&path).map_err(|e| HostError::Load(format!("cannot read {}: {e}", path.display()))))
+                .await
+                .map_err(|e| HostError::Load(format!("read task: {e}")))??;
+        self.load_bytes(bytes, ctx).await
+    }
+
+    /// [`Engine::load`] from bytes already read, so the bytes a caller checked (hashed, approved)
+    /// are the bytes that run.
+    pub async fn load_bytes(&self, bytes: Vec<u8>, ctx: ModuleContext) -> Result<ModuleHandle, HostError> {
+        let engine = self.engine.clone();
         // Compiling takes a while; keep it off the async worker threads.
         let component = tokio::task::spawn_blocking(move || {
-            let bytes = std::fs::read(&path).map_err(|e| HostError::Load(format!("cannot read {}: {e}", path.display())))?;
             Component::from_binary(&engine, &bytes).map_err(|e| HostError::Load(format!("not a WebAssembly component: {e}")))
         })
         .await

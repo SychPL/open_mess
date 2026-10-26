@@ -8,6 +8,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::modules::Modules;
+
 /// A tool as both front ends describe it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolInfo {
@@ -29,15 +31,19 @@ pub enum ToolError {
 }
 
 /// The tools of this daemon.
-#[derive(Debug)]
 pub struct Registry {
     started: Instant,
+    modules: Modules,
 }
 
 impl Registry {
-    /// The built-in tools; `started` is when the daemon started, for `status`.
+    /// The tools with no modules; `started` is when the daemon started, for `status`.
     pub fn with_builtin(started: Instant) -> Registry {
-        Registry { started }
+        Registry::new(started, Modules::default())
+    }
+
+    pub fn new(started: Instant, modules: Modules) -> Registry {
+        Registry { started, modules }
     }
 
     pub fn list(&self) -> Vec<ToolInfo> {
@@ -56,7 +62,14 @@ impl Registry {
                 Ok(json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "uptime_seconds": self.started.elapsed().as_secs(),
-                    "modules": [],
+                    "modules": self.modules.list().into_iter().map(|module| json!({
+                        "name": module.name,
+                        "file": module.file,
+                        "version": module.version,
+                        "platform": module.platform,
+                        "state": module.state.to_string(),
+                        "hosts": module.hosts,
+                    })).collect::<Vec<_>>(),
                     "accounts": [],
                 }))
             }

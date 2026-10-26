@@ -3,7 +3,8 @@ name = "open-mess"
 description = "The open_mess daemon and CLI"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# The module host (wasmtime 50) needs 1.97.
+rust-version = "1.97"
 license.workspace = true
 publish.workspace = true
 
@@ -23,6 +24,7 @@ getrandom = "0.4.3"
 # the mock store. keyring-core plus the Windows store crate is the keyring 4 ecosystem's way for an
 # application to choose its store.
 keyring-core = "1.0.1"
+open-mess-host = { path = "../open-mess-host" }
 # Talks only to http://127.0.0.1: no TLS, no system proxy.
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 rmcp = { version = "3.7.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
@@ -32,8 +34,10 @@ rusqlite = { version = "0.41.0", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Module files and manifests are approved by their SHA-256.
+sha2 = "0.10.9"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = "1.1.0"

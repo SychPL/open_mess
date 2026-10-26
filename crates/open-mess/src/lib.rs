@@ -4,6 +4,7 @@ pub mod api;
 pub mod cli;
 pub mod daemon;
 pub mod instance;
+pub mod modules;
 pub mod paths;
 pub mod secrets;
 pub mod store;
@@ -30,6 +31,8 @@ pub enum Error {
     Secrets(#[from] keyring_core::Error),
     #[error("cannot generate a random token: {0}")]
     Random(String),
+    #[error("module host: {0}")]
+    Host(#[from] open_mess_host::HostError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

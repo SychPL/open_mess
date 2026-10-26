@@ -5,10 +5,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use open_mess_host::ip_policy::AddressPolicy;
+use open_mess_host::{Engine, ModuleContext, Net};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 
 use crate::instance::InstanceLock;
+use crate::modules::Modules;
 use crate::store::Store;
 use crate::tools::Registry;
 use crate::{Error, api, paths, secrets};
@@ -24,13 +28,13 @@ pub fn run() -> Result<(), Error> {
     // A second daemon fails here and leaves the running one's error file alone.
     let _lock = acquire_lock(&dir)?;
     let error_file = dir.join(LAST_START_ERROR_FILE);
-    let (runtime, listener, token) = start(&dir).inspect_err(|err| {
+    let (runtime, listener, token, registry) = start(&dir, started).inspect_err(|err| {
         let _ = std::fs::write(&error_file, format!("{}\n", err.to_string().replace(['\r', '\n'], " ")));
     })?;
     let _ = std::fs::remove_file(&error_file);
     // Never println!: it panics when the launcher has closed stdout.
     let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
-    runtime.block_on(api::serve(listener, token, Arc::new(Registry::with_builtin(started)), ctrl_c()))
+    runtime.block_on(api::serve(listener, token, Arc::new(registry), ctrl_c()))
 }
 
 /// The instance lock, retried for half a second: a CLI checking whether a daemon runs holds it for
@@ -45,14 +49,23 @@ fn acquire_lock(dir: &Path) -> Result<InstanceLock, Error> {
     InstanceLock::acquire(dir)
 }
 
-fn start(dir: &Path) -> Result<(Runtime, TcpListener, String), Error> {
+fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, String, Registry), Error> {
     let store = Store::open(&dir.join("state.sqlite3"))?;
     let port = store.port()?;
     let token = secrets::local_api_token()?;
     let runtime = Runtime::new()?;
     let listener = runtime.block_on(api::bind(port))?;
-    Ok((runtime, listener, token))
+    // One engine for the process; the modules it runs keep it alive.
+    let engine = Engine::new()?;
+    // ponytail: host events go nowhere until the event bus subscribes to them.
+    let (events, _) = mpsc::channel(EVENT_QUEUE);
+    let ctx = |_: &str| ModuleContext { data_dir: dir.to_path_buf(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
+    let modules = runtime.block_on(Modules::scan(&store, &engine, &dir.join("modules"), ctx))?;
+    Ok((runtime, listener, token, Registry::new(started, modules)))
 }
+
+/// Host events waiting for the daemon; a full queue holds the reporting module back.
+const EVENT_QUEUE: usize = 256;
 
 async fn ctrl_c() {
     // Without a Ctrl+C handler the daemon runs until it is killed, rather than stopping at once.

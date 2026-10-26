@@ -118,7 +118,7 @@ fn error_response(status: StatusCode, message: String) -> Response {
 }
 
 /// The MCP face of the registry: `tools/list` and `tools/call` delegate to it unchanged.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct McpServer {
     registry: Arc<Registry>,
 }

@@ -29,6 +29,10 @@ mod guest {
 
     struct Echo;
 
+    /// The manifest's hosts, padded so the core's tests can add one by patching the built file
+    /// (a rebuild with another manifest under the same name).
+    const HOSTS: &str = "localhost                               ";
+
     fn http_error(e: &http::HttpError) -> &'static str {
         match e {
             http::HttpError::Blocked(_) => "blocked",
@@ -123,7 +127,8 @@ mod guest {
                 name: "test-echo".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 platform: "test".to_string(),
-                hosts: vec!["localhost".to_string()],
+                // black_box: the padded string stays in the file as written.
+                hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),
                 sign_in_hosts: Vec::new(),
                 wam: None,
                 extra_tools: Vec::new(),

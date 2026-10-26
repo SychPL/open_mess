@@ -11,7 +11,7 @@ house style.
 
 ## Get it running
 
-You need stable Rust 1.89 or newer, the WebAssembly target the platform modules build for, and git.
+You need stable Rust 1.97 or newer, the WebAssembly target the platform modules build for, and git.
 
 ```bash
 rustup target add wasm32-wasip2
@@ -34,6 +34,7 @@ commit.
 | `crates/open-mess/src/paths.rs` | the data folder: `%APPDATA%\open_mess`, or `OPEN_MESS_DATA_DIR` |
 | `crates/open-mess/src/store.rs` | SQLite state (`state.sqlite3`): schema migrations, configuration such as the port |
 | `crates/open-mess/src/secrets.rs` | secrets in Windows Credential Manager, starting with the local API token |
+| `crates/open-mess/src/modules.rs` | the modules folder: module files, their approval and the running modules |
 | `crates/open-mess/src/tools.rs` | the tool registry: every tool, for MCP and the CLI alike |
 | `crates/open-mess/src/api.rs` | the local API on `127.0.0.1`: bearer token, `/mcp` (MCP) and `/api` (CLI) |
 | `crates/open-mess/src/cli.rs` | the `om` command line, generated from the registry |
