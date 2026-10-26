@@ -1,0 +1,28 @@
+{
+  "messages": [
+    {
+      "id": "1800000000310",
+      "conversationid": "19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+      "messagetype": "ThreadActivity/SyntheticNewEvent",
+      "content": "<syntheticevent><eventtime>1800000000310</eventtime></syntheticevent>",
+      "originalarrivaltime": "2027-01-15T08:00:00.310Z"
+    },
+    {
+      "id": "1800000000300",
+      "conversationid": "19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+      "from": "8:orgid:00000000-0000-0000-0000-000000000002",
+      "messagetype": "RichText/Html",
+      "content": "<p>synthetic</p>",
+      "originalarrivaltime": "2027-01-15T08:00:00.300Z",
+      "properties": {}
+    },
+    {
+      "id": "1800000000290",
+      "conversationid": "19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+      "messagetype": "ThreadActivity/SyntheticNewEvent",
+      "content": "<syntheticevent />",
+      "originalarrivaltime": "2027-01-15T08:00:00.290Z"
+    }
+  ],
+  "_metadata": {}
+}

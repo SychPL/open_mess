@@ -1,11 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "xtask"]
+members = ["crates/*", "modules/*", "xtask"]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88: the wit-bindgen toolchain the wasm modules build with (wit-parser, wasm-encoder) needs it.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 publish = false
 

@@ -1,0 +1,12 @@
+{
+  "region": "emea",
+  "regionGtms": {
+    "chatService": "https://emea.ng.msg.teams.microsoft.com",
+    "middleTier": "https://teams.microsoft.com/api/mt/emea"
+  },
+  "tokens": {
+    "skypeToken": "synthetic-skype-token-not-a-real-one",
+    "expiresIn": 4500,
+    "tokenType": "SkypeToken"
+  }
+}

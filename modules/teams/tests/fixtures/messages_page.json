@@ -1,0 +1,53 @@
+{
+  "messages": [
+    {
+      "id": "1800000000300",
+      "clientmessageid": "5555",
+      "conversationid": "19:cccccccccccccccccccccccccccccccc@thread.tacv2",
+      "conversationLink": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/19:cccccccccccccccccccccccccccccccc@thread.tacv2;messageid=1800000000100",
+      "from": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/contacts/8:orgid:00000000-0000-0000-0000-000000000002",
+      "imdisplayname": "Synthetic Person Two",
+      "messagetype": "RichText/Html",
+      "contenttype": "text",
+      "content": "<p>Hi <span itemtype=\"http://schema.skype.com/Mention\" itemscope itemid=\"0\">Synthetic Person One</span></p>",
+      "originalarrivaltime": "2027-01-15T08:00:00.300Z",
+      "composetime": "2027-01-15T08:00:00.300Z",
+      "properties": {
+        "mentions": "[{\"@type\":\"http://schema.skype.com/Mention\",\"itemid\":\"0\",\"mri\":\"8:orgid:00000000-0000-0000-0000-000000000001\",\"mentionType\":\"person\",\"displayName\":\"Synthetic Person One\"}]"
+      },
+      "rootMessageId": "1800000000100",
+      "sequenceId": 9,
+      "type": "Message",
+      "version": "1800000000300"
+    },
+    {
+      "id": "1800000000200",
+      "clientmessageid": "4444",
+      "conversationid": "19:cccccccccccccccccccccccccccccccc@thread.tacv2",
+      "from": "8:orgid:00000000-0000-0000-0000-000000000001",
+      "messagetype": "Text",
+      "content": "plain 1 < 2",
+      "originalarrivaltime": "2027-01-15T08:00:00.200Z",
+      "properties": { "edittime": "1800000000250" },
+      "rootMessageId": "1800000000200",
+      "type": "Message",
+      "version": "1800000000250"
+    },
+    {
+      "id": "1800000000100",
+      "conversationid": "19:cccccccccccccccccccccccccccccccc@thread.tacv2",
+      "from": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/contacts/8:orgid:00000000-0000-0000-0000-000000000002",
+      "imdisplayname": "Synthetic Person Two",
+      "messagetype": "RichText/Html",
+      "content": "",
+      "originalarrivaltime": "2027-01-15T08:00:00.100Z",
+      "properties": { "deletetime": "1800000000400" },
+      "type": "Message",
+      "version": "1800000000400"
+    }
+  ],
+  "_metadata": {
+    "backwardLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:cccccccccccccccccccccccccccccccc@thread.tacv2/messages?startTime=1&pageSize=3&view=msnp24Equivalent|supportsMessageProperties&syncState=b2xkZXI",
+    "syncState": "bmV3ZXI"
+  }
+}

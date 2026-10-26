@@ -1,0 +1,25 @@
+{
+  "isMultiGeo": false,
+  "licenseDetails": { "isFreemium": false },
+  "ocdiRedirect": null,
+  "partition": "emea01",
+  "region": "emea",
+  "regionGtms": {
+    "chatServiceAfd": "https://teams.microsoft.com/api/chatsvc/emea",
+    "chatService": "https://emea.ng.msg.teams.microsoft.com",
+    "middleTier": "https://teams.microsoft.com/api/mt/emea",
+    "ams": "https://eu-api.asm.skype.com",
+    "amsV2": "https://eu-prod.asyncgw.teams.microsoft.com",
+    "calling_trouterUrl": "https://go-eu.trouter.teams.microsoft.com/v3/c",
+    "calling_registrarUrl": "https://teams.microsoft.com/registrar/prod/V2/registrations",
+    "search": "https://teams.microsoft.com/api/search/emea",
+    "unifiedPresence": "https://presence.teams.microsoft.com"
+  },
+  "regionSettings": {},
+  "teamsDataBoundary": "eu",
+  "tokens": {
+    "skypeToken": "synthetic-skype-token-not-a-real-one",
+    "expiresIn": 4500,
+    "tokenType": "SkypeToken"
+  }
+}

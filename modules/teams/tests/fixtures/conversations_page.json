@@ -1,0 +1,73 @@
+{
+  "conversations": [
+    {
+      "id": "19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+      "type": "Thread",
+      "version": 1800000000101,
+      "targetLink": "https://teams.microsoft.com/api/chatsvc/emea/v1/threads/19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+      "messages": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2/messages",
+      "memberProperties": { "role": "User" },
+      "lastUpdatedMessageId": 1800000000100,
+      "lastUpdatedMessageVersion": 1800000000100,
+      "threadProperties": {
+        "topic": "Synthetic group chat",
+        "lastjoinat": "1799999000000",
+        "createdat": "1799990000000"
+      },
+      "properties": {
+        "consumptionhorizon": "1800000000000;1800000000050;1111",
+        "consumptionHorizonBookmark": "1800000000000;1800000000060;2222",
+        "isemptyconversation": "False",
+        "lastimreceivedtime": "2027-01-15T08:00:00.100Z"
+      },
+      "lastMessage": {
+        "id": "1800000000100",
+        "clientmessageid": "3333",
+        "conversationid": "19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+        "conversationLink": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2",
+        "from": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/contacts/8:orgid:00000000-0000-0000-0000-000000000002",
+        "imdisplayname": "Synthetic Person Two",
+        "messagetype": "RichText/Html",
+        "content": "<p>synthetic text</p>",
+        "originalarrivaltime": "2027-01-15T08:00:00.100Z",
+        "composetime": "2027-01-15T08:00:00.100Z",
+        "properties": {},
+        "rootMessageId": "1800000000100",
+        "sequenceId": 7,
+        "type": "Message",
+        "version": "1800000000100"
+      }
+    },
+    {
+      "id": "19:00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002@unq.gbl.spaces",
+      "type": "Conversation",
+      "properties": { "consumptionhorizon": "", "isemptyconversation": "True" },
+      "lastMessage": {}
+    },
+    {
+      "id": "19:cccccccccccccccccccccccccccccccc@thread.tacv2",
+      "type": "Thread",
+      "threadProperties": { "topic": "Synthetic channel" },
+      "properties": { "consumptionhorizon": "1800000000200;1800000000250;4444" },
+      "lastMessage": {
+        "id": "1800000000200",
+        "conversationid": "19:cccccccccccccccccccccccccccccccc@thread.tacv2",
+        "from": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/contacts/8:orgid:00000000-0000-0000-0000-000000000001",
+        "messagetype": "RichText/Html",
+        "content": "<p>synthetic channel post</p>",
+        "originalarrivaltime": 1800000000200
+      }
+    },
+    {
+      "id": "19:meeting_c3ludGhldGljLW1lZXRpbmc@thread.v2",
+      "type": "Thread",
+      "properties": {}
+    }
+  ],
+  "_metadata": {
+    "totalCount": 4,
+    "forwardLink": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=4&syncState=Zm9yd2FyZA",
+    "backwardLink": "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=4&startTime=1&syncState=YmFja3dhcmQ",
+    "syncState": "c3luY3N0YXRl"
+  }
+}
