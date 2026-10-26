@@ -2,8 +2,9 @@
 //! conversions between the generated types and the crate's plain ones.
 
 use crate::error::ModuleError;
+use crate::limits;
 use crate::net;
-use crate::runtime::{AccountInfo, HostState, Manifest, ToolDecl, WamIdentity};
+use crate::runtime::{AccountInfo, HostEvent, HostState, Manifest, NewMessage, SessionState, ToolDecl, WamIdentity};
 
 wasmtime::component::bindgen!({
     world: "platform-module",
@@ -31,15 +32,17 @@ impl http::Host for HostState {
 }
 
 impl websocket::Host for HostState {
-    async fn open(&mut self, _url: String, _headers: Vec<(String, String)>) -> Result<u32, http::HttpError> {
-        Err(http::HttpError::Network(not_yet("websocket")))
+    async fn open(&mut self, url: String, headers: Vec<(String, String)>) -> Result<u32, http::HttpError> {
+        Ok(self.sockets.open(&self.env.net, &self.env.hosts, &url, &headers, &self.guest_events).await?)
     }
 
-    async fn send(&mut self, _conn: u32, _text: String) -> Result<(), http::HttpError> {
-        Err(http::HttpError::Network(not_yet("websocket")))
+    async fn send(&mut self, conn: u32, text: String) -> Result<(), http::HttpError> {
+        Ok(self.sockets.send(conn, text).await?)
     }
 
-    async fn close(&mut self, _conn: u32) {}
+    async fn close(&mut self, conn: u32) {
+        self.sockets.close(conn);
+    }
 }
 
 impl storage::Host for HostState {
@@ -81,13 +84,46 @@ impl sign_in::Host for HostState {
 }
 
 impl host::Host for HostState {
-    async fn log(&mut self, _level: u8, _message: String) {}
+    /// 0 error, 1 warn, 2 info, 3 debug, anything higher trace.
+    async fn log(&mut self, level: u8, mut message: String) {
+        message.truncate(message.floor_char_boundary(limits::MAX_LOG_MESSAGE));
+        let module = self.env.name.as_str();
+        match level {
+            0 => tracing::error!(module, "{message}"),
+            1 => tracing::warn!(module, "{message}"),
+            2 => tracing::info!(module, "{message}"),
+            3 => tracing::debug!(module, "{message}"),
+            _ => tracing::trace!(module, "{message}"),
+        }
+    }
 
-    async fn set_timer(&mut self, _id: u32, _after_ms: u32) {}
+    async fn set_timer(&mut self, id: u32, after_ms: u32) {
+        if !self.timers.set(id, after_ms, &self.guest_events) {
+            tracing::warn!(module = %self.env.name, "timer not set: {} timers are pending", limits::MAX_TIMERS);
+        }
+    }
 
-    async fn session(&mut self, _account: String, _state: host::SessionState) {}
+    async fn session(&mut self, account: String, state: host::SessionState) {
+        let state = match state {
+            host::SessionState::Online => SessionState::Online,
+            host::SessionState::Offline => SessionState::Offline,
+            host::SessionState::AuthRequired => SessionState::AuthRequired,
+        };
+        self.env.events.send(HostEvent::Session { module: self.env.name.clone(), account, state }).await.ok();
+    }
 
-    async fn message_arrived(&mut self, _msg: host::NewMessage) {}
+    async fn message_arrived(&mut self, msg: host::NewMessage) {
+        let msg = NewMessage {
+            module: self.env.name.clone(),
+            account: msg.account,
+            conversation: msg.conversation,
+            message: msg.message,
+            own: msg.own,
+            mentions_me: msg.mentions_me,
+            direct: msg.direct,
+        };
+        self.env.events.send(HostEvent::MessageArrived(msg)).await.ok();
+    }
 }
 
 impl From<net::HttpError> for http::HttpError {

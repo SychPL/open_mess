@@ -21,6 +21,16 @@ pub const MAX_RETRY_AFTER: u32 = 300;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Waiting for the next bytes of a response.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// One WebSocket message, either way; a larger incoming one closes the socket.
+pub const MAX_WS_MESSAGE: usize = 4 * 1024 * 1024;
+/// Open WebSockets per module instance.
+pub const MAX_SOCKETS: usize = 4;
+/// Pending timers per module instance.
+pub const MAX_TIMERS: usize = 32;
+/// The shortest timer delay; shorter ones are lengthened to it.
+pub const MIN_TIMER_DELAY: Duration = Duration::from_millis(100);
+/// One `host.log` line; the rest is cut off.
+pub const MAX_LOG_MESSAGE: usize = 2048;
 
 /// The time limits an engine or a `Net` applies; `Default` is the constants above.
 #[derive(Clone, Copy, Debug)]

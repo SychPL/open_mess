@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{Engine, ModuleContext, ModuleHandle, Net, limits};
+use open_mess_host::{Engine, HostEvent, ModuleContext, ModuleHandle, Net, limits};
+use tokio::sync::mpsc;
 
 /// A module built by `cargo xtask ci` (the wasm build runs before the tests), found from this test
 /// binary so a custom `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET` works too: the binary is
@@ -20,10 +21,16 @@ pub fn wasm(name: &str) -> PathBuf {
     found.unwrap_or_else(|| panic!("{} is missing; build the modules first (cargo xtask ci)", relative.display()))
 }
 
-/// A context whose network allows loopback, so modules can reach the tests' local servers.
+/// A context whose network allows loopback, so modules can reach the tests' local servers, and
+/// the receiving end of its host events.
+pub fn context_with_events() -> (ModuleContext, mpsc::Receiver<HostEvent>) {
+    let (events, receiver) = mpsc::channel(8);
+    let net = Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests());
+    (ModuleContext { data_dir: std::env::temp_dir(), events, net }, receiver)
+}
+
 pub fn context() -> ModuleContext {
-    let (events, _) = tokio::sync::mpsc::channel(8);
-    ModuleContext { data_dir: std::env::temp_dir(), events, net: Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests()) }
+    context_with_events().0
 }
 
 pub async fn load(engine: &Engine, name: &str) -> ModuleHandle {

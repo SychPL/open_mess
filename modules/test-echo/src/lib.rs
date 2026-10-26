@@ -5,7 +5,9 @@
 //! or `{"error"}` (the `http-error` case name); `ws` opens a WebSocket to `{"url"}`, sends "ping"
 //! and returns `{"conn"}` or `{"error"}`; `store` sets key "k" to `{"size"}` bytes and returns the
 //! length read back (`{"len"}`, plus `{"error"}` when the set failed); `timer` sets timer 7 to
-//! fire after 100 ms. `restore` succeeds only for account "known"; `sign-in` is not supported.
+//! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` in
+//! conversation "c" that mentions the user. `restore` succeeds only for account "known";
+//! `sign-in` is not supported.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -63,6 +65,18 @@ mod guest {
             }
             "timer" => {
                 host::set_timer(7, 100);
+                json!({})
+            }
+            "message" => {
+                host::session("a", host::SessionState::Online);
+                host::message_arrived(&host::NewMessage {
+                    account: "a".to_string(),
+                    conversation: "c".to_string(),
+                    message: text("text"),
+                    own: false,
+                    mentions_me: true,
+                    direct: false,
+                });
                 json!({})
             }
             _ => return Err(types::ModuleError::NotSupported(tool.to_string())),

@@ -55,7 +55,7 @@ pub enum HttpError {
     Network(String),
 }
 
-fn blocked(why: impl Into<String>) -> HttpError {
+pub(crate) fn blocked(why: impl Into<String>) -> HttpError {
     HttpError::Blocked(why.into())
 }
 
@@ -99,7 +99,7 @@ fn retry_after(headers: &HeaderMap) -> Option<u32> {
 #[derive(Clone, Debug)]
 pub struct Net {
     policy: AddressPolicy,
-    limits: Limits,
+    pub(crate) limits: Limits,
 }
 
 impl Net {

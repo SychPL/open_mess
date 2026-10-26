@@ -18,6 +18,8 @@ use crate::runtime::{AccountInfo, HostState, ModuleEnv};
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
+/// WebSocket frames and timer firings waiting for a module; a full queue holds the socket back.
+const EVENT_QUEUE: usize = 64;
 
 pub(crate) type Reply<T> = oneshot::Sender<Result<T, HostError>>;
 
@@ -27,6 +29,24 @@ pub(crate) enum Request {
     Restore(String, Reply<()>),
     SignOut(String, Reply<()>),
     Call { account: String, tool: String, args: String, reply: Reply<String> },
+}
+
+/// What a module instance's sockets and timers deliver to its `events` export, through the actor
+/// so each delivery is an ordinary call with the normal limits (spec 8.3).
+pub(crate) enum GuestEvent {
+    WsMessage { conn: u32, text: String },
+    WsClosed { conn: u32, reason: String },
+    Timer { id: u32, generation: u64 },
+}
+
+/// A task that belongs to a module instance (a socket, a timer): aborted when dropped, so an
+/// instance that is dropped takes them with it.
+pub(crate) struct Task(pub(crate) tokio::task::JoinHandle<()>);
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Whether a module is serving calls.
@@ -90,6 +110,9 @@ pub(crate) struct Actor {
     limits: Limits,
     deadline: Deadline,
     instance: Option<(Store<HostState>, PlatformModule)>,
+    /// The current instance's events; replaced and dropped with it, so a dropped instance's
+    /// leftovers never reach the next one.
+    events: Option<mpsc::Receiver<GuestEvent>>,
     crashes: u32,
     state: watch::Sender<ModuleState>,
 }
@@ -102,18 +125,19 @@ impl Actor {
         env: Arc<ModuleEnv>,
     ) -> (Actor, watch::Receiver<ModuleState>) {
         let (state, watch) = watch::channel(ModuleState::Running);
-        let actor = Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, crashes: 0, state };
+        let actor = Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, events: None, crashes: 0, state };
         (actor, watch)
     }
 
-    fn store(&self) -> Store<HostState> {
-        let mut store = Store::new(&self.engine, HostState::new(self.deadline.clone(), self.env.clone()));
+    fn store(&self) -> (Store<HostState>, mpsc::Receiver<GuestEvent>) {
+        let (events, queue) = mpsc::channel(EVENT_QUEUE);
+        let mut store = Store::new(&self.engine, HostState::new(self.deadline.clone(), self.env.clone(), events));
         store.limiter(|state| &mut state.limiter);
         // Yield to the executor on every epoch tick, so a busy module never holds a thread, and
         // stop it once its call is past the deadline.
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(|state| Ok(if state.data().deadline.expired() { UpdateDeadline::Interrupt } else { UpdateDeadline::Yield(1) }));
-        store
+        (store, queue)
     }
 
     /// Gives the module a new environment; the current instance is dropped so the next call
@@ -121,6 +145,7 @@ impl Actor {
     pub(crate) fn reset(&mut self, env: Arc<ModuleEnv>) {
         self.env = env;
         self.instance = None;
+        self.events = None;
     }
 
     /// Runs one export under the call limits, instantiating the module first if the last call
@@ -155,8 +180,9 @@ impl Actor {
         let (mut store, module) = match self.instance.take() {
             Some(instance) => instance,
             None => {
-                let mut store = self.store();
+                let (mut store, events) = self.store();
                 let module = within(&self.deadline, self.pre.instantiate_async(&mut store)).await?;
+                self.events = Some(events);
                 (store, module)
             }
         };
@@ -166,6 +192,7 @@ impl Actor {
     }
 
     fn crashed(&mut self, error: HostError) -> HostError {
+        self.events = None;
         self.crashes = self.crashes.saturating_add(1);
         tracing::warn!(module = %self.env.name, crashes = self.crashes, "module stopped: {error}");
         self.state.send_replace(if self.crashes >= limits::MAX_CRASHES {
@@ -176,32 +203,83 @@ impl Actor {
         error
     }
 
-    /// Serves requests until every handle is dropped or the module is disabled.
+    /// Serves requests and the instance's events until every handle is dropped or the module is
+    /// disabled.
     pub(crate) async fn serve(mut self, mut requests: mpsc::Receiver<Request>) {
-        while let Some(request) = requests.recv().await {
-            match request {
-                Request::SignIn(reply) => {
-                    let result = self.run(|m, s| Box::pin(m.open_mess_module_module().call_sign_in(s))).await;
-                    reply.send(module_result(result).map(Into::into)).ok();
-                }
-                Request::Restore(account, reply) => {
-                    let result = self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_restore(s, &account).await })).await;
-                    reply.send(module_result(result)).ok();
-                }
-                Request::SignOut(account, reply) => {
-                    let result = self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_sign_out(s, &account).await })).await;
-                    reply.send(result).ok();
-                }
-                Request::Call { account, tool, args, reply } => {
-                    let result =
-                        self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_call(s, &account, &tool, &args).await })).await;
-                    reply.send(module_result(result)).ok();
-                }
+        loop {
+            let work = tokio::select! {
+                request = requests.recv() => match request {
+                    Some(request) => Ok(request),
+                    None => break,
+                },
+                Some(event) = next_event(&mut self.events) => Err(event),
+            };
+            match work {
+                Ok(request) => self.answer(request).await,
+                Err(event) => self.deliver(event).await,
             }
             if *self.state.borrow() == ModuleState::Disabled {
                 break;
             }
         }
+    }
+
+    async fn deliver(&mut self, event: GuestEvent) {
+        // A crash is recorded by `run`; there is nobody else to tell.
+        let _delivered = match event {
+            GuestEvent::WsMessage { conn, text } => {
+                self.run(move |m, s| Box::pin(async move { m.open_mess_module_events().call_on_ws_message(s, conn, &text).await })).await
+            }
+            GuestEvent::WsClosed { conn, reason } => {
+                self.run(move |m, s| {
+                    Box::pin(async move {
+                        s.data_mut().sockets.close(conn);
+                        m.open_mess_module_events().call_on_ws_closed(s, conn, &reason).await
+                    })
+                })
+                .await
+            }
+            GuestEvent::Timer { id, generation } => {
+                self.run(move |m, s| {
+                    Box::pin(async move {
+                        if !s.data_mut().timers.fired(id, generation) {
+                            return Ok(());
+                        }
+                        m.open_mess_module_events().call_on_timer(s, id).await
+                    })
+                })
+                .await
+            }
+        };
+    }
+
+    async fn answer(&mut self, request: Request) {
+        match request {
+            Request::SignIn(reply) => {
+                let result = self.run(|m, s| Box::pin(m.open_mess_module_module().call_sign_in(s))).await;
+                reply.send(module_result(result).map(Into::into)).ok();
+            }
+            Request::Restore(account, reply) => {
+                let result = self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_restore(s, &account).await })).await;
+                reply.send(module_result(result)).ok();
+            }
+            Request::SignOut(account, reply) => {
+                let result = self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_sign_out(s, &account).await })).await;
+                reply.send(result).ok();
+            }
+            Request::Call { account, tool, args, reply } => {
+                let result =
+                    self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_call(s, &account, &tool, &args).await })).await;
+                reply.send(module_result(result)).ok();
+            }
+        }
+    }
+}
+
+async fn next_event(events: &mut Option<mpsc::Receiver<GuestEvent>>) -> Option<GuestEvent> {
+    match events {
+        Some(events) => events.recv().await,
+        None => std::future::pending().await,
     }
 }
 

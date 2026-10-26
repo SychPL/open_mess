@@ -9,6 +9,8 @@ pub mod ip_policy;
 pub mod limits;
 mod net;
 mod runtime;
+mod timers;
+mod ws;
 
 pub use actor::ModuleState;
 pub use error::{HostError, ModuleError};

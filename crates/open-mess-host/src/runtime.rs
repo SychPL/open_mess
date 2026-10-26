@@ -7,12 +7,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-use crate::actor::{Actor, Deadline, ModuleState, QUEUE, Reply, Request};
+use crate::actor::{Actor, Deadline, GuestEvent, ModuleState, QUEUE, Reply, Request};
 use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::HostError;
 use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
 use crate::net::Net;
+use crate::timers::Timers;
+use crate::ws::Sockets;
 
 /// Mirrors `manifest` in `wit/module.wit`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +105,7 @@ pub(crate) struct ModuleEnv {
     pub(crate) name: String,
     pub(crate) hosts: HostList,
     pub(crate) net: Net,
+    pub(crate) events: mpsc::Sender<HostEvent>,
 }
 
 /// The state a module instance runs with: a WASI context with nothing inherited, plus the host
@@ -113,10 +116,14 @@ pub(crate) struct HostState {
     pub(crate) limiter: ModuleLimiter,
     pub(crate) deadline: Deadline,
     pub(crate) env: Arc<ModuleEnv>,
+    pub(crate) sockets: Sockets,
+    pub(crate) timers: Timers,
+    /// Where this instance's sockets and timers send what they deliver.
+    pub(crate) guest_events: mpsc::Sender<GuestEvent>,
 }
 
 impl HostState {
-    pub(crate) fn new(deadline: Deadline, env: Arc<ModuleEnv>) -> Self {
+    pub(crate) fn new(deadline: Deadline, env: Arc<ModuleEnv>, guest_events: mpsc::Sender<GuestEvent>) -> Self {
         // No preopens, environment, arguments or sockets; stdin is empty and stdout/stderr are
         // discarded (WasiCtxBuilder's defaults, made explicit for the network).
         let wasi = WasiCtx::builder()
@@ -125,7 +132,16 @@ impl HostState {
             .allow_ip_name_lookup(false)
             .socket_addr_check(|_, _| Box::pin(async { false }))
             .build();
-        HostState { wasi, table: ResourceTable::new(), limiter: ModuleLimiter::default(), deadline, env }
+        HostState {
+            wasi,
+            table: ResourceTable::new(),
+            limiter: ModuleLimiter::default(),
+            deadline,
+            env,
+            sockets: Sockets::default(),
+            timers: Timers::default(),
+            guest_events,
+        }
     }
 }
 
@@ -192,9 +208,11 @@ impl Engine {
             .instantiate_pre(&component)
             .and_then(PlatformModulePre::new)
             .map_err(|e| HostError::Load(format!("not a platform module: {e}")))?;
-        // The manifest runs before the module has a name or hosts: its imports reach nothing.
-        let ModuleContext { net, .. } = ctx;
-        let loading = ModuleEnv { name: String::new(), hosts: HostList::default(), net: net.clone() };
+        // The manifest runs before the module has a name or hosts: its imports reach nothing, and
+        // its host events go nowhere.
+        let ModuleContext { net, events, .. } = ctx;
+        let (nowhere, _) = mpsc::channel(1);
+        let loading = ModuleEnv { name: String::new(), hosts: HostList::default(), net: net.clone(), events: nowhere };
         let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
             .run(|m, s| Box::pin(m.open_mess_module_module().call_manifest(s)))
@@ -205,7 +223,7 @@ impl Engine {
         let hosts = HostList::parse(&manifest.hosts)?;
         // Not used until the sign-in window (milestone E), but a bad manifest is refused now.
         HostList::parse(&manifest.sign_in_hosts)?;
-        actor.reset(Arc::new(ModuleEnv { name: manifest.name.clone(), hosts, net }));
+        actor.reset(Arc::new(ModuleEnv { name: manifest.name.clone(), hosts, net, events }));
         let (requests, queue) = mpsc::channel(QUEUE);
         tokio::spawn(actor.serve(queue));
         Ok(ModuleHandle { manifest, requests, state })
