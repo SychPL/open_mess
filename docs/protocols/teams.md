@@ -222,15 +222,28 @@ AMS objects (`/v1/objects/<id>` in `properties.files[].filePreview.previewUrl`,
 
 Reading (**CONFIRMED**, safe): each conversation carries `properties.consumptionhorizon` formatted
 `<originalArrivalTime>;<timeStamp>;<clientMessageId>` (normaliser `Re` in the shared worker; empty
-becomes `0;0;0`), plus `lastMessage`. Unread = a last message newer than the first field of the
-horizon. `GET v1/threads/<id>/consumptionhorizons` reads other members' positions.
+becomes `0;0;0`), an optional "marked as unread" bookmark in `properties.userConsumptionHorizon` or
+`properties.consumptionHorizonBookmark` (same format), plus `lastMessageTimeUtc` and `lastMessage`.
+The client's rule (shared worker, the module exporting `T8`/`il`/`qJ`; functions `U`, `Z`, `X`):
+
+1. Bookmark set (its `originalArrivalTime` is not 0 and its `clientMessageId` is not `"0"`): the
+   conversation is unread - this is how "mark as unread" survives a horizon that is already past the
+   last message.
+2. Otherwise, if the last message was sent by the user (`lastMessage.from` ends with the user's MRI,
+   or the `<initiator>` of a call event is the user): read.
+3. Otherwise unread when `lastMessageTimeUtc` (fallback `lastMessage.originalarrivaltime`) is greater
+   than the horizon's `originalArrivalTime`.
+
+The client also ignores a bookmark older than its per-app horizon and has special cases for call
+recordings and channel reply chains (`rclch`); open_mess can start with rules 1-3.
+`GET v1/threads/<id>/consumptionhorizons` reads other members' positions.
 
 Writes open_mess must never send (**CONFIRMED** in the builders):
 
 | Write | Request |
 | --- | --- |
 | mark conversation read | `PUT v1/users/ME/conversations/<id>/properties?name=consumptionhorizon` body `{"consumptionhorizon":"..."}` (`setConversationConsumptionHorizon`) |
-| read bookmark | same with `name=consumptionHorizonBookmark` |
+| mark as unread / bookmark | same with `name=consumptionHorizonBookmark` |
 | reply chain read position | message property `userMetaData` with key `l2ch` (`setReplyChainConsumptionHorizon`); constants `rclch`, `rclchBookmark` |
 | mark message read | `PUT .../messages/<msgId>/properties?name=isread` body `{"isread":"true"}` (`markReadStatus`; this is the "markRead" of the spec) |
 | batch conversation properties | `setConversationPropertyBatch` (may carry any of the above) |
@@ -379,7 +392,9 @@ Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
 7. 9.2 read receipts: replace the name list with the concrete writes of section 3.4
    (`properties?name=consumptionhorizon`, `consumptionHorizonBookmark`, message `isread`,
    `userMetaData`/`l2ch`, batch property writes) and require an allow-list of writable property names
-   (only `emotions` for reactions). There is no separate read-receipt endpoint.
+   (only `emotions` for reactions). There is no separate read-receipt endpoint. The `unread` tool
+   (8.5) computes unread state with the client's rule of section 3.4, including the "marked as
+   unread" bookmark.
 8. 9.2 coexistence: own endpoint id = own UUID v4 used for `v2/users/ME/endpoints/<id>`, Trouter
    `epid` and registrar `registrationId`; own device UUID; never call `activeendpoint`, never publish
    presence or Trouter `userActivity`.
@@ -414,7 +429,8 @@ the user present (spec 9.5):
    client.
 8. Whether `PUT v2/users/ME/endpoints/<id>` alone (without `activeendpoint`) is enough to get
    `/messaging` events, and whether an extra endpoint changes push delivery to the user's phone.
-9. Page size limits and `syncState` semantics for conversations and messages.
+9. Page size limits and `syncState` semantics for conversations and messages, and that the unread
+   rule of section 3.4 matches what the official client shows (including a chat marked as unread).
 10. Substrate request body for chat messages (`entityType`, `contentSources`) and the
     `X-AnchorMailbox` format.
 11. AMS image download: header token vs cookie, and which view names exist for received images.
