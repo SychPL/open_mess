@@ -23,6 +23,10 @@ const MIGRATIONS: &[&str] = &[
     // conversation; `write` is `never`, `confirm` or `autonomous`.
     "CREATE TABLE permissions (account TEXT NOT NULL, conversation TEXT NOT NULL DEFAULT '', read INTEGER NOT NULL, write TEXT NOT NULL,
          PRIMARY KEY (account, conversation));",
+    // Writes in all their states (pending.rs); `args` (the module tool's arguments, with the text)
+    // is emptied once the action can no longer run.
+    "CREATE TABLE pending (id TEXT PRIMARY KEY, account TEXT NOT NULL, conversation TEXT NOT NULL, kind TEXT NOT NULL, args TEXT NOT NULL,
+         fingerprint TEXT NOT NULL, state TEXT NOT NULL, created_ms INTEGER NOT NULL, decided_ms INTEGER, detail TEXT);",
 ];
 
 /// Configuration and state in `state.sqlite3`.

@@ -60,6 +60,10 @@ impl module::Guest for Teams {
     ) -> Result<types::Attachment, types::ModuleError> {
         Err(not_yet())
     }
+
+    fn describe_target(_account: String, _conversation: String, _message: Option<String>) -> Result<types::Target, types::ModuleError> {
+        Err(not_yet())
+    }
 }
 
 impl events::Guest for Teams {

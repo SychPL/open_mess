@@ -10,7 +10,12 @@
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
 //! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
 //! `read_messages` and `unread` return one synthetic message or conversation that names the
-//! account; `list_conversations` returns the group chats "c1" and "c2". The `restore` export succeeds only for account "known"; the `sign-in` export is not
+//! account; `list_conversations` returns the group chats "c1" and "c2". The writes `send`,
+//! `edit_message` and `react` append their tool and arguments to the storage key "writes" (the
+//! tool `writes` returns them) and succeed, except a `text` of "uncertain" (the module error), "fail"
+//! (a platform error) or "slow" (recorded, then busy until the call limit). `describe-target`
+//! returns the target the tool `set-target` stored for `{"conversation"}` (`{"participants"}` as
+//! `[id, name]` pairs, `{"text"}` for any message), else participant "p1" (Pat) and "message <id>". The `restore` export succeeds only for account "known"; the `sign-in` export is not
 //! supported; `sign-out` reports the account offline; `get-attachment` downloads an `http://`
 //! attachment id and returns fixed bytes named after any other.
 
@@ -120,6 +125,26 @@ mod guest {
                 "unread": "unread",
                 "untrusted": {"title": format!("Echo {account}")},
             }]}),
+            "send" | "edit_message" | "react" => {
+                let mut writes = stored("writes").as_array().cloned().unwrap_or_default();
+                writes.push(json!({ "tool": tool, "args": args }));
+                storage::set("writes", Value::from(writes).to_string().as_bytes())
+                    .map_err(|_| types::ModuleError::Platform("storage".to_string()))?;
+                match text("text").as_str() {
+                    "uncertain" => return Err(types::ModuleError::Uncertain("no answer from the server".to_string())),
+                    "fail" => return Err(types::ModuleError::Platform("refused".to_string())),
+                    "slow" => loop {
+                        std::hint::spin_loop();
+                    },
+                    _ => json!({}),
+                }
+            }
+            "writes" => json!({ "items": stored("writes").as_array().cloned().unwrap_or_default() }),
+            "set-target" => {
+                storage::set(&format!("target:{}", text("conversation")), args_json.as_bytes())
+                    .map_err(|_| types::ModuleError::Platform("storage".to_string()))?;
+                json!({})
+            }
             "message" => {
                 host::session("a", host::SessionState::Online);
                 host::message_arrived(&host::NewMessage {
@@ -135,6 +160,11 @@ mod guest {
             _ => return Err(types::ModuleError::NotSupported(tool.to_string())),
         };
         Ok(result.to_string())
+    }
+
+    /// A JSON value the module stored under `key`, else null.
+    fn stored(key: &str) -> Value {
+        storage::get(key).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
     }
 
     impl module::Guest for Echo {
@@ -187,6 +217,20 @@ mod guest {
                 b"attachment bytes from test-echo".to_vec()
             };
             Ok(types::Attachment { file_name: attachment, content_type: "text/plain".to_string(), data })
+        }
+
+        fn describe_target(_account: String, conversation: String, message: Option<String>) -> Result<types::Target, types::ModuleError> {
+            let target = stored(&format!("target:{conversation}"));
+            let participant = |pair: &Value| {
+                let (id, name) = (pair.get(0)?.as_str()?, pair.get(1)?.as_str()?);
+                Some(types::Participant { id: id.to_string(), display_name: name.to_string() })
+            };
+            let participants = match target.get("participants").and_then(Value::as_array) {
+                Some(pairs) => pairs.iter().filter_map(participant).collect(),
+                None => vec![types::Participant { id: "p1".to_string(), display_name: "Pat".to_string() }],
+            };
+            let text = |id: String| target.get("text").and_then(Value::as_str).map_or_else(|| format!("message {id}"), str::to_string);
+            Ok(types::Target { conversation_title: format!("Echo {conversation}"), participants, target_text: message.map(text) })
         }
     }
 

@@ -169,7 +169,7 @@ impl Accounts {
     /// its module; then the module signs it out, after every call already queued for it (a module
     /// runs its calls in order, and no time limit here cuts that wait short, so a queued restore
     /// cannot store a token after the secrets are gone); then its secrets go, and last its
-    /// permissions, its row and attachments. A removal cut short keeps the marked row, so it can be run again; secrets that
+    /// permissions, pending actions, row and attachments. A removal cut short keeps the marked row, so it can be run again; secrets that
     /// cannot be deleted leave the account signed out (offline).
     pub async fn remove(&self, id: &str) -> Result<(), Error> {
         let account = self.get(id)?.ok_or_else(|| Error::Account(format!("unknown account {id:?}")))?;
@@ -194,6 +194,7 @@ impl Accounts {
             let store = self.store();
             // Signed in again later, the account starts from the default permissions.
             store.conn().execute("DELETE FROM permissions WHERE account = ?1", [id])?;
+            store.conn().execute("DELETE FROM pending WHERE account = ?1", [id])?;
             store.conn().execute("DELETE FROM accounts WHERE id = ?1", [id])?;
         }
         // Best effort: a file an agent still has open stays until the attachments' retention.

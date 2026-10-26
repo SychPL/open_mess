@@ -8,7 +8,7 @@ use keyring_core::api::CredentialStore;
 use crate::error::ModuleError;
 use crate::limits;
 use crate::net;
-use crate::runtime::{AccountInfo, Attachment, HostEvent, HostState, Manifest, NewMessage, SessionState, ToolDecl, WamIdentity};
+use crate::runtime::{AccountInfo, Attachment, HostEvent, HostState, Manifest, NewMessage, Participant, SessionState, Target, ToolDecl, WamIdentity};
 use crate::sign_in::{UNAVAILABLE, wait_for_user};
 use crate::storage::{Storage, StorageError};
 
@@ -226,6 +226,16 @@ impl From<types::Attachment> for Attachment {
     }
 }
 
+impl From<types::Target> for Target {
+    fn from(t: types::Target) -> Self {
+        Target {
+            conversation_title: t.conversation_title,
+            participants: t.participants.into_iter().map(|p| Participant { id: p.id, display_name: p.display_name }).collect(),
+            target_text: t.target_text,
+        }
+    }
+}
+
 impl From<types::ModuleError> for ModuleError {
     fn from(e: types::ModuleError) -> Self {
         match e {
@@ -234,6 +244,7 @@ impl From<types::ModuleError> for ModuleError {
             types::ModuleError::Platform(s) => ModuleError::Platform(s),
             types::ModuleError::InvalidArgs(s) => ModuleError::InvalidArgs(s),
             types::ModuleError::NotSupported(s) => ModuleError::NotSupported(s),
+            types::ModuleError::Uncertain(s) => ModuleError::Uncertain(s),
         }
     }
 }

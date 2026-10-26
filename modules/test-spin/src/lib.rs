@@ -54,6 +54,10 @@ mod guest {
                 std::hint::spin_loop();
             }
         }
+
+        fn describe_target(_account: String, _conversation: String, _message: Option<String>) -> Result<types::Target, types::ModuleError> {
+            Err(types::ModuleError::NotSupported("describe-target".to_string()))
+        }
     }
 
     impl events::Guest for Spin {

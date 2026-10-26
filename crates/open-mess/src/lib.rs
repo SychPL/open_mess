@@ -8,6 +8,7 @@ pub mod events;
 pub mod instance;
 pub mod modules;
 pub mod paths;
+pub mod pending;
 pub mod permissions;
 pub mod secrets;
 pub mod store;
@@ -36,6 +37,8 @@ pub enum Error {
     Random(String),
     #[error("{0}")]
     Account(String),
+    #[error("unknown action {0:?}")]
+    UnknownAction(String),
     #[error("module host: {0}")]
     Host(#[from] open_mess_host::HostError),
     #[error(transparent)]

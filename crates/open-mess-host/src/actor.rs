@@ -14,7 +14,7 @@ use wasmtime::{Store, UpdateDeadline};
 use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::{HostError, ModuleError};
 use crate::limits::{self, Limits};
-use crate::runtime::{AccountInfo, Attachment, HostState, ModuleEnv};
+use crate::runtime::{AccountInfo, Attachment, HostState, ModuleEnv, Target};
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
@@ -39,6 +39,12 @@ pub(crate) enum Request {
     GetAttachment {
         ids: [String; 4],
         reply: Reply<Attachment>,
+    },
+    /// Account and conversation ids, and the message a write is about.
+    DescribeTarget {
+        ids: [String; 2],
+        message: Option<String>,
+        reply: Reply<Target>,
     },
 }
 
@@ -334,6 +340,16 @@ impl Actor {
                             s.data_mut().max_body = limits::MAX_BODY;
                             result
                         })
+                    })
+                    .await;
+                reply.send(module_result(result).map(Into::into)).ok();
+            }
+            Request::DescribeTarget { ids: [account, conversation], message, reply } => {
+                let result = self
+                    .run(move |m, s| {
+                        Box::pin(
+                            async move { m.open_mess_module_module().call_describe_target(s, &account, &conversation, message.as_deref()).await },
+                        )
                     })
                     .await;
                 reply.send(module_result(result).map(Into::into)).ok();

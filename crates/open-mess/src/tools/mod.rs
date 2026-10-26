@@ -145,12 +145,12 @@ fn no_params(args: &Value) -> Result<(), ToolError> {
     }
 }
 
-fn unknown_account(id: &str) -> ToolError {
+pub(crate) fn unknown_account(id: &str) -> ToolError {
     ToolError::InvalidArgs(format!("unknown account {id:?} - the accounts tool lists them"))
 }
 
 /// An account a tool may use: one being removed is unknown to the tools.
-fn find(accounts: &Accounts, id: &str) -> Result<Account, ToolError> {
+pub(crate) fn find(accounts: &Accounts, id: &str) -> Result<Account, ToolError> {
     accounts.get(id).map_err(failed)?.filter(|account| account.state != REMOVING).ok_or_else(|| unknown_account(id))
 }
 
@@ -206,7 +206,7 @@ fn list_accounts(accounts: &Accounts) -> Result<Value, ToolError> {
 }
 
 /// The account's running module, or an error naming the module's state.
-fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolError> {
+pub(crate) fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolError> {
     let modules = accounts.modules();
     modules.handle(&account.module).cloned().ok_or_else(|| {
         ToolError::Module(match modules.state(&account.module) {
@@ -218,7 +218,7 @@ fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolEr
 
 /// A module call under the call limit, counted from now: a call waiting behind others on the same
 /// module counts its wait too.
-async fn within<T>(module: &str, call: impl Future<Output = Result<T, HostError>>) -> Result<T, ToolError> {
+pub(crate) async fn within<T>(module: &str, call: impl Future<Output = Result<T, HostError>>) -> Result<T, ToolError> {
     match tokio::time::timeout(CALL_TIMEOUT, call).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(ToolError::Module(format!("module {module}: {err}"))),

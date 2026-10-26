@@ -51,6 +51,23 @@ interface types {
         data: list<u8>,
     }
 
+    // Someone in a conversation, as the approval of a write shows them.
+    record participant {
+        id: string,
+        display-name: string,
+    }
+
+    // What a write is about, as the user sees it when approving it (spec 8.6). The core binds the
+    // approval to a fingerprint of the participants' ids and `target-text`, and describes the
+    // target again before it runs the write: a change voids the approval.
+    record target {
+        conversation-title: string,
+        // Empty for a channel: a channel is the target itself, its members are not compared.
+        participants: list<participant>,
+        // The current text of the message a reply, edit or reaction is about; none without one.
+        target-text: option<string>,
+    }
+
     variant module-error {
         // The session is gone; the user must sign in again.
         auth-required(string),
@@ -60,6 +77,9 @@ interface types {
         platform(string),
         invalid-args(string),
         not-supported(string),
+        // A write may have reached the platform but its answer did not arrive; the core never
+        // runs it again by itself (spec 8.5).
+        uncertain(string),
     }
 }
 
@@ -163,17 +183,23 @@ interface host {
 
 interface module {
     // Aliased: a type and a function can't share the name `manifest` in one interface.
-    use types.{manifest as module-manifest, account-info, attachment, module-error};
+    use types.{manifest as module-manifest, account-info, attachment, module-error, target};
 
     manifest: func() -> module-manifest;
     sign-in: func() -> result<account-info, module-error>;
     // Restores a session from stored secrets at daemon start.
     restore: func(account: string) -> result<_, module-error>;
     sign-out: func(account: string);
-    // Runs a shared tool (spec 8.5) or one of the manifest's extra tools.
+    // Runs a shared tool (spec 8.5) or one of the manifest's extra tools. The writes `send`,
+    // `edit_message` and `react` come only once the agent permissions and, where needed, the
+    // user's approval allow them (spec 8.6); any successful result means done.
     call: func(account: string, tool: string, args-json: string) -> result<string, module-error>;
     // The `get_attachment` tool: the attachment's bytes, for the core to save.
     get-attachment: func(account: string, conversation: string, message: string, attachment: string) -> result<attachment, module-error>;
+    // What a write (`send`, `edit_message`, `react`) in `conversation` would be about; `message` is
+    // the message replied to, edited or reacted to. Reads only: changes nothing on the platform
+    // and marks nothing as read.
+    describe-target: func(account: string, conversation: string, message: option<string>) -> result<target, module-error>;
 }
 
 interface events {

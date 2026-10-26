@@ -19,6 +19,7 @@ pub use actor::ModuleState;
 pub use error::{HostError, ModuleError};
 pub use net::{HttpError, Net, Request, Response};
 pub use runtime::{
-    AccountInfo, Attachment, Engine, HostEvent, Manifest, ModuleContext, ModuleHandle, NewMessage, SessionState, ToolDecl, WamIdentity,
+    AccountInfo, Attachment, Engine, HostEvent, Manifest, ModuleContext, ModuleHandle, NewMessage, Participant, SessionState, Target, ToolDecl,
+    WamIdentity,
 };
 pub use secrets::{delete_account_secrets, platform_store as credential_store};
