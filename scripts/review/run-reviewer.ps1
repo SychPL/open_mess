@@ -26,6 +26,9 @@ param(
 # denied (bash, edit, write, webfetch, MCP tools); inherited by the cmd.exe and opencode children.
 # opencode's built-in MCP resource readers ignore this and stay available, read-only.
 $env:OPENCODE_PERMISSION = '{"*":"deny","read":"allow","grep":"allow","glob":"allow","list":"allow"}'
+# open_mess: no opencode snapshots - they write git objects and index entries into the reviewed checkout.
+$env:OPENCODE_CONFIG_CONTENT = '{"snapshot":false}'
+foreach ($v in 'GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_PREFIX', 'GIT_COMMON_DIR') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 
 $rel = [IO.Path]::GetRelativePath($RepoDir, $PromptFile).Replace([char]92, [char]47)  # backslash -> fwd slash
 $ocPrompt = "Wykonaj doslownie instrukcje z pliku @$rel. NIE uruchamiaj polecen terminala ani git - tylko czytaj pliki"
