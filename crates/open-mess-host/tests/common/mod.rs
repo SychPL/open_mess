@@ -2,23 +2,22 @@
 
 // clippy.toml allows unwrap in #[test] functions only; these helpers are test code too. Each test
 // binary compiles this module and uses only some of it.
-#![allow(clippy::unwrap_used, dead_code)]
+#![allow(clippy::unwrap_used, clippy::panic, dead_code)]
 
 use std::path::PathBuf;
 
 use open_mess_host::ip_policy::AddressPolicy;
 use open_mess_host::{Engine, ModuleContext, ModuleHandle, Net, limits};
 
-/// A module built by `cargo xtask ci` (the wasm build runs before the tests), found next to this
-/// test binary so a custom `CARGO_TARGET_DIR` works too: `<target>/<profile>/deps/<test>.exe`
-/// -> `<target>/wasm32-wasip2/<profile>/<name>.wasm`.
+/// A module built by `cargo xtask ci` (the wasm build runs before the tests), found from this test
+/// binary so a custom `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET` works too: the binary is
+/// `<target>[/<triple>]/<profile>/deps/<test>.exe`, the module `<target>/wasm32-wasip2/<profile>/<name>.wasm`.
 pub fn wasm(name: &str) -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let profile_dir = exe.parent().and_then(|deps| deps.parent()).unwrap();
-    let target = profile_dir.parent().unwrap();
-    let path = target.join("wasm32-wasip2").join(profile_dir.file_name().unwrap()).join(format!("{name}.wasm"));
-    assert!(path.exists(), "{} is missing; build the modules first (cargo xtask ci)", path.display());
-    path
+    let relative = PathBuf::from("wasm32-wasip2").join(profile_dir.file_name().unwrap()).join(format!("{name}.wasm"));
+    let found = profile_dir.ancestors().map(|dir| dir.join(&relative)).find(|path| path.exists());
+    found.unwrap_or_else(|| panic!("{} is missing; build the modules first (cargo xtask ci)", relative.display()))
 }
 
 /// A context whose network allows loopback, so modules can reach the tests' local servers.

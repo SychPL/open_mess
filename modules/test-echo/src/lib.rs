@@ -5,7 +5,7 @@
 //! or `{"error"}` (the `http-error` case name); `ws` opens a WebSocket to `{"url"}`, sends "ping"
 //! and returns `{"conn"}` or `{"error"}`; `store` sets key "k" to `{"size"}` bytes and returns the
 //! length read back (`{"len"}`, plus `{"error"}` when the set failed); `timer` sets timer 7 to
-//! fire after 100 ms.
+//! fire after 100 ms. `restore` succeeds only for account "known"; `sign-in` is not supported.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -87,8 +87,9 @@ mod guest {
             Err(types::ModuleError::NotSupported("sign-in".to_string()))
         }
 
-        fn restore(_account: String) -> Result<(), types::ModuleError> {
-            Ok(())
+        // Only account "known" has a session, so tests can tell restore from sign-out.
+        fn restore(account: String) -> Result<(), types::ModuleError> {
+            if account == "known" { Ok(()) } else { Err(types::ModuleError::AuthRequired(account)) }
         }
 
         fn sign_out(_account: String) {}

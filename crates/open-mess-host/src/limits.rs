@@ -50,20 +50,28 @@ pub(crate) struct ModuleLimiter {
     table_elements: usize,
 }
 
-fn grow(total: usize, current: usize, desired: usize, max: usize, what: &str) -> wasmtime::Result<usize> {
-    let total = total.saturating_sub(current).saturating_add(desired);
-    if total > max { Err(wasmtime::format_err!("module {what} limit reached")) } else { Ok(total) }
+/// Counts a growth into `total`. Growth past the memory's or table's own maximum is refused
+/// without counting: wasmtime asks the limiter before it checks that maximum, the guest just sees
+/// the grow fail, and counting it would make a later, allowed growth trap.
+fn grow(total: &mut usize, current: usize, desired: usize, own_max: Option<usize>, cap: usize, what: &str) -> wasmtime::Result<bool> {
+    if own_max.is_some_and(|max| desired > max) {
+        return Ok(false);
+    }
+    let grown = total.saturating_sub(current).saturating_add(desired);
+    if grown > cap {
+        return Err(wasmtime::format_err!("module {what} limit reached"));
+    }
+    *total = grown;
+    Ok(true)
 }
 
 impl wasmtime::ResourceLimiter for ModuleLimiter {
-    fn memory_growing(&mut self, current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
-        self.memory = grow(self.memory, current, desired, MAX_MEMORY, "memory")?;
-        Ok(true)
+    fn memory_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        grow(&mut self.memory, current, desired, maximum, MAX_MEMORY, "memory")
     }
 
-    fn table_growing(&mut self, current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
-        self.table_elements = grow(self.table_elements, current, desired, MAX_TABLE_ELEMENTS, "table")?;
-        Ok(true)
+    fn table_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        grow(&mut self.table_elements, current, desired, maximum, MAX_TABLE_ELEMENTS, "table")
     }
 }
 
@@ -80,5 +88,13 @@ mod tests {
         assert!(limiter.memory_growing(0, 1, None).is_err());
         // Growing one memory counts only the difference.
         assert!(limiter.memory_growing(MAX_MEMORY / 2, MAX_MEMORY / 2, None).is_ok());
+    }
+
+    #[test]
+    fn growth_past_the_memorys_own_maximum_is_not_counted() {
+        let mut limiter = ModuleLimiter::default();
+        // Refused (the guest sees -1), not a trap, and not counted.
+        assert!(!limiter.memory_growing(0, MAX_MEMORY, Some(1024)).unwrap());
+        assert!(limiter.memory_growing(0, MAX_MEMORY, None).unwrap());
     }
 }

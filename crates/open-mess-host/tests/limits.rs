@@ -5,7 +5,18 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::load;
-use open_mess_host::{Engine, HostError, ModuleState, limits};
+use open_mess_host::{Engine, HostError, ModuleError, ModuleState, limits};
+
+#[tokio::test]
+async fn lifecycle_exports_reach_the_module() {
+    let engine = Engine::with_limits(limits::for_tests()).unwrap();
+    let echo = load(&engine, "open_mess_test_echo").await;
+    echo.restore("known").await.unwrap();
+    let result = echo.restore("other").await;
+    assert!(matches!(&result, Err(HostError::Module(ModuleError::AuthRequired(account))) if account == "other"), "{result:?}");
+    echo.sign_out("other").await.unwrap();
+    assert!(matches!(echo.sign_in().await, Err(HostError::Module(ModuleError::NotSupported(_)))));
+}
 
 #[tokio::test]
 async fn infinite_loop_is_interrupted() {
@@ -63,6 +74,6 @@ async fn module_errors_are_not_crashes() {
     let engine = Engine::with_limits(limits::for_tests()).unwrap();
     let echo = load(&engine, "open_mess_test_echo").await;
     let result = echo.call("a", "no-such-tool", "{}").await;
-    assert!(matches!(result, Err(HostError::Module(open_mess_host::ModuleError::NotSupported(_)))), "{result:?}");
+    assert!(matches!(result, Err(HostError::Module(ModuleError::NotSupported(_)))), "{result:?}");
     assert_eq!(echo.state(), ModuleState::Running);
 }
