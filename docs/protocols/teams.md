@@ -1,8 +1,10 @@
-# Microsoft Teams client protocol (static analysis)
+# Microsoft Teams client protocol
 
-Status: static analysis only, 2026-10-26. Nothing here was observed on the wire. No account was
-signed in, no request was sent to a Microsoft service, and nothing from the official client's user
-data (`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\`) or any browser profile was read.
+Status: sections 1-8 come from static analysis (2026-10-26): no account was signed in for them, no
+request was sent to a Microsoft service, and nothing from the official client's user data
+(`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\`) or any browser profile was read. Facts later
+checked on the wire, with the user present, are in "Live results" at the end and override the
+static sections where they differ.
 
 Every fact carries one marker:
 
@@ -389,10 +391,10 @@ Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
 1. 9.1 client ids: keep both, but state their roles. `1fec8e78-...` is the native desktop id with
    redirect `https://login.microsoftonline.com/common/oauth2/nativeclient`; `5e3ce6c0-...` is the
    web SPA id with redirect `https://teams.microsoft.com/v2`. Use the desktop id for open_mess.
-2. 9.1 sign-in order: (a) WAM is what the official desktop does, but only proven for the MSTeams
-   package identity - mark "may be refused for a third-party caller". (b) Embedded WebView2 with
-   auth code + PKCE against the `nativeclient` redirect is the concrete fallback (no loopback
-   redirect). (c) Device code has no code path in either client; keep it last and flag it as untested.
+2. 9.1 sign-in order: (a) WAM - confirmed live for a third-party process ("Live results", item 1);
+   (b) embedded WebView2 with auth code + PKCE against the `nativeclient` redirect is the fallback
+   (no loopback redirect); (c) device code has no code path in either client; keep it last and
+   flag it as untested.
 3. 9.1 tokens: replace "chat API and search tokens" with the audience table of section 1.4, and note
    CAE (`CP1`, claims challenges on 401 with `WWW-Authenticate`) - refresh on a claims challenge, not
    only on expiry.
