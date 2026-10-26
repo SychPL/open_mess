@@ -81,10 +81,8 @@ used. Those facts cite chunk name and the module or function they sit in instead
 - **CONFIRMED** the native side uses WAM through OneAuth: `ms-teams.exe` contains (UTF-16)
   `Windows.Security.Authentication.Web.Core` and `WebAuthenticationCoreManager`, and (ASCII)
   `msauth://Microsoft.AAD.BrokerPlugin` and `Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy`.
-- **UNCONFIRMED** whether a process that is not the MSTeams package can call WAM with
-  `1fec8e78-...`. WAM binds tokens to the calling app's identity and redirect URI; the official
-  client calls it from its own package identity. This is the biggest open question for spec 9.1
-  option 1.
+- **CONFIRMED LIVE (2026-10-26)** a process that is not the MSTeams package can get Teams tokens
+  from WAM with `1fec8e78-...`, silently and without any dialog. See "Live results", item 1.
 
 ### 1.3 Redirect URIs and embedded WebView
 
@@ -431,14 +429,13 @@ Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
 Static analysis could not settle these; each needs one redacted capture on the user's account, with
 the user present (spec 9.5):
 
-1. WAM with `1fec8e78-...` from a non-MSTeams process: accepted, refused, or needs a different
-   redirect.
+1. ~~WAM with `1fec8e78-...` from a non-MSTeams process~~ - done, accepted (see "Live results").
 2. Embedded WebView2 auth code + PKCE with `1fec8e78-...` and the `nativeclient` redirect: accepted by
    the tenant's conditional access? Refresh token lifetime?
 3. Device code with `1fec8e78-...` (only with explicit consent, spec 9.5).
-4. The full authz response shape and real `regionGtms` keys/values (only key names are known).
-5. Which token the chat service accepts from open_mess: CAE for `https://ic3.teams.office.com`, AAD,
-   or skype token only; same for Trouter allocate and AMS.
+4. ~~The full authz response shape and real `regionGtms` keys~~ - done (see "Live results", item 2).
+5. Which token Trouter allocate and AMS accept from open_mess (the chat service accepts a plain AAD
+   token for `https://ic3.teams.office.com` - see "Live results", item 3).
 6. Exact values for `x-ms-client-type`, `x-ms-client-version` and `clientinfo` that the services
    accept from a non-official client.
 7. Trouter allocate response fields, the downstream request envelope and the `/messaging` payload
@@ -454,3 +451,81 @@ the user present (spec 9.5):
 11. AMS image download: header token vs cookie, and which view names exist for received images.
 12. Whether the public `teams.microsoft.com/v2` build differs from the packaged build analysed here
     (fetching the CDN bundle without signing in and diffing it with REA `compare_bundles` is enough).
+
+## Live results
+
+Captured on the user's corporate account with the user present (spec 9.5). Nothing here contains a
+token, tenant id, user id or account name.
+
+1. **WAM from a non-MSTeams process - accepted** (2026-10-26). An unpackaged Rust console program
+   (`windows` crate 0.62, scratch probe, not in the repo) asked WAM for a token:
+   - provider: `FindAccountProviderWithAuthorityAsync("https://login.microsoft.com", "organizations")`;
+   - request: `WebTokenRequest(provider, "https://ic3.teams.office.com/.default", "1fec8e78-...")`
+     with properties `wam_compat=2.0` and `authority=https://login.microsoftonline.com/organizations`;
+   - `GetTokenSilentlyAsync(request)` without an account: `UserInteractionRequired`
+     (`0xCAA10001`, `interaction_required`) - expected, no account chosen;
+   - `FindAllAccountsWithClientIdAsync(provider, "1fec8e78-...")`: status success, the work
+     accounts known to Windows are visible to this client id;
+   - `GetTokenSilentlyWithWebAccountAsync(request, account)`: **success, no dialog**. Token claims:
+     `aud = https://ic3.teams.office.com`, `appid = 1fec8e78-bce4-4aaf-ab1b-5451cc387264`,
+     `scp = Teams.AccessAsUser.All`, lifetime 60-90 minutes, no `xms_cc` (CAE was not requested).
+
+   Consequence for spec 9.1: option 1 (WAM) works for open_mess as a separate program. The sign-in
+   flow is: find the provider, list the accounts visible to the client id, let the user pick one in
+   the configuration window, then get every token silently with that account; the interactive WAM
+   dialog (`IWebAuthenticationCoreManagerInterop::RequestTokenForWindowAsync`) is needed only when
+   a silent call returns `UserInteractionRequired`. Requesting CAE (`claims` with `cp1`) is still to
+   be tried.
+
+2. **authsvc with a WAM token - accepted** (2026-10-26). `POST
+   https://teams.microsoft.com/api/authsvc/v1.0/authz` with `Authorization: Bearer <WAM token for
+   https://api.spaces.skype.com>`, headers `claimsChallengeCapable: true`,
+   `ms-teams-authz-type: ExplicitLogin`, `X-MS-Migration: True`, `x-ms-client-type: web`, empty
+   body: HTTP 200. Response top-level keys: `isMultiGeo`, `licenseDetails`, `ocdiRedirect`,
+   `partition`, `region`, `regionGtms`, `regionSettings`, `teamsDataBoundary`, `tokens`. The skype
+   token is in `tokens.{skypeToken, expiresIn, tokenType}` (`expiresIn` about 75 minutes). Region
+   values look like `emea` / `emea01`. `regionGtms` has 112 keys, including `chatServiceAfd`
+   (`https://teams.microsoft.com/api/chatsvc/<region>`), `chatService`
+   (`https://<region>.ng.msg.teams.microsoft.com`), `middleTier`
+   (`https://teams.microsoft.com/api/mt/<region>`), `ams`, `amsV2`
+   (`https://<geo>-prod.asyncgw.teams.microsoft.com`), `calling_trouterUrl`
+   (`https://go-<geo>.trouter.teams.microsoft.com/v3/c` - a v3 path, the calling stack's URL; the
+   messaging Trouter flow of section 5 is still to be captured), `calling_registrarUrl`,
+   `teamsPushServiceAfd`, `search`, `unifiedPresence`. There is no `searchService` key.
+3. **Chat service with an AAD token - accepted** (2026-10-26). `GET
+   <chatServiceAfd>/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=5&startTime=1` with
+   `Authorization: Bearer <WAM token for https://ic3.teams.office.com>` (no CAE claim requested, no
+   skype token) and `BehaviorOverride: redirectAs404`: HTTP 200 on the first hop, no regional
+   redirect. The skype token is not needed for the chat service. Page keys: `_metadata`
+   (`backwardLink`, `forwardLink`, `syncState`, `totalCount`) and `conversations`. Conversation keys:
+   `id`, `lastMessage`, `lastUpdatedMessageId`, `lastUpdatedMessageVersion`, `memberProperties`,
+   `messages`, `properties`, `targetLink`, `threadProperties`, `type`, `version`.
+   `properties` keys: `addedBy`, `addedByTenantId`, `consumptionHorizonBookmark`,
+   `consumptionhorizon`, `favorite`, `isemptyconversation`, `isfollowed`, `ispinned`,
+   `lastTimeFavorited`, `lastimreceivedtime`; all 5 conversations had `consumptionhorizon`.
+   `lastMessage` keys: `clientmessageid`, `composetime`, `content`, `conversationLink`,
+   `conversationid`, `from`, `id`, `imdisplayname`, `messagetype`, `originalarrivaltime`,
+   `properties`, `rootMessageId`, `s2spartnername`, `sequenceId`, `type`, `version`.
+4. **`GET <chatServiceAfd>/v1/users/ME/properties` with the same AAD token - accepted**, HTTP 200.
+   Keys include `readReceiptsEnabled`, `selfChatSettings`, `locale`, `favorites`, `userDetails`,
+   `personalFileSite`; there is **no `appConsumptionHorizon`** here, so the "mark all as read"
+   horizon comes from another request (CSA is the next candidate).
+
+5. **Sending with an AAD token, without registering an endpoint - accepted** (2026-10-26, a real
+   message the user asked to send to a colleague, text approved by the user). Steps:
+   - `GET https://graph.microsoft.com/v1.0/users?$filter=startswith(displayName,'<prefix>')` with a
+     WAM token for `https://graph.microsoft.com/.default` (Teams client id): HTTP 200, so the Teams
+     client id can look people up in Graph;
+   - the 1:1 chat id is `19:<oidA>_<oidB>@unq.gbl.spaces`; of the two orders only one exists
+     (`GET .../conversations/<id>` 200 vs 404), so a client checks both - the order rule is not
+     settled from one sample;
+   - `POST <chatServiceAfd>/v1/users/ME/conversations/<id>/messages` with
+     `Authorization: Bearer <ic3 token>`, `BehaviorOverride: redirectAs404`, body
+     `{content: "<p>...</p>", messagetype: "RichText/Html", contenttype: "Text", imdisplayname,
+     clientmessageid, properties: {importance, subject, mentions: "[]", files: "[]",
+     formatVariant: "TEAMS"}}`: HTTP 201 with `OriginalArrivalTime`.
+   No endpoint registration, Trouter connection or skype token was needed to send.
+
+All checks in items 1-4 were read-only: no endpoint registration, no property write, no Trouter
+connection. Values printed during the checks were limited to status codes, key names, counts and
+service URLs.
