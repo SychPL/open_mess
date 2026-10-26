@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod cli;
+pub mod daemon;
 pub mod instance;
 pub mod paths;
 pub mod secrets;
