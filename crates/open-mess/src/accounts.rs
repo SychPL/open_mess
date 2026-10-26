@@ -6,18 +6,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use keyring_core::api::CredentialStore;
-use open_mess_host::{AccountInfo, HostError, ModuleError, SessionState};
+use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, SessionState};
 use rusqlite::OptionalExtension;
+use serde_json::Value;
 use tokio::task::JoinSet;
 
 use crate::Error;
 use crate::modules::{ModuleState, Modules};
 use crate::store::Store;
+use crate::tools::{ToolError, shared};
 
 /// The longest module account id taken; it becomes part of credential names.
 const MAX_ACCOUNT_ID: usize = 256;
 /// Display names are cut to this many characters.
 const MAX_DISPLAY_NAME: usize = 256;
+/// The state of an account being removed: no tool reaches it, no module report changes it, and a
+/// removal cut short (the daemon stopped) can be run again.
+pub const REMOVING: &str = "removing";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
@@ -25,7 +30,7 @@ pub struct Account {
     pub module: String,
     pub module_account: String,
     pub display_name: String,
-    /// `online`, `offline` or `auth-required`, as the module last reported it.
+    /// `online`, `offline` or `auth-required`, as the module last reported it, or [`REMOVING`].
     pub state: String,
 }
 
@@ -44,11 +49,14 @@ pub struct Accounts {
     modules: Modules,
     data_dir: PathBuf,
     credentials: Arc<CredentialStore>,
+    /// Held while an attachment is saved and while a removed account's attachments are deleted, so
+    /// a download that ends during a removal leaves no file behind.
+    attachments: Mutex<()>,
 }
 
 impl Accounts {
     pub fn new(store: Store, modules: Modules, data_dir: PathBuf, credentials: Arc<CredentialStore>) -> Accounts {
-        Accounts { store: Mutex::new(store), modules, data_dir, credentials }
+        Accounts { store: Mutex::new(store), modules, data_dir, credentials, attachments: Mutex::new(()) }
     }
 
     /// Never held across an await.
@@ -100,17 +108,20 @@ impl Accounts {
         Ok(account)
     }
 
-    /// Records what a module reported about one of its accounts. Unknown accounts are ignored.
+    /// Records what a module reported about one of its accounts. Unknown accounts and accounts
+    /// being removed are left alone.
     pub fn set_state(&self, module: &str, module_account: &str, state: SessionState) -> Result<(), Error> {
-        self.store()
-            .conn()
-            .execute("UPDATE accounts SET state = ?1 WHERE module = ?2 AND module_account = ?3", [state_name(state), module, module_account])?;
+        self.store().conn().execute(
+            "UPDATE accounts SET state = ?1 WHERE module = ?2 AND module_account = ?3 AND state <> ?4",
+            [state_name(state), module, module_account, REMOVING],
+        )?;
         Ok(())
     }
 
     /// The state agents see: an account whose module does not run is offline (spec 8.3).
     pub fn effective_state(&self, account: &Account) -> String {
         match self.modules.state(&account.module) {
+            _ if account.state == REMOVING => REMOVING.into(),
             Some(ModuleState::Active) => account.state.clone(),
             _ => state_name(SessionState::Offline).into(),
         }
@@ -119,7 +130,7 @@ impl Accounts {
     /// Restores every account's session at daemon start, all modules at once.
     pub async fn restore(&self) -> Result<(), Error> {
         let mut restores = JoinSet::new();
-        for account in self.list()? {
+        for account in self.list()?.into_iter().filter(|account| account.state != REMOVING) {
             match self.modules.handle(&account.module) {
                 Some(handle) => {
                     let handle = handle.clone();
@@ -143,14 +154,26 @@ impl Accounts {
         Ok(())
     }
 
-    /// Removes the account (spec 8.8): its row first, so no new call reaches its module; then
-    /// the module signs it out, after every call already queued for it (a module runs its calls in
-    /// order, and no time limit here cuts that wait short, so a queued restore cannot store a token
-    /// after the secrets are gone); then its secrets and its attachments. Secrets that cannot be
-    /// deleted bring the account back, so removing it can be tried again.
+    /// Writes an attachment downloaded for the account, unless the account is gone or being
+    /// removed by now. Blocking.
+    pub fn save_attachment(&self, id: &str, attachment: Attachment) -> Result<Value, ToolError> {
+        let _saving = self.attachments.lock().unwrap_or_else(PoisonError::into_inner);
+        match self.get(id) {
+            Ok(Some(account)) if account.state != REMOVING => shared::save_attachment(&self.data_dir, id, attachment),
+            Ok(_) => Err(ToolError::Module(format!("account {id:?} was removed"))),
+            Err(err) => Err(ToolError::Failed(err.to_string())),
+        }
+    }
+
+    /// Removes the account (spec 8.8). It is marked [`REMOVING`] first, so no new call reaches
+    /// its module; then the module signs it out, after every call already queued for it (a module
+    /// runs its calls in order, and no time limit here cuts that wait short, so a queued restore
+    /// cannot store a token after the secrets are gone); then its secrets go, and last its row and
+    /// attachments. A removal cut short keeps the marked row, so it can be run again; secrets that
+    /// cannot be deleted leave the account signed out (offline).
     pub async fn remove(&self, id: &str) -> Result<(), Error> {
         let account = self.get(id)?.ok_or_else(|| Error::Account(format!("unknown account {id:?}")))?;
-        self.store().conn().execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+        self.store().conn().execute("UPDATE accounts SET state = ?2 WHERE id = ?1", [id, REMOVING])?;
         if let Some(handle) = self.modules.handle(&account.module) {
             // A failed sign-out leaves a session on the server; the account goes anyway. The
             // host's own call limit bounds the call.
@@ -162,14 +185,13 @@ impl Accounts {
             .await
             .unwrap_or_else(|err| Err(err.to_string()));
         if let Err(why) = deleted {
-            self.store().conn().execute(
-                "INSERT OR IGNORE INTO accounts (id, module, module_account, display_name, state) VALUES (?1, ?2, ?3, ?4, ?5)",
-                [&account.id, &account.module, &account.module_account, &account.display_name, &account.state],
-            )?;
+            self.store().conn().execute("UPDATE accounts SET state = ?2 WHERE id = ?1", [id, state_name(SessionState::Offline)])?;
             return Err(Error::Account(format!("cannot delete the account's secrets: {why}")));
         }
+        let _saving = self.attachments.lock().unwrap_or_else(PoisonError::into_inner);
+        self.store().conn().execute("DELETE FROM accounts WHERE id = ?1", [id])?;
         // Best effort: a file an agent still has open stays until the attachments' retention.
-        let _ = std::fs::remove_dir_all(crate::tools::shared::attachments_dir(&self.data_dir, id));
+        let _ = std::fs::remove_dir_all(shared::attachments_dir(&self.data_dir, id));
         Ok(())
     }
 }

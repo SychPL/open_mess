@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
-use crate::accounts::{Account, Accounts};
+use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::ModuleState;
 
 /// A tool as both front ends describe it.
@@ -141,8 +141,9 @@ fn unknown_account(id: &str) -> ToolError {
     ToolError::InvalidArgs(format!("unknown account {id:?} - the accounts tool lists them"))
 }
 
+/// An account a tool may use: one being removed is unknown to the tools.
 fn find(accounts: &Accounts, id: &str) -> Result<Account, ToolError> {
-    accounts.get(id).map_err(failed)?.ok_or_else(|| unknown_account(id))
+    accounts.get(id).map_err(failed)?.filter(|account| account.state != REMOVING).ok_or_else(|| unknown_account(id))
 }
 
 fn list_accounts(accounts: &Accounts) -> Result<Value, ToolError> {
@@ -212,7 +213,8 @@ async fn call_account(accounts: &Accounts, account: &Account, tool: &str, args: 
 async fn fan_out(accounts: &Arc<Accounts>, tool: &str, args: &Value) -> Result<Value, ToolError> {
     let mut calls = JoinSet::new();
     let mut errors = Vec::new();
-    for (index, account) in accounts.list().map_err(failed)?.into_iter().enumerate() {
+    let list = accounts.list().map_err(failed)?.into_iter().filter(|account| account.state != REMOVING);
+    for (index, account) in list.enumerate() {
         if let Err(err) = module(accounts, &account) {
             errors.push((index, account.id, err.to_string()));
             continue;
@@ -253,12 +255,12 @@ async fn fan_out(accounts: &Arc<Accounts>, tool: &str, args: &Value) -> Result<V
 }
 
 /// The module fetches the bytes; the core writes the file (spec 8.5).
-async fn get_attachment(accounts: &Accounts, id: &str, args: &Value) -> Result<Value, ToolError> {
+async fn get_attachment(accounts: &Arc<Accounts>, id: &str, args: &Value) -> Result<Value, ToolError> {
     let account = find(accounts, id)?;
     let handle = module(accounts, &account)?;
     let arg = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
     let attachment =
         within(&account.module, handle.get_attachment(&account.module_account, arg("conversation"), arg("message"), arg("attachment"))).await?;
-    let data_dir = accounts.data_dir().to_path_buf();
-    tokio::task::spawn_blocking(move || shared::save_attachment(&data_dir, &account.id, attachment)).await.map_err(failed)?
+    let accounts = Arc::clone(accounts);
+    tokio::task::spawn_blocking(move || accounts.save_attachment(&account.id, attachment)).await.map_err(failed)?
 }

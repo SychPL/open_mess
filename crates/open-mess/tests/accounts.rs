@@ -252,8 +252,36 @@ async fn secrets_left_behind_keep_the_account() {
     cred.set_error(keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))));
 
     assert!(d.accounts.remove("test-echo:a").await.is_err());
-    assert!(d.accounts.get("test-echo:a").unwrap().is_some());
+    // The account stays, signed out.
+    assert_eq!(d.accounts.get("test-echo:a").unwrap().unwrap().state, "offline");
     // Removing again works once the store does.
     d.accounts.remove("test-echo:a").await.unwrap();
     assert!(d.accounts.get("test-echo:a").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn interrupted_removal_can_be_run_again() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    d.accounts.add("test-echo", info("b")).unwrap();
+    attachment(&d.registry, "test-echo:a").await;
+    // The daemon stopped in the middle of removing "a": its row is marked.
+    let state = rusqlite::Connection::open(d.dir.path().join("state.sqlite3")).unwrap();
+    state.execute("UPDATE accounts SET state = 'removing' WHERE id = 'test-echo:a'", []).unwrap();
+    assert!(read_messages(&d.registry, "test-echo:a").await.is_err());
+    // The fan-out skips it without an error.
+    let unread = d.registry.call("unread", json!({})).await.unwrap();
+    assert_eq!(unread["items"].as_array().unwrap().len(), 1);
+    assert_eq!(unread["items"][0]["account"], "test-echo:b");
+    assert!(unread.get("errors").is_none(), "{unread}");
+    // A module report doesn't bring it back, and a download that ends now saves nothing.
+    d.accounts.set_state("test-echo", "a", SessionState::Online).unwrap();
+    assert_eq!(d.accounts.get("test-echo:a").unwrap().unwrap().state, "removing");
+    let late = open_mess_host::Attachment { file_name: "late.txt".into(), content_type: "text/plain".into(), data: b"late".to_vec() };
+    assert!(d.accounts.save_attachment("test-echo:a", late).is_err());
+    assert!(!attachments_dir(d.dir.path(), "test-echo:a").join("late.txt").exists());
+
+    d.accounts.remove("test-echo:a").await.unwrap();
+    assert!(d.accounts.get("test-echo:a").unwrap().is_none());
+    assert!(!attachments_dir(d.dir.path(), "test-echo:a").exists());
 }
