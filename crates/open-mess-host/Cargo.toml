@@ -14,6 +14,10 @@ test-support = []
 
 [dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+# Module secrets: keyring picks the platform store (Windows Credential Manager), keyring-core is
+# its store interface, so tests can use the mock store.
+keyring = "4.2.0"
+keyring-core = "1.0.1"
 psl = "2.1.245"
 # rustls with the platform verifier (Windows certificate store, for TLS-inspecting company
 # proxies) and the system proxy settings; ring is the crypto provider (no cmake/NASM build).
@@ -21,6 +25,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["http2", "
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 # The same platform verifier reqwest uses, for WebSocket TLS.
 rustls-platform-verifier = "0.7.1"
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
@@ -32,6 +37,7 @@ wasmtime-wasi = { version = "50.0.0", default-features = false, features = ["p2"
 [dev-dependencies]
 axum = "0.8.9"
 open-mess-host = { path = ".", features = ["test-support"] }
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 

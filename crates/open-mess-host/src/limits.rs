@@ -29,6 +29,8 @@ pub const MAX_SOCKETS: usize = 4;
 pub const MAX_TIMERS: usize = 32;
 /// The shortest timer delay; shorter ones are lengthened to it.
 pub const MIN_TIMER_DELAY: Duration = Duration::from_millis(100);
+/// A module's storage: the bytes of all keys and values together.
+pub const STORAGE_QUOTA: usize = 16 * 1024 * 1024;
 /// One `host.log` line; the rest is cut off.
 pub const MAX_LOG_MESSAGE: usize = 2048;
 

@@ -33,6 +33,11 @@ pub fn context() -> ModuleContext {
     context_with_events().0
 }
 
+/// A context with its own data folder, for tests that use module storage.
+pub fn context_in(data_dir: PathBuf) -> ModuleContext {
+    ModuleContext { data_dir, ..context() }
+}
+
 pub async fn load(engine: &Engine, name: &str) -> ModuleHandle {
     engine.load(&wasm(name), context()).await.unwrap()
 }

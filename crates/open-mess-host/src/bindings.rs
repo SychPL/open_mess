@@ -1,10 +1,16 @@
 //! The host side of `wit/module.wit`: generated bindings, the imports a module may call and the
 //! conversions between the generated types and the crate's plain ones.
 
+use std::sync::Arc;
+
+use keyring_core::api::CredentialStore;
+
 use crate::error::ModuleError;
 use crate::limits;
 use crate::net;
 use crate::runtime::{AccountInfo, HostEvent, HostState, Manifest, NewMessage, SessionState, ToolDecl, WamIdentity};
+use crate::sign_in::{UNAVAILABLE, wait_for_user};
+use crate::storage::{Storage, StorageError};
 
 wasmtime::component::bindgen!({
     world: "platform-module",
@@ -17,8 +23,25 @@ wasmtime::component::bindgen!({
 
 use open_mess::module::{host, http, secrets, sign_in, storage, types, websocket};
 
-fn not_yet(what: &str) -> String {
-    format!("not supported yet: {what}")
+impl HostState {
+    /// The module's storage, opened on first use. Not while the manifest is read at load: the
+    /// module has no name yet.
+    fn storage(&mut self) -> Result<&mut Storage, StorageError> {
+        if self.env.name.is_empty() {
+            return Err(StorageError::Failed("storage is not available while the module loads".to_string()));
+        }
+        if self.storage.is_none() {
+            self.storage = Some(Storage::open(&self.env.data_dir, &self.env.name)?);
+        }
+        self.storage.as_mut().ok_or_else(|| StorageError::Failed("storage did not open".to_string()))
+    }
+
+    fn secret_store(&self) -> Result<Arc<CredentialStore>, String> {
+        if self.env.name.is_empty() {
+            return Err("secrets are not available while the module loads".to_string());
+        }
+        crate::secrets::platform_store()
+    }
 }
 
 impl types::Host for HostState {}
@@ -46,40 +69,64 @@ impl websocket::Host for HostState {
 }
 
 impl storage::Host for HostState {
-    async fn get(&mut self, _key: String) -> Option<Vec<u8>> {
-        None
+    async fn get(&mut self, key: String) -> Option<Vec<u8>> {
+        match self.storage().and_then(|storage| storage.get(&key)) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(module = %self.env.name, "storage read failed: {e:?}");
+                None
+            }
+        }
     }
 
-    async fn set(&mut self, _key: String, _value: Vec<u8>) -> Result<(), storage::StorageError> {
-        Err(storage::StorageError::Failed(not_yet("storage")))
+    async fn set(&mut self, key: String, value: Vec<u8>) -> Result<(), storage::StorageError> {
+        self.storage().and_then(|storage| storage.set(&key, &value)).map_err(|e| match e {
+            StorageError::QuotaExceeded => storage::StorageError::QuotaExceeded,
+            StorageError::Failed(why) => storage::StorageError::Failed(why),
+        })
     }
 
-    async fn delete(&mut self, _key: String) {}
+    async fn delete(&mut self, key: String) {
+        if let Err(e) = self.storage().and_then(|storage| storage.delete(&key)) {
+            tracing::warn!(module = %self.env.name, "storage delete failed: {e:?}");
+        }
+    }
 }
 
 impl secrets::Host for HostState {
-    async fn get(&mut self, _account: String, _key: String) -> Option<String> {
-        None
+    async fn get(&mut self, account: String, key: String) -> Option<String> {
+        let store = self.secret_store().ok()?;
+        crate::secrets::get(&*store, &self.env.name, &account, &key)
     }
 
-    async fn set(&mut self, _account: String, _key: String, _value: String) -> Result<(), String> {
-        Err(not_yet("secrets"))
+    async fn set(&mut self, account: String, key: String, value: String) -> Result<(), String> {
+        let store = self.secret_store()?;
+        crate::secrets::set(&*store, &self.env.name, &account, &key, &value)
     }
 
-    async fn delete(&mut self, _account: String, _key: String) {}
+    async fn delete(&mut self, account: String, key: String) {
+        if let Ok(store) = self.secret_store() {
+            crate::secrets::delete(&*store, &self.env.name, &account, &key);
+        }
+    }
 }
 
+/// Refused until the configuration window exists; codes and URLs are never logged.
 impl sign_in::Host for HostState {
-    async fn show_device_code(&mut self, _code: String, _verification_url: String) {}
+    async fn show_device_code(&mut self, _code: String, _verification_url: String) {
+        tracing::debug!(module = %self.env.name, "device code not shown: {UNAVAILABLE}");
+    }
 
-    async fn show_qr(&mut self, _data: String) {}
+    async fn show_qr(&mut self, _data: String) {
+        tracing::debug!(module = %self.env.name, "QR code not shown: {UNAVAILABLE}");
+    }
 
     async fn open_page(&mut self, _url: String, _redirect_prefix: String) -> Result<String, sign_in::SignInError> {
-        Err(sign_in::SignInError::Refused(not_yet("sign-in")))
+        wait_for_user(&self.deadline, async { Err(sign_in::SignInError::Refused(UNAVAILABLE.to_string())) }).await
     }
 
     async fn wam_token(&mut self, _scopes: Vec<String>, _interactive: bool) -> Result<String, sign_in::SignInError> {
-        Err(sign_in::SignInError::Refused(not_yet("sign-in")))
+        wait_for_user(&self.deadline, async { Err(sign_in::SignInError::Refused(UNAVAILABLE.to_string())) }).await
     }
 }
 

@@ -5,8 +5,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use wasmtime::{Store, UpdateDeadline};
@@ -62,21 +62,60 @@ pub enum ModuleState {
     Disabled,
 }
 
-/// The deadline of the call in progress, shared by the actor and the store's epoch callback.
+/// The deadline of the call in progress, shared by the actor, the store's epoch callback and the
+/// sign-in imports, which pause it while they wait for the user (spec 8.3, R4).
 #[derive(Clone, Default)]
-pub(crate) struct Deadline(Arc<Mutex<Option<Instant>>>);
+pub(crate) struct Deadline(Arc<Mutex<DeadlineState>>);
+
+#[derive(Default)]
+struct DeadlineState {
+    at: Option<Instant>,
+    paused_since: Option<Instant>,
+}
+
+/// While paused, the actor looks at the deadline this often.
+const PAUSED_POLL: Duration = Duration::from_secs(1);
 
 impl Deadline {
-    fn set(&self, at: Option<Instant>) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = at;
+    fn state(&self) -> MutexGuard<'_, DeadlineState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn at(&self) -> Option<Instant> {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn set(&self, at: Option<Instant>) {
+        *self.state() = DeadlineState { at, paused_since: None };
+    }
+
+    /// When the actor should look at the deadline again; None outside a call.
+    fn wake_at(&self) -> Option<Instant> {
+        let state = self.state();
+        if state.paused_since.is_some() { state.at.map(|_| Instant::now() + PAUSED_POLL) } else { state.at }
     }
 
     pub(crate) fn expired(&self) -> bool {
-        self.at().is_some_and(|at| Instant::now() >= at)
+        let state = self.state();
+        state.paused_since.is_none() && state.at.is_some_and(|at| Instant::now() >= at)
+    }
+
+    /// Stops the clock until the returned guard is dropped; the paused time is added back.
+    pub(crate) fn pause(&self) -> Paused<'_> {
+        let mut state = self.state();
+        if state.paused_since.is_none() {
+            state.paused_since = Some(Instant::now());
+        }
+        Paused(self)
+    }
+}
+
+pub(crate) struct Paused<'a>(&'a Deadline);
+
+impl Drop for Paused<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state();
+        if let Some(since) = state.paused_since.take()
+            && let Some(at) = &mut state.at
+        {
+            *at += since.elapsed();
+        }
     }
 }
 
@@ -88,7 +127,7 @@ type Export<'a, R> = Pin<Box<dyn Future<Output = wasmtime::Result<R>> + Send + '
 async fn within<R>(deadline: &Deadline, call: impl Future<Output = wasmtime::Result<R>>) -> Result<R, HostError> {
     tokio::pin!(call);
     loop {
-        let Some(at) = deadline.at() else { return Err(HostError::Timeout) };
+        let Some(at) = deadline.wake_at() else { return Err(HostError::Timeout) };
         tokio::select! {
             result = &mut call => {
                 // The root cause is the trap itself; the outer error is a WebAssembly backtrace.
@@ -286,4 +325,24 @@ async fn next_event(events: &mut Option<mpsc::Receiver<GuestEvent>>) -> Option<G
 /// A call that ran but returned the module's own error.
 fn module_result<T, E: Into<ModuleError>>(result: Result<Result<T, E>, HostError>) -> Result<T, HostError> {
     result.and_then(|r| r.map_err(|e| HostError::Module(e.into())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_time_does_not_count() {
+        let deadline = Deadline::default();
+        deadline.set(Some(Instant::now() + Duration::from_millis(50)));
+        {
+            let _paused = deadline.pause();
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!deadline.expired());
+        }
+        // The 100 ms paused were added back: 50 ms are still left.
+        assert!(!deadline.expired());
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(deadline.expired());
+    }
 }

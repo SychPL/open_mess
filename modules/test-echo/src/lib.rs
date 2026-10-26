@@ -6,8 +6,9 @@
 //! and returns `{"conn"}` or `{"error"}`; `store` sets key "k" to `{"size"}` bytes and returns the
 //! length read back (`{"len"}`, plus `{"error"}` when the set failed); `timer` sets timer 7 to
 //! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` in
-//! conversation "c" that mentions the user. `restore` succeeds only for account "known";
-//! `sign-in` is not supported.
+//! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
+//! `open-page` and `wam-token` answered. The `restore` export succeeds only for account "known";
+//! the `sign-in` export is not supported.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -22,7 +23,7 @@ mod guest {
     }
 
     use bindings::exports::open_mess::module::{events, module};
-    use bindings::open_mess::module::{host, http, storage, types, websocket};
+    use bindings::open_mess::module::{host, http, sign_in, storage, types, websocket};
     use serde_json::{Value, json};
 
     struct Echo;
@@ -66,6 +67,20 @@ mod guest {
             "timer" => {
                 host::set_timer(7, 100);
                 json!({})
+            }
+            "sign-in" => {
+                let describe = |result: Result<String, sign_in::SignInError>| match result {
+                    Ok(_) => "ok".to_string(),
+                    Err(sign_in::SignInError::Cancelled) => "cancelled".to_string(),
+                    Err(sign_in::SignInError::TimedOut) => "timed-out".to_string(),
+                    Err(sign_in::SignInError::Refused(why)) => format!("refused: {why}"),
+                    Err(sign_in::SignInError::Blocked(why)) => format!("blocked: {why}"),
+                };
+                sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
+                json!({
+                    "open-page": describe(sign_in::open_page("https://login.example.com/", "https://login.example.com/done")),
+                    "wam-token": describe(sign_in::wam_token(&["scope".to_string()], true)),
+                })
             }
             "message" => {
                 host::session("a", host::SessionState::Online);

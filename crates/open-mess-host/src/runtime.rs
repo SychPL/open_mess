@@ -13,6 +13,7 @@ use crate::error::HostError;
 use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
 use crate::net::Net;
+use crate::storage::Storage;
 use crate::timers::Timers;
 use crate::ws::Sockets;
 
@@ -102,7 +103,9 @@ pub struct ModuleContext {
 
 /// What a module's imports work with; shared by all its instances.
 pub(crate) struct ModuleEnv {
+    /// Empty while the manifest is read at load; storage and secrets are refused then.
     pub(crate) name: String,
+    pub(crate) data_dir: PathBuf,
     pub(crate) hosts: HostList,
     pub(crate) net: Net,
     pub(crate) events: mpsc::Sender<HostEvent>,
@@ -118,6 +121,7 @@ pub(crate) struct HostState {
     pub(crate) env: Arc<ModuleEnv>,
     pub(crate) sockets: Sockets,
     pub(crate) timers: Timers,
+    pub(crate) storage: Option<Storage>,
     /// Where this instance's sockets and timers send what they deliver.
     pub(crate) guest_events: mpsc::Sender<GuestEvent>,
 }
@@ -140,6 +144,7 @@ impl HostState {
             env,
             sockets: Sockets::default(),
             timers: Timers::default(),
+            storage: None,
             guest_events,
         }
     }
@@ -210,9 +215,9 @@ impl Engine {
             .map_err(|e| HostError::Load(format!("not a platform module: {e}")))?;
         // The manifest runs before the module has a name or hosts: its imports reach nothing, and
         // its host events go nowhere.
-        let ModuleContext { net, events, .. } = ctx;
+        let ModuleContext { data_dir, events, net } = ctx;
         let (nowhere, _) = mpsc::channel(1);
-        let loading = ModuleEnv { name: String::new(), hosts: HostList::default(), net: net.clone(), events: nowhere };
+        let loading = ModuleEnv { name: String::new(), data_dir: data_dir.clone(), hosts: HostList::default(), net: net.clone(), events: nowhere };
         let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
             .run(|m, s| Box::pin(m.open_mess_module_module().call_manifest(s)))
@@ -223,7 +228,7 @@ impl Engine {
         let hosts = HostList::parse(&manifest.hosts)?;
         // Not used until the sign-in window (milestone E), but a bad manifest is refused now.
         HostList::parse(&manifest.sign_in_hosts)?;
-        actor.reset(Arc::new(ModuleEnv { name: manifest.name.clone(), hosts, net, events }));
+        actor.reset(Arc::new(ModuleEnv { name: manifest.name.clone(), data_dir, hosts, net, events }));
         let (requests, queue) = mpsc::channel(QUEUE);
         tokio::spawn(actor.serve(queue));
         Ok(ModuleHandle { manifest, requests, state })
