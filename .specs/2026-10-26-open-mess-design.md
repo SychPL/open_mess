@@ -154,9 +154,9 @@ Ustawiane w sekcji "Uprawnienia agentów" okna, per konto, opcjonalnie zawężon
 
 **Samodzielne wysyłanie jest opcją do wyboru** (decyzja użytkownika): agent może wysyłać bez potwierdzenia tylko tam, gdzie użytkownik świadomie ustawił "samodzielnie" - per konto, opcjonalnie zawężone do wybranych rozmów, oraz osobno w każdej regule wyzwalacza (8.7). Nowe konto startuje z "z potwierdzeniem" (decyzja projektowa).
 
-"Z potwierdzeniem" oznacza, że działa tylko ścieżka `prepare_message` -> `send_prepared`, a `send_prepared` przechodzi dopiero po zatwierdzeniu **poza zasięgiem agenta**: powiadomienie Windows z dokładną rozmową, odbiorcami i tekstem oraz przyciskami Wyślij / Odrzuć, a także lista "Do zatwierdzenia" w oknie konfiguracji. Zgoda wyrażona w czacie z agentem nie wystarcza, bo agent mógłby ją zmyślić albo wywołać `send_prepared` sam. Dotyczy to agentów w sesji interaktywnej, agentów uruchomionych przez wyzwalacz i CLI wywołanego nieinteraktywnie (np. z narzędzia Bash agenta). Decyzja projektowa.
+"Z potwierdzeniem" oznacza, że działa tylko ścieżka `prepare_message` -> `send_prepared`, a `send_prepared` przechodzi dopiero po zatwierdzeniu **poza zasięgiem agenta**: powiadomienie Windows z dokładną rozmową, odbiorcami i tekstem oraz przyciskami Wyślij / Odrzuć, a także lista "Do zatwierdzenia" w oknie konfiguracji. Zgoda wyrażona w czacie z agentem nie wystarcza, bo agent mógłby ją zmyślić albo wywołać `send_prepared` sam. Dotyczy to agentów w sesji interaktywnej, agentów uruchomionych przez wyzwalacz i CLI. Decyzja projektowa.
 
-CLI uruchomione przez człowieka w interaktywnym terminalu (stdin to terminal) traktujemy jako użytkownika: wysyła bez dodatkowego zatwierdzenia, a uprawnienia agentów go nie ograniczają. Decyzja projektowa.
+CLI nie ma żadnych dodatkowych przywilejów: podlega tym samym uprawnieniom i tej samej ścieżce zatwierdzania co MCP. Demon nie umie wiarygodnie odróżnić człowieka w terminalu od agenta, który sam otwiera konsolę (np. `Start-Process` z narzędzia Bash), więc rozróżnianie po terminalu byłoby obejściem uprawnień. Człowiek wysyłający z CLI na koncie "z potwierdzeniem" klika Wyślij w powiadomieniu tak jak przy agencie; kto chce wysyłać bez tego, ustawia "samodzielnie". Decyzja projektowa (recenzja Codex i GLM commita d82e768 odrzuciła wcześniejszą regułę "CLI w interaktywnym terminalu = użytkownik").
 
 Rdzeń egzekwuje uprawnienia - nie polega na tym, że agent się do nich zastosuje.
 
@@ -239,7 +239,7 @@ Użytkownik nie ma konta ani organizacji testowej Microsoft 365 - wszystko odbyw
 - **Testy zapisu na żywo tylko w czacie z samym sobą** (notatki dla siebie). Wysyłka, edycja i reakcje nigdy nie dotykają rozmów z innymi osobami podczas testów.
 - **Testy na żywo nie działają automatycznie:** są oznaczone `#[ignore]`, wymagają jawnej zmiennej środowiskowej i obecności użytkownika. CI ich nigdy nie uruchamia.
 - **Mały ruch:** testy i przechwytywanie protokołu robią tylko tyle zapytań, ile trzeba, żeby nie wyglądać jak atak i nie powodować ograniczania konta.
-- **Przechwyty protokołu** (REA) z konta firmowego są czyszczone z tokenów, identyfikatorów tenantu i użytkowników oraz treści wiadomości, zanim cokolwiek trafi do repo.
+- **Przechwyty protokołu** (REA) z konta firmowego są czyszczone z tokenów, ciasteczek, identyfikatorów tenantu i użytkowników oraz treści wiadomości, zanim cokolwiek trafi do repo.
 
 ## 10. Wnioski z `teams-wrapper` (`C:\Projekty\sych.pl\teams_wraper`)
 
@@ -296,7 +296,7 @@ Decyzje projektowe (moje, do sprawdzenia przy czytaniu):
 - Tauri 2 / WebView2 dla okna konfiguracji,
 - kolejność po Teams: Discord, potem Slack,
 - trzy poziomy pisania (nigdy / z potwierdzeniem / samodzielnie), nowe konto startuje z "z potwierdzeniem",
-- zatwierdzanie wysyłki tylko poza zasięgiem agenta (powiadomienie Windows, lista "Do zatwierdzenia"), nigdy samą zgodą w czacie; CLI w interaktywnym terminalu = użytkownik,
+- zatwierdzanie wysyłki tylko poza zasięgiem agenta (powiadomienie Windows, lista "Do zatwierdzenia"), nigdy samą zgodą w czacie; CLI podlega tym samym uprawnieniom co MCP,
 - grupowanie, cisza nocna i limity wyzwalaczy; domyślnie obudzony agent nie wysyła bez zatwierdzenia,
 - sekrety w Menedżerze poświadczeń Windows, stan w SQLite, brak lokalnego archiwum wiadomości,
 - brak narzędzia do oznaczania jako przeczytane,
@@ -319,7 +319,7 @@ Decyzje projektowe (moje, do sprawdzenia przy czytaniu):
 ## 15. Threat model
 
 Zaufani:
-- użytkownik przy komputerze: okno konfiguracji, przyciski w powiadomieniach Windows, CLI w interaktywnym terminalu,
+- użytkownik przy komputerze: okno konfiguracji i przyciski w powiadomieniach Windows (CLI nie jest kanałem zaufanym - może go wywołać agent),
 - rdzeń open_mess i jego zapis stanu w `%APPDATA%\open_mess\`.
 
 Częściowo zaufani - agenci (Claude Code, Codex, agenci z wyzwalaczy): działają w dobrej wierze, ale mogą się mylić albo zostać zmanipulowani treścią wiadomości (prompt injection). Dlatego rdzeń sam egzekwuje uprawnienia (8.6), a wysyłka "z potwierdzeniem" wymaga zatwierdzenia poza ich zasięgiem.
