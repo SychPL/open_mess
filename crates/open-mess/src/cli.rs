@@ -16,7 +16,7 @@ use crate::daemon::{self, LAST_START_ERROR_FILE};
 use crate::instance::InstanceLock;
 use crate::store::{DEFAULT_PORT, Store};
 use crate::tools::ToolInfo;
-use crate::{paths, secrets};
+use crate::{Error, paths, secrets};
 
 #[derive(Debug, Parser)]
 #[command(name = "om", bin_name = "om", version, about = "open_mess: your messengers, for AI agents", arg_required_else_help = true)]
@@ -64,10 +64,11 @@ fn not_running() -> Failure {
     Failure { code: 2, message }
 }
 
-/// Whether a daemon runs on this data folder. Takes the lock for a moment when none does.
-// ponytail: a daemon starting in that moment exits "already running"; only checked after a failed start.
+/// Whether a daemon holds this data folder's instance lock. Only a lock held by someone else
+/// counts: failing to open or lock the file proves nothing. When the lock is free this takes it
+/// for an instant; a starting daemon retries for that (daemon.rs).
 fn daemon_holds_the_lock() -> bool {
-    paths::data_dir().is_ok_and(|dir| InstanceLock::acquire(&dir).is_err())
+    paths::data_dir().is_ok_and(|dir| matches!(InstanceLock::acquire(&dir), Err(Error::AlreadyRunning)))
 }
 
 /// Why the daemon's last start failed, if it did. A successful start deletes the file.
@@ -190,6 +191,8 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
     let ToolArgs { args, json_output } = parse_tool_args(rest)?;
     // After a failed start, whatever holds the port may be another program: don't send it the token
     // unless a daemon holds the lock (a good start may have failed to delete the file).
+    // ponytail: a daemon still starting holds the lock for the milliseconds before its bind fails;
+    // closing that window needs the daemon to prove itself before the token is sent.
     if last_start_error().is_some() && !daemon_holds_the_lock() {
         return Err(not_running());
     }

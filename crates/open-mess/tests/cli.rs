@@ -127,6 +127,19 @@ fn cli_without_daemon_shows_the_last_start_error() {
     assert!(other_program.accept().is_err());
 }
 
+#[test]
+fn cli_takes_only_a_held_lock_as_a_running_daemon() {
+    let dir = data_dir();
+    std::fs::write(dir.path().join("last-start-error.txt"), "port 7341 is already in use\n").unwrap();
+    // daemon.lock can't be opened (here: it is a folder), which proves nothing about a daemon.
+    std::fs::create_dir(dir.path().join("daemon.lock")).unwrap();
+    let other_program = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let output = om(dir.path(), other_program.local_addr().unwrap().port(), TOKEN, &["status"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    other_program.set_nonblocking(true).unwrap();
+    assert!(other_program.accept().is_err());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_ignores_a_stale_start_error_while_the_daemon_runs() {
     let (port, _stop) = start().await;

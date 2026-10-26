@@ -101,6 +101,24 @@ fn failed_start_leaves_its_reason_until_the_next_good_start() {
 }
 
 #[test]
+fn a_cli_checking_the_lock_does_not_stop_a_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    Store::open(&dir.path().join("state.sqlite3")).unwrap().set_config("port", &port.to_string()).unwrap();
+
+    // The CLI's check holds the lock for an instant; here, for a while longer.
+    let probe = open_mess::instance::InstanceLock::acquire(dir.path()).unwrap();
+    let mut daemon = om(dir.path()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    drop(probe);
+    let answer = unauthenticated_get(port);
+    daemon.kill().unwrap();
+    let output = daemon.wait_with_output().unwrap();
+
+    assert!(answer.starts_with("HTTP/1.1 401"), "{answer:?} {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
 fn closed_stdout_does_not_stop_the_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();

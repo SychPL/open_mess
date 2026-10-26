@@ -3,7 +3,7 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -22,7 +22,7 @@ pub fn run() -> Result<(), Error> {
     let started = Instant::now();
     let dir = paths::data_dir()?;
     // A second daemon fails here and leaves the running one's error file alone.
-    let _lock = InstanceLock::acquire(&dir)?;
+    let _lock = acquire_lock(&dir)?;
     let error_file = dir.join(LAST_START_ERROR_FILE);
     let (runtime, listener, token) = start(&dir).inspect_err(|err| {
         let _ = std::fs::write(&error_file, format!("{}\n", err.to_string().replace(['\r', '\n'], " ")));
@@ -31,6 +31,18 @@ pub fn run() -> Result<(), Error> {
     // Never println!: it panics when the launcher has closed stdout.
     let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
     runtime.block_on(api::serve(listener, token, Arc::new(Registry::with_builtin(started)), ctrl_c()))
+}
+
+/// The instance lock, retried for half a second: a CLI checking whether a daemon runs holds it for
+/// an instant (cli.rs), and must not be taken for a running daemon.
+fn acquire_lock(dir: &Path) -> Result<InstanceLock, Error> {
+    for _ in 0..25 {
+        match InstanceLock::acquire(dir) {
+            Err(Error::AlreadyRunning) => std::thread::sleep(Duration::from_millis(20)),
+            result => return result,
+        }
+    }
+    InstanceLock::acquire(dir)
 }
 
 fn start(dir: &Path) -> Result<(Runtime, TcpListener, String), Error> {
