@@ -81,9 +81,11 @@ The review tooling needs Windows with:
 - the Codex CLI (`codex`), signed in,
 - `opencode` with the Z.ai coding plan (`zai-coding-plan/glm-5.3`), signed in.
 
-`scripts/review/run-reviewer.ps1` times out a stuck reviewer, retries it, and falls back to
-another model when one is unavailable. Without these tools the hook prints a notice and skips the
-review; a maintainer then reviews your commits before merge.
+`scripts/review/run-reviewer.ps1` times out a stuck reviewer and retries it. GLM falls back from
+`glm-5.3` to `glm-5.3-flash`; Codex has no fallback, so a Codex review is always done by Codex.
+Reviewers only get read-only tools: they read untrusted diffs and must not be able to run
+commands or change files. Without these tools the hook prints a notice and skips the review; a
+maintainer then reviews your commits before merge.
 
 ## Sending a change
 

@@ -7,7 +7,8 @@ param(
   [int]$TimeoutSec = 480,
   [int]$AttemptsPerModel = 2
 )
-# Copied from the dual-review-loop skill; open_mess calls it from review-spec.sh and review-commit.sh.
+# Copied from the dual-review-loop skill and hardened for open_mess (changes marked "open_mess:");
+# called by review-spec.sh and review-commit.sh.
 # Watchdog runner for external reviewers (codex CLI / ZCode or opencode GLM / agy CLI).
 # Exit codes: 0 = VERDICT APPROVE, 1 = VERDICT REJECT (findings in $OutFile),
 #             2 = whole fallback chain dead (timeouts / no valid verdict).
@@ -20,6 +21,11 @@ param(
 # portable across providers). agy has no resume here - it prints no session id
 # in print mode, so every agy attempt starts fresh. Neither has ZCode (its
 # session id is not printed in -p mode).
+
+# open_mess: reviewers read untrusted diffs, so opencode gets read-only tools. Everything else is
+# denied (bash, edit, write, webfetch, MCP tools); inherited by the cmd.exe and opencode children.
+# opencode's built-in MCP resource readers ignore this and stay available, read-only.
+$env:OPENCODE_PERMISSION = '{"*":"deny","read":"allow","grep":"allow","glob":"allow","list":"allow"}'
 
 $rel = [IO.Path]::GetRelativePath($RepoDir, $PromptFile).Replace([char]92, [char]47)  # backslash -> fwd slash
 $ocPrompt = "Wykonaj doslownie instrukcje z pliku @$rel. NIE uruchamiaj polecen terminala ani git - tylko czytaj pliki"
@@ -89,10 +95,11 @@ except Exception:
   return ''
 }
 
+# open_mess: Codex has no fallback to another provider. A GLM verdict filed as the Codex review would
+# let a spec or commit pass without the Codex review AGENTS.md requires; a dead Codex is exit 2.
 $chain = if ($Reviewer -eq 'codex') {
   @(
-    @{ name = 'codex(default model)';          kind = 'codex' },
-    @{ name = 'zai-coding-plan/glm-5.3';       kind = 'oc'; model = 'zai-coding-plan/glm-5.3' }
+    @{ name = 'codex(default model)';          kind = 'codex' }
   )
 } elseif ($Reviewer -eq 'agy') {
   @(

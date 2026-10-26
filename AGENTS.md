@@ -29,7 +29,8 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
 
 - **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
   `unimplemented!`, no indexing (`[i]`) on data that came from outside. The workspace lints deny
-  them; `clippy.toml` relaxes them in tests only.
+  them; `clippy.toml` allows `unwrap`, `expect`, `panic!` and indexing in tests (`todo!`,
+  `unimplemented!` and `unreachable!` stay denied there too).
 - **No `unsafe`** (`unsafe_code = "deny"`). The only exceptions will be Windows API bindings
   that have no safe wrapper (WAM sign-in, Credential Manager). Each one gets a local
   `#[allow(unsafe_code)]` with a comment saying why, and is listed here.

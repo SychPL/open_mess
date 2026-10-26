@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 # Never crash: non-test code returns errors instead of panicking (AGENTS.md, "Never crash").
-# clippy.toml relaxes these inside tests.
+# clippy.toml allows unwrap, expect, panic and indexing inside tests.
 [workspace.lints.rust]
 unsafe_code = "deny"
 
