@@ -17,6 +17,9 @@ for tool in pwsh cygpath codex opencode; do
 done
 
 mkdir -p "$dir"
+# Git exports GIT_INDEX_FILE (and sometimes GIT_DIR) to hooks. Reviewers must not inherit them:
+# opencode's snapshots would write into this checkout's index and corrupt it.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_COMMON_DIR
 # Already queued: amend and rebase replays don't review twice. Delete <sha>.patch to re-run.
 [ -e "$dir/$sha.patch" ] && exit 0
 git -C "$root" show --stat --patch "$sha" > "$dir/$sha.patch"
