@@ -151,6 +151,10 @@ impl host::Host for HostState {
     }
 
     async fn session(&mut self, account: String, state: host::SessionState) {
+        if account.len() > limits::MAX_EVENT_TEXT {
+            tracing::warn!(module = %self.env.name, "session event dropped: account id over {} bytes", limits::MAX_EVENT_TEXT);
+            return;
+        }
         let state = match state {
             host::SessionState::Online => SessionState::Online,
             host::SessionState::Offline => SessionState::Offline,
@@ -160,6 +164,10 @@ impl host::Host for HostState {
     }
 
     async fn message_arrived(&mut self, msg: host::NewMessage) {
+        if [&msg.account, &msg.conversation, &msg.message].iter().any(|text| text.len() > limits::MAX_EVENT_TEXT) {
+            tracing::warn!(module = %self.env.name, "message event dropped: a field is over {} bytes", limits::MAX_EVENT_TEXT);
+            return;
+        }
         let msg = NewMessage {
             module: self.env.name.clone(),
             account: msg.account,

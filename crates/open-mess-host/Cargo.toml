@@ -14,6 +14,8 @@ test-support = []
 
 [dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+# The system proxy settings reqwest uses, read for WebSockets too.
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 # Module secrets: keyring picks the platform store (Windows Credential Manager), keyring-core is
 # its store interface, so tests can use the mock store.
 keyring = "4.2.0"
@@ -27,7 +29,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rustls-platform-verifier = "0.7.1"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tracing = "0.1.44"
 url = "2.5.8"

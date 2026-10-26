@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::{context_with_events, load, wasm};
 use futures_util::{SinkExt, StreamExt};
-use open_mess_host::{Engine, HostEvent, ModuleHandle, SessionState, limits};
+use open_mess_host::{Engine, HostError, HostEvent, ModuleHandle, SessionState, limits};
 use tokio_tungstenite::tungstenite::Message;
 
 static LOGS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -49,20 +49,38 @@ async fn wait_for_log(needle: &str) -> bool {
     false
 }
 
-/// Answers every text frame with "pong-<port>", or with one 5 MiB frame when `big`.
-async fn ws_server(big: bool) -> SocketAddr {
+#[derive(Clone, Copy)]
+enum Server {
+    /// Answers every text frame with "pong-<port>".
+    Pong,
+    /// Answers every text frame with one 5 MiB frame.
+    Big,
+    /// Sends 100 frames as soon as a client connects, then reads.
+    Flood,
+}
+
+async fn ws_server(kind: Server) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
-                while let Some(Ok(message)) = ws.next().await {
-                    if message.is_text() {
-                        let reply = if big { "x".repeat(5 * 1024 * 1024) } else { format!("pong-{}", addr.port()) };
-                        if ws.send(Message::text(reply)).await.is_err() {
+                if let Server::Flood = kind {
+                    for _ in 0..100 {
+                        if ws.send(Message::text("flood")).await.is_err() {
                             return;
                         }
+                    }
+                }
+                while let Some(Ok(message)) = ws.next().await {
+                    let reply = match kind {
+                        Server::Pong => format!("pong-{}", addr.port()),
+                        Server::Big => "x".repeat(5 * 1024 * 1024),
+                        Server::Flood => continue,
+                    };
+                    if message.is_text() && ws.send(Message::text(reply)).await.is_err() {
+                        return;
                     }
                 }
             });
@@ -82,7 +100,7 @@ async fn open(module: &ModuleHandle, url: String) -> String {
 
 #[tokio::test]
 async fn ws_frames_reach_the_module() {
-    let addr = ws_server(false).await;
+    let addr = ws_server(Server::Pong).await;
     let module = echo().await;
     assert_eq!(open(&module, format!("ws://localhost:{}", addr.port())).await, r#"{"conn":1}"#);
     let line = format!("ws 1 message pong-{}", addr.port());
@@ -91,7 +109,7 @@ async fn ws_frames_reach_the_module() {
 
 #[tokio::test]
 async fn ws_host_not_on_list_is_blocked() {
-    let addr = ws_server(false).await;
+    let addr = ws_server(Server::Pong).await;
     let module = echo().await;
     // test-echo lists only "localhost".
     assert_eq!(open(&module, format!("ws://{addr}")).await, r#"{"error":"blocked"}"#);
@@ -100,7 +118,7 @@ async fn ws_host_not_on_list_is_blocked() {
 
 #[tokio::test]
 async fn fifth_socket_is_refused() {
-    let addr = ws_server(false).await;
+    let addr = ws_server(Server::Pong).await;
     let module = echo().await;
     let url = format!("ws://localhost:{}", addr.port());
     for conn in 1..=limits::MAX_SOCKETS {
@@ -111,10 +129,35 @@ async fn fifth_socket_is_refused() {
 
 #[tokio::test]
 async fn oversized_frame_closes_the_socket() {
-    let addr = ws_server(true).await;
+    let addr = ws_server(Server::Big).await;
     let module = echo().await;
     assert_eq!(open(&module, format!("ws://localhost:{}", addr.port())).await, r#"{"conn":1}"#);
     assert!(wait_for_log("ws 1 closed message too large").await, "{}", logs());
+}
+
+#[tokio::test]
+async fn a_busy_module_still_sends_when_its_events_pile_up() {
+    // The server's 100 frames fill the module's event queue while it is busy; its 40 frames must
+    // still go out instead of waiting for a socket that waits for the module.
+    let addr = ws_server(Server::Flood).await;
+    let module = echo().await;
+    let url = format!("ws://localhost:{}", addr.port());
+    assert_eq!(module.call("a", "ws-burst", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap(), r#"{"sent":40}"#);
+}
+
+#[tokio::test]
+async fn a_crash_closes_the_instances_sockets() {
+    let addr = ws_server(Server::Pong).await;
+    let module = echo().await;
+    let url = format!("ws://localhost:{}", addr.port());
+    for conn in 1..=limits::MAX_SOCKETS {
+        assert_eq!(open(&module, url.clone()).await, format!(r#"{{"conn":{conn}}}"#));
+    }
+    assert!(matches!(module.call("a", "trap", "{}").await, Err(HostError::Crashed(_))));
+    // A fresh instance: its sockets start over and the old ones no longer count.
+    for conn in 1..=limits::MAX_SOCKETS {
+        assert_eq!(open(&module, url.clone()).await, format!(r#"{{"conn":{conn}}}"#));
+    }
 }
 
 #[tokio::test]
@@ -138,4 +181,9 @@ async fn message_arrived_becomes_host_event() {
     assert_eq!((message.module.as_str(), message.account.as_str(), message.conversation.as_str()), ("test-echo", "a", "c"));
     assert_eq!(message.message, "hi");
     assert!(message.mentions_me && !message.own && !message.direct);
+    // An event larger than the cap is dropped: only the session event comes through.
+    let huge = "x".repeat(limits::MAX_EVENT_TEXT + 1);
+    assert_eq!(module.call("a", "message", &format!(r#"{{"text":"{huge}"}}"#)).await.unwrap(), "{}");
+    assert!(matches!(events.recv().await, Some(HostEvent::Session { .. })));
+    assert!(events.try_recv().is_err());
 }

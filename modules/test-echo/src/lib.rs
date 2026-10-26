@@ -7,7 +7,8 @@
 //! length read back (`{"len"}`, plus `{"error"}` when the set failed); `timer` sets timer 7 to
 //! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` in
 //! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
-//! `open-page` and `wam-token` answered. The `restore` export succeeds only for account "known";
+//! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
+//! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The `restore` export succeeds only for account "known";
 //! the `sign-in` export is not supported.
 
 #[cfg(target_arch = "wasm32")]
@@ -82,6 +83,18 @@ mod guest {
                     "wam-token": describe(sign_in::wam_token(&["scope".to_string()], true)),
                 })
             }
+            "trap" => std::process::abort(),
+            // Opens a socket, stays busy while the server's frames pile up, then sends 40 frames.
+            "ws-burst" => match websocket::open(&text("url"), &[]) {
+                Ok(conn) => {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_millis(500) {
+                        std::hint::spin_loop();
+                    }
+                    json!({ "sent": (0..40).take_while(|_| websocket::send(conn, "x").is_ok()).count() })
+                }
+                Err(e) => json!({ "error": http_error(&e) }),
+            },
             "message" => {
                 host::session("a", host::SessionState::Online);
                 host::message_arrived(&host::NewMessage {

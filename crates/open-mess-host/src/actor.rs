@@ -19,7 +19,8 @@ use crate::runtime::{AccountInfo, HostState, ModuleEnv};
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
 /// WebSocket frames and timer firings waiting for a module; a full queue holds the socket back.
-const EVENT_QUEUE: usize = 64;
+/// With `MAX_WS_MESSAGE` frames that is at most 64 MiB held for a module outside its memory.
+const EVENT_QUEUE: usize = 16;
 
 pub(crate) type Reply<T> = oneshot::Sender<Result<T, HostError>>;
 

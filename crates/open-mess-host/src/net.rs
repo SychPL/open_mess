@@ -158,6 +158,9 @@ impl Net {
         let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|_| HttpError::Network("invalid method".to_string()))?;
         let headers = header_map(&req.headers)?;
         // Through the system proxy the proxy connects; directly, only to the checked addresses.
+        // The proxy comes from the static Windows settings (and the proxy environment variables):
+        // reqwest does not run PAC scripts or WPAD, which spec 8.3 asks for. ponytail: PAC/WPAD
+        // needs WinHTTP (WinHttpGetProxyForUrl), a Windows API binding for AGENTS.md's list.
         // ponytail: one client per request keeps each connection pinned to its own check; a
         // pool per host and address set if fetch volume ever matters.
         let mut client = reqwest::Client::builder()
