@@ -293,7 +293,7 @@ pub fn set_enabled(store: &Store, name: &str, enabled: bool) -> Result<(), Error
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

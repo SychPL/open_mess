@@ -1,7 +1,7 @@
 //! Accounts bound to modules: routing of the shared tools, module states, fan-out and removal.
 
 // Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 mod common;
 
@@ -12,7 +12,7 @@ use common::{install, running, wasm};
 use keyring_core::api::CredentialStore;
 use open_mess::accounts::Accounts;
 use open_mess::modules;
-use open_mess::tools::shared::UNTRUSTED_NOTICE;
+use open_mess::tools::shared::{UNTRUSTED_NOTICE, attachments_dir};
 use open_mess::tools::{Registry, ToolError};
 use open_mess_host::{AccountInfo, Engine, HostEvent, SessionState, limits};
 use serde_json::{Value, json};
@@ -52,6 +52,12 @@ async fn read_messages(registry: &Registry, account: &str) -> Result<Value, Tool
     registry.call("read_messages", json!({"account": account, "conversation": "c1"})).await
 }
 
+/// Downloads test-echo's attachment for `account` and returns where it was written.
+async fn attachment(registry: &Registry, account: &str) -> std::path::PathBuf {
+    let args = json!({"account": account, "conversation": "c1", "message": "m1", "attachment": "notes.txt"});
+    std::path::PathBuf::from(registry.call("get_attachment", args).await.unwrap()["path"].as_str().unwrap())
+}
+
 #[tokio::test]
 async fn routes_to_the_accounts_module() {
     let d = daemon(&[ECHO]).await;
@@ -84,7 +90,7 @@ async fn routes_to_the_accounts_module() {
         .call("get_attachment", json!({"account": "test-echo:a", "conversation": "c1", "message": "m1", "attachment": "notes.txt"}))
         .await
         .unwrap();
-    assert_eq!(attachment["path"], d.dir.path().join("attachments").join("notes.txt").display().to_string());
+    assert_eq!(attachment["path"], attachments_dir(d.dir.path(), "test-echo:a").join("notes.txt").display().to_string());
     assert_eq!(attachment["untrusted"]["file_name"], "notes.txt");
 }
 
@@ -168,6 +174,8 @@ async fn remove_account_deletes_secrets_and_signs_out() {
         names.execute("INSERT INTO secrets (account, key) VALUES (?1, 'refresh')", [account]).unwrap();
     }
 
+    let (attachment_a, attachment_b) = (attachment(&d.registry, "test-echo:a").await, attachment(&d.registry, "test-echo:b").await);
+
     d.accounts.remove("test-echo:a").await.unwrap();
 
     // test-echo reports an account it signs out as offline.
@@ -177,6 +185,7 @@ async fn remove_account_deletes_secrets_and_signs_out() {
     assert_eq!(secret("b").get_password().unwrap(), "token");
     let ids: Vec<String> = d.accounts.list().unwrap().into_iter().map(|account| account.id).collect();
     assert_eq!(ids, ["test-echo:b"]);
+    assert!(!attachment_a.exists() && attachment_b.exists());
     assert!(d.accounts.remove("test-echo:a").await.is_err());
 }
 
@@ -227,4 +236,24 @@ async fn module_errors_over_the_api() {
     let result = client.call_tool(rmcp::model::CallToolRequestParams::new("read_messages").with_arguments(args)).await.unwrap();
     assert_eq!(result.is_error, Some(true));
     client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn secrets_left_behind_keep_the_account() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let names = rusqlite::Connection::open(d.dir.path().join("modules").join("test-echo.sqlite3")).unwrap();
+    names.execute_batch("CREATE TABLE IF NOT EXISTS secrets (account TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (account, key))").unwrap();
+    names.execute("INSERT INTO secrets (account, key) VALUES ('a', 'refresh')", []).unwrap();
+    let entry = d.credentials.build("open_mess/module/test-echo", "a/refresh", None).unwrap();
+    entry.set_password("token").unwrap();
+    // The credential store refuses the delete, as a locked Credential Manager would.
+    let cred: &keyring_core::mock::Cred = entry.as_any().downcast_ref().unwrap();
+    cred.set_error(keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))));
+
+    assert!(d.accounts.remove("test-echo:a").await.is_err());
+    assert!(d.accounts.get("test-echo:a").unwrap().is_some());
+    // Removing again works once the store does.
+    d.accounts.remove("test-echo:a").await.unwrap();
+    assert!(d.accounts.get("test-echo:a").unwrap().is_none());
 }

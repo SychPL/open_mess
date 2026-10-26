@@ -106,6 +106,13 @@ fn notice_only_when_untrusted_present() {
     assert_eq!(parse_module_result("writing_context", r#"{"examples": []}"#).unwrap(), json!({"examples": []}));
 }
 
+#[test]
+fn oversized_module_result_is_an_error() {
+    let json = json!({"items": [message(&"x".repeat(shared::MAX_RESULT))]}).to_string();
+    let result = parse_module_result("read_messages", &json);
+    assert!(matches!(&result, Err(ToolError::Module(why)) if why.contains("over 16 MiB")), "{:?}", result.err());
+}
+
 #[tokio::test]
 async fn attachment_is_written_by_the_core() {
     let dir = tempfile::tempdir().unwrap();
@@ -115,9 +122,9 @@ async fn attachment_is_written_by_the_core() {
         net: open_mess_host::Net::new(AddressPolicy::Strict),
     };
     let echo = Engine::new().unwrap().load(&common::wasm("open_mess_test_echo"), ctx).await.unwrap();
-    let attachments = dir.path().join("attachments");
+    let attachments = shared::attachments_dir(dir.path(), "test-echo:a");
 
-    let first = shared::save_attachment(dir.path(), echo.get_attachment("a", "c", "m", "report.txt").await.unwrap()).unwrap();
+    let first = shared::save_attachment(dir.path(), "test-echo:a", echo.get_attachment("a", "c", "m", "report.txt").await.unwrap()).unwrap();
     let path = std::path::PathBuf::from(first["path"].as_str().unwrap());
     assert_eq!(path, attachments.join("report.txt"));
     assert_eq!(std::fs::read(&path).unwrap(), b"attachment bytes from test-echo");
@@ -133,12 +140,12 @@ async fn attachment_is_written_by_the_core() {
     }
 
     // The same name again: a new file, the first one is kept.
-    let second = shared::save_attachment(dir.path(), echo.get_attachment("a", "c", "m", "report.txt").await.unwrap()).unwrap();
+    let second = shared::save_attachment(dir.path(), "test-echo:a", echo.get_attachment("a", "c", "m", "report.txt").await.unwrap()).unwrap();
     assert_eq!(std::path::PathBuf::from(second["path"].as_str().unwrap()), attachments.join("report (1).txt"));
     assert!(path.exists());
 
     // A name that climbs out of the folder lands inside it, cleaned; the original is reported as untrusted.
-    let climbing = shared::save_attachment(dir.path(), echo.get_attachment("a", "c", "m", "../x").await.unwrap()).unwrap();
+    let climbing = shared::save_attachment(dir.path(), "test-echo:a", echo.get_attachment("a", "c", "m", "../x").await.unwrap()).unwrap();
     assert_eq!(std::path::PathBuf::from(climbing["path"].as_str().unwrap()), attachments.join("x"));
     assert_eq!(climbing["untrusted"]["file_name"], "../x");
     assert!(!dir.path().join("x").exists());

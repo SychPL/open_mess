@@ -260,5 +260,5 @@ async fn get_attachment(accounts: &Accounts, id: &str, args: &Value) -> Result<V
     let attachment =
         within(&account.module, handle.get_attachment(&account.module_account, arg("conversation"), arg("message"), arg("attachment"))).await?;
     let data_dir = accounts.data_dir().to_path_buf();
-    tokio::task::spawn_blocking(move || shared::save_attachment(&data_dir, attachment)).await.map_err(failed)?
+    tokio::task::spawn_blocking(move || shared::save_attachment(&data_dir, &account.id, attachment)).await.map_err(failed)?
 }

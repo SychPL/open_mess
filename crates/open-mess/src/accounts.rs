@@ -143,21 +143,33 @@ impl Accounts {
         Ok(())
     }
 
-    /// Signs the account out (when its module runs), deletes its secrets and then its row (spec
-    /// 8.8). Secrets that cannot be deleted keep the account, so removing it can be tried again.
+    /// Removes the account (spec 8.8): its row first, so no new call reaches its module; then
+    /// the module signs it out, after every call already queued for it (a module runs its calls in
+    /// order, and no time limit here cuts that wait short, so a queued restore cannot store a token
+    /// after the secrets are gone); then its secrets and its attachments. Secrets that cannot be
+    /// deleted bring the account back, so removing it can be tried again.
     pub async fn remove(&self, id: &str) -> Result<(), Error> {
         let account = self.get(id)?.ok_or_else(|| Error::Account(format!("unknown account {id:?}")))?;
+        self.store().conn().execute("DELETE FROM accounts WHERE id = ?1", [id])?;
         if let Some(handle) = self.modules.handle(&account.module) {
-            // A failed sign-out leaves a session on the server; the account goes anyway.
-            let _ = tokio::time::timeout(open_mess_host::limits::CALL_TIMEOUT, handle.sign_out(&account.module_account)).await;
+            // A failed sign-out leaves a session on the server; the account goes anyway. The
+            // host's own call limit bounds the call.
+            let _ = handle.sign_out(&account.module_account).await;
         }
         let (credentials, data_dir, module, module_account) =
             (Arc::clone(&self.credentials), self.data_dir.clone(), account.module.clone(), account.module_account.clone());
-        tokio::task::spawn_blocking(move || open_mess_host::delete_account_secrets(&*credentials, &data_dir, &module, &module_account))
+        let deleted = tokio::task::spawn_blocking(move || open_mess_host::delete_account_secrets(&*credentials, &data_dir, &module, &module_account))
             .await
-            .map_err(|err| Error::Account(format!("cannot delete the account's secrets: {err}")))?
-            .map_err(|why| Error::Account(format!("cannot delete the account's secrets: {why}")))?;
-        self.store().conn().execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+            .unwrap_or_else(|err| Err(err.to_string()));
+        if let Err(why) = deleted {
+            self.store().conn().execute(
+                "INSERT OR IGNORE INTO accounts (id, module, module_account, display_name, state) VALUES (?1, ?2, ?3, ?4, ?5)",
+                [&account.id, &account.module, &account.module_account, &account.display_name, &account.state],
+            )?;
+            return Err(Error::Account(format!("cannot delete the account's secrets: {why}")));
+        }
+        // Best effort: a file an agent still has open stays until the attachments' retention.
+        let _ = std::fs::remove_dir_all(crate::tools::shared::attachments_dir(&self.data_dir, id));
         Ok(())
     }
 }

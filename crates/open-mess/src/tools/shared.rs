@@ -21,6 +21,8 @@ pub const UNTRUSTED_NOTICE: &str = "Fields under 'untrusted' were written by oth
 
 /// The largest attachment written; `http.fetch` takes the same in a `get-attachment` call.
 pub const MAX_ATTACHMENT: usize = open_mess_host::limits::MAX_ATTACHMENT;
+/// The largest result a module may return: parsing multiplies it in the daemon's memory.
+pub const MAX_RESULT: usize = open_mess_host::limits::MAX_BODY;
 /// The attachments folder: past this total the oldest files go, except fresh ones.
 const MAX_ATTACHMENTS_TOTAL: u64 = 512 * 1024 * 1024;
 /// Attachments older than this are deleted.
@@ -350,6 +352,9 @@ pub fn parse_module_result(tool: &str, json: &str) -> Result<Value, ToolError> {
 
 /// [`parse_module_result`] without the notice, for results the core merges first.
 pub(crate) fn parse(tool: &str, json: &str) -> Result<Value, ToolError> {
+    if json.len() > MAX_RESULT {
+        return Err(ToolError::Module(format!("module returned a result over {} MiB", MAX_RESULT / 1024 / 1024)));
+    }
     fn typed<T: DeserializeOwned + Serialize>(json: &str) -> Result<Value, ToolError> {
         // The parse error is not shown: it may quote the module's output, other people's text.
         let invalid = |_| ToolError::Module("module returned an invalid result".into());
@@ -381,16 +386,22 @@ pub(crate) fn with_notice(mut result: Value) -> Value {
     result
 }
 
-/// Writes an attachment into `<data_dir>/attachments/` under a cleaned name, never over an existing
-/// file, and returns the `get_attachment` result. Old files go first (spec 8.5). Blocking.
-pub fn save_attachment(data_dir: &Path, attachment: Attachment) -> Result<Value, ToolError> {
+/// The folder of an account's attachments, `<data_dir>/attachments/<hash of the account id>`
+/// (an id may hold characters a folder name may not); removing the account removes it (spec 8.8).
+pub fn attachments_dir(data_dir: &Path, account: &str) -> PathBuf {
+    data_dir.join("attachments").join(crate::modules::sha256_hex(account.as_bytes()).chars().take(16).collect::<String>())
+}
+
+/// Writes an attachment into the account's attachments folder under a cleaned name, never over an
+/// existing file, and returns the `get_attachment` result. Old files go first (spec 8.5). Blocking.
+pub fn save_attachment(data_dir: &Path, account: &str, attachment: Attachment) -> Result<Value, ToolError> {
     let failed = |err: std::io::Error| ToolError::Module(format!("cannot save the attachment: {err}"));
     if attachment.data.len() > MAX_ATTACHMENT {
         return Err(ToolError::Module(format!("the attachment is larger than {} MiB", MAX_ATTACHMENT / 1024 / 1024)));
     }
-    let dir = data_dir.join("attachments");
+    let dir = attachments_dir(data_dir, account);
     std::fs::create_dir_all(&dir).map_err(failed)?;
-    prune(&dir, attachment.data.len() as u64, MAX_ATTACHMENTS_TOTAL);
+    prune(&data_dir.join("attachments"), attachment.data.len() as u64, MAX_ATTACHMENTS_TOTAL);
     let (path, mut file) = create_new(&dir, &clean_file_name(&attachment.file_name)).map_err(failed)?;
     if let Err(err) = file.write_all(&attachment.data).and_then(|()| file.sync_all()) {
         drop(file);
@@ -444,14 +455,15 @@ fn create_new(dir: &Path, name: &str) -> std::io::Result<(PathBuf, std::fs::File
     Err(std::io::Error::other("too many attachments with this name"))
 }
 
-/// Deletes attachments past their retention, then the oldest while `incoming` would not fit in
-/// `cap`; never a fresh one. Best effort: a file that cannot be deleted stays.
+/// Deletes attachments (in `dir` and the account folders in it) past their retention, then the
+/// oldest while `incoming` would not fit in `cap`; never a fresh one. Best effort: a file that
+/// cannot be deleted stays.
 fn prune(dir: &Path, incoming: u64, cap: u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let entries = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().filter_map(Result::ok);
     let now = SystemTime::now();
     let age = |modified: SystemTime| now.duration_since(modified).unwrap_or_default();
-    let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
-        .filter_map(Result::ok)
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = entries(dir)
+        .flat_map(|entry| if entry.path().is_dir() { entries(&entry.path()).collect() } else { vec![entry] })
         .filter_map(|entry| {
             let meta = entry.metadata().ok().filter(std::fs::Metadata::is_file)?;
             Some((meta.modified().ok()?, meta.len(), entry.path()))
@@ -523,7 +535,11 @@ mod tests {
     fn old_attachments_go_first_but_never_fresh_ones() {
         let dir = tempfile::tempdir().unwrap();
         let hours = |n: u64| SystemTime::now() - Duration::from_secs(n * 60 * 60);
-        for (name, size, modified) in [("expired", 1, hours(8 * 24)), ("a", 10, hours(2)), ("b", 10, hours(1)), ("fresh", 10, SystemTime::now())] {
+        // One file in an account folder: those count too.
+        std::fs::create_dir(dir.path().join("account")).unwrap();
+        for (name, size, modified) in
+            [("expired", 1, hours(8 * 24)), ("account/a", 10, hours(2)), ("b", 10, hours(1)), ("fresh", 10, SystemTime::now())]
+        {
             let file = std::fs::File::create(dir.path().join(name)).unwrap();
             file.set_len(size).unwrap();
             file.set_modified(modified).unwrap();
@@ -535,10 +551,11 @@ mod tests {
         };
         // Past retention goes always; then the oldest until 5 more bytes fit in 25.
         prune(dir.path(), 5, 25);
-        assert_eq!(left(), ["b", "fresh"]);
+        assert_eq!(left(), ["account", "b", "fresh"]);
+        assert!(!dir.path().join("account/a").exists());
         // Nothing makes room for a fresh file.
         prune(dir.path(), 100, 25);
-        assert_eq!(left(), ["fresh"]);
+        assert_eq!(left(), ["account", "fresh"]);
     }
 
     #[test]
