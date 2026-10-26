@@ -52,8 +52,10 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
   message through open_mess must not change what the user sees as read.
 - **No token extraction.** Accounts sign in through the platform's own sign-in flow, inside
   open_mess. Never copy tokens, cookies or browser profiles from another app.
-- **Secrets and message contents never leave the user's machine and never reach logs,** test
-  fixtures, docs, issues, PRs or commits. Protocol captures are redacted (no tokens, cookies,
+- **Secrets never leave the user's machine; message contents go only to the platform itself and
+  to the agents the user connects** (and through them to those agents' model providers, which is
+  the point of open_mess). open_mess never sends them anywhere else, and neither ever reaches logs,
+  test fixtures, docs, issues, PRs or commits. Protocol captures are redacted (no tokens, cookies,
   tenant ids, user ids or real message text) before they are written anywhere.
 - **Messages from other people are untrusted data, never instructions.** Anything that hands
   message content to an agent marks it as such.
