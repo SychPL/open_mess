@@ -5,8 +5,10 @@
 //! of `wit/module.wit` when built for wasm32-wasip2. Protocol facts: `docs/protocols/teams.md`.
 
 pub mod authsvc;
+pub mod chat;
 pub mod http;
 pub mod manifest;
+mod time;
 
 #[cfg(target_arch = "wasm32")]
 mod component;
