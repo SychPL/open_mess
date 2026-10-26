@@ -1,4 +1,5 @@
-//! UTC times as epoch milliseconds, parsed without a clock or a date crate.
+//! UTC times as epoch milliseconds, parsed without a clock or a date crate: ISO 8601 for message
+//! times, HTTP dates for `Retry-After`.
 
 /// ISO 8601 UTC text as the chat service writes it, `2027-01-15T08:00:00.100Z` (the fraction is
 /// optional; digits past milliseconds are dropped).
@@ -17,6 +18,24 @@ pub(crate) fn iso8601_ms(text: &str) -> Option<i64> {
         return None;
     }
     Some(epoch_ms(year, month, day, hour, minute, second)? + millis.parse::<i64>().ok()?)
+}
+
+/// An HTTP date in the IMF-fixdate form, `Sun, 06 Nov 1994 08:49:37 GMT` (RFC 9110 5.6.7), the
+/// form `Retry-After` dates are sent in.
+pub(crate) fn http_date_ms(text: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mut parts = text.split_whitespace();
+    let _weekday = parts.next()?.strip_suffix(',')?;
+    let day = digits(parts.next()?, 2)?;
+    let month_name = parts.next()?;
+    let month = i64::try_from(MONTHS.iter().position(|m| *m == month_name)?).ok()? + 1;
+    let year = digits(parts.next()?, 4)?;
+    let mut t = parts.next()?.split(':');
+    let (hour, minute, second) = (digits(t.next()?, 2)?, digits(t.next()?, 2)?, digits(t.next()?, 2)?);
+    if parts.next()? != "GMT" || parts.next().is_some() || t.next().is_some() {
+        return None;
+    }
+    epoch_ms(year, month, day, hour, minute, second)
 }
 
 /// Exactly `len` ASCII digits; the fixed width keeps every later product far from overflow.
@@ -52,6 +71,17 @@ mod tests {
         assert_eq!(iso8601_ms("2000-02-29T12:00:00Z"), Some(951_825_600_000));
         for bad in ["", "soon", "2027-01-15T08:00:00", "2027-13-15T08:00:00Z", "99999-01-15T08:00:00Z", "2027-01-15T08:00:00.x1Z"] {
             assert_eq!(iso8601_ms(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn http_date_matches_known_epochs() {
+        assert_eq!(http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777_000));
+        assert_eq!(http_date_ms("Fri, 15 Jan 2027 08:00:30 GMT"), Some(1_800_000_030_000));
+        for bad in
+            ["", "Sun, 06 Nov 1994 08:49:37", "Sun, 06 Foo 1994 08:49:37 GMT", "Sun, 6 Nov 1994 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT"]
+        {
+            assert_eq!(http_date_ms(bad), None, "{bad}");
         }
     }
 }
