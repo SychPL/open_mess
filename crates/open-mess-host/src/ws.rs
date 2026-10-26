@@ -74,8 +74,8 @@ async fn tunnel(proxy: &Uri, auth: Option<&HeaderValue>, host: &str, port: u16) 
 /// Connects the way the system proxy settings say: through the proxy (HTTP CONNECT) when they
 /// send this host through an http:// one, else directly to a checked address.
 /// ponytail: the static settings, as for http.fetch; PAC/WPAD needs WinHTTP (see net.rs). An
-/// https:// or SOCKS proxy is not spoken here and the socket goes direct, as it did before proxies
-/// were read at all; speak them if a network needs that.
+/// https:// or SOCKS proxy is not spoken here and the socket is refused rather than sent around
+/// the proxy the user set up; speak them if a network needs that.
 async fn tcp(url: &url::Url, addrs: &[SocketAddr]) -> Result<TcpStream, HttpError> {
     let host = url.host_str().ok_or_else(|| blocked("the URL has no host"))?;
     let port = url.port_or_known_default().ok_or_else(|| blocked("the URL has no port"))?;
@@ -84,7 +84,8 @@ async fn tcp(url: &url::Url, addrs: &[SocketAddr]) -> Result<TcpStream, HttpErro
     let target: Uri = format!("{scheme}://{host}:{port}/").parse().map_err(network)?;
     match Matcher::from_system().intercept(&target) {
         Some(proxy) if proxy.uri().scheme_str() == Some("http") => tunnel(proxy.uri(), proxy.basic_auth(), host, port).await,
-        _ => direct(addrs).await,
+        Some(_) => Err(network("the system proxy is not an http:// proxy, which WebSockets cannot use yet")),
+        None => direct(addrs).await,
     }
 }
 

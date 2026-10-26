@@ -54,11 +54,11 @@ pub(crate) fn set(store: &CredentialStore, storage: &mut Storage, module: &str, 
 /// Deletes the credential even when the module's storage is unavailable; the name is forgotten
 /// when it is.
 pub(crate) fn delete(store: &CredentialStore, storage: Option<&mut Storage>, module: &str, account: &str, key: &str) {
-    if let Ok(entry) = entry(store, module, account, key) {
-        entry.delete_credential().ok();
-        if let Some(storage) = storage {
-            storage.remove_secret(account, key).ok();
-        }
+    let Ok(entry) = entry(store, module, account, key) else { return };
+    // A credential that could not be deleted keeps its name, so it can still be found.
+    let gone = matches!(entry.delete_credential(), Ok(()) | Err(keyring_core::Error::NoEntry));
+    if gone && let Some(storage) = storage {
+        storage.remove_secret(account, key).ok();
     }
 }
 
@@ -118,6 +118,13 @@ mod tests {
         cred.set_error(keyring_core::Error::TooLong("password".to_string(), 2560));
         assert!(set(&*store, &mut storage, "m", "acct", "k", "too long").is_err());
         // Not recorded: recording it now finds it new.
+        assert_eq!(storage.add_secret("acct", "k").unwrap(), Some(true));
+        // A delete the store refuses keeps the name; one that works forgets it.
+        set(&*store, &mut storage, "m", "acct", "k", "v").unwrap();
+        cred.set_error(keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))));
+        delete(&*store, Some(&mut storage), "m", "acct", "k");
+        assert_eq!(storage.add_secret("acct", "k").unwrap(), Some(false));
+        delete(&*store, Some(&mut storage), "m", "acct", "k");
         assert_eq!(storage.add_secret("acct", "k").unwrap(), Some(true));
         drop(storage);
         std::fs::remove_dir_all(dir).unwrap();
