@@ -150,13 +150,14 @@ fn conversation(c: &Value, path: &str) -> Result<Conversation, ProtoError> {
     })
 }
 
-/// The kind follows the id shapes of docs 3.1.
+/// The kind follows the id shapes of docs 3.1; 1:1 chats are confirmed live ("Live results" 5).
+/// `@thread.skype` is used by old channels and old group chats alike, so it stays `Other`.
 fn kind(id: &str) -> ConversationKind {
     if id.starts_with("19:meeting_") {
         ConversationKind::Meeting
     } else if id.ends_with("@unq.gbl.spaces") {
         ConversationKind::Direct
-    } else if id.ends_with("@thread.tacv2") || id.ends_with("@thread.skype") {
+    } else if id.ends_with("@thread.tacv2") {
         ConversationKind::Channel
     } else if id.ends_with("@thread.v2") {
         ConversationKind::Group
@@ -283,13 +284,16 @@ pub fn read_messages(dir: &ServiceDirectory, conv: &str, page: Option<&str>, lim
     Ok(request("GET", paged(endpoint(dir, &[conv, "messages"]), page, &first)?, None))
 }
 
+/// The body follows the send accepted live ("Live results" 5), minus the sender's display name
+/// and the empty importance and subject.
 pub fn send(dir: &ServiceDirectory, conv: &str, html: &str, client_message_id: &str) -> HttpRequest {
-    let body = json!({"content": html, "messagetype": "RichText/Html", "contenttype": "text", "clientmessageid": client_message_id});
+    let properties = json!({"mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
+    let body = json!({"content": html, "messagetype": "RichText/Html", "contenttype": "Text", "clientmessageid": client_message_id, "properties": properties});
     request("POST", endpoint(dir, &[conv, "messages"]), Some(body))
 }
 
 pub fn edit(dir: &ServiceDirectory, conv: &str, message_id: &str, html: &str) -> HttpRequest {
-    let body = json!({"content": html, "messagetype": "RichText/Html", "contenttype": "text"});
+    let body = json!({"content": html, "messagetype": "RichText/Html", "contenttype": "Text"});
     request("PUT", endpoint(dir, &[conv, "messages", message_id]), Some(body))
 }
 
@@ -373,8 +377,6 @@ mod tests {
     #[test]
     fn decodes_conversation_page() {
         let page = conversations();
-        let kinds: Vec<_> = page.items.iter().map(|c| c.kind).collect();
-        assert_eq!(kinds, [ConversationKind::Group, ConversationKind::Direct, ConversationKind::Channel, ConversationKind::Meeting]);
         let group = &page.items[0];
         assert_eq!(group.id, GROUP);
         assert_eq!(group.last_message_id.as_deref(), Some("1800000000100"));
@@ -389,6 +391,14 @@ mod tests {
         assert_eq!(page.backward_link.as_deref(), Some(&*format!("{BASE}?view=msnp24Equivalent&pageSize=4&startTime=1&syncState=YmFja3dhcmQ")));
         assert_eq!(page.sync_state.as_deref(), Some("c3luY3N0YXRl"));
         assert!(page.skipped.is_empty());
+    }
+
+    #[test]
+    fn kinds_from_id_shapes_unconfirmed_shape() {
+        let kinds: Vec<_> = conversations().items.iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, [ConversationKind::Group, ConversationKind::Direct, ConversationKind::Channel, ConversationKind::Meeting]);
+        assert_eq!(kind("19:dddddddddddddddddddddddddddddddd@thread.skype"), ConversationKind::Other);
+        assert_eq!(kind("48:notes"), ConversationKind::Other);
     }
 
     #[test]
@@ -496,7 +506,9 @@ mod tests {
     fn send_carries_client_message_id() {
         let r = send(&dir(), GROUP, "<p>hi</p>", "9999");
         assert_eq!((r.method.as_str(), r.url.as_str()), ("POST", &*format!("{BASE}/{GROUP}/messages")));
-        assert_eq!(body(&r), json!({"content": "<p>hi</p>", "messagetype": "RichText/Html", "contenttype": "text", "clientmessageid": "9999"}));
+        let properties = json!({"mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
+        let expected = json!({"content": "<p>hi</p>", "messagetype": "RichText/Html", "contenttype": "Text", "clientmessageid": "9999", "properties": properties});
+        assert_eq!(body(&r), expected);
         assert!(r.headers.contains(&("BehaviorOverride".to_string(), "redirectAs404".to_string())));
     }
 
