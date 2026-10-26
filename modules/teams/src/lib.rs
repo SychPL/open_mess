@@ -8,6 +8,7 @@ pub mod authsvc;
 pub mod chat;
 pub mod http;
 pub mod manifest;
+pub mod text;
 mod time;
 
 #[cfg(target_arch = "wasm32")]

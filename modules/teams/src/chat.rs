@@ -6,6 +6,7 @@ use url::Url;
 
 use crate::authsvc::ServiceDirectory;
 use crate::http::HttpRequest;
+use crate::text::escape_html;
 use crate::{ProtoError, incompatible, parse_json, time};
 
 const VIEW_CONVERSATIONS: &str = "msnp24Equivalent";
@@ -223,21 +224,6 @@ fn mentions(props: &Value, path: &str) -> Result<Vec<Mention>, ProtoError> {
         Ok(Mention { mri: req_str(m, &at, "mri")?.to_string(), name: opt_str(m, &at, "displayName")?.map(str::to_string) })
     };
     list.iter().enumerate().map(mention).collect()
-}
-
-pub(crate) fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn page<T>(v: &Value, items: Vec<T>, skipped: Vec<String>) -> Result<Page<T>, ProtoError> {
