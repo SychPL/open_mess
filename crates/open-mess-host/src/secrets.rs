@@ -3,6 +3,7 @@
 //! module only ever reaches its own service (spec 8.3). The module's storage lists the names of its
 //! secrets, which caps their number at `MAX_SECRETS`.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,11 +21,15 @@ pub fn platform_store() -> Result<Arc<CredentialStore>, String> {
 
 /// The credential for a module's account and key. Control characters are refused: Windows cuts a
 /// credential name at a NUL, which would let `<account>/<key>` name another module's credential.
+/// In Credential Manager the credential is Local: the default, Enterprise, roams with a roaming
+/// Windows profile to the user's other machines, and secrets never leave this one (spec 8.4).
 fn entry(store: &CredentialStore, module: &str, account: &str, key: &str) -> Result<Entry, String> {
     if account.chars().chain(key.chars()).any(char::is_control) {
         return Err("account and key may not contain control characters".to_string());
     }
-    store.build(&format!("open_mess/module/{module}"), &format!("{account}/{key}"), None).map_err(|e| e.to_string())
+    let local = HashMap::from([("persistence", "Local")]);
+    let modifiers = store.vendor().starts_with("Windows Credential Manager").then_some(&local);
+    store.build(&format!("open_mess/module/{module}"), &format!("{account}/{key}"), modifiers).map_err(|e| e.to_string())
 }
 
 fn failed(e: StorageError) -> String {
@@ -119,6 +124,18 @@ mod tests {
         set(&*store, &mut storage, "m", "acct", "one-more", "v").unwrap();
         drop(storage);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn module_secrets_stay_on_this_machine() {
+        let store = platform_store().unwrap();
+        let module = format!("open-mess-test-{}", std::process::id());
+        let entry = entry(&*store, &module, "acct", "k").unwrap();
+        entry.set_password("not a secret").unwrap();
+        let persistence = entry.get_attributes().unwrap().get("persistence").cloned();
+        entry.delete_credential().unwrap();
+        assert_eq!(persistence.as_deref(), Some("Local"));
     }
 
     #[test]
