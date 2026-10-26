@@ -21,13 +21,15 @@ cargo xtask ci
 ```
 
 `cargo xtask ci` runs exactly what CI runs: `cargo fmt --check`, `cargo clippy -D warnings`, the
-tests and the `wasm32-wasip2` build of the Teams module. Run it before every commit.
+`wasm32-wasip2` build of the modules (the host's tests load them) and the tests. Run it before every
+commit.
 
 ## How the code is laid out
 
 | Path | What |
 |---|---|
 | `crates/open-mess/` | the `om` binary: daemon and CLI |
+| `crates/open-mess-host/` | the module host: loads platform modules and runs them under limits |
 | `modules/teams/` | the Teams platform module, a WebAssembly component implementing `wit/module.wit` |
 | `wit/` | the contract between the core and platform modules |
 | `xtask/` | repository tasks (`cargo xtask ci`, `cargo xtask hooks`) |
@@ -36,7 +38,7 @@ tests and the `wasm32-wasip2` build of the Teams module. Run it before every com
 | `.githooks/` | the post-commit hook that sends each commit for review |
 | `plan/` | local notes and plans, gitignored, never committed |
 
-More crates (core, module host) arrive with the specs that introduce them.
+More crates (core) arrive with the specs that introduce them.
 
 ## Rules that aren't negotiable
 
