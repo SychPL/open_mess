@@ -75,7 +75,12 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, String, 
             let _ = accounts.restore().await;
         }
     });
-    Ok((runtime, listener, token, Registry::new(started, accounts)))
+    let registry = Registry::new(started, accounts);
+    if let Some(pending) = registry.pending() {
+        pending.recover()?;
+        runtime.spawn(Arc::clone(pending).sweep());
+    }
+    Ok((runtime, listener, token, registry))
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.

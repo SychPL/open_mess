@@ -1822,6 +1822,7 @@ name = "open-mess"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "chrono",
  "clap",
  "getrandom 0.4.3",
  "keyring-core",

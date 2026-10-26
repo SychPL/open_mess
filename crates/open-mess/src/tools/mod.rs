@@ -5,7 +5,8 @@
 //! module of the account they name; without an account, `list_conversations`, `unread` and
 //! `mentions` ask every account at once. Read tools see only what the agent permissions allow
 //! (spec 8.6): an account or conversation the agent may not read is refused when named and left
-//! out of lists.
+//! out of lists. The writes never reach a module from here: they become pending actions
+//! (pending.rs), which run under the write permission.
 
 pub mod shared;
 
@@ -21,6 +22,7 @@ use tokio::task::JoinSet;
 
 use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::ModuleState;
+use crate::pending::{Kind, Pending, State};
 use crate::permissions;
 
 /// A tool as both front ends describe it.
@@ -58,17 +60,25 @@ pub struct Registry {
     started: Instant,
     /// None when the daemon runs no modules and has no accounts.
     accounts: Option<Arc<Accounts>>,
+    /// The accounts' writes; None with the accounts.
+    pending: Option<Arc<Pending>>,
 }
 
 impl Registry {
     /// The tools with no modules and no accounts; `started` is when the daemon started, for
     /// `status`.
     pub fn with_builtin(started: Instant) -> Registry {
-        Registry { started, accounts: None }
+        Registry { started, accounts: None, pending: None }
     }
 
     pub fn new(started: Instant, accounts: Arc<Accounts>) -> Registry {
-        Registry { started, accounts: Some(accounts) }
+        let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
+        Registry { started, accounts: Some(accounts), pending: Some(pending) }
+    }
+
+    /// The pending actions, for the approval UI and the configuration window.
+    pub fn pending(&self) -> Option<&Arc<Pending>> {
+        self.pending.as_ref()
     }
 
     pub fn list(&self) -> Vec<ToolInfo> {
@@ -88,14 +98,26 @@ impl Registry {
             return self.status();
         }
         let args = shared::validate(name, args)?;
-        let Some(accounts) = &self.accounts else {
+        let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending) else {
             return match args.account {
                 Some(id) => Err(unknown_account(&id)),
                 None => Ok(json!({"items": []})),
             };
         };
+        if let Some(kind) = Kind::for_tool(name) {
+            // The schema makes `account` and `conversation` required.
+            let account = args.account.unwrap_or_default();
+            let conversation = args.module_args.get("conversation").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let outcome = pending.create(kind, &account, &conversation, args.module_args).await?;
+            return serde_json::to_value(outcome).map_err(failed);
+        }
         match (name, args.account) {
             ("accounts", _) => list_accounts(accounts),
+            ("pending", account) => {
+                let state = args.module_args.get("state").and_then(Value::as_str).map(State::parse).transpose().map_err(failed)?;
+                let limit = args.module_args.get("limit").and_then(Value::as_u64).and_then(|limit| u32::try_from(limit).ok()).unwrap_or(20);
+                pending.list(account.as_deref(), state, limit)
+            }
             (_, None) => fan_out(accounts, name, &args.module_args).await,
             ("get_attachment", Some(id)) => get_attachment(accounts, &id, &args.module_args).await,
             (_, Some(id)) => {

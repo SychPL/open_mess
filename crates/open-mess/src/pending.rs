@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use open_mess_host::limits::CALL_TIMEOUT;
 use open_mess_host::{HostError, ModuleError, Target};
 use rusqlite::OptionalExtension;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
 use crate::Error;
@@ -51,7 +52,11 @@ impl Kind {
         }
     }
 
-    /// The module tool that runs it.
+    /// The write tool (and module tool) that makes it.
+    pub fn for_tool(tool: &str) -> Option<Kind> {
+        [Kind::Send, Kind::Edit, Kind::React].into_iter().find(|kind| kind.tool() == tool)
+    }
+
     fn tool(self) -> &'static str {
         match self {
             Kind::Send => "send",
@@ -70,7 +75,8 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum State {
     Waiting,
     /// Approved (or autonomous) and running.
@@ -102,7 +108,7 @@ impl State {
         }
     }
 
-    fn parse(name: &str) -> Result<State, Error> {
+    pub(crate) fn parse(name: &str) -> Result<State, Error> {
         State::ALL.into_iter().find(|state| state.name() == name).ok_or_else(|| bad_row("state", name))
     }
 }
@@ -137,10 +143,11 @@ impl std::fmt::Debug for Preview {
 }
 
 /// What a write tool answers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Outcome {
     pub action: String,
     pub state: State,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
@@ -261,6 +268,36 @@ impl Pending {
         }
         self.forget(action);
         if approve { Ok(self.execute(action).await?.0) } else { Ok(State::Rejected) }
+    }
+
+    /// The `pending` tool: the newest actions first, never their text.
+    pub fn list(&self, account: Option<&str>, state: Option<State>, limit: u32) -> Result<Value, ToolError> {
+        let store = self.accounts.store();
+        let mut statement = store
+            .conn()
+            .prepare(
+                "SELECT id, account, conversation, kind, state, created_ms, decided_ms, detail FROM pending
+                 WHERE (?1 IS NULL OR account = ?1) AND (?2 IS NULL OR state = ?2) ORDER BY created_ms DESC, rowid DESC LIMIT ?3",
+            )
+            .map_err(failed)?;
+        let rows = statement
+            .query_map(rusqlite::params![account, state.map(State::name), limit], |row| {
+                let mut item = Map::new();
+                for (index, key) in ["action", "account", "conversation", "kind", "state"].into_iter().enumerate() {
+                    item.insert(key.into(), row.get::<_, String>(index)?.into());
+                }
+                item.insert("created".into(), time(row.get(5)?).into());
+                if let Some(decided) = row.get::<_, Option<i64>>(6)? {
+                    item.insert("decided".into(), time(decided).into());
+                }
+                if let Some(detail) = row.get::<_, Option<String>>(7)? {
+                    item.insert("detail".into(), detail.into());
+                }
+                Ok(Value::Object(item))
+            })
+            .map_err(failed)?;
+        let items = rows.collect::<Result<Vec<_>, _>>().map_err(failed)?;
+        Ok(json!({ "items": items }))
     }
 
     /// An action's state.
@@ -391,6 +428,11 @@ fn too_many() -> ToolError {
 
 fn ttl_ms() -> i64 {
     i64::try_from(APPROVAL_TTL.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Milliseconds since 1970 as RFC 3339, UTC.
+fn time(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
 fn now_ms() -> i64 {
