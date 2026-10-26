@@ -14,7 +14,7 @@ use wasmtime::{Store, UpdateDeadline};
 use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::{HostError, ModuleError};
 use crate::limits::{self, Limits};
-use crate::runtime::{AccountInfo, HostState};
+use crate::runtime::{AccountInfo, HostState, ModuleEnv};
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
@@ -84,7 +84,7 @@ async fn within<R>(deadline: &Deadline, call: impl Future<Output = wasmtime::Res
 }
 
 pub(crate) struct Actor {
-    pub(crate) name: String,
+    env: Arc<ModuleEnv>,
     engine: wasmtime::Engine,
     pre: PlatformModulePre<HostState>,
     limits: Limits,
@@ -95,20 +95,32 @@ pub(crate) struct Actor {
 }
 
 impl Actor {
-    pub(crate) fn new(engine: wasmtime::Engine, pre: PlatformModulePre<HostState>, limits: Limits) -> (Actor, watch::Receiver<ModuleState>) {
+    pub(crate) fn new(
+        engine: wasmtime::Engine,
+        pre: PlatformModulePre<HostState>,
+        limits: Limits,
+        env: Arc<ModuleEnv>,
+    ) -> (Actor, watch::Receiver<ModuleState>) {
         let (state, watch) = watch::channel(ModuleState::Running);
-        let actor = Actor { name: String::new(), engine, pre, limits, deadline: Deadline::default(), instance: None, crashes: 0, state };
+        let actor = Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, crashes: 0, state };
         (actor, watch)
     }
 
     fn store(&self) -> Store<HostState> {
-        let mut store = Store::new(&self.engine, HostState::new(self.deadline.clone()));
+        let mut store = Store::new(&self.engine, HostState::new(self.deadline.clone(), self.env.clone()));
         store.limiter(|state| &mut state.limiter);
         // Yield to the executor on every epoch tick, so a busy module never holds a thread, and
         // stop it once its call is past the deadline.
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(|state| Ok(if state.data().deadline.expired() { UpdateDeadline::Interrupt } else { UpdateDeadline::Yield(1) }));
         store
+    }
+
+    /// Gives the module a new environment; the current instance is dropped so the next call
+    /// runs with it.
+    pub(crate) fn reset(&mut self, env: Arc<ModuleEnv>) {
+        self.env = env;
+        self.instance = None;
     }
 
     /// Runs one export under the call limits, instantiating the module first if the last call
@@ -155,7 +167,7 @@ impl Actor {
 
     fn crashed(&mut self, error: HostError) -> HostError {
         self.crashes = self.crashes.saturating_add(1);
-        tracing::warn!(module = %self.name, crashes = self.crashes, "module stopped: {error}");
+        tracing::warn!(module = %self.env.name, crashes = self.crashes, "module stopped: {error}");
         self.state.send_replace(if self.crashes >= limits::MAX_CRASHES {
             ModuleState::Disabled
         } else {

@@ -1,6 +1,7 @@
 //! The wasmtime engine, module loading and the state each module instance runs with.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -9,7 +10,9 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use crate::actor::{Actor, Deadline, ModuleState, QUEUE, Reply, Request};
 use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::HostError;
+use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
+use crate::net::Net;
 
 /// Mirrors `manifest` in `wit/module.wit`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +94,15 @@ pub struct ModuleContext {
     /// The daemon's data folder; the module's storage lives under `modules/` in it.
     pub data_dir: PathBuf,
     pub events: mpsc::Sender<HostEvent>,
+    /// The network modules reach the outside world through.
+    pub net: Net,
+}
+
+/// What a module's imports work with; shared by all its instances.
+pub(crate) struct ModuleEnv {
+    pub(crate) name: String,
+    pub(crate) hosts: HostList,
+    pub(crate) net: Net,
 }
 
 /// The state a module instance runs with: a WASI context with nothing inherited, plus the host
@@ -100,10 +112,11 @@ pub(crate) struct HostState {
     table: ResourceTable,
     pub(crate) limiter: ModuleLimiter,
     pub(crate) deadline: Deadline,
+    pub(crate) env: Arc<ModuleEnv>,
 }
 
 impl HostState {
-    pub(crate) fn new(deadline: Deadline) -> Self {
+    pub(crate) fn new(deadline: Deadline, env: Arc<ModuleEnv>) -> Self {
         // No preopens, environment, arguments or sockets; stdin is empty and stdout/stderr are
         // discarded (WasiCtxBuilder's defaults, made explicit for the network).
         let wasi = WasiCtx::builder()
@@ -112,7 +125,7 @@ impl HostState {
             .allow_ip_name_lookup(false)
             .socket_addr_check(|_, _| Box::pin(async { false }))
             .build();
-        HostState { wasi, table: ResourceTable::new(), limiter: ModuleLimiter::default(), deadline }
+        HostState { wasi, table: ResourceTable::new(), limiter: ModuleLimiter::default(), deadline, env }
     }
 }
 
@@ -164,7 +177,7 @@ impl Engine {
     }
 
     /// Compiles a module, reads its manifest (under the call limits) and starts its actor.
-    pub async fn load(&self, wasm: &Path, _ctx: ModuleContext) -> Result<ModuleHandle, HostError> {
+    pub async fn load(&self, wasm: &Path, ctx: ModuleContext) -> Result<ModuleHandle, HostError> {
         let engine = self.engine.clone();
         let path = wasm.to_path_buf();
         // Compiling takes a while; keep it off the async worker threads.
@@ -179,14 +192,20 @@ impl Engine {
             .instantiate_pre(&component)
             .and_then(PlatformModulePre::new)
             .map_err(|e| HostError::Load(format!("not a platform module: {e}")))?;
-        let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits);
+        // The manifest runs before the module has a name or hosts: its imports reach nothing.
+        let ModuleContext { net, .. } = ctx;
+        let loading = ModuleEnv { name: String::new(), hosts: HostList::default(), net: net.clone() };
+        let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
             .run(|m, s| Box::pin(m.open_mess_module_module().call_manifest(s)))
             .await
             .map_err(|e| HostError::Load(format!("manifest call failed: {e}")))?
             .into();
         check_name(&manifest.name)?;
-        actor.name.clone_from(&manifest.name);
+        let hosts = HostList::parse(&manifest.hosts)?;
+        // Not used until the sign-in window (milestone E), but a bad manifest is refused now.
+        HostList::parse(&manifest.sign_in_hosts)?;
+        actor.reset(Arc::new(ModuleEnv { name: manifest.name.clone(), hosts, net }));
         let (requests, queue) = mpsc::channel(QUEUE);
         tokio::spawn(actor.serve(queue));
         Ok(ModuleHandle { manifest, requests, state })

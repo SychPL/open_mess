@@ -2,6 +2,7 @@
 //! conversions between the generated types and the crate's plain ones.
 
 use crate::error::ModuleError;
+use crate::net;
 use crate::runtime::{AccountInfo, HostState, Manifest, ToolDecl, WamIdentity};
 
 wasmtime::component::bindgen!({
@@ -22,8 +23,10 @@ fn not_yet(what: &str) -> String {
 impl types::Host for HostState {}
 
 impl http::Host for HostState {
-    async fn fetch(&mut self, _req: http::Request) -> Result<http::Response, http::HttpError> {
-        Err(http::HttpError::Network(not_yet("http")))
+    async fn fetch(&mut self, req: http::Request) -> Result<http::Response, http::HttpError> {
+        let req = net::Request { method: req.method, url: req.url, headers: req.headers, body: req.body };
+        let response = self.env.net.fetch(&self.env.hosts, req).await?;
+        Ok(http::Response { status: response.status, headers: response.headers, body: response.body })
     }
 }
 
@@ -85,6 +88,18 @@ impl host::Host for HostState {
     async fn session(&mut self, _account: String, _state: host::SessionState) {}
 
     async fn message_arrived(&mut self, _msg: host::NewMessage) {}
+}
+
+impl From<net::HttpError> for http::HttpError {
+    fn from(e: net::HttpError) -> Self {
+        match e {
+            net::HttpError::Blocked(s) => http::HttpError::Blocked(s),
+            net::HttpError::Timeout => http::HttpError::Timeout,
+            net::HttpError::TooLarge => http::HttpError::TooLarge,
+            net::HttpError::Throttled(secs) => http::HttpError::Throttled(secs),
+            net::HttpError::Network(s) => http::HttpError::Network(s),
+        }
+    }
 }
 
 impl From<types::Manifest> for Manifest {

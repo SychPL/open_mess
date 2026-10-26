@@ -6,7 +6,8 @@
 
 use std::path::PathBuf;
 
-use open_mess_host::{Engine, ModuleContext, ModuleHandle};
+use open_mess_host::ip_policy::AddressPolicy;
+use open_mess_host::{Engine, ModuleContext, ModuleHandle, Net, limits};
 
 /// A module built by `cargo xtask ci` (the wasm build runs before the tests), found next to this
 /// test binary so a custom `CARGO_TARGET_DIR` works too: `<target>/<profile>/deps/<test>.exe`
@@ -20,9 +21,10 @@ pub fn wasm(name: &str) -> PathBuf {
     path
 }
 
+/// A context whose network allows loopback, so modules can reach the tests' local servers.
 pub fn context() -> ModuleContext {
     let (events, _) = tokio::sync::mpsc::channel(8);
-    ModuleContext { data_dir: std::env::temp_dir(), events }
+    ModuleContext { data_dir: std::env::temp_dir(), events, net: Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests()) }
 }
 
 pub async fn load(engine: &Engine, name: &str) -> ModuleHandle {

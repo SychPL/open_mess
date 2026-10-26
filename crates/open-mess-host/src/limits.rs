@@ -13,23 +13,33 @@ pub const MAX_TABLE_ELEMENTS: usize = 1_000_000;
 pub const MAX_CRASHES: u32 = 3;
 /// How often the epoch ticker lets running WebAssembly check its deadline.
 pub const EPOCH_TICK: Duration = Duration::from_millis(10);
+/// HTTP response body; a longer one is cut off with `too-large`.
+pub const MAX_BODY: usize = 16 * 1024 * 1024;
+/// A `Retry-After` (seconds) above this ends the fetch with `throttled` instead of a response.
+pub const MAX_RETRY_AFTER: u32 = 300;
+/// Establishing a TCP (and TLS) connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Waiting for the next bytes of a response.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The limits an engine applies; `Default` is the constants above.
+/// The time limits an engine or a `Net` applies; `Default` is the constants above.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub call_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { call_timeout: CALL_TIMEOUT }
+        Limits { call_timeout: CALL_TIMEOUT, connect_timeout: CONNECT_TIMEOUT, read_timeout: READ_TIMEOUT }
     }
 }
 
 /// Short limits that keep tests fast.
 #[cfg(any(test, feature = "test-support"))]
 pub fn for_tests() -> Limits {
-    Limits { call_timeout: Duration::from_secs(2) }
+    Limits { call_timeout: Duration::from_secs(2), connect_timeout: Duration::from_secs(1), read_timeout: Duration::from_secs(1) }
 }
 
 /// Caps a module instance's memories and tables in total, so a component with many memories gets
