@@ -21,6 +21,14 @@ pub enum Error {
     SchemaTooNew { found: i64, known: i64 },
     #[error("state database: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("port {0} is already in use - change it in the configuration window or set another port")]
+    PortInUse(u16),
+    #[error("cannot listen on 127.0.0.1:{port}: {source}")]
+    Listen { port: u16, source: std::io::Error },
+    #[error("Credential Manager: {0}")]
+    Secrets(#[from] keyring_core::Error),
+    #[error("cannot generate a random token: {0}")]
+    Random(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

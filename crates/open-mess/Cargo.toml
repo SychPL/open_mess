@@ -38,7 +38,7 @@ windows-native-keyring-store = "1.1.0"
 [dev-dependencies]
 rmcp = { version = "3.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["sync", "test-util"] }
 
 [lints]
 workspace = true
