@@ -811,6 +811,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "open-mess-test-echo"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "open-mess-test-hog"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "open-mess-test-spin"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

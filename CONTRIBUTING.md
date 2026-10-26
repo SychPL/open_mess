@@ -31,6 +31,7 @@ commit.
 | `crates/open-mess/` | the `om` binary: daemon and CLI |
 | `crates/open-mess-host/` | the module host: loads platform modules and runs them under limits |
 | `modules/teams/` | the Teams platform module, a WebAssembly component implementing `wit/module.wit` |
+| `modules/test-*/` | small guest modules the module host's tests load (`publish = false`) |
 | `wit/` | the contract between the core and platform modules |
 | `xtask/` | repository tasks (`cargo xtask ci`, `cargo xtask hooks`) |
 | `.specs/` | specs, one per non-trivial change; review output in `.specs/review/` is local |
