@@ -6,13 +6,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use keyring_core::api::CredentialStore;
 use open_mess::accounts::Accounts;
 use open_mess::modules::{self, Modules};
 use open_mess::store::Store;
+use open_mess::tools::Registry;
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{Engine, HostEvent, ModuleContext, Net};
+use open_mess_host::{AccountInfo, Engine, HostEvent, ModuleContext, Net, limits};
+use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 /// A module built by `cargo xtask ci` (the wasm build runs before the tests), found from this test
@@ -88,4 +91,33 @@ pub async fn running(data_dir: &Path, engine: &Engine, events: mpsc::Sender<Host
 
 pub fn accounts(data_dir: &Path, modules: Modules, credentials: Arc<CredentialStore>) -> Arc<Accounts> {
     Arc::new(Accounts::new(store(data_dir), modules, data_dir.to_path_buf(), credentials))
+}
+
+pub struct Daemon {
+    pub dir: TempDir,
+    pub accounts: Arc<Accounts>,
+    pub registry: Registry,
+    pub events: mpsc::Receiver<HostEvent>,
+    pub credentials: Arc<CredentialStore>,
+}
+
+/// A daemon's accounts and tools over module files (file name, built module), all approved.
+pub async fn daemon(files: &[(&str, &str)]) -> Daemon {
+    let dir = tempfile::tempdir().unwrap();
+    for (file, module) in files {
+        install(dir.path(), file, &std::fs::read(wasm(module)).unwrap());
+    }
+    let engine = Engine::with_limits(limits::for_tests()).unwrap();
+    let (sender, events) = mpsc::channel(64);
+    let modules = running(dir.path(), &engine, sender).await;
+    let credentials: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
+    let accounts = accounts(dir.path(), modules, Arc::clone(&credentials));
+    let registry = Registry::new(Instant::now(), Arc::clone(&accounts));
+    Daemon { dir, accounts, registry, events, credentials }
+}
+
+pub const ECHO: (&str, &str) = ("echo.wasm", "open_mess_test_echo");
+
+pub fn info(id: &str) -> AccountInfo {
+    AccountInfo { id: id.into(), display_name: format!("User {id}") }
 }

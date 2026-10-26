@@ -10,7 +10,7 @@
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
 //! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
 //! `read_messages` and `unread` return one synthetic message or conversation that names the
-//! account. The `restore` export succeeds only for account "known"; the `sign-in` export is not
+//! account; `list_conversations` returns the group chats "c1" and "c2". The `restore` export succeeds only for account "known"; the `sign-in` export is not
 //! supported; `sign-out` reports the account offline; `get-attachment` downloads an `http://`
 //! attachment id and returns fixed bytes named after any other.
 
@@ -110,6 +110,10 @@ mod guest {
                 "own": false,
                 "untrusted": {"sender_name": "Echo", "text": format!("hello {account}")},
             }]}),
+            "list_conversations" => {
+                let items = ["c1", "c2"].map(|id| json!({"id": id, "kind": "group", "untrusted": {"title": format!("Echo {id}")}}));
+                json!({ "items": items })
+            }
             "unread" => json!({"items": [{
                 "conversation": "c",
                 "kind": "direct",

@@ -19,6 +19,10 @@ const MIGRATIONS: &[&str] = &[
     // Accounts, each bound to the module that signed it in; `id` is `<module>:<module_account>`.
     "CREATE TABLE accounts (id TEXT PRIMARY KEY, module TEXT NOT NULL, module_account TEXT NOT NULL, display_name TEXT NOT NULL,
          state TEXT NOT NULL);",
+    // Agent permissions (spec 8.6): one row per account (`conversation` empty) and per overridden
+    // conversation; `write` is `never`, `confirm` or `autonomous`.
+    "CREATE TABLE permissions (account TEXT NOT NULL, conversation TEXT NOT NULL DEFAULT '', read INTEGER NOT NULL, write TEXT NOT NULL,
+         PRIMARY KEY (account, conversation));",
 ];
 
 /// Configuration and state in `state.sqlite3`.

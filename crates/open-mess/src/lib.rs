@@ -8,6 +8,7 @@ pub mod events;
 pub mod instance;
 pub mod modules;
 pub mod paths;
+pub mod permissions;
 pub mod secrets;
 pub mod store;
 pub mod tools;
