@@ -50,7 +50,7 @@ Etap 1 jest skończony, gdy:
 - spotkania, transkrypcje, głos, wideo (etapy 2 i 3),
 - statusy obecności, tworzenie zespołów i kanałów, zaproszenia, dołączanie do zespołów/serwerów, rozpoczynanie rozmów z nowymi osobami,
 - interfejs do czatowania dla człowieka,
-- Linux i macOS (rdzeń nie powinien tego blokować, ale nie testujemy i nie wydajemy),
+- Linux i macOS jako platforma produktu (nie wydajemy, nie testujemy okna, logowania WAM ani autostartu). CI uruchamia jednak testy rdzenia także na Linuksie, żeby rdzeń nie zależał od Windows,
 - sklep / podpisywanie modułów od osób trzecich,
 - oznaczanie wiadomości jako przeczytane (świadomie brak takiego narzędzia).
 
@@ -58,7 +58,7 @@ Etap 1 jest skończony, gdy:
 
 - open_mess w jakikolwiek sposób psuje oficjalnego klienta Teams (puste rozmowy, wylogowania, zmiana stanu przeczytania przez samo czytanie).
 - Działanie wymaga wyciągania tokenów z innych aplikacji albo z przeglądarki.
-- Każda sesja agenta albo każda platforma to osobny, stale działający proces.
+- Platformy, konta albo połączenia działają w osobnych procesach, albo każda sesja agenta potrzebuje własnej kopii rdzenia. Jedyny wyjątek to cienki most stdio z 8.7 (tylko przekazuje komunikaty do demona, bez logiki platform), żyjący tyle co sesja Claude Code, która go uruchomiła.
 - W tle stale działa silnik przeglądarki (jak Chromium w `teams-wrapper`).
 - Agent wysyła wiadomość jako użytkownik wbrew ustawionym uprawnieniom (np. bez potwierdzenia, gdy wymagane jest potwierdzenie).
 - Treść wiadomości od innych osób jest traktowana przez system jako polecenie.
@@ -80,7 +80,7 @@ Jeden plik `om.exe`:
 - `om daemon` - uruchamiany automatycznie przy logowaniu do Windows. Zawiera: środowisko modułów WASM, sesje kont, połączenia na żywo, lokalne API (MCP + API dla CLI), wyzwalacze, ikonę w zasobniku i okno konfiguracji otwierane na żądanie.
 - `om <polecenie>` - krótko żyjące wywołanie CLI, które łączy się z działającym demonem przez lokalne API. Jeśli demon nie działa, CLI go uruchamia albo zwraca czytelny błąd (wybór budującego).
 
-Lokalne API nasłuchuje wyłącznie na `127.0.0.1`, wymaga losowego tokenu Bearer (generowanego przy instalacji) i nigdy nie jest wystawiane w sieci.
+Lokalne API nasłuchuje wyłącznie na `127.0.0.1`, wymaga losowego tokenu Bearer (generowanego przy pierwszym uruchomieniu demona) i nigdy nie jest wystawiane w sieci.
 
 ### 8.2 Wejścia: MCP, CLI, okno
 
@@ -97,7 +97,7 @@ Podział odpowiedzialności:
 - **Moduł** zna protokół platformy: jakie zapytania wysłać, jak zinterpretować odpowiedzi i zdarzenia, jak przebiega logowanie.
 - **Rdzeń (host)** wykonuje wszystko, co dotyka świata zewnętrznego, i udostępnia to modułowi jako importy:
   - HTTP i WebSocket (z limitami tempa, ponawianiem po 429 / `Retry-After`, logowaniem bez sekretów),
-  - lista dozwolonych hostów sieciowych per moduł, deklarowana w manifeście modułu i egzekwowana przez rdzeń,
+  - lista dozwolonych hostów sieciowych per moduł: deklarowana w manifeście (dokładne nazwy albo wzorce sufiksu, np. `*.sharepoint.com` dla domeny SharePoint organizacji, nieznanej w chwili budowy modułu), pokazywana użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie, egzekwowana przez rdzeń. Niezależnie od listy rdzeń twardo blokuje adresy pętli zwrotnej, link-local i prywatne (IPv4 i IPv6), sprawdzając adres po rozwiązaniu nazwy (ochrona przed DNS rebinding), więc żaden moduł nie dosięgnie usług lokalnych ani sieci LAN,
   - trwałe przechowywanie danych modułu (klucz-wartość),
   - sekrety (tokeny odświeżania itp.) w Menedżerze poświadczeń Windows - moduł nigdy nie dostaje dostępu do sekretów innego modułu,
   - zegar i timery,
@@ -105,6 +105,8 @@ Podział odpowiedzialności:
   - emisja zdarzeń (nowa wiadomość, zmiana stanu sesji) do rdzenia, który obsługuje wyzwalacze.
 - **Moduł eksportuje**: manifest (nazwa, wersja, platforma, dozwolone hosty, obsługiwane operacje, dodatkowe narzędzia), logowanie i przywracanie sesji, operacje ze wspólnego zestawu (8.5), obsługę zdarzeń na żywo.
 - **Dodatkowe narzędzia modułu**: moduł może zadeklarować własne narzędzia spoza wspólnego zestawu (np. w przyszłości `teams.list_meetings`); rdzeń wystawia je w MCP i CLI z przedrostkiem modułu. To jest furtka dla modułów funkcji (spotkania) z etapów 2-3.
+
+Limity zasobów (decyzja projektowa, recenzja R1): każde wywołanie modułu ma limit czasu wykonania (przerywanie przez epoch/fuel silnika WASM) i limit pamięci; przekroczenie przerywa wywołanie, moduł jest wyładowywany, a stan i błąd pokazują `status` i okno. Po kilku awariach z rzędu rdzeń nie ładuje modułu ponownie automatycznie. Inne moduły i konta działają dalej. Konkretne wartości limitów - wybór budującego.
 
 Instalacja modułu: plik `.wasm` w katalogu modułów (`%APPDATA%\open_mess\modules\`) albo "Dodaj z pliku" w sekcji Moduły okna. Moduły można włączać i wyłączać bez restartu demona.
 
@@ -143,6 +145,8 @@ Stan:
 
 Czytanie nigdy nie oznacza wiadomości jako przeczytanych.
 
+Wyniki narzędzi czytających (`unread`, `mentions`, `read_messages`, `search`, `list_conversations`) oddzielają treść pochodzącą od innych osób (tekst, nazwy, nazwy plików) od metadanych i oznaczają ją jako niezaufaną, tak samo jak powiadomienia wyzwalaczy (AGENTS.md).
+
 Identyfikatory rozmów i wiadomości są nieprzezroczyste dla agenta i jednoznacznie wskazują platformę i konto. Treść wiadomości dla agenta: zwykły tekst / Markdown (konwersja z HTML Teams i z powrotem po stronie modułu).
 
 ### 8.6 Uprawnienia agentów
@@ -152,7 +156,12 @@ Ustawiane w sekcji "Uprawnienia agentów" okna, per konto, opcjonalnie zawężon
 - czytanie: tak / nie,
 - pisanie: nigdy / z potwierdzeniem / samodzielnie.
 
-**Samodzielne wysyłanie jest opcją do wyboru** (decyzja użytkownika): agent może wysyłać bez potwierdzenia tylko tam, gdzie użytkownik świadomie ustawił "samodzielnie" - per konto, opcjonalnie zawężone do wybranych rozmów, oraz osobno w każdej regule wyzwalacza (8.7). Nowe konto startuje z "z potwierdzeniem" (decyzja projektowa).
+**Samodzielne wysyłanie jest opcją do wyboru** (decyzja użytkownika): agent może wysyłać bez potwierdzenia tylko tam, gdzie użytkownik świadomie ustawił "samodzielnie" - per konto, opcjonalnie zawężone do wybranych rozmów. Nowe konto startuje z "z potwierdzeniem" (decyzja projektowa).
+
+Kto ma jakie uprawnienia (decyzja projektowa, recenzja R1):
+- Klienci MCP i CLI używają wspólnego tokenu lokalnego API i dostają uprawnienia konta/rozmowy.
+- Agent uruchomiony przez wyzwalacz (akcja 2 w 8.7) dostaje od demona własny token zakresowy, ważny tylko do końca tego uruchomienia (zakończenie procesu albo limit czasu). Uprawnienia tego tokenu to minimum z uprawnień konta/rozmowy i uprawnień reguły. Reguła może tylko zawęzić, nigdy rozszerzyć - np. konto "samodzielnie" + reguła "tylko czytanie i przygotowanie" = wysyłka tylko przez zatwierdzenie; konto z czytaniem "nie" = brak czytania niezależnie od reguły.
+- Powiadomienie do otwartej sesji (akcja 1 w 8.7) nie zmienia uprawnień tej sesji: działa ona dalej z uprawnieniami konta. Jeśli konto ma "samodzielnie", obudzona sesja może wysłać bez zatwierdzenia - okno konfiguracji ostrzega o tym przy zapisie takiej reguły. Kto tego nie chce, ustawia na koncie albo w danej rozmowie "z potwierdzeniem" albo używa akcji 2.
 
 "Z potwierdzeniem" oznacza, że działa tylko ścieżka `prepare_message` -> `send_prepared`, a `send_prepared` przechodzi dopiero po zatwierdzeniu **poza zasięgiem agenta**: powiadomienie Windows z dokładną rozmową, odbiorcami i tekstem oraz przyciskami Wyślij / Odrzuć, a także lista "Do zatwierdzenia" w oknie konfiguracji. Zgoda wyrażona w czacie z agentem nie wystarcza, bo agent mógłby ją zmyślić albo wywołać `send_prepared` sam. Dotyczy to agentów w sesji interaktywnej, agentów uruchomionych przez wyzwalacz i CLI. Decyzja projektowa.
 
@@ -167,14 +176,14 @@ Sekcja "Wyzwalacze" w oknie. Reguła = warunek + akcja.
 Warunki: DM do użytkownika, wzmianka, nowa wiadomość w wybranej rozmowie, wiadomość od wybranych osób; zawsze w ramach konkretnego konta.
 
 Akcje:
-1. **Wpis do otwartej sesji Claude Code** przez kanał MCP (`notifications/claude/channel`, z deklaracją możliwości `experimental: { "claude/channel": {} }` - mechanizm używany przez wtyczkę Telegram, potwierdzony dla transportu stdio). Jeśli kanał nie działa przez transport HTTP, budujący dodaje cienki most stdio (`om mcp-stdio`), który przekazuje do demona - to jedyny dopuszczalny dodatkowy, krótkotrwały proces. Claude Code dostarcza kanały tylko do sesji uruchomionych z włączonymi kanałami (flaga przy starcie; dla serwera spoza listy zatwierdzonych wtyczek prawdopodobnie tryb deweloperski) - to akceptowalne, okno konfiguracji pokazuje gotowe polecenie startu. Gdy takich sesji jest kilka, powiadomienie dostaje ostatnio aktywna (bez duplikatów); gdy nie ma żadnej, działa akcja 2, jeśli reguła ją ma. Decyzja projektowa (pytanie z przeglądu dokumentu).
-2. **Uruchomienie agenta od zera** gdy nie ma sesji: demon wykonuje skonfigurowane polecenie (np. `claude -p "<prompt>"` albo Codex) z treścią zdarzenia.
+1. **Wpis do otwartej sesji Claude Code** przez kanał MCP (`notifications/claude/channel`, z deklaracją możliwości `experimental: { "claude/channel": {} }` - mechanizm używany przez wtyczkę Telegram, potwierdzony dla transportu stdio). Jeśli kanał nie działa przez transport HTTP, budujący dodaje cienki most stdio (`om mcp-stdio`), który tylko przekazuje komunikaty do demona. Most uruchamia i kończy Claude Code; żyje tyle co sesja, która włączyła kanały - po jednym na taką sesję. To jedyny wyjątek od zasady jednego procesu (sekcja 6): bez logiki platform, bez sesji kont, bez własnego stanu. Claude Code dostarcza kanały tylko do sesji uruchomionych z włączonymi kanałami (flaga przy starcie; dla serwera spoza listy zatwierdzonych wtyczek prawdopodobnie tryb deweloperski) - to akceptowalne, okno konfiguracji pokazuje gotowe polecenie startu. Gdy takich sesji jest kilka, powiadomienie dostaje ostatnio aktywna (bez duplikatów); gdy nie ma żadnej, działa akcja 2, jeśli reguła ją ma. Decyzja projektowa (pytanie z przeglądu dokumentu).
+2. **Uruchomienie agenta od zera** gdy nie ma sesji: demon uruchamia skonfigurowany program (np. `claude -p` albo Codex) ze stałą listą argumentów ustaloną w regule, bezpośrednio, bez powłoki. Treść zdarzenia nigdy nie jest wklejana do polecenia ani argumentów: trafia do programu przez stdin albo jako ścieżka do pliku z treścią, oznaczoną jako niezaufana. Proces dostaje token zakresowy z 8.6 (np. przez konfigurację MCP przekazaną w zmiennej środowiskowej albo pliku tymczasowym). Decyzja projektowa (recenzja R1).
 3. **Webhook** HTTPS z podpisem HMAC (jak w `teams-wrapper`).
 
 Zabezpieczenia (decyzje projektowe):
 - grupowanie: zdarzenia z jednej rozmowy są zbierane i wysyłane jako jedno powiadomienie po chwili ciszy,
 - cisza nocna i limit pobudek na godzinę per reguła,
-- treść od innych osób jest przekazywana jako dane, wyraźnie oznaczona jako niezaufana; agent obudzony przez wyzwalacz domyślnie może tylko czytać i przygotowywać wiadomości (wysyłka przez "Do zatwierdzenia"), chyba że reguła jawnie pozwala na więcej.
+- treść od innych osób jest przekazywana jako dane, wyraźnie oznaczona jako niezaufana; agent uruchomiony przez wyzwalacz (akcja 2) domyślnie może tylko czytać i przygotowywać wiadomości (wysyłka przez "Do zatwierdzenia"), chyba że reguła pozwala na więcej - nadal nie więcej niż konto (8.6).
 
 ### 8.8 Okno konfiguracji
 
@@ -300,6 +309,8 @@ Decyzje projektowe (moje, do sprawdzenia przy czytaniu):
 - grupowanie, cisza nocna i limity wyzwalaczy; domyślnie obudzony agent nie wysyła bez zatwierdzenia,
 - sekrety w Menedżerze poświadczeń Windows, stan w SQLite, brak lokalnego archiwum wiadomości,
 - brak narzędzia do oznaczania jako przeczytane,
+- reguły wyzwalaczy tylko zawężają uprawnienia; agent z akcji 2 dostaje token zakresowy na czas uruchomienia (8.6),
+- limity czasu i pamięci dla modułów WASM; lista hostów modułu zatwierdzana przez użytkownika, adresy lokalne i prywatne zawsze zablokowane (8.3),
 - docelowe zużycie pamięci poniżej ~60 MB,
 - nazwa pliku wykonywalnego `om.exe`, dane w `%APPDATA%\open_mess\`,
 - `unread` = stan nieprzeczytania platformy, tylko do odczytu (8.5),
@@ -338,4 +349,4 @@ Brak (przed pierwszą rundą recenzji).
 
 ## Changelog rund
 
-Brak (przed pierwszą rundą recenzji).
+- R1 (Codex REJECT, GLM REJECT): reguły wyzwalaczy tylko zawężają uprawnienia, tokeny zakresowe dla uruchomień z akcji 2, akcja 1 dziedziczy uprawnienia konta z ostrzeżeniem (Codex P1, GLM P2); limity czasu i pamięci modułów WASM (Codex P2); most stdio jako jawny, długożyjący wyjątek od zasady jednego procesu (Codex P2); akcja 2 bez powłoki i bez wklejania treści do polecenia (GLM P2); lista hostów modułu zatwierdzana przez użytkownika, wzorce sufiksu, twarda blokada adresów lokalnych i prywatnych (GLM P2, P3); oznaczanie niezaufanej treści w wynikach narzędzi (GLM P3); doprecyzowanie Linuksa w CI (GLM P3); token API przy pierwszym uruchomieniu (GLM P3).
