@@ -6,8 +6,20 @@
 
 mod common;
 
-use common::{context_in, wasm};
-use open_mess_host::{Engine, ModuleHandle, limits};
+use common::{context_in, context_with_events, wasm};
+use open_mess_host::{Engine, ModuleContext, ModuleHandle, limits};
+
+#[tokio::test]
+async fn imports_reach_nothing_while_the_manifest_loads() {
+    // test-echo's manifest export writes to storage and reports a session.
+    let dir = tempfile::tempdir().unwrap();
+    let (context, mut events) = context_with_events();
+    let context = ModuleContext { data_dir: dir.path().to_path_buf(), ..context };
+    let module = Engine::new().unwrap().load(&wasm("open_mess_test_echo"), context).await.unwrap();
+    assert!(!dir.path().join("modules").exists());
+    assert!(events.try_recv().is_err());
+    drop(module);
+}
 
 /// With the default call limit: a 16 MiB value in a debug build can take a while.
 async fn echo(data_dir: &std::path::Path) -> ModuleHandle {

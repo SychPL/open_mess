@@ -101,12 +101,15 @@ impl secrets::Host for HostState {
 
     async fn set(&mut self, account: String, key: String, value: String) -> Result<(), String> {
         let store = self.secret_store()?;
-        crate::secrets::set(&*store, &self.env.name, &account, &key, &value)
+        let env = self.env.clone();
+        let storage = self.storage().map_err(|e| format!("{e:?}"))?;
+        crate::secrets::set(&*store, storage, &env.name, &account, &key, &value)
     }
 
     async fn delete(&mut self, account: String, key: String) {
-        if let Ok(store) = self.secret_store() {
-            crate::secrets::delete(&*store, &self.env.name, &account, &key);
+        let env = self.env.clone();
+        if let (Ok(store), Ok(storage)) = (self.secret_store(), self.storage()) {
+            crate::secrets::delete(&*store, storage, &env.name, &account, &key);
         }
     }
 }

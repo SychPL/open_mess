@@ -113,7 +113,12 @@ mod guest {
     }
 
     impl module::Guest for Echo {
+        // Also tries storage and a host event: the host must let neither through while the
+        // manifest is read at load. (Secrets are refused the same way; trying them here could
+        // reach the real credential store if that broke.)
         fn manifest() -> types::Manifest {
+            storage::set("loaded", b"1").ok();
+            host::session("a", host::SessionState::Online);
             types::Manifest {
                 name: "test-echo".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),

@@ -31,6 +31,8 @@ pub const MAX_TIMERS: usize = 32;
 pub const MIN_TIMER_DELAY: Duration = Duration::from_millis(100);
 /// A module's storage: the bytes of all keys and values together.
 pub const STORAGE_QUOTA: usize = 16 * 1024 * 1024;
+/// Secrets (credentials) one module keeps, all accounts together.
+pub const MAX_SECRETS: usize = 64;
 /// One string of a host event (an account, conversation or message id); a larger event is dropped,
 /// because it would sit in the daemon's queue outside the module's memory limit.
 pub const MAX_EVENT_TEXT: usize = 64 * 1024;

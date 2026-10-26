@@ -239,11 +239,18 @@ impl Engine {
 /// only.
 fn check_name(name: &str) -> Result<(), HostError> {
     let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_';
-    if (1..=64).contains(&name.len()) && name.chars().all(plain) {
-        Ok(())
-    } else {
-        Err(HostError::Load("the manifest name must be 1-64 characters of a-z, 0-9, '-' or '_'".to_string()))
+    if !(1..=64).contains(&name.len()) || !name.chars().all(plain) {
+        return Err(HostError::Load("the manifest name must be 1-64 characters of a-z, 0-9, '-' or '_'".to_string()));
     }
+    // Windows device names: `con.sqlite3` would open the console, not a file.
+    let device = ["con", "prn", "aux", "nul"].contains(&name)
+        || ["com", "lpt"]
+            .iter()
+            .any(|prefix| name.strip_prefix(prefix).is_some_and(|n| n.len() == 1 && n != "0" && n.chars().all(|c| c.is_ascii_digit())));
+    if device {
+        return Err(HostError::Load(format!("the manifest name {name:?} is a Windows device name")));
+    }
+    Ok(())
 }
 
 /// A loaded module. Clones share the module; calls from all of them run one at a time.
@@ -296,10 +303,10 @@ mod tests {
 
     #[test]
     fn module_name_is_a_plain_identifier() {
-        for good in ["teams", "test-echo", "a_1"] {
+        for good in ["teams", "test-echo", "a_1", "com", "com10", "console"] {
             assert!(check_name(good).is_ok(), "{good}");
         }
-        for bad in ["", "Teams", "../teams", "a/b", "a.b", "tëams", &"a".repeat(65)] {
+        for bad in ["", "Teams", "../teams", "a/b", "a.b", "tëams", &"a".repeat(65), "con", "nul", "com1", "lpt9"] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
     }

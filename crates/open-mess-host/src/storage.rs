@@ -30,8 +30,33 @@ impl Storage {
         let dir = data_dir.join("modules");
         std::fs::create_dir_all(&dir).map_err(|e| StorageError::Failed(e.to_string()))?;
         let db = Connection::open(dir.join(format!("{module}.sqlite3")))?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL)")?;
+        // `secrets` lists the module's credentials (not their values), so their number is capped
+        // and they can be found again; it is not counted in the quota.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS secrets (account TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (account, key));",
+        )?;
         Ok(Storage { db })
+    }
+
+    /// Records a secret's name; false when it is new and `MAX_SECRETS` are recorded already.
+    pub(crate) fn add_secret(&mut self, account: &str, key: &str) -> Result<bool, StorageError> {
+        let tx = self.db.transaction()?;
+        let known: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM secrets WHERE account = ?1 AND key = ?2)", [account, key], |row| row.get(0))?;
+        if !known {
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM secrets", [], |row| row.get(0))?;
+            if usize::try_from(count).unwrap_or(usize::MAX) >= limits::MAX_SECRETS {
+                return Ok(false);
+            }
+            tx.execute("INSERT INTO secrets (account, key) VALUES (?1, ?2)", [account, key])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn remove_secret(&self, account: &str, key: &str) -> Result<(), StorageError> {
+        self.db.execute("DELETE FROM secrets WHERE account = ?1 AND key = ?2", [account, key])?;
+        Ok(())
     }
 
     pub(crate) fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
