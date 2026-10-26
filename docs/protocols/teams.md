@@ -511,6 +511,21 @@ token, tenant id, user id or account name.
    `personalFileSite`; there is **no `appConsumptionHorizon`** here, so the "mark all as read"
    horizon comes from another request (CSA is the next candidate).
 
-All checks above were read-only: no endpoint registration, no property write, no Trouter
+5. **Sending with an AAD token, without registering an endpoint - accepted** (2026-10-26, a real
+   message the user asked to send to a colleague, text approved by the user). Steps:
+   - `GET https://graph.microsoft.com/v1.0/users?$filter=startswith(displayName,'<prefix>')` with a
+     WAM token for `https://graph.microsoft.com/.default` (Teams client id): HTTP 200, so the Teams
+     client id can look people up in Graph;
+   - the 1:1 chat id is `19:<oidA>_<oidB>@unq.gbl.spaces`; of the two orders only one exists
+     (`GET .../conversations/<id>` 200 vs 404), so a client checks both - the order rule is not
+     settled from one sample;
+   - `POST <chatServiceAfd>/v1/users/ME/conversations/<id>/messages` with
+     `Authorization: Bearer <ic3 token>`, `BehaviorOverride: redirectAs404`, body
+     `{content: "<p>...</p>", messagetype: "RichText/Html", contenttype: "Text", imdisplayname,
+     clientmessageid, properties: {importance, subject, mentions: "[]", files: "[]",
+     formatVariant: "TEAMS"}}`: HTTP 201 with `OriginalArrivalTime`.
+   No endpoint registration, Trouter connection or skype token was needed to send.
+
+All checks in items 1-4 were read-only: no endpoint registration, no property write, no Trouter
 connection. Values printed during the checks were limited to status codes, key names, counts and
 service URLs.
