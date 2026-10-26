@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -173,6 +173,34 @@ fn cli_mcp_command() {
     assert!(stdout.starts_with("claude mcp add --transport http"), "{stdout}");
     assert!(stdout.contains("open_mess http://127.0.0.1:7400/mcp"), "{stdout}");
     assert!(stdout.contains("\"Authorization: Bearer t0ken\""), "{stdout}");
+}
+
+#[test]
+fn cli_closed_stdout_is_fine() {
+    let dir = data_dir();
+    let mut child = om_command(dir.path(), 7400, TOKEN, &["mcp-command"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    // The reader goes away before om writes, like `om ... | head -0`.
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_reports_a_failed_write() {
+    let (port, _stop) = start().await;
+    let dir = data_dir();
+    // A stdout that refuses writes: a full device on Unix, a read-only file on Windows.
+    #[cfg(unix)]
+    let refusing = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+    #[cfg(windows)]
+    let refusing = {
+        let path = dir.path().join("read-only");
+        std::fs::write(&path, "").unwrap();
+        std::fs::File::open(&path).unwrap()
+    };
+    let output = om_command(dir.path(), port, TOKEN, &["status", "--json"]).stdout(refusing).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("cannot write"), "{}", stderr(&output));
 }
 
 #[test]

@@ -96,12 +96,19 @@ pub fn run() -> ExitCode {
 fn mcp_command() -> Result<(), Failure> {
     let port = port()?;
     let token = token()?;
-    // Writes ignore errors: println! panics when stdout is closed (`om status | head -1`).
-    let _ = writeln!(
+    written(writeln!(
         std::io::stdout(),
         "claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\""
-    );
-    Ok(())
+    ))
+}
+
+/// Output goes through writeln!, never println!, which panics when stdout is closed. A reader that
+/// went away (`om status | head -1`) is fine; any other write error means lost output.
+fn written(result: std::io::Result<()>) -> Result<(), Failure> {
+    match result {
+        Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(failed(format!("cannot write the result: {err}"))),
+        _ => Ok(()),
+    }
 }
 
 /// `OPEN_MESS_PORT`, else the port stored in the data folder, else the default.
@@ -183,9 +190,7 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
     let token = token()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?;
     let result = runtime.block_on(call(port, &token, tool, &args))?;
-    // A closed stdout (`om status | head -1`) is not an error of the tool.
-    let _ = print_result(&result, json_output);
-    Ok(())
+    written(print_result(&result, json_output))
 }
 
 async fn call(port: u16, token: &str, tool: &str, args: &Value) -> Result<Value, Failure> {
