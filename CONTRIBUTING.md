@@ -11,7 +11,7 @@ house style.
 
 ## Get it running
 
-You need stable Rust 1.85 or newer, the WebAssembly target the platform modules build for, and git.
+You need stable Rust 1.88 or newer, the WebAssembly target the platform modules build for, and git.
 
 ```bash
 rustup target add wasm32-wasip2

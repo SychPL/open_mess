@@ -10,7 +10,9 @@ const CI_STEPS: &[&[&str]] = &[
     &["fmt", "--all", "--check"],
     &["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"],
     &["test", "--workspace", "--locked"],
-    // The component the core loads; its glue only exists for wasm32 (needs `rustup target add wasm32-wasip2`).
+    // The component the core loads; its glue only exists for wasm32 (needs `rustup target add wasm32-wasip2`),
+    // so it gets its own clippy pass before the build.
+    &["clippy", "-p", "open-mess-teams", "--target", "wasm32-wasip2", "--locked", "--", "-D", "warnings"],
     &["build", "-p", "open-mess-teams", "--target", "wasm32-wasip2", "--locked"],
 ];
 

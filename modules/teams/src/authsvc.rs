@@ -113,6 +113,14 @@ mod tests {
     }
 
     #[test]
+    fn ams_falls_back_and_skype_token_is_optional() {
+        let body = br#"{"regionGtms": {"chatServiceAfd": "https://teams.microsoft.com/api/chatsvc/emea", "ams": "https://eu-api.asm.skype.com"}}"#;
+        let s = decode(body, NOW).unwrap();
+        assert_eq!(s.directory.ams.as_ref().map(Url::as_str), Some("https://eu-api.asm.skype.com/"));
+        assert!(s.skype_token.is_none() && s.expires_at_ms.is_none());
+    }
+
+    #[test]
     fn plain_http_directory_is_incompatible() {
         let body =
             String::from_utf8(OK.to_vec()).unwrap().replace("https://teams.microsoft.com/api/chatsvc", "http://teams.microsoft.com/api/chatsvc");
