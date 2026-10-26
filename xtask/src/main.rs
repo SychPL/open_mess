@@ -31,6 +31,10 @@ fn ci() -> bool {
     // wasm32-wasip2`), so they get their own clippy pass. They are built before the tests, which load them.
     let mut wasm = vec!["--target", "wasm32-wasip2", "--locked"];
     let modules = modules();
+    if modules.is_empty() {
+        eprintln!("no packages found in modules/");
+        return false;
+    }
     for module in &modules {
         wasm.extend(["-p", module]);
     }
@@ -42,7 +46,7 @@ fn ci() -> bool {
         vec!["test", "--workspace", "--locked"],
     ];
     // `all` stops at the first failing step, like CI.
-    !modules.is_empty() && steps.iter().all(|args| run("cargo", args))
+    steps.iter().all(|args| run("cargo", args))
 }
 
 fn main() -> ExitCode {

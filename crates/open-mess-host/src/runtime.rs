@@ -2,14 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Store, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
+use crate::actor::{Actor, Deadline, ModuleState, QUEUE, Reply, Request};
 use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::HostError;
-use crate::limits;
+use crate::limits::{self, Limits, ModuleLimiter};
 
 /// Mirrors `manifest` in `wit/module.wit`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +37,13 @@ pub struct ToolDecl {
     pub description: String,
     pub input_schema: String,
     pub writes: bool,
+}
+
+/// Mirrors `account-info` in `wit/module.wit`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountInfo {
+    pub id: String,
+    pub display_name: String,
 }
 
 /// Mirrors `session-state` in `wit/module.wit`.
@@ -91,10 +98,12 @@ pub struct ModuleContext {
 pub(crate) struct HostState {
     wasi: WasiCtx,
     table: ResourceTable,
+    pub(crate) limiter: ModuleLimiter,
+    pub(crate) deadline: Deadline,
 }
 
 impl HostState {
-    fn new() -> Self {
+    pub(crate) fn new(deadline: Deadline) -> Self {
         // No preopens, environment, arguments or sockets; stdin is empty and stdout/stderr are
         // discarded (WasiCtxBuilder's defaults, made explicit for the network).
         let wasi = WasiCtx::builder()
@@ -103,7 +112,7 @@ impl HostState {
             .allow_ip_name_lookup(false)
             .socket_addr_check(|_, _| Box::pin(async { false }))
             .build();
-        HostState { wasi, table: ResourceTable::new() }
+        HostState { wasi, table: ResourceTable::new(), limiter: ModuleLimiter::default(), deadline }
     }
 }
 
@@ -117,11 +126,22 @@ impl WasiView for HostState {
 pub struct Engine {
     engine: wasmtime::Engine,
     linker: Linker<HostState>,
+    limits: Limits,
 }
 
 impl Engine {
     /// Creates the engine and starts its epoch ticker, which lets running modules be interrupted.
     pub fn new() -> Result<Engine, HostError> {
+        Self::build(Limits::default())
+    }
+
+    /// An engine with other limits, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_limits(limits: Limits) -> Result<Engine, HostError> {
+        Self::build(limits)
+    }
+
+    fn build(limits: Limits) -> Result<Engine, HostError> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
         let engine = wasmtime::Engine::new(&config).map_err(|e| HostError::Load(format!("engine: {e}")))?;
@@ -140,10 +160,10 @@ impl Engine {
                 }
             })
             .map_err(|e| HostError::Load(format!("epoch ticker: {e}")))?;
-        Ok(Engine { engine, linker })
+        Ok(Engine { engine, linker, limits })
     }
 
-    /// Compiles a module, instantiates it and reads its manifest.
+    /// Compiles a module, reads its manifest (under the call limits) and starts its actor.
     pub async fn load(&self, wasm: &Path, _ctx: ModuleContext) -> Result<ModuleHandle, HostError> {
         let engine = self.engine.clone();
         let path = wasm.to_path_buf();
@@ -159,24 +179,17 @@ impl Engine {
             .instantiate_pre(&component)
             .and_then(PlatformModulePre::new)
             .map_err(|e| HostError::Load(format!("not a platform module: {e}")))?;
-        let mut store = self.store();
-        let instance = pre.instantiate_async(&mut store).await.map_err(|e| HostError::Load(format!("instantiation failed: {e}")))?;
-        let manifest: Manifest = instance
-            .open_mess_module_module()
-            .call_manifest(&mut store)
+        let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits);
+        let manifest: Manifest = actor
+            .run(|m, s| Box::pin(m.open_mess_module_module().call_manifest(s)))
             .await
             .map_err(|e| HostError::Load(format!("manifest call failed: {e}")))?
             .into();
         check_name(&manifest.name)?;
-        Ok(ModuleHandle { manifest })
-    }
-
-    fn store(&self) -> Store<HostState> {
-        let mut store = Store::new(&self.engine, HostState::new());
-        // Yield to the executor on every epoch tick, so a busy module never blocks a thread.
-        store.set_epoch_deadline(1);
-        store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Yield(1)));
-        store
+        actor.name.clone_from(&manifest.name);
+        let (requests, queue) = mpsc::channel(QUEUE);
+        tokio::spawn(actor.serve(queue));
+        Ok(ModuleHandle { manifest, requests, state })
     }
 }
 
@@ -191,15 +204,47 @@ fn check_name(name: &str) -> Result<(), HostError> {
     }
 }
 
-/// A loaded module.
+/// A loaded module. Clones share the module; calls from all of them run one at a time.
+#[derive(Clone)]
 pub struct ModuleHandle {
     manifest: Manifest,
+    requests: mpsc::Sender<Request>,
+    state: watch::Receiver<ModuleState>,
 }
 
 impl ModuleHandle {
     /// The manifest read at load time; the host list it declares is the one enforced.
     pub fn manifest(&self) -> Result<Manifest, HostError> {
         Ok(self.manifest.clone())
+    }
+
+    pub fn state(&self) -> ModuleState {
+        self.state.borrow().clone()
+    }
+
+    async fn request<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, HostError> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(request(reply)).await.map_err(|_| HostError::Closed)?;
+        answer.await.map_err(|_| HostError::Closed)?
+    }
+
+    /// Runs the module's interactive sign-in and returns the account it signed in.
+    pub async fn sign_in(&self) -> Result<AccountInfo, HostError> {
+        self.request(Request::SignIn).await
+    }
+
+    /// Restores an account's session from its stored secrets (at daemon start).
+    pub async fn restore(&self, account: &str) -> Result<(), HostError> {
+        self.request(|reply| Request::Restore(account.to_string(), reply)).await
+    }
+
+    pub async fn sign_out(&self, account: &str) -> Result<(), HostError> {
+        self.request(|reply| Request::SignOut(account.to_string(), reply)).await
+    }
+
+    /// Runs a tool: a shared one (spec 8.5) or one of the manifest's extra tools.
+    pub async fn call(&self, account: &str, tool: &str, args_json: &str) -> Result<String, HostError> {
+        self.request(|reply| Request::Call { account: account.to_string(), tool: tool.to_string(), args: args_json.to_string(), reply }).await
     }
 }
 

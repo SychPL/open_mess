@@ -2,7 +2,7 @@
 //! conversions between the generated types and the crate's plain ones.
 
 use crate::error::ModuleError;
-use crate::runtime::{HostState, Manifest, ToolDecl, WamIdentity};
+use crate::runtime::{AccountInfo, HostState, Manifest, ToolDecl, WamIdentity};
 
 wasmtime::component::bindgen!({
     world: "platform-module",
@@ -102,6 +102,12 @@ impl From<types::Manifest> for Manifest {
                 .map(|t| ToolDecl { name: t.name, description: t.description, input_schema: t.input_schema, writes: t.writes })
                 .collect(),
         }
+    }
+}
+
+impl From<types::AccountInfo> for AccountInfo {
+    fn from(a: types::AccountInfo) -> Self {
+        AccountInfo { id: a.id, display_name: a.display_name }
     }
 }
 

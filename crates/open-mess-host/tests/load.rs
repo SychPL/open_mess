@@ -1,20 +1,9 @@
 //! Loading platform modules: the built Teams component and files that are not components.
 
-use std::path::{Path, PathBuf};
+mod common;
 
-use open_mess_host::{Engine, HostError, ModuleContext};
-
-/// A module built by `cargo xtask ci` (the wasm build runs before the tests).
-fn wasm(name: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/wasm32-wasip2/debug").join(format!("{name}.wasm"));
-    assert!(path.exists(), "{} is missing; build the modules first (cargo xtask ci)", path.display());
-    path
-}
-
-fn context() -> ModuleContext {
-    let (events, _) = tokio::sync::mpsc::channel(8);
-    ModuleContext { data_dir: std::env::temp_dir(), events }
-}
+use common::{context, wasm};
+use open_mess_host::{Engine, HostError};
 
 #[tokio::test]
 async fn loads_teams_manifest() {
