@@ -1,9 +1,12 @@
 //! open_mess: the daemon, its local API and the `om` CLI.
 
+pub mod accounts;
 pub mod api;
 pub mod cli;
 pub mod daemon;
+pub mod events;
 pub mod instance;
+pub mod modules;
 pub mod paths;
 pub mod secrets;
 pub mod store;
@@ -30,6 +33,10 @@ pub enum Error {
     Secrets(#[from] keyring_core::Error),
     #[error("cannot generate a random token: {0}")]
     Random(String),
+    #[error("{0}")]
+    Account(String),
+    #[error("module host: {0}")]
+    Host(#[from] open_mess_host::HostError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

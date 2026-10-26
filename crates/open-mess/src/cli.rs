@@ -36,9 +36,10 @@ enum Action {
     Tool(Vec<String>),
 }
 
-/// The longest a script waits for one answer from the daemon.
+/// The longest a script waits for one answer from the daemon: a module call (its wait in the
+/// module's queue included) plus a little to parse it or write an attachment.
 // ponytail: one limit for every tool; a tool that legitimately runs longer needs its own.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(open_mess_host::limits::CALL_TIMEOUT.as_secs() + 5);
 
 /// Why `om` stopped, with its exit code.
 struct Failure {

@@ -52,6 +52,21 @@ pub struct AccountInfo {
     pub display_name: String,
 }
 
+/// Mirrors `attachment` in `wit/module.wit`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub file_name: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+// Hand-written so that a `{:?}` never prints the file name or the bytes.
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attachment").field("content_type", &self.content_type).field("len", &self.data.len()).finish_non_exhaustive()
+    }
+}
+
 /// Mirrors `session-state` in `wit/module.wit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -122,6 +137,8 @@ pub(crate) struct HostState {
     pub(crate) sockets: Sockets,
     pub(crate) timers: Timers,
     pub(crate) storage: Option<Storage>,
+    /// The largest HTTP body `http.fetch` takes now: `MAX_ATTACHMENT` during `get-attachment`.
+    pub(crate) max_body: usize,
     /// Where this instance's sockets and timers send what they deliver.
     pub(crate) guest_events: mpsc::Sender<GuestEvent>,
 }
@@ -145,6 +162,7 @@ impl HostState {
             sockets: Sockets::default(),
             timers: Timers::default(),
             storage: None,
+            max_body: limits::MAX_BODY,
             guest_events,
         }
     }
@@ -197,13 +215,22 @@ impl Engine {
         Ok(Engine { engine, linker, limits })
     }
 
-    /// Compiles a module, reads its manifest (under the call limits) and starts its actor.
+    /// Compiles a module file, reads its manifest (under the call limits) and starts its actor.
     pub async fn load(&self, wasm: &Path, ctx: ModuleContext) -> Result<ModuleHandle, HostError> {
-        let engine = self.engine.clone();
         let path = wasm.to_path_buf();
+        let bytes =
+            tokio::task::spawn_blocking(move || std::fs::read(&path).map_err(|e| HostError::Load(format!("cannot read {}: {e}", path.display()))))
+                .await
+                .map_err(|e| HostError::Load(format!("read task: {e}")))??;
+        self.load_bytes(bytes, ctx).await
+    }
+
+    /// [`Engine::load`] from bytes already read, so the bytes a caller checked (hashed, approved)
+    /// are the bytes that run.
+    pub async fn load_bytes(&self, bytes: Vec<u8>, ctx: ModuleContext) -> Result<ModuleHandle, HostError> {
+        let engine = self.engine.clone();
         // Compiling takes a while; keep it off the async worker threads.
         let component = tokio::task::spawn_blocking(move || {
-            let bytes = std::fs::read(&path).map_err(|e| HostError::Load(format!("cannot read {}: {e}", path.display())))?;
             Component::from_binary(&engine, &bytes).map_err(|e| HostError::Load(format!("not a WebAssembly component: {e}")))
         })
         .await
@@ -294,6 +321,12 @@ impl ModuleHandle {
     /// Runs a tool: a shared one (spec 8.5) or one of the manifest's extra tools.
     pub async fn call(&self, account: &str, tool: &str, args_json: &str) -> Result<String, HostError> {
         self.request(|reply| Request::Call { account: account.to_string(), tool: tool.to_string(), args: args_json.to_string(), reply }).await
+    }
+
+    /// The bytes of an attachment, for the core to save (the `get_attachment` tool).
+    pub async fn get_attachment(&self, account: &str, conversation: &str, message: &str, attachment: &str) -> Result<Attachment, HostError> {
+        let ids = [account, conversation, message, attachment].map(str::to_string);
+        self.request(|reply| Request::GetAttachment { ids, reply }).await
     }
 }
 

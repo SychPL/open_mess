@@ -14,7 +14,7 @@ use wasmtime::{Store, UpdateDeadline};
 use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::{HostError, ModuleError};
 use crate::limits::{self, Limits};
-use crate::runtime::{AccountInfo, HostState, ModuleEnv};
+use crate::runtime::{AccountInfo, Attachment, HostState, ModuleEnv};
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
@@ -29,7 +29,17 @@ pub(crate) enum Request {
     SignIn(Reply<AccountInfo>),
     Restore(String, Reply<()>),
     SignOut(String, Reply<()>),
-    Call { account: String, tool: String, args: String, reply: Reply<String> },
+    Call {
+        account: String,
+        tool: String,
+        args: String,
+        reply: Reply<String>,
+    },
+    /// Account, conversation, message and attachment ids.
+    GetAttachment {
+        ids: [String; 4],
+        reply: Reply<Attachment>,
+    },
 }
 
 /// What a module instance's sockets and timers deliver to its `events` export, through the actor
@@ -311,6 +321,22 @@ impl Actor {
                 let result =
                     self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_call(s, &account, &tool, &args).await })).await;
                 reply.send(module_result(result)).ok();
+            }
+            Request::GetAttachment { ids: [account, conversation, message, attachment], reply } => {
+                let result = self
+                    .run(move |m, s| {
+                        Box::pin(async move {
+                            // Attachments have their own size limit (spec 8.5); a trap or timeout
+                            // drops the store, so the limit never outlives the call.
+                            s.data_mut().max_body = limits::MAX_ATTACHMENT;
+                            let result =
+                                m.open_mess_module_module().call_get_attachment(&mut *s, &account, &conversation, &message, &attachment).await;
+                            s.data_mut().max_body = limits::MAX_BODY;
+                            result
+                        })
+                    })
+                    .await;
+                reply.send(module_result(result).map(Into::into)).ok();
             }
         }
     }

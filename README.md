@@ -13,7 +13,7 @@ messenger is connected yet. The design is
 
 ## Try it
 
-On Windows, with Rust 1.89 or newer:
+On Windows, with Rust 1.97 or newer:
 
 ```bash
 cargo run -p open-mess -- daemon

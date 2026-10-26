@@ -104,10 +104,13 @@ async fn call_tool(State(registry): State<Arc<Registry>>, Path(tool): Path<Strin
             Err(err) => return error_response(StatusCode::BAD_REQUEST, format!("arguments are not valid JSON: {err}")),
         }
     };
-    match registry.call(&tool, args) {
+    match registry.call(&tool, args).await {
         Ok(result) => Json(result).into_response(),
         Err(err @ ToolError::UnknownTool(_)) => error_response(StatusCode::NOT_FOUND, err.to_string()),
         Err(err @ ToolError::InvalidArgs(_)) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
+        // The daemon is fine; the module behind the tool is not.
+        Err(err @ ToolError::Module(_)) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err @ ToolError::Failed(_)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 
@@ -116,7 +119,7 @@ fn error_response(status: StatusCode, message: String) -> Response {
 }
 
 /// The MCP face of the registry: `tools/list` and `tools/call` delegate to it unchanged.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct McpServer {
     registry: Arc<Registry>,
 }
@@ -145,12 +148,14 @@ impl ServerHandler for McpServer {
 
     async fn call_tool(&self, request: CallToolRequestParams, _context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
         let args = Value::Object(request.arguments.unwrap_or_default());
-        match self.registry.call(&request.name, args) {
+        match self.registry.call(&request.name, args).await {
             Ok(result) => Ok(CallToolResult::structured(result).into()),
-            // MCP: an unknown tool is a protocol error, bad arguments are a tool error the model
-            // can correct.
+            // MCP: an unknown tool is a protocol error; bad arguments and module failures are tool
+            // errors the model can see and act on.
             Err(err @ ToolError::UnknownTool(_)) => Err(ErrorData::invalid_params(err.to_string(), None)),
-            Err(err @ ToolError::InvalidArgs(_)) => Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]).into()),
+            Err(err @ (ToolError::InvalidArgs(_) | ToolError::Module(_) | ToolError::Failed(_))) => {
+                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]).into())
+            }
         }
     }
 }

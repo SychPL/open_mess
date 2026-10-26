@@ -8,7 +8,7 @@ use keyring_core::api::CredentialStore;
 use crate::error::ModuleError;
 use crate::limits;
 use crate::net;
-use crate::runtime::{AccountInfo, HostEvent, HostState, Manifest, NewMessage, SessionState, ToolDecl, WamIdentity};
+use crate::runtime::{AccountInfo, Attachment, HostEvent, HostState, Manifest, NewMessage, SessionState, ToolDecl, WamIdentity};
 use crate::sign_in::{UNAVAILABLE, wait_for_user};
 use crate::storage::{Storage, StorageError};
 
@@ -49,7 +49,7 @@ impl types::Host for HostState {}
 impl http::Host for HostState {
     async fn fetch(&mut self, req: http::Request) -> Result<http::Response, http::HttpError> {
         let req = net::Request { method: req.method, url: req.url, headers: req.headers, body: req.body };
-        let response = self.env.net.fetch(&self.env.hosts, req).await?;
+        let response = self.env.net.fetch_up_to(&self.env.hosts, req, self.max_body).await?;
         Ok(http::Response { status: response.status, headers: response.headers, body: response.body })
     }
 }
@@ -217,6 +217,12 @@ impl From<types::Manifest> for Manifest {
 impl From<types::AccountInfo> for AccountInfo {
     fn from(a: types::AccountInfo) -> Self {
         AccountInfo { id: a.id, display_name: a.display_name }
+    }
+}
+
+impl From<types::Attachment> for Attachment {
+    fn from(a: types::Attachment) -> Self {
+        Attachment { file_name: a.file_name, content_type: a.content_type, data: a.data }
     }
 }
 

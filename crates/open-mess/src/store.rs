@@ -11,7 +11,15 @@ pub const DEFAULT_PORT: u16 = 7341;
 
 /// Schema migrations in order: entry `i` takes `PRAGMA user_version` from `i` to `i + 1`.
 /// Append only; never edit a migration that has shipped.
-const MIGRATIONS: &[&str] = &["CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);"];
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    // One row per manifest name: the file that is the module, its hashes, and what the user approved.
+    "CREATE TABLE modules (name TEXT PRIMARY KEY, file TEXT NOT NULL, file_sha256 TEXT NOT NULL, manifest_sha256 TEXT NOT NULL,
+         approved_manifest_sha256 TEXT, approved_file_sha256 TEXT, enabled INTEGER NOT NULL DEFAULT 1);",
+    // Accounts, each bound to the module that signed it in; `id` is `<module>:<module_account>`.
+    "CREATE TABLE accounts (id TEXT PRIMARY KEY, module TEXT NOT NULL, module_account TEXT NOT NULL, display_name TEXT NOT NULL,
+         state TEXT NOT NULL);",
+];
 
 /// Configuration and state in `state.sqlite3`.
 #[derive(Debug)]
@@ -28,6 +36,11 @@ impl Store {
         let mut conn = Connection::open(path)?;
         migrate(&mut conn)?;
         Ok(Store { conn })
+    }
+
+    /// The connection, for the modules and accounts tables.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     pub fn get_config(&self, key: &str) -> Result<Option<String>, Error> {

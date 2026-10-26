@@ -8,8 +8,11 @@
 //! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` in
 //! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
-//! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The `restore` export succeeds only for account "known";
-//! the `sign-in` export is not supported.
+//! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
+//! `read_messages` and `unread` return one synthetic message or conversation that names the
+//! account. The `restore` export succeeds only for account "known"; the `sign-in` export is not
+//! supported; `sign-out` reports the account offline; `get-attachment` downloads an `http://`
+//! attachment id and returns fixed bytes named after any other.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -29,6 +32,10 @@ mod guest {
 
     struct Echo;
 
+    /// The manifest's hosts, padded so the core's tests can add one by patching the built file
+    /// (a rebuild with another manifest under the same name).
+    const HOSTS: &str = "localhost                               ";
+
     fn http_error(e: &http::HttpError) -> &'static str {
         match e {
             http::HttpError::Blocked(_) => "blocked",
@@ -39,7 +46,7 @@ mod guest {
         }
     }
 
-    fn call(tool: &str, args_json: &str) -> Result<String, types::ModuleError> {
+    fn call(account: &str, tool: &str, args_json: &str) -> Result<String, types::ModuleError> {
         let args: Value = serde_json::from_str(args_json).map_err(|e| types::ModuleError::InvalidArgs(e.to_string()))?;
         let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
         let result = match tool {
@@ -95,6 +102,20 @@ mod guest {
                 }
                 Err(e) => json!({ "error": http_error(&e) }),
             },
+            "read_messages" => json!({"items": [{
+                "id": "m1",
+                "conversation": text("conversation"),
+                "sent_at": "2026-10-27T10:00:00Z",
+                "edited": false,
+                "own": false,
+                "untrusted": {"sender_name": "Echo", "text": format!("hello {account}")},
+            }]}),
+            "unread" => json!({"items": [{
+                "conversation": "c",
+                "kind": "direct",
+                "unread": "unread",
+                "untrusted": {"title": format!("Echo {account}")},
+            }]}),
             "message" => {
                 host::session("a", host::SessionState::Online);
                 host::message_arrived(&host::NewMessage {
@@ -123,7 +144,8 @@ mod guest {
                 name: "test-echo".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 platform: "test".to_string(),
-                hosts: vec!["localhost".to_string()],
+                // black_box: the padded string stays in the file as written.
+                hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),
                 sign_in_hosts: Vec::new(),
                 wam: None,
                 extra_tools: Vec::new(),
@@ -139,10 +161,28 @@ mod guest {
             if account == "known" { Ok(()) } else { Err(types::ModuleError::AuthRequired(account)) }
         }
 
-        fn sign_out(_account: String) {}
+        fn sign_out(account: String) {
+            host::session(&account, host::SessionState::Offline);
+        }
 
-        fn call(_account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
-            call(&tool, &args_json)
+        fn call(account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
+            call(&account, &tool, &args_json)
+        }
+
+        // An `http://` id is downloaded; any other id gets fixed bytes named after it.
+        fn get_attachment(
+            _account: String,
+            _conversation: String,
+            _message: String,
+            attachment: String,
+        ) -> Result<types::Attachment, types::ModuleError> {
+            let data = if attachment.starts_with("http://") {
+                let request = http::Request { method: "GET".to_string(), url: attachment.clone(), headers: Vec::new(), body: Vec::new() };
+                http::fetch(&request).map_err(|e| types::ModuleError::Platform(http_error(&e).to_string()))?.body
+            } else {
+                b"attachment bytes from test-echo".to_vec()
+            };
+            Ok(types::Attachment { file_name: attachment, content_type: "text/plain".to_string(), data })
         }
     }
 
