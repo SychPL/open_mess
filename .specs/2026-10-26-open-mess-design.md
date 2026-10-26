@@ -100,7 +100,7 @@ Podział odpowiedzialności:
 - **Moduł** zna protokół platformy: jakie zapytania wysłać, jak zinterpretować odpowiedzi i zdarzenia, jak przebiega logowanie.
 - **Rdzeń (host)** wykonuje wszystko, co dotyka świata zewnętrznego, i udostępnia to modułowi jako importy:
   - HTTP i WebSocket (z limitami tempa, ponawianiem po 429 / `Retry-After`, logowaniem bez sekretów). Rdzeń używa systemowych ustawień proxy Windows (w tym PAC/WPAD) i systemowego magazynu zaufanych certyfikatów, żeby działać w sieciach firmowych z wymuszonym proxy i inspekcją TLS. Przy połączeniu przez proxy lista hostów i blokada adresów prywatnych dotyczą hosta docelowego (rozwiązanego przez rdzeń przed wysłaniem do proxy); sam adres proxy, ustawiony przez system albo organizację, jest dozwolony, a przypięcie adresu z punktu niżej działa tylko przy połączeniach bezpośrednich (recenzja R5),
-  - lista dozwolonych hostów sieciowych per moduł: deklarowana w manifeście (dokładne nazwy albo wzorce sufiksu, np. `*.sharepoint.com` dla domeny SharePoint organizacji, nieznanej w chwili budowy modułu; wzorzec musi leżeć poniżej domeny rejestrowalnej według listy sufiksów publicznych, więc `*.com` albo `*.co.uk` są odrzucane - recenzja R7), pokazywana użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie, egzekwowana przez rdzeń. Niezależnie od listy rdzeń twardo blokuje adresy pętli zwrotnej, link-local i prywatne (IPv4 i IPv6), sprawdzając adres po rozwiązaniu nazwy (ochrona przed DNS rebinding), więc żaden moduł nie dosięgnie usług lokalnych ani sieci LAN. Rdzeń łączy się dokładnie z adresem, który sprawdził (bez drugiego rozwiązywania nazwy), i nie podąża automatycznie za przekierowaniami HTTP: każdy krok przekierowania przechodzi tę samą kontrolę listy hostów i adresu, a limit kroków jest stały,
+  - lista dozwolonych hostów sieciowych per moduł: deklarowana w manifeście (dokładne nazwy albo wzorce sufiksu, np. `*.sharepoint.com` dla domeny SharePoint organizacji, nieznanej w chwili budowy modułu; wzorzec musi leżeć poniżej domeny rejestrowalnej według listy sufiksów publicznych, więc `*.com` albo `*.co.uk` są odrzucane - recenzja R7), pokazywana użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie, egzekwowana przez rdzeń. Niezależnie od listy rdzeń dopuszcza wyłącznie globalnie routowalne adresy unicast: blokuje pętlę zwrotną, link-local, RFC 1918, CGNAT `100.64.0.0/10` (np. Tailscale), unikalne lokalne IPv6 `fc00::/7`, adresy nieokreślone, rozgłoszeniowe i multicast oraz pozostałe zakresy specjalnego przeznaczenia z rejestru IANA, także w postaci IPv6 mapowanej z IPv4 (recenzja R9), sprawdzając adres po rozwiązaniu nazwy (ochrona przed DNS rebinding), więc żaden moduł nie dosięgnie usług lokalnych ani sieci LAN. Rdzeń łączy się dokładnie z adresem, który sprawdził (bez drugiego rozwiązywania nazwy), i nie podąża automatycznie za przekierowaniami HTTP: każdy krok przekierowania przechodzi tę samą kontrolę listy hostów i adresu, a limit kroków jest stały,
   - trwałe przechowywanie danych modułu (klucz-wartość) z limitem rozmiaru per moduł; zapis ponad limit zwraca błąd,
   - sekrety (tokeny odświeżania itp.) w Menedżerze poświadczeń Windows - moduł nigdy nie dostaje dostępu do sekretów innego modułu,
   - zegar i timery, kryptograficznie bezpieczne liczby losowe (weryfikatory PKCE, identyfikatory urządzeń),
@@ -119,7 +119,7 @@ Model asynchroniczny wywołań między rdzeniem a modułem (natywne async kompon
 ### 8.4 Dane i sekrety
 
 - Sekrety (tokeny odświeżania, token lokalnego API): Menedżer poświadczeń Windows.
-- Stan (konfiguracja, kursory rozmów, identyfikatory widzianych wiadomości dla wyzwalaczy, akcje piszące oczekujące na zatwierdzenie, stan wyzwalaczy): SQLite w `%APPDATA%\open_mess\`.
+- Stan (konfiguracja, kursory rozmów, identyfikatory widzianych wiadomości dla wyzwalaczy, akcje piszące we wszystkich stanach raportowanych przez `pending`, łącznie z wykonanymi samodzielnie i niepewnymi - przez ustalony czas przechowywania (recenzja R9), stan wyzwalaczy): SQLite w `%APPDATA%\open_mess\`.
 - Treści wiadomości nie są archiwizowane lokalnie; źródłem prawdy jest serwer platformy. Krótkotrwała pamięć podręczna jest dozwolona, jeśli budujący jej potrzebuje.
 - Logi nie zawierają tokenów, ciasteczek ani treści wiadomości.
 
@@ -179,7 +179,7 @@ Sekcja "Wyzwalacze" w oknie. Reguła = warunek + akcja.
 Warunki: DM do użytkownika, wzmianka, nowa wiadomość w wybranej rozmowie, wiadomość od wybranych osób; zawsze w ramach konkretnego konta. Własne wiadomości użytkownika (wysłane z dowolnego klienta) nigdy nie odpalają reguł. Reguła nie odpala dla rozmów, których agent nie może czytać (8.6) - cofnięcie uprawnienia czytania natychmiast wycisza związane z nim wyzwalacze (recenzja R7).
 
 Akcje:
-1. **Wpis do otwartej sesji Claude Code** przez kanał MCP (`notifications/claude/channel`, z deklaracją możliwości `experimental: { "claude/channel": {} }` - mechanizm używany przez wtyczkę Telegram, potwierdzony dla transportu stdio). Jeśli kanał nie działa przez transport HTTP, budujący dodaje cienki most stdio (`om mcp-stdio`), który tylko przekazuje komunikaty do demona. Claude Code sam uruchamia most jako swój serwer MCP (stdio) i kończy go razem z sesją; most niczego nie uruchamia, tylko przekazuje komunikaty - po jednym na sesję z włączonymi kanałami. To jedyny wyjątek od zasady jednego procesu (sekcja 6): bez logiki platform, bez sesji kont, bez własnego stanu. Claude Code dostarcza kanały tylko do sesji uruchomionych z włączonymi kanałami (flaga przy starcie; dla serwera spoza listy zatwierdzonych wtyczek prawdopodobnie tryb deweloperski) - to akceptowalne, okno konfiguracji pokazuje gotowe polecenie startu. Gdy takich sesji jest kilka, powiadomienie dostaje ostatnio aktywna (bez duplikatów); gdy nie ma żadnej, działa akcja 2, jeśli reguła ją ma. Decyzja projektowa (pytanie z przeglądu dokumentu).
+1. **Wpis do otwartej sesji Claude Code** przez kanał MCP (`notifications/claude/channel`, z deklaracją możliwości `experimental: { "claude/channel": {} }` - mechanizm używany przez wtyczkę Telegram, potwierdzony dla transportu stdio). Jeśli kanał nie działa przez transport HTTP, budujący dodaje cienki most stdio (`om mcp-stdio`), który tylko przekazuje komunikaty do demona. Claude Code sam uruchamia most jako swój serwer MCP (stdio) i kończy go razem z sesją; most niczego nie uruchamia, tylko przekazuje komunikaty - po jednym na sesję z włączonymi kanałami. Gdy demon zniknie albo się zrestartuje, most ponawia połączenie z lokalnym API z rosnącym odstępem; do tego czasu narzędzia w tej sesji zwracają czytelny błąd "demon niedostępny" zamiast cicho milczeć (recenzja R9). To jedyny wyjątek od zasady jednego procesu (sekcja 6): bez logiki platform, bez sesji kont, bez własnego stanu. Claude Code dostarcza kanały tylko do sesji uruchomionych z włączonymi kanałami (flaga przy starcie; dla serwera spoza listy zatwierdzonych wtyczek prawdopodobnie tryb deweloperski) - to akceptowalne, okno konfiguracji pokazuje gotowe polecenie startu. Gdy takich sesji jest kilka, powiadomienie dostaje ostatnio aktywna (bez duplikatów); gdy nie ma żadnej, działa akcja 2, jeśli reguła ją ma. Decyzja projektowa (pytanie z przeglądu dokumentu).
 2. **Uruchomienie agenta od zera** gdy nie ma sesji: demon uruchamia skonfigurowany program (np. `claude -p` albo Codex) ze stałą listą argumentów ustaloną w regule, bezpośrednio, bez powłoki. Treść zdarzenia nigdy nie jest wklejana do polecenia ani argumentów: trafia do programu przez stdin albo jako ścieżka do pliku z treścią, oznaczoną jako niezaufana. Takie pliki leżą w katalogu tymczasowym demona, mają limit rozmiaru i są usuwane po zakończeniu uruchomienia, a pozostałości (np. po awarii demona) są usuwane przy jego starcie (recenzje R5 i R6). Proces korzysta z MCP/CLI na tych samych zasadach co każdy inny wywołujący (8.6). Decyzja projektowa (recenzja R1).
 
 Zabezpieczenia (decyzje projektowe):
@@ -206,42 +206,46 @@ Technologia okna - decyzja projektowa: Tauri 2 (WebView2, wbudowany w Windows 11
 
 ## 9. Moduł Teams
 
-Wszystkie konkretne identyfikatory i adresy poniżej pochodzą z publicznej wiedzy o nieoficjalnym API Teams i **muszą zostać potwierdzone przez REA** na aktualnym kliencie przed implementacją.
+Fakty o protokole pochodzą z analizy statycznej REA pakietu nowego Teams (MSTeams 26260.1717.5229.7049, zawiera pełny klient web) - szczegóły, dowody i lista rzeczy do sprawdzenia na żywo: `docs/protocols/teams.md`. Każdy fakt oznaczony tam jako niepotwierdzony (sekcja "Needs live capture") wymaga jednego oczyszczonego przechwytu na żywo (9.5), zanim kod będzie od niego zależał.
 
 ### 9.1 Logowanie
 
-Moduł loguje się tak jak oficjalny klient: logowanie Microsoft (Entra ID) z identyfikatorem aplikacji Teams, a potem sam odświeża tokeny. Znane identyfikatory: Teams desktop/mobile `1fec8e78-bce4-4aaf-ab1b-5451cc387264`, Teams web `5e3ce6c0-2b1f-4285-8d4b-75ee78787346` (do potwierdzenia).
+Moduł loguje się tak jak oficjalny klient: logowanie Microsoft (Entra ID) z identyfikatorem aplikacji Teams, a potem sam odświeża tokeny. Identyfikatory (potwierdzone w kodzie klienta): desktop `1fec8e78-bce4-4aaf-ab1b-5451cc387264` z przekierowaniem `https://login.microsoftonline.com/common/oauth2/nativeclient` - tego używa open_mess; web `5e3ce6c0-2b1f-4285-8d4b-75ee78787346` (SPA, przekierowanie `https://teams.microsoft.com/v2`) - tylko jako zapas.
 
-Sposoby logowania, w kolejności preferencji (pierwsze zadanie implementacji to próba wszystkich na koncie użytkownika, bo zasady firmy mogą część blokować):
-1. **Konto Windows (WAM)** - logowanie bez hasła kontem, którym użytkownik jest zalogowany do Windows; tak robi nowy Teams.
-2. **Osadzona strona logowania** - kod autoryzacji + PKCE w oknie WebView2, rdzeń przechwytuje przekierowanie.
-3. **Kod urządzenia** - użytkownik wpisuje kod na stronie Microsoftu.
+Sposoby logowania, w kolejności preferencji (pierwsze zadanie implementacji to próba na koncie użytkownika, przy nim - 9.5):
+1. **Konto Windows (WAM)** - tak robi oficjalny desktop. Potwierdzone tylko dla wywołującego, którym jest pakiet MSTeams; WAM może odmówić programowi innej firmy.
+2. **Osadzona strona logowania** - kod autoryzacji + PKCE (`S256`) w oknie WebView2 z przekierowaniem `nativeclient`, które rdzeń przechwytuje. To konkretna droga zapasowa; przekierowania na localhost dla tych identyfikatorów nie ma.
+3. **Kod urządzenia** - żaden z klientów go nie używa; niesprawdzony, ostatni (9.5).
 
-Po zalogowaniu (decyzja projektowa, recenzja R2): przy logowaniu przez WAM aplikacja nie dostaje tokenu odświeżania - sesję trzyma broker Windows, a odnowienie to ciche pobranie tokenu przez WAM; przy osadzonej stronie logowania i kodzie urządzenia token odświeżania trafia do sekretów. W obu przypadkach tokeny dostępu (m.in. dla API czatów, wyszukiwania) odświeżane z wyprzedzeniem, przed wygaśnięciem. Błąd 401 -> jedna próba odświeżenia -> dopiero potem stan "zaloguj ponownie". Hasło użytkownika nigdy nie przechodzi przez open_mess poza stroną logowania Microsoftu.
+Tokeny: dla każdej usługi osobny token z tabeli odbiorców w `docs/protocols/teams.md` (m.in. czaty i Trouter, middle tier, wyszukiwanie `https://outlook.office.com/`, SharePoint organizacji). Klient prosi o tokeny CAE (`CP1`), więc moduł odświeża token nie tylko przed wygaśnięciem, ale też po wyzwaniu CAE (401 z `WWW-Authenticate` żądającym claims).
+
+Po zalogowaniu (decyzja projektowa, recenzja R2): przy logowaniu przez WAM aplikacja nie dostaje tokenu odświeżania - sesję trzyma broker Windows, a odnowienie to ciche pobranie tokenu przez WAM; przy osadzonej stronie logowania i kodzie urządzenia token odświeżania trafia do sekretów. Błąd 401 bez wyzwania CAE -> jedna próba odświeżenia -> dopiero potem stan "zaloguj ponownie". Hasło użytkownika nigdy nie przechodzi przez open_mess poza stroną logowania Microsoftu.
 
 ### 9.2 Współistnienie z oficjalnym Teams
 
 Wymaganie nadrzędne (sekcja 6). open_mess zachowuje się jak osobne urządzenie, np. telefon obok komputera:
-- własna sesja i własna rejestracja urządzenia / punktu końcowego z własnym, raz wygenerowanym i zapamiętanym identyfikatorem; nigdy nie używa identyfikatorów oficjalnego klienta,
+- własna rejestracja punktu końcowego: raz wygenerowany i zapamiętany UUID v4 (`PUT v2/users/ME/endpoints/<uuid>`, ten sam UUID jako `epid` w Trouter i `registrationId` w rejestratorze) i własny identyfikator urządzenia; nigdy identyfikatory oficjalnego klienta,
 - nie czyta ani nie zapisuje niczego w danych oficjalnego klienta (`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\` i podobne),
-- nie wywołuje operacji potwierdzenia odczytu (`consumptionhorizon`, `markRead`, `readReceipt` i ich odpowiedników),
-- szanuje limity serwera (tempo zapytań, `Retry-After`), żeby nie powodować ograniczania konta,
+- nie zapisuje stanu przeczytania. Osobnego endpointu potwierdzeń odczytu nie ma; zakazane są konkretne zapisy: właściwość `consumptionhorizon`, `consumptionHorizonBookmark`, `isread` wiadomości, `l2ch` w metadanych użytkownika, "oznacz wszystko jako przeczytane" (`appConsumptionHorizon`) i zbiorcze zapisy właściwości. Moduł zapisuje właściwości wyłącznie z listy dozwolonych nazw, na której jest tylko `emotions` (reakcje),
+- nie wywołuje `activeendpoint`, nie publikuje obecności ani aktywności użytkownika w Trouter (żeby nie przejmować powiadomień z telefonu ani statusu),
+- szanuje limity serwera tak jak oficjalny klient: honoruje `Retry-After`, rezygnuje, gdy przekracza on 300 s, najwyżej 4 ponowienia z wykładniczym odstępem, zapytania w tle oznaczone niskim priorytetem,
 - test akceptacyjny: tydzień równoległej pracy z oficjalnym klientem bez objawów z sekcji 6.
 
 ### 9.3 Wiadomości, zdarzenia, wyszukiwanie
 
-Do potwierdzenia przez REA:
-- wymiana tokenu Entra ID na token usługi czatów (authsvc), z którego wynika też regionalny adres usługi czatów,
-- usługa czatów (`.../v1/users/ME/conversations`, `.../messages`) - lista rozmów, historia, wysyłka, edycja, reakcje,
-- zdarzenia na żywo przez Trouter (WebSocket); odpytywanie jako zapas, gdy połączenie na żywo zawiedzie,
-- wyszukiwanie przez usługę wyszukiwania Microsoft 365 (substrate),
-- załączniki: obrazy w wiadomościach (usługa mediów Teams) i pliki w OneDrive/SharePoint (wymaga tokenu dla domeny SharePoint organizacji).
+- **Katalog usług:** wymiana tokenu w authsvc pod `https://teams.microsoft.com/api/authsvc/v1.0/authz` (stary host `authsvc.teams.microsoft.com` jest w kodzie oznaczony jako przestarzały). Pole `regionGtms` odpowiedzi to katalog adresów: usługa czatów (`chatServiceAfd`), Trouter, rejestrator, AMS, middle tier, wyszukiwanie.
+- **Token Skype jest wycofywany:** klient przechodzi na tokeny Entra/CAE (usługa czatów, Trouter i AMS przyjmują token dla `https://ic3.teams.office.com` - do potwierdzenia na żywo); token Skype zostaje dla middle tier i jako zapas, zgodnie z `WWW-Authenticate: token_types=`.
+- **Usługa czatów:** baza z `regionGtms.chatServiceAfd` (`teams.microsoft.com/api/chatsvc/<region>/`), z obsługą przekierowań 404 + `Location` (`BehaviorOverride: redirectAs404`). Lista rozmów, historia (stronicowanie `syncState` / `backwardLink`), pojedyncza wiadomość, wysyłka, edycja, usuwanie, reakcje (`properties?name=emotions`), wątki. Treść wiadomości to HTML (`RichText/Html`), wzmianki w `properties.mentions`. Nowy klient bierze listę rozmów z agregatora (CSA) - open_mess go nie potrzebuje.
+- **`unread`** liczy stan nieprzeczytania regułą klienta z `docs/protocols/teams.md` (horyzont odczytu rozmowy, zakładka "oznacz jako nieprzeczytane", `appConsumptionHorizon` z "oznacz wszystko jako przeczytane") - wyłącznie odczytując te wartości.
+- **Zdarzenia na żywo:** Trouter v4 (alokacja `go.trouter.teams.microsoft.com/v4/a`, Socket.IO, rejestracja w rejestratorze); identyfikator aplikacji powiadomień, który rejestrator przyjmie od open_mess, do ustalenia na żywo. Odpytywanie usługi czatów jako zapas, gdy połączenie na żywo zawiedzie.
+- **Wyszukiwanie:** `POST https://substrate.office.com/search/api/v2/query` z tokenem `https://outlook.office.com/`.
+- **Załączniki:** obrazy przez AMS (baza z `regionGtms`); pliki w OneDrive/SharePoint - host organizacji odkrywany przez middle tier (`beta/me/files/availability`) i dane zespołu. Manifest modułu Teams deklaruje dla nich wzorzec `*.sharepoint.com` (8.3).
 
 Gdy odpowiedź serwera ma nieznany kształt, operacja kończy się jawnym błędem "niezgodny protokół" i stan modułu to pokazuje - bez zgadywania pól i bez wysyłania częściowo zbudowanych wiadomości (wzorzec z `teams-wrapper`).
 
 ### 9.4 Rola REA
 
-REA (MCP do inżynierii wstecznej) służy do ustalenia rzeczywistego protokołu: analiza paczki aplikacji Teams Web (`teams.microsoft.com/v2`) i nowego klienta desktop (pakiet MSTeams, WebView2), przechwycenie przepływu logowania, wymiany tokenów, wywołań usługi czatów, Trouter i wyszukiwania na koncie testowym lub na koncie użytkownika w osobnym profilu. Wyniki zapisywane jako dokument protokołu w repo - bez tokenów, ciasteczek, identyfikatorów tenantu i treści wiadomości (wzorzec `docs/protocol-capture.md` z `teams-wrapper`).
+Analiza statyczna REA jest zrobiona (`docs/protocols/teams.md`). Dalej REA służy do przechwytów na żywo z listy "Needs live capture" - przy użytkowniku, na koncie firmowym, z minimalnym ruchem (9.5) - i do ponownej analizy po większych aktualizacjach klienta Teams. Wyniki trafiają do `docs/protocols/teams.md`, zawsze oczyszczone z tokenów, ciasteczek, identyfikatorów tenantu i użytkowników oraz treści wiadomości.
 
 ### 9.5 Testy na koncie firmowym
 
@@ -351,7 +355,7 @@ Granica twardnienia (zamrożona): nie bronimy się przed złośliwym kodem dzia�
 - R4, Codex P1 ("niezaufany moduł WASM może wysłać wiadomość zwykłym zapytaniem HTTP do zatwierdzonego hosta, omijając uprawnienia"): odrzucone jako błąd specu, przyjęte jako granica zaufania. Rdzeń nie może egzekwować uprawnień na poziomie surowych zapytań modułu do API platformy bez rozumienia każdego protokołu, co przeczy idei modułów. Moduł, któremu użytkownik powierzył konto, jest zaufany dla tego konta; izolacja chroni resztę systemu. Zapisane w threat modelu (sekcja 15).
 - R6, Codex P1 w recenzji commita 6d1e45f ("przez firmowe proxy moduł może dosięgnąć LAN, gdy zatwierdzona domena odpowiada proxy innym, prywatnym adresem"): przyjęte jako znane ograniczenie, nie jako błąd specu. Przy połączeniu przez proxy nazwę rozwiązuje proxy, więc rdzeń nie może przypiąć adresu; ochrona LAN zależy wtedy od proxy organizacji. Atak wymaga, żeby użytkownik zatwierdził w liście hostów modułu domenę kontrolowaną przez atakującego. Bez proxy ochrona działa w pełni (przypięcie adresu). Okno przy instalacji modułu spoza repo mówi, że przy aktywnym proxy systemowym ochrona sieci lokalnej zależy od proxy.
 - R6, GLM P3 (świeże załączniki chwilowo przekraczają limit katalogu): przyjęte bez zmian - przekroczenie trwa tylko przez okno ochrony świeżych plików.
-Pozostałe zgłoszenia R1-R8 przyjęto.
+Pozostałe zgłoszenia R1-R9 przyjęto.
 
 ## Changelog rund
 
@@ -363,3 +367,4 @@ Pozostałe zgłoszenia R1-R8 przyjęto.
 - R6 (Codex REJECT, GLM APPROVE): zatwierdzenie reakcji wiąże się z treścią wiadomości docelowej (Codex P2); stały port lokalnego API (GLM P3); klasa czytanie/pisanie dla dodatkowych narzędzi modułów (GLM P3); podmiana modułu wymaga zgody na przejęcie kont (GLM P3); sprzątanie plików akcji 2 przy starcie (GLM P3); proxy a ochrona LAN i chwilowe przekroczenie limitu załączników - rebutale (sekcja 16).
 - R7 (Codex REJECT, GLM APPROVE): wyzwalacze respektują uprawnienie czytania (Codex P2); stan "niepewne" dla akcji bez potwierdzenia i identyfikator klienta zamiast automatycznego ponawiania (Codex P2); kontrola celu obejmuje odpowiedź na konkretną wiadomość (Codex P2); minimalna głębokość wzorców hostów, jeden plik na nazwę modułu, własne wiadomości nie odpalają reguł, zbiorcze powiadomienie bez zatwierdzania naraz, połączenia na żywo po stronie rdzenia, dodatkowe narzędzia czytające pod uprawnieniem czytania (GLM P3).
 - R8 (Codex REJECT, GLM APPROVE): zamrożona zasada zasobów - limit równoczesnych uruchomień agentów z akcji 2 i liczby trwałych połączeń modułu, oraz ogólna reguła dla każdego mnożonego zasobu (Codex P2 x2); `pending` obejmuje akcje samodzielne, rozstrzyganie niepewnych edycji i reakcji (GLM P3).
+- R9 (Codex REJECT, GLM APPROVE): dozwolone tylko globalnie routowalne adresy unicast, w tym blokada CGNAT `100.64.0.0/10` (Codex P2); trwały zapis wszystkich stanów `pending` (GLM P3); most stdio ponawia połączenie z demonem (GLM P3). Sekcja 9 przepisana na podstawie analizy statycznej REA (`docs/protocols/teams.md`).
