@@ -234,13 +234,15 @@ service user properties, `GET v1/users/ME/properties`).
 The client's rule (shared worker, the module exporting `T8`/`il`/`qJ`; functions `L`, `P`, `B`, `U`,
 `Z`, `X`), with `app` = `appConsumptionHorizon.chat` for chats or `.channel` for channels:
 
-1. Effective horizon = max(`consumptionhorizon.originalArrivalTime`, `app`), except that `app` is
-   not applied when the user joined the thread after it (`threadProperties.lastjoinat > app`) or a
-   channel was created after it, while the conversation's own horizon is empty.
-2. The bookmark counts only if `app` is older than the bookmark's `timeStamp`; otherwise it is
-   treated as `0;0;0`. A counted bookmark with a non-zero time and a `clientMessageId` other than
-   `"0"` makes the conversation unread - this is how "mark as unread" survives a horizon that is
-   already past the last message, and how "mark all as read" later cancels it.
+1. Effective horizon = max(`consumptionhorizon.originalArrivalTime`, `app`). Exception (`ne`/`z`):
+   when the conversation's own `originalArrivalTime` is 0 and either the user joined the chat after
+   `app` (`threadProperties.lastjoinat > app`) or the channel was created after `app`
+   (`threadProperties.createdat > app`), `app` is not applied and the horizon stays 0.
+2. The bookmark counts only if `app` is older than the bookmark's `timeStamp` (second field);
+   otherwise it is treated as `0;0;0`. A counted bookmark whose `originalArrivalTime` (first field) is
+   not 0 and whose `clientMessageId` (third field) is not `"0"` makes the conversation unread - this
+   is how "mark as unread" survives a horizon that is already past the last message, and how "mark
+   all as read" later cancels it.
 3. Otherwise, if the last message was sent by the user (`lastMessage.from` ends with the user's MRI,
    or the `<initiator>` of a call event is the user): read.
 4. Otherwise unread when `lastMessageTimeUtc` (fallback `lastMessage.originalarrivaltime`) is greater
