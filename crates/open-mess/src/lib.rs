@@ -4,6 +4,7 @@ pub mod accounts;
 pub mod api;
 pub mod cli;
 pub mod daemon;
+pub mod events;
 pub mod instance;
 pub mod modules;
 pub mod paths;
