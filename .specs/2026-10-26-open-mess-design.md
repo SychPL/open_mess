@@ -152,9 +152,11 @@ Ustawiane w sekcji "Uprawnienia agentów" okna, per konto, opcjonalnie zawężon
 - czytanie: tak / nie,
 - pisanie: nigdy / z potwierdzeniem / samodzielnie.
 
-"Z potwierdzeniem" oznacza, że działa tylko ścieżka `prepare_message` -> `send_prepared`. Potwierdzenie przychodzi:
-- w sesji interaktywnej: agent pokazuje użytkownikowi dokładną rozmowę, odbiorców i tekst, a `send_prepared` woła dopiero po zgodzie w czacie (jak w `teams-wrapper`),
-- dla agentów uruchomionych przez wyzwalacz (nikt nie siedzi w czacie): przygotowane wiadomości trafiają na listę "Do zatwierdzenia" (powiadomienie Windows z przyciskami Wyślij / Odrzuć oraz lista w oknie konfiguracji). Decyzja projektowa.
+**Samodzielne wysyłanie jest opcją do wyboru** (decyzja użytkownika): agent może wysyłać bez potwierdzenia tylko tam, gdzie użytkownik świadomie ustawił "samodzielnie" - per konto, opcjonalnie zawężone do wybranych rozmów, oraz osobno w każdej regule wyzwalacza (8.7). Nowe konto startuje z "z potwierdzeniem" (decyzja projektowa).
+
+"Z potwierdzeniem" oznacza, że działa tylko ścieżka `prepare_message` -> `send_prepared`, a `send_prepared` przechodzi dopiero po zatwierdzeniu **poza zasięgiem agenta**: powiadomienie Windows z dokładną rozmową, odbiorcami i tekstem oraz przyciskami Wyślij / Odrzuć, a także lista "Do zatwierdzenia" w oknie konfiguracji. Zgoda wyrażona w czacie z agentem nie wystarcza, bo agent mógłby ją zmyślić albo wywołać `send_prepared` sam. Dotyczy to agentów w sesji interaktywnej, agentów uruchomionych przez wyzwalacz i CLI wywołanego nieinteraktywnie (np. z narzędzia Bash agenta). Decyzja projektowa.
+
+CLI uruchomione przez człowieka w interaktywnym terminalu (stdin to terminal) traktujemy jako użytkownika: wysyła bez dodatkowego zatwierdzenia, a uprawnienia agentów go nie ograniczają. Decyzja projektowa.
 
 Rdzeń egzekwuje uprawnienia - nie polega na tym, że agent się do nich zastosuje.
 
@@ -230,6 +232,15 @@ Gdy odpowiedź serwera ma nieznany kształt, operacja kończy się jawnym błęd
 
 REA (MCP do inżynierii wstecznej) służy do ustalenia rzeczywistego protokołu: analiza paczki aplikacji Teams Web (`teams.microsoft.com/v2`) i nowego klienta desktop (pakiet MSTeams, WebView2), przechwycenie przepływu logowania, wymiany tokenów, wywołań usługi czatów, Trouter i wyszukiwania na koncie testowym lub na koncie użytkownika w osobnym profilu. Wyniki zapisywane jako dokument protokołu w repo - bez tokenów, ciasteczek, identyfikatorów tenantu i treści wiadomości (wzorzec `docs/protocol-capture.md` z `teams-wrapper`).
 
+### 9.5 Testy na koncie firmowym
+
+Użytkownik nie ma konta ani organizacji testowej Microsoft 365 - wszystko odbywa się na koncie firmowym (decyzja użytkownika). Zasady:
+- **Próba logowania tylko przy obecności użytkownika.** Kolejność 9.1 jest jednocześnie kolejnością od najmniej podejrzanego: najpierw WAM, potem osadzona strona logowania. Kod urządzenia z identyfikatorem aplikacji Teams to znany wzorzec phishingu i może uruchomić alarm bezpieczeństwa albo zablokować konto - próbujemy go tylko wtedy, gdy dwa pierwsze sposoby zawiodą, i tylko za wyraźną zgodą użytkownika w danej chwili.
+- **Testy zapisu na żywo tylko w czacie z samym sobą** (notatki dla siebie). Wysyłka, edycja i reakcje nigdy nie dotykają rozmów z innymi osobami podczas testów.
+- **Testy na żywo nie działają automatycznie:** są oznaczone `#[ignore]`, wymagają jawnej zmiennej środowiskowej i obecności użytkownika. CI ich nigdy nie uruchamia.
+- **Mały ruch:** testy i przechwytywanie protokołu robią tylko tyle zapytań, ile trzeba, żeby nie wyglądać jak atak i nie powodować ograniczania konta.
+- **Przechwyty protokołu** (REA) z konta firmowego są czyszczone z tokenów, identyfikatorów tenantu i użytkowników oraz treści wiadomości, zanim cokolwiek trafi do repo.
+
 ## 10. Wnioski z `teams-wrapper` (`C:\Projekty\sych.pl\teams_wraper`)
 
 Przyczyny problemów (analiza kodu, 2026-10-26):
@@ -273,8 +284,10 @@ Decyzje użytkownika:
 - okno służy tylko do konfiguracji; układ A; zamknięcie okna nie zatrzymuje reszty,
 - moduły dodawalne bez przebudowy, jako DLL albo WASM,
 - zaczynamy od Teams; inne komunikatory później jako moduły,
+- brak konta testowego: wszystko na koncie firmowym (zasady w 9.5),
 - kolejność etapów 1 -> 2 -> 3; szczegółowo planujemy tylko etap 1,
 - opcja automatycznego budzenia agenta, gdy ktoś napisze,
+- agent może wysyłać samodzielnie, ale tylko gdy użytkownik to wybierze,
 - nic nie może psuć oficjalnego Teams; sesja ma się trzymać.
 
 Decyzje projektowe (moje, do sprawdzenia przy czytaniu):
@@ -282,7 +295,8 @@ Decyzje projektowe (moje, do sprawdzenia przy czytaniu):
 - MCP przez HTTP na localhost w demonie (jak `teams-wrapper`), CLI przez to samo lokalne API,
 - Tauri 2 / WebView2 dla okna konfiguracji,
 - kolejność po Teams: Discord, potem Slack,
-- trzy poziomy pisania (nigdy / z potwierdzeniem / samodzielnie) i lista "Do zatwierdzenia" dla agentów obudzonych przez wyzwalacz,
+- trzy poziomy pisania (nigdy / z potwierdzeniem / samodzielnie), nowe konto startuje z "z potwierdzeniem",
+- zatwierdzanie wysyłki tylko poza zasięgiem agenta (powiadomienie Windows, lista "Do zatwierdzenia"), nigdy samą zgodą w czacie; CLI w interaktywnym terminalu = użytkownik,
 - grupowanie, cisza nocna i limity wyzwalaczy; domyślnie obudzony agent nie wysyła bez zatwierdzenia,
 - sekrety w Menedżerze poświadczeń Windows, stan w SQLite, brak lokalnego archiwum wiadomości,
 - brak narzędzia do oznaczania jako przeczytane,
@@ -304,7 +318,19 @@ Decyzje projektowe (moje, do sprawdzenia przy czytaniu):
 
 ## 15. Threat model
 
-Do uzupełnienia po decyzji właściciela, kto i jak zatwierdza wysyłkę "z potwierdzeniem" (pytanie otwarte z przeglądu dokumentu).
+Zaufani:
+- użytkownik przy komputerze: okno konfiguracji, przyciski w powiadomieniach Windows, CLI w interaktywnym terminalu,
+- rdzeń open_mess i jego zapis stanu w `%APPDATA%\open_mess\`.
+
+Częściowo zaufani - agenci (Claude Code, Codex, agenci z wyzwalaczy): działają w dobrej wierze, ale mogą się mylić albo zostać zmanipulowani treścią wiadomości (prompt injection). Dlatego rdzeń sam egzekwuje uprawnienia (8.6), a wysyłka "z potwierdzeniem" wymaga zatwierdzenia poza ich zasięgiem.
+
+Niezaufane:
+- treść wiadomości, nazwy, załączniki i wszystko inne pochodzące od innych osób,
+- odpowiedzi serwerów platform i zdarzenia WebSocket (mogą mieć nieznany albo zepsuty kształt),
+- moduły WASM spoza repo (izolacja, lista dozwolonych hostów, brak dostępu do cudzych sekretów),
+- adresy webhooków podane w konfiguracji (tylko HTTPS, podpis HMAC, bez sekretów w treści).
+
+Granica twardnienia (zamrożona): nie bronimy się przed złośliwym kodem działającym na koncie Windows użytkownika z zamiarem obejścia open_mess - taki kod może i tak czytać Menedżer poświadczeń, symulować terminal albo klikać w powiadomienia. Bronimy się przed agentem, który przez pomyłkę albo manipulację próbuje zrobić więcej, niż pozwalają uprawnienia, używając zwykłych narzędzi (MCP, CLI z narzędzia Bash).
 
 ## 16. Rejestr rebutali
 
