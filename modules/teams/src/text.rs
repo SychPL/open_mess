@@ -80,13 +80,18 @@ fn line_break(out: &mut String) {
     }
 }
 
-/// The text after `</name ...>`, or nothing when the element never closes.
+/// The text after `</name ...>` (any letter case), or nothing when the element never closes. Scans
+/// forward only, so many such elements in one message stay linear.
 fn skip_past_close<'a>(rest: &'a str, name: &str) -> &'a str {
-    // ASCII lower-casing keeps byte offsets, so the index is valid in `rest`.
-    match rest.to_ascii_lowercase().find(&format!("</{name}")) {
-        Some(i) => rest.get(i..).and_then(|r| r.split_once('>')).map_or("", |(_, after)| after),
-        None => "",
+    let mut search = rest;
+    while let Some(i) = search.find("</") {
+        let after = search.get(i + 2..).unwrap_or("");
+        if after.get(..name.len()).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+            return after.split_once('>').map_or("", |(_, text)| text);
+        }
+        search = after;
     }
+    ""
 }
 
 /// The value of attribute `name` (any letter case), entities decoded.
@@ -297,6 +302,7 @@ mod tests {
         }
         assert!(!md.contains('<') && !md.contains("x()"), "{md}");
         assert!(!html_to_markdown("<style>p { color: red }</style>ok").contains("color"));
+        assert_eq!(html_to_markdown("<SCRIPT>a</b>c</Script >d<script>e</script>f"), "df");
         assert_eq!(html_to_markdown("a < b"), "a < b");
         for odd in ["<", "<a", "<a href=\"x", "<!-- x", "<!-- a > b -->c", "<script>", "</", "<p\u{e9}>\u{e9}", "&", "&#;", "<a href=>x</a>"] {
             html_to_markdown(odd);
