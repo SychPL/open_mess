@@ -10,6 +10,7 @@ pub mod http;
 pub mod manifest;
 pub mod text;
 mod time;
+pub mod unread;
 
 #[cfg(target_arch = "wasm32")]
 mod component;
