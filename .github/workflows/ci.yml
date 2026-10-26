@@ -29,8 +29,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
-      # The same command contributors run locally: fmt, clippy -D warnings, tests.
+      # The same command contributors run locally: fmt, clippy -D warnings, tests, wasm module build.
       - run: cargo xtask ci
 
   dependencies:

@@ -140,7 +140,8 @@ interface host {
         conversation: string,
         message: string,
         // True when the message is from the signed-in user; such messages never fire triggers.
-        own: bool,
+        // `own` is a WIT keyword, so the name is escaped with `%`; bindings still call it `own`.
+        %own: bool,
         mentions-me: bool,
         direct: bool,
     }
@@ -152,9 +153,10 @@ interface host {
 }
 
 interface module {
-    use types.{manifest, account-info, module-error};
+    // Aliased: a type and a function can't share the name `manifest` in one interface.
+    use types.{manifest as module-manifest, account-info, module-error};
 
-    manifest: func() -> manifest;
+    manifest: func() -> module-manifest;
     sign-in: func() -> result<account-info, module-error>;
     // Restores a session from stored secrets at daemon start.
     restore: func(account: string) -> result<_, module-error>;

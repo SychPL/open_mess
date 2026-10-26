@@ -1,6 +1,7 @@
 //! Repository tasks.
 //!
-//! `cargo xtask ci` runs the same gates as CI (fmt, clippy, tests); run it before every commit.
+//! `cargo xtask ci` runs the same gates as CI (fmt, clippy, tests, the wasm32-wasip2 module build);
+//! run it before every commit.
 //! `cargo xtask hooks` points git at `.githooks/`, which sends every commit to the Codex and GLM reviewers.
 
 use std::process::{Command, ExitCode};
@@ -9,6 +10,8 @@ const CI_STEPS: &[&[&str]] = &[
     &["fmt", "--all", "--check"],
     &["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"],
     &["test", "--workspace", "--locked"],
+    // The component the core loads; its glue only exists for wasm32 (needs `rustup target add wasm32-wasip2`).
+    &["build", "-p", "open-mess-teams", "--target", "wasm32-wasip2", "--locked"],
 ];
 
 fn run(program: &str, args: &[&str]) -> bool {

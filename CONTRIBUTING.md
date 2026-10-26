@@ -11,29 +11,32 @@ house style.
 
 ## Get it running
 
-You need stable Rust 1.85 or newer and git.
+You need stable Rust 1.85 or newer, the WebAssembly target the platform modules build for, and git.
 
 ```bash
+rustup target add wasm32-wasip2
 cargo build
 cargo run -p open-mess
 cargo xtask ci
 ```
 
-`cargo xtask ci` runs exactly what CI runs: `cargo fmt --check`, `cargo clippy -D warnings` and
-the tests. Run it before every commit.
+`cargo xtask ci` runs exactly what CI runs: `cargo fmt --check`, `cargo clippy -D warnings`, the
+tests and the `wasm32-wasip2` build of the Teams module. Run it before every commit.
 
 ## How the code is laid out
 
 | Path | What |
 |---|---|
 | `crates/open-mess/` | the `om` binary: daemon and CLI |
+| `modules/teams/` | the Teams platform module, a WebAssembly component implementing `wit/module.wit` |
+| `wit/` | the contract between the core and platform modules |
 | `xtask/` | repository tasks (`cargo xtask ci`, `cargo xtask hooks`) |
 | `.specs/` | specs, one per non-trivial change; review output in `.specs/review/` is local |
 | `scripts/review/` | the Codex and GLM review scripts and their prompts |
 | `.githooks/` | the post-commit hook that sends each commit for review |
 | `plan/` | local notes and plans, gitignored, never committed |
 
-More crates (core, module host, Teams module) arrive with the specs that introduce them.
+More crates (core, module host) arrive with the specs that introduce them.
 
 ## Rules that aren't negotiable
 
