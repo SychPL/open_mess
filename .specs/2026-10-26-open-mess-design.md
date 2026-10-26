@@ -140,9 +140,9 @@ Czytanie:
 Pisanie:
 - `send` - wysłanie wiadomości; odpowiedź w wątku i odpowiedź na konkretną wiadomość jako parametry,
 - `edit_message`, `react`,
-- `pending` - stan akcji czekających na zatwierdzenie (oczekuje / wykonano / odrzucono / wygasło / niepewne).
+- `pending` - stan akcji piszących: czekających na zatwierdzenie i wykonanych samodzielnie (oczekuje / wykonano / odrzucono / wygasło / niepewne).
 
-Wynik niepewny (recenzja R7): jeśli platforma mogła przyjąć akcję, ale odpowiedź nie dotarła (np. limit czasu), akcja ma stan "niepewne" i nie jest automatycznie ponawiana. Moduł nadaje każdej wysyłce własny identyfikator klienta (jeśli platforma go obsługuje) i przy następnej okazji sprawdza w rozmowie, czy wiadomość istnieje, zmieniając stan na "wykonano" albo pozwalając ponowić bez duplikatu.
+Wynik niepewny (recenzja R7): jeśli platforma mogła przyjąć akcję, ale odpowiedź nie dotarła (np. limit czasu), akcja ma stan "niepewne" i nie jest automatycznie ponawiana. Moduł nadaje każdej wysyłce własny identyfikator klienta (jeśli platforma go obsługuje) i przy następnej okazji sprawdza w rozmowie, czy wiadomość istnieje, zmieniając stan na "wykonano" albo pozwalając ponowić bez duplikatu. Dla edycji i reakcji moduł sprawdza aktualną treść wiadomości albo obecność reakcji (recenzja R8).
 
 Każde narzędzie piszące zachowuje się według uprawnień (8.6): "samodzielnie" - wykonuje od razu; "z potwierdzeniem" - tworzy akcję czekającą na zatwierdzenie i zwraca jej identyfikator; "nigdy" - zwraca błąd. Osobne narzędzia do przygotowania i wysłania (`prepare_message` / `send_prepared` z `teams-wrapper`) są zbędne, bo zatwierdzenie nie odbywa się już w czacie z agentem (decyzja projektowa, recenzja R3).
 
@@ -342,6 +342,8 @@ Niezaufane:
 - odpowiedzi serwerów platform i zdarzenia WebSocket (mogą mieć nieznany albo zepsuty kształt),
 - moduły WASM spoza repo: izolacja chroni komputer, sieć lokalną, inne moduły i inne konta (lista hostów, brak dostępu do cudzych sekretów, limity). Nie chroni konta, które użytkownik danemu modułowi powierzył: moduł z tokenami konta i dostępem do hostów platformy może wykonać na tym koncie dowolną operację, bo rdzeń nie rozumie znaczenia jego zapytań HTTP. Uprawnienia agentów (8.6) chronią przed agentami, nie przed modułem. Instalacja modułu i zalogowanie nim konta to zaufanie do jego kodu, jak instalacja aplikacji - okno mówi to wprost przy instalacji i logowaniu (rebutal R4, sekcja 16),
 
+Zasada zasobów (zamrożona, recenzja R8): wszystko, co moduł, wyzwalacz albo agent może mnożyć - połączenia (w tym trwałe WebSockety per moduł), uruchomienia agentów z akcji 2 (równocześnie per reguła i łącznie; nadmiarowe zdarzenia czekają w kolejce albo są łączone, nie uruchamiają kolejnych procesów), pliki, akcje oczekujące, magazyn modułu, rozmiar odpowiedzi - ma limit liczby albo rozmiaru egzekwowany przez rdzeń. Konkretne wartości to wybór budującego. Zgłoszenie postaci "brak limitu dla X", gdzie X podlega tej zasadzie, jest rozstrzygnięte przez tę zasadę.
+
 Granica twardnienia (zamrożona): nie bronimy się przed złośliwym kodem działającym na koncie Windows użytkownika z zamiarem obejścia open_mess - taki kod może i tak czytać Menedżer poświadczeń, symulować terminal albo klikać w powiadomienia. Bronimy się przed agentem, który przez pomyłkę albo manipulację próbuje zrobić więcej, niż pozwalają uprawnienia, używając zwykłych narzędzi (MCP, CLI z narzędzia Bash).
 
 ## 16. Rejestr rebutali
@@ -349,7 +351,7 @@ Granica twardnienia (zamrożona): nie bronimy się przed złośliwym kodem dzia�
 - R4, Codex P1 ("niezaufany moduł WASM może wysłać wiadomość zwykłym zapytaniem HTTP do zatwierdzonego hosta, omijając uprawnienia"): odrzucone jako błąd specu, przyjęte jako granica zaufania. Rdzeń nie może egzekwować uprawnień na poziomie surowych zapytań modułu do API platformy bez rozumienia każdego protokołu, co przeczy idei modułów. Moduł, któremu użytkownik powierzył konto, jest zaufany dla tego konta; izolacja chroni resztę systemu. Zapisane w threat modelu (sekcja 15).
 - R6, Codex P1 w recenzji commita 6d1e45f ("przez firmowe proxy moduł może dosięgnąć LAN, gdy zatwierdzona domena odpowiada proxy innym, prywatnym adresem"): przyjęte jako znane ograniczenie, nie jako błąd specu. Przy połączeniu przez proxy nazwę rozwiązuje proxy, więc rdzeń nie może przypiąć adresu; ochrona LAN zależy wtedy od proxy organizacji. Atak wymaga, żeby użytkownik zatwierdził w liście hostów modułu domenę kontrolowaną przez atakującego. Bez proxy ochrona działa w pełni (przypięcie adresu). Okno przy instalacji modułu spoza repo mówi, że przy aktywnym proxy systemowym ochrona sieci lokalnej zależy od proxy.
 - R6, GLM P3 (świeże załączniki chwilowo przekraczają limit katalogu): przyjęte bez zmian - przekroczenie trwa tylko przez okno ochrony świeżych plików.
-Pozostałe zgłoszenia R1-R7 przyjęto.
+Pozostałe zgłoszenia R1-R8 przyjęto.
 
 ## Changelog rund
 
@@ -360,3 +362,4 @@ Pozostałe zgłoszenia R1-R7 przyjęto.
 - R5 (Codex REJECT, GLM REJECT): przepływ treści do podłączonych agentów i ich dostawców modeli zapisany wprost w specu i AGENTS.md (Codex P2); zatwierdzenie wiąże się ze składem uczestników i treścią celu, zmiana unieważnia akcję (Codex P2); proxy systemowe i systemowy magazyn certyfikatów (GLM P2); losowość dla modułów, cykl życia kont przy wyłączaniu/usuwaniu modułu, limit oczekujących akcji i łączenie powiadomień, sprzątanie plików akcji 2, ochrona świeżych załączników i ich własny limit rozmiaru (GLM P3).
 - R6 (Codex REJECT, GLM APPROVE): zatwierdzenie reakcji wiąże się z treścią wiadomości docelowej (Codex P2); stały port lokalnego API (GLM P3); klasa czytanie/pisanie dla dodatkowych narzędzi modułów (GLM P3); podmiana modułu wymaga zgody na przejęcie kont (GLM P3); sprzątanie plików akcji 2 przy starcie (GLM P3); proxy a ochrona LAN i chwilowe przekroczenie limitu załączników - rebutale (sekcja 16).
 - R7 (Codex REJECT, GLM APPROVE): wyzwalacze respektują uprawnienie czytania (Codex P2); stan "niepewne" dla akcji bez potwierdzenia i identyfikator klienta zamiast automatycznego ponawiania (Codex P2); kontrola celu obejmuje odpowiedź na konkretną wiadomość (Codex P2); minimalna głębokość wzorców hostów, jeden plik na nazwę modułu, własne wiadomości nie odpalają reguł, zbiorcze powiadomienie bez zatwierdzania naraz, połączenia na żywo po stronie rdzenia, dodatkowe narzędzia czytające pod uprawnieniem czytania (GLM P3).
+- R8 (Codex REJECT, GLM APPROVE): zamrożona zasada zasobów - limit równoczesnych uruchomień agentów z akcji 2 i liczby trwałych połączeń modułu, oraz ogólna reguła dla każdego mnożonego zasobu (Codex P2 x2); `pending` obejmuje akcje samodzielne, rozstrzyganie niepewnych edycji i reakcji (GLM P3).
