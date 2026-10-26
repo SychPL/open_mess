@@ -102,12 +102,12 @@ Podział odpowiedzialności:
   - trwałe przechowywanie danych modułu (klucz-wartość) z limitem rozmiaru per moduł; zapis ponad limit zwraca błąd,
   - sekrety (tokeny odświeżania itp.) w Menedżerze poświadczeń Windows - moduł nigdy nie dostaje dostępu do sekretów innego modułu,
   - zegar i timery,
-  - "prymitywy logowania" wyświetlane w oknie konfiguracji: pokaż kod urządzenia, pokaż kod QR, otwórz stronę logowania w osadzonym oknie przeglądarki i zwróć adres, na który nastąpiło przekierowanie, użyj konta Windows (WAM) - szczegóły w sekcji 9.1,
+  - "prymitywy logowania" wyświetlane w oknie konfiguracji: pokaż kod urządzenia, pokaż kod QR, otwórz stronę logowania w osadzonym oknie przeglądarki i zwróć adres, na który nastąpiło przekierowanie, użyj konta Windows (WAM) - szczegóły w sekcji 9.1. Tożsamość logowania jest częścią manifestu i zgody przy instalacji (recenzja R3): moduł deklaruje hosty stron logowania, a dla WAM identyfikator aplikacji i zasoby/zakresy, o które prosi. Okno pokazuje to użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie. Rdzeń otwiera w osadzonym oknie tylko adresy HTTPS z zatwierdzonych hostów logowania, zawsze pokazuje w oknie aktualny host strony i przerywa logowanie, gdy strona przejdzie na host spoza listy; WAM dostaje wyłącznie zatwierdzony identyfikator aplikacji i zakresy,
   - emisja zdarzeń (nowa wiadomość, zmiana stanu sesji) do rdzenia, który obsługuje wyzwalacze.
 - **Moduł eksportuje**: manifest (nazwa, wersja, platforma, dozwolone hosty, obsługiwane operacje, dodatkowe narzędzia), logowanie i przywracanie sesji, operacje ze wspólnego zestawu (8.5), obsługę zdarzeń na żywo.
 - **Dodatkowe narzędzia modułu**: moduł może zadeklarować własne narzędzia spoza wspólnego zestawu (np. w przyszłości `teams.list_meetings`); rdzeń wystawia je w MCP i CLI z przedrostkiem modułu. To jest furtka dla modułów funkcji (spotkania) z etapów 2-3.
 
-Limity zasobów (decyzja projektowa, recenzja R1): każde wywołanie modułu ma limit czasu wykonania (przerywanie przez epoch/fuel silnika WASM) i limit pamięci; przekroczenie przerywa wywołanie, moduł jest wyładowywany, a stan i błąd pokazują `status` i okno. Po kilku awariach z rzędu rdzeń nie ładuje modułu ponownie automatycznie. Inne moduły i konta działają dalej. Konkretne wartości limitów - wybór budującego.
+Limity zasobów (decyzja projektowa, recenzje R1 i R3): każde wywołanie modułu ma limit czasu wykonania i limit pamięci. Limit czasu liczy się zegarowo dla całego wywołania, łącznie z czasem w importach rdzenia: epoch/fuel przerywa kod WASM, a importy HTTP i WebSocket mają własne limity połączenia i odczytu, `Retry-After` dłuższy niż ustalony maksymalny czas oczekiwania kończy się błędem zamiast czekania, a po przekroczeniu limitu całego wywołania rdzeń anuluje trwające operacje sieciowe; przekroczenie przerywa wywołanie, moduł jest wyładowywany, a stan i błąd pokazują `status` i okno. Po kilku awariach z rzędu rdzeń nie ładuje modułu ponownie automatycznie. Inne moduły i konta działają dalej. Konkretne wartości limitów - wybór budującego.
 
 Instalacja modułu: plik `.wasm` w katalogu modułów (`%APPDATA%\open_mess\modules\`) albo "Dodaj z pliku" w sekcji Moduły okna. Moduły można włączać i wyłączać bez restartu demona.
 
@@ -116,7 +116,7 @@ Model asynchroniczny wywołań między rdzeniem a modułem (natywne async kompon
 ### 8.4 Dane i sekrety
 
 - Sekrety (tokeny odświeżania, token lokalnego API): Menedżer poświadczeń Windows.
-- Stan (konfiguracja, kursory rozmów, identyfikatory widzianych wiadomości dla wyzwalaczy, przygotowane wiadomości oczekujące na zatwierdzenie, stan wyzwalaczy): SQLite w `%APPDATA%\open_mess\`.
+- Stan (konfiguracja, kursory rozmów, identyfikatory widzianych wiadomości dla wyzwalaczy, akcje piszące oczekujące na zatwierdzenie, stan wyzwalaczy): SQLite w `%APPDATA%\open_mess\`.
 - Treści wiadomości nie są archiwizowane lokalnie; źródłem prawdy jest serwer platformy. Krótkotrwała pamięć podręczna jest dozwolona, jeśli budujący jej potrzebuje.
 - Logi nie zawierają tokenów, ciasteczek ani treści wiadomości.
 
@@ -131,15 +131,15 @@ Czytanie:
 - `mentions` - wzmianki o użytkowniku,
 - `read_messages` - historia rozmowy / kanału / wątku, ze stronicowaniem,
 - `search` - wyszukiwanie wiadomości,
-- `get_attachment` - pobranie załącznika (zrzut ekranu, PDF) do pliku lokalnego, żeby agent mógł go przeczytać. Ścieżkę wybiera rdzeń: plik trafia do zarządzanego katalogu (`%APPDATA%\open_messttachments\`) pod oczyszczoną nazwą, nigdy nie nadpisuje istniejących plików, a narzędzie zwraca ścieżkę; agent nie podaje ścieżki docelowej (recenzja R2),
+- `get_attachment` - pobranie załącznika (zrzut ekranu, PDF) do pliku lokalnego, żeby agent mógł go przeczytać. Ścieżkę wybiera rdzeń: plik trafia do zarządzanego katalogu (`%APPDATA%\open_mess\attachments\`) pod oczyszczoną nazwą, nigdy nie nadpisuje istniejących plików, a narzędzie zwraca ścieżkę; agent nie podaje ścieżki docelowej (recenzja R2),
 - `writing_context` - przykłady wiadomości napisanych przez użytkownika w danej rozmowie, żeby agent pisał jego stylem (przeniesione z `teams-wrapper`, łącznie z filtrami: tylko wiadomości użytkownika, bez sekretów, kodu, samych linków, danych operacyjnych).
 
 Pisanie:
-- `prepare_message` -> jednorazowy token przygotowania (wygasa po kilku minutach),
-- `send_prepared` - wysłanie przygotowanej wiadomości,
-- `send` - wysłanie od razu, dostępne tylko tam, gdzie uprawnienia pozwalają agentowi pisać samodzielnie,
+- `send` - wysłanie wiadomości; odpowiedź w wątku i odpowiedź na konkretną wiadomość jako parametry,
 - `edit_message`, `react`,
-- odpowiedź w wątku i odpowiedź na konkretną wiadomość jako parametry `prepare_message` / `send`.
+- `pending` - stan akcji czekających na zatwierdzenie (oczekuje / wysłano / odrzucono / wygasło).
+
+Każde narzędzie piszące zachowuje się według uprawnień (8.6): "samodzielnie" - wykonuje od razu; "z potwierdzeniem" - tworzy akcję czekającą na zatwierdzenie i zwraca jej identyfikator; "nigdy" - zwraca błąd. Osobne narzędzia do przygotowania i wysłania (`prepare_message` / `send_prepared` z `teams-wrapper`) są zbędne, bo zatwierdzenie nie odbywa się już w czacie z agentem (decyzja projektowa, recenzja R3).
 
 Stan:
 - `status` - stan demona, modułów, sesji.
@@ -161,7 +161,7 @@ Ustawiane w sekcji "Uprawnienia agentów" okna, per konto, opcjonalnie zawężon
 
 Kto ma jakie uprawnienia (decyzja projektowa, recenzje R1 i R2): **jedne zasady dla każdego wywołującego.** Rdzeń egzekwuje wyłącznie uprawnienia konta/rozmowy, tak samo dla MCP, CLI, sesji obudzonej powiadomieniem i agenta uruchomionego przez wyzwalacz. Nie ma tokenów zakresowych ani uprawnień per reguła: każdy proces na koncie użytkownika może wywołać CLI ze wspólnym tokenem, więc węższe uprawnienia dla jednego wywołującego dałoby się obejść zwykłym `om send` z narzędzia Bash. Kto nie chce, żeby agent obudzony przez wyzwalacz wysyłał bez zatwierdzenia, ustawia dla konta albo danej rozmowy "z potwierdzeniem". Okno konfiguracji ostrzega przy zapisie reguły wyzwalacza, która obejmuje konto albo rozmowę z "samodzielnie".
 
-"Z potwierdzeniem" oznacza, że działa tylko ścieżka `prepare_message` -> `send_prepared`, a `send_prepared` przechodzi dopiero po zatwierdzeniu **poza zasięgiem agenta**: powiadomienie Windows z dokładną rozmową, odbiorcami i tekstem oraz przyciskami Wyślij / Odrzuć, a także lista "Do zatwierdzenia" w oknie konfiguracji. Zgoda wyrażona w czacie z agentem nie wystarcza, bo agent mógłby ją zmyślić albo wywołać `send_prepared` sam. Dotyczy to agentów w sesji interaktywnej, agentów uruchomionych przez wyzwalacz i CLI. Decyzja projektowa.
+"Z potwierdzeniem" oznacza, że każda akcja pisząca - wysłanie, edycja i reakcja - czeka na zatwierdzenie **poza zasięgiem agenta**: powiadomienie Windows z dokładną rozmową, odbiorcami, treścią (dla edycji: przed i po, dla reakcji: która i pod czym) oraz przyciskami Zatwierdź / Odrzuć, a także lista "Do zatwierdzenia" w oknie konfiguracji. Niezatwierdzona akcja wygasa po ustalonym czasie. Zgoda wyrażona w czacie z agentem nie wystarcza, bo agent mógłby ją zmyślić. Dotyczy to agentów w sesji interaktywnej, agentów uruchomionych przez wyzwalacz i CLI. Decyzja projektowa.
 
 CLI nie ma żadnych dodatkowych przywilejów: podlega tym samym uprawnieniom i tej samej ścieżce zatwierdzania co MCP. Demon nie umie wiarygodnie odróżnić człowieka w terminalu od agenta, który sam otwiera konsolę (np. `Start-Process` z narzędzia Bash), więc rozróżnianie po terminalu byłoby obejściem uprawnień. Człowiek wysyłający z CLI na koncie "z potwierdzeniem" klika Wyślij w powiadomieniu tak jak przy agencie; kto chce wysyłać bez tego, ustawia "samodzielnie". Decyzja projektowa (recenzja Codex i GLM commita d82e768 odrzuciła wcześniejszą regułę "CLI w interaktywnym terminalu = użytkownik").
 
@@ -190,7 +190,7 @@ Sekcje:
 - **Konta** - lista kont ze stanem połączenia, "Dodaj konto", "Zaloguj ponownie", usuwanie konta,
 - **Uprawnienia agentów** - sekcja 8.6,
 - **Wyzwalacze** - sekcja 8.7,
-- **Do zatwierdzenia** - przygotowane wiadomości czekające na decyzję (może być częścią innej sekcji, wybór budującego),
+- **Do zatwierdzenia** - akcje piszące (wysłanie, edycja, reakcja) czekające na decyzję (może być częścią innej sekcji, wybór budującego),
 - **Moduły** - zainstalowane moduły, włącz / wyłącz, dodaj z pliku,
 - **Integracje (MCP / CLI)** - gotowe polecenia do podłączenia MCP, ścieżka do CLI,
 - **Demon i logi** - stan, pamięć, połączenia, ostatnie błędy.
@@ -253,7 +253,7 @@ Przyczyny problemów (analiza kodu, 2026-10-26):
 - **Wylogowania** (prawie pewne): wrapper uruchamia ukryty Chromium z pełnym Teams Web i podsłuchuje z niego nagłówki z tokenem. Sam tokenu nie odświeża - polega na tym, że ukryta strona wyśle kolejne zapytanie. Po wygaśnięciu tokenu (około godziny) dostaje 401 i przechodzi w "auth_required".
 - **Puste rozmowy w oficjalnym Teams** (niepotwierdzone, dwie hipotezy): (a) drugi pełny klient Teams działający cały czas w tle z zablokowanymi zapytaniami o potwierdzenia odczytu; (b) skrypt skilla `log-time` (`teams-peer-resolver.ps1`) kopiuje pliki IndexedDB oficjalnego Teams w trakcie jego pracy - otwarty uchwyt może uniemożliwić Teams porządkowanie bazy i doprowadzić do uznania pamięci podręcznej za uszkodzoną. Hipoteza (b) dotyczy narzędzia poza open_mess i warto ją sprawdzić niezależnie.
 
-Do przeniesienia: dwuetapowa wysyłka, czytanie bez oznaczania jako przeczytane, `writing_context` z filtrami, MCP przez HTTP w jednym procesie dla Claude i Codexa, jawny błąd przy niezgodnym protokole. Webhook z `teams-wrapper` świadomie nie przechodzi do etapu 1 (sekcja 5).
+Do przeniesienia: zatwierdzanie wysyłki (u nas poza zasięgiem agenta, 8.6), czytanie bez oznaczania jako przeczytane, `writing_context` z filtrami, MCP przez HTTP w jednym procesie dla Claude i Codexa, jawny błąd przy niezgodnym protokole. Webhook z `teams-wrapper` świadomie nie przechodzi do etapu 1 (sekcja 5).
 
 Do uniknięcia: przeglądarka w tle, podsłuchiwanie tokenów, dotykanie danych oficjalnego klienta.
 
@@ -341,9 +341,10 @@ Granica twardnienia (zamrożona): nie bronimy się przed złośliwym kodem dzia�
 
 ## 16. Rejestr rebutali
 
-Brak odrzuconych zgłoszeń: w R1 i R2 wszystkie zgłoszenia przyjęto.
+Brak odrzuconych zgłoszeń: w R1-R3 wszystkie zgłoszenia przyjęto.
 
 ## Changelog rund
 
 - R1 (Codex REJECT, GLM REJECT): reguły wyzwalaczy tylko zawężają uprawnienia, tokeny zakresowe dla uruchomień z akcji 2, akcja 1 dziedziczy uprawnienia konta z ostrzeżeniem (Codex P1, GLM P2); limity czasu i pamięci modułów WASM (Codex P2); most stdio jako jawny, długożyjący wyjątek od zasady jednego procesu (Codex P2); akcja 2 bez powłoki i bez wklejania treści do polecenia (GLM P2); lista hostów modułu zatwierdzana przez użytkownika, wzorce sufiksu, twarda blokada adresów lokalnych i prywatnych (GLM P2, P3); oznaczanie niezaufanej treści w wynikach narzędzi (GLM P3); doprecyzowanie Linuksa w CI (GLM P3); token API przy pierwszym uruchomieniu (GLM P3).
 - R2 (Codex REJECT, GLM REJECT): usunięte tokeny zakresowe i uprawnienia per reguła - wszyscy wywołujący mają uprawnienia konta/rozmowy, bo agent może obejść węższe uprawnienia przez `om send` (Codex P1); WAM bez tokenu odświeżania, odnowienie przez broker (Codex P2); przypięcie połączenia do sprawdzonego adresu i kontrola każdego przekierowania (GLM P2); `get_attachment` zapisuje tylko do zarządzanego katalogu (GLM P2); webhooki usunięte z etapu 1, bo wysyłałyby treść poza maszynę (GLM P2); limit magazynu modułu, cykl życia mostu stdio, `get_attachment` w oznaczaniu niezaufanej treści, rejestr rebutali (GLM P3).
+- R3 (Codex REJECT, GLM REJECT): każda akcja pisząca (wysłanie, edycja, reakcja) przechodzi przez zatwierdzenie poza agentem, a `prepare_message`/`send_prepared` zastąpione jednym `send` i narzędziem `pending` (Codex P2, GLM P3); zegarowy limit wywołania modułu obejmuje importy sieciowe, limit `Retry-After` (Codex P2, GLM P2); hosty stron logowania i tożsamość WAM w manifeście i zgodzie przy instalacji, kontrola hosta strony logowania (GLM P2); naprawiona ścieżka katalogu załączników (GLM P3, Codex P2 w recenzji commita 3f7dacc).
