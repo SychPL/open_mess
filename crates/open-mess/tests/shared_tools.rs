@@ -125,6 +125,12 @@ async fn attachment_is_written_by_the_core() {
     assert_eq!(first["content_type"], "text/plain");
     assert_eq!(first["untrusted"]["file_name"], "report.txt");
     assert_eq!(first["untrusted_notice"], UNTRUSTED_NOTICE);
+    #[cfg(windows)]
+    {
+        let mut zone = path.as_os_str().to_owned();
+        zone.push(":Zone.Identifier");
+        assert!(std::fs::read_to_string(zone).unwrap().contains("ZoneId=3"));
+    }
 
     // The same name again: a new file, the first one is kept.
     let second = shared::save_attachment(dir.path(), echo.get_attachment("a", "c", "m", "report.txt").await.unwrap()).unwrap();

@@ -11,8 +11,8 @@
 //! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
 //! `read_messages` and `unread` return one synthetic message or conversation that names the
 //! account. The `restore` export succeeds only for account "known"; the `sign-in` export is not
-//! supported; `sign-out` reports the account offline; `get-attachment` returns fixed bytes named
-//! after the attachment id.
+//! supported; `sign-out` reports the account offline; `get-attachment` downloads an `http://`
+//! attachment id and returns fixed bytes named after any other.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -169,14 +169,20 @@ mod guest {
             call(&account, &tool, &args_json)
         }
 
-        // Fixed bytes, named after the attachment id, so tests choose the file name.
+        // An `http://` id is downloaded; any other id gets fixed bytes named after it.
         fn get_attachment(
             _account: String,
             _conversation: String,
             _message: String,
             attachment: String,
         ) -> Result<types::Attachment, types::ModuleError> {
-            Ok(types::Attachment { file_name: attachment, content_type: "text/plain".to_string(), data: b"attachment bytes from test-echo".to_vec() })
+            let data = if attachment.starts_with("http://") {
+                let request = http::Request { method: "GET".to_string(), url: attachment.clone(), headers: Vec::new(), body: Vec::new() };
+                http::fetch(&request).map_err(|e| types::ModuleError::Platform(http_error(&e).to_string()))?.body
+            } else {
+                b"attachment bytes from test-echo".to_vec()
+            };
+            Ok(types::Attachment { file_name: attachment, content_type: "text/plain".to_string(), data })
         }
     }
 

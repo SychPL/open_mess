@@ -42,8 +42,9 @@ interface types {
         extra-tools: list<tool-decl>,
     }
 
-    // An attachment's bytes, which the module fetches with `http.fetch`. The core writes them to
-    // a file it names; a module never writes files (spec 8.5).
+    // An attachment's bytes, which the module fetches with `http.fetch`; during `get-attachment`
+    // fetch takes bodies up to the attachment limit instead of the general one. The core writes
+    // the bytes to a file it names; a module never writes files (spec 8.5).
     record attachment {
         file-name: string,
         content-type: string,

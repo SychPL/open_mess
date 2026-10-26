@@ -137,6 +137,8 @@ pub(crate) struct HostState {
     pub(crate) sockets: Sockets,
     pub(crate) timers: Timers,
     pub(crate) storage: Option<Storage>,
+    /// The largest HTTP body `http.fetch` takes now: `MAX_ATTACHMENT` during `get-attachment`.
+    pub(crate) max_body: usize,
     /// Where this instance's sockets and timers send what they deliver.
     pub(crate) guest_events: mpsc::Sender<GuestEvent>,
 }
@@ -160,6 +162,7 @@ impl HostState {
             sockets: Sockets::default(),
             timers: Timers::default(),
             storage: None,
+            max_body: limits::MAX_BODY,
             guest_events,
         }
     }

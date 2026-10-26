@@ -150,6 +150,11 @@ impl Net {
     /// One HTTP exchange for a module. Redirects come back as they are; the module fetches the
     /// `Location` itself, which goes through the same checks.
     pub async fn fetch(&self, hosts: &HostList, req: Request) -> Result<Response, HttpError> {
+        self.fetch_up_to(hosts, req, limits::MAX_BODY).await
+    }
+
+    /// [`Net::fetch`] with a body of at most `max_body` bytes.
+    pub(crate) async fn fetch_up_to(&self, hosts: &HostList, req: Request, max_body: usize) -> Result<Response, HttpError> {
         let url = url::Url::parse(&req.url).map_err(|_| blocked("not a valid URL"))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(blocked("only http and https URLs"));
@@ -180,12 +185,12 @@ impl Net {
         {
             return Err(HttpError::Throttled(secs));
         }
-        if response.content_length().is_some_and(|len| len > limits::MAX_BODY as u64) {
+        if response.content_length().is_some_and(|len| len > max_body as u64) {
             return Err(HttpError::TooLarge);
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(network)? {
-            if body.len().saturating_add(chunk.len()) > limits::MAX_BODY {
+            if body.len().saturating_add(chunk.len()) > max_body {
                 return Err(HttpError::TooLarge);
             }
             body.extend_from_slice(&chunk);

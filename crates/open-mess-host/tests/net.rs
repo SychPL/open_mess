@@ -19,13 +19,15 @@ use open_mess_host::ip_policy::AddressPolicy;
 use open_mess_host::{Engine, HttpError, Net, Request, limits};
 
 /// Serves `/ok`, `/redirect` (302 to its own `/ok`), `/endless` (a body that never ends),
-/// `/slow` (answers after 10 s) and `/throttle/<secs>` (429 with Retry-After).
+/// `/slow` (answers after 10 s), `/throttle/<secs>` (429 with Retry-After) and `/big` (one byte
+/// over the general body limit).
 async fn server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app =
         Router::new()
             .route("/ok", get(|| async { "ok" }))
+            .route("/big", get(|| async { vec![b'x'; limits::MAX_BODY + 1] }))
             .route("/redirect", get(move || async move { (StatusCode::FOUND, [(header::LOCATION, format!("http://{addr}/ok"))]) }))
             .route(
                 "/endless",
@@ -143,4 +145,18 @@ async fn module_fetch_follows_its_host_list() {
     assert_eq!(echo.call("a", "fetch", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap(), r#"{"status":200}"#);
     let url = format!("http://{addr}/ok");
     assert_eq!(echo.call("a", "fetch", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap(), r#"{"error":"blocked"}"#);
+}
+
+#[tokio::test]
+async fn attachments_have_their_own_size_limit() {
+    let addr = server().await;
+    let engine = Engine::with_limits(limits::for_tests()).unwrap();
+    let echo = load(&engine, "open_mess_test_echo").await;
+    let url = format!("http://localhost:{}/big", addr.port());
+    // An ordinary call stops at the general limit...
+    let result = echo.call("a", "fetch", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap();
+    assert_eq!(result, r#"{"error":"too-large"}"#);
+    // ...an attachment download does not, and the next call has the general limit again.
+    assert_eq!(echo.get_attachment("a", "c", "m", &url).await.unwrap().data.len(), limits::MAX_BODY + 1);
+    assert_eq!(echo.call("a", "fetch", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap(), r#"{"error":"too-large"}"#);
 }

@@ -49,7 +49,7 @@ impl types::Host for HostState {}
 impl http::Host for HostState {
     async fn fetch(&mut self, req: http::Request) -> Result<http::Response, http::HttpError> {
         let req = net::Request { method: req.method, url: req.url, headers: req.headers, body: req.body };
-        let response = self.env.net.fetch(&self.env.hosts, req).await?;
+        let response = self.env.net.fetch_up_to(&self.env.hosts, req, self.max_body).await?;
         Ok(http::Response { status: response.status, headers: response.headers, body: response.body })
     }
 }

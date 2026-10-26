@@ -325,9 +325,15 @@ impl Actor {
             Request::GetAttachment { ids: [account, conversation, message, attachment], reply } => {
                 let result = self
                     .run(move |m, s| {
-                        Box::pin(
-                            async move { m.open_mess_module_module().call_get_attachment(s, &account, &conversation, &message, &attachment).await },
-                        )
+                        Box::pin(async move {
+                            // Attachments have their own size limit (spec 8.5); a trap or timeout
+                            // drops the store, so the limit never outlives the call.
+                            s.data_mut().max_body = limits::MAX_ATTACHMENT;
+                            let result =
+                                m.open_mess_module_module().call_get_attachment(&mut *s, &account, &conversation, &message, &attachment).await;
+                            s.data_mut().max_body = limits::MAX_BODY;
+                            result
+                        })
                     })
                     .await;
                 reply.send(module_result(result).map(Into::into)).ok();
