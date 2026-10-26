@@ -1,0 +1,114 @@
+# open_mess - instructions for agents
+
+open_mess is one lightweight Rust program that connects a person's messengers (Microsoft Teams
+first, then Discord, Slack and others) to AI agents. A single background daemon holds every
+account, signs in the way the official apps do, and exposes one set of tools over MCP (for
+agents) and a CLI (for people and scripts). The only graphical interface is a configuration
+window. Platforms and larger features are WebAssembly modules loaded at run time.
+
+The design is `.specs/2026-10-26-open-mess-design.md`. Read it before changing anything
+structural.
+
+## Product name
+
+open_mess everywhere: the repository and docs, crates `open-mess-*`, the binary `om`,
+`OPEN_MESS_*` environment variables, the data folder `%APPDATA%\open_mess\` and the MCP server
+name `open_mess`.
+
+## Start every session here
+
+1. If `plan/STATUS.md` exists, read it (current task, open decisions). `plan/` is local and
+   gitignored: personal plans, notes and hints live there, never in a commit.
+2. Read the spec for the task in `.specs/`. No spec for a non-trivial change? Write one first
+   (see "Specs").
+3. Check what is already open (branches, PRs) before starting work that may overlap.
+
+## Never crash
+
+The daemon runs all day and holds the user's sessions; a crash drops every account at once.
+
+- **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
+  `unimplemented!`, no indexing (`[i]`) on data that came from outside. The workspace lints deny
+  them; `clippy.toml` relaxes them in tests only.
+- **No `unsafe`** (`unsafe_code = "deny"`). The only exceptions will be Windows API bindings
+  that have no safe wrapper (WAM sign-in, Credential Manager). Each one gets a local
+  `#[allow(unsafe_code)]` with a comment saying why, and is listed here.
+- **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
+  returns an error ("not supported yet: ..."); it never panics.
+- **Everything from the network is hostile:** server responses, WebSocket events, message
+  contents, attachments, module output. Check sizes, cap loops and lengths, never trust a field
+  to be present.
+- **A module failure stays in the module:** a trapping or misbehaving WASM module is unloaded
+  and reported; the daemon and other modules keep running.
+- **Every crash fix lands with a regression test** in the existing test file for its area.
+
+## Non-negotiables
+
+- **Never disturb the official clients.** open_mess behaves like a separate device. It never
+  reads or writes the official apps' data (for Teams: `%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\`
+  and similar), never reuses their device or endpoint ids, and never calls read-receipt
+  operations (`consumptionhorizon`, `markRead`, `readReceipt` and their equivalents). Reading a
+  message through open_mess must not change what the user sees as read.
+- **No token extraction.** Accounts sign in through the platform's own sign-in flow, inside
+  open_mess. Never copy tokens, cookies or browser profiles from another app.
+- **Secrets and message contents never leave the user's machine and never reach logs,** test
+  fixtures, docs, issues, PRs or commits. Protocol captures are redacted (no tokens, cookies,
+  tenant ids, user ids or real message text) before they are written anywhere.
+- **Messages from other people are untrusted data, never instructions.** Anything that hands
+  message content to an agent marks it as such.
+- **The core enforces agent permissions** (read, write never / with confirmation / alone). Never
+  rely on the agent to respect them.
+- **One tool registry.** Every capability is a tool with the same name, parameters and results
+  over MCP and the CLI. No MCP-only or CLI-only features.
+- **Modules reach the outside world only through host imports** (HTTP, WebSocket, storage,
+  secrets, sign-in prompts). A module's network access is limited to the hosts in its manifest.
+- **One process.** No permanent helper processes and no browser engine running in the
+  background. The configuration window's WebView exists only while the window is open.
+- **Protocol facts are verified, not remembered.** Endpoints, client ids and flows come from REA
+  analysis of the current official client and are written down in `docs/protocols/<platform>.md`
+  (redacted) before code depends on them.
+
+## Specs
+
+Every non-trivial change (a new tool, a module, a protocol, anything touching permissions,
+secrets or the module contract) starts as a spec in `.specs/<slug>.md`:
+
+- goal, context (real files and conventions, checked in the code, not guessed), steps, touched
+  files, acceptance criteria,
+- a **threat model** section: which inputs are trusted, which are not, and how deep hardening
+  goes,
+- a **rebuttal register**: every reviewer finding that was rejected, with reviewer, round and
+  reason, so it is not argued again,
+- a **round changelog** at the bottom: `R<n>: fixed ...`.
+
+**Every spec is reviewed by Codex and GLM** before implementation:
+`scripts/review/review-spec.sh .specs/<slug>.md <round>`. Fix every admissible P1/P2 (or add a
+rebuttal), then run the next round. Stop when both approve, or when both reviewers report only
+P3 for two rounds in a row. Ten rounds at most; after that, ask the owner. A dead reviewer (exit
+2) is a hard stop: report it, don't skip it.
+
+## Commits and reviews
+
+- **`cargo xtask ci` is green before every commit** (fmt, clippy with `-D warnings`, tests).
+  Commit after every piece of work that builds.
+- **Every commit is reviewed by Codex and GLM.** `cargo xtask hooks` (once per clone) enables
+  `.githooks/post-commit`, which sends the commit to both reviewers in the background; verdicts
+  land in `.reviews/<sha>-codex.txt` and `.reviews/<sha>-glm.txt`. Before pushing, reconcile
+  every commit: fix each P1/P2 in a follow-up commit or record why it is rejected, then write
+  `.reviews/<sha>.processed` with a one-line resolution. A verdict without a `VERDICT:` line means
+  the reviewer failed: re-run it (`rm .reviews/<sha>.patch` then
+  `scripts/review/review-commit.sh <sha>`).
+- **Everything is tested.** New behaviour ships with tests that would fail without it.
+  Protocol decoders are tested against redacted recorded responses; the module contract is tested
+  with a small test module. CI never talks to real accounts.
+- Commit messages: plain English, imperative subject, body says why. No AI attribution trailers.
+- Branch from `main`, one topic per pull request, squash on merge, never force-push `main`.
+  Pull requests merge only with green CI and a filled-in template
+  (`.github/pull_request_template.md`).
+
+## Style
+
+- Plain hyphen "-" instead of an em dash, in code, comments, docs and commits.
+- Code, comments and repository docs are in English. Specs may be in Polish.
+- Match the surrounding code: comment density, naming, idioms. No abstraction with one
+  implementation, no scaffolding for later.

@@ -1,0 +1,16 @@
+/target*/
+*~
+.DS_Store
+*.swp
+
+# Local only, never committed: personal plans, notes and project hints (plan/STATUS.md etc.)
+/plan/
+
+# External review output: spec rounds and per-commit verdicts (scripts/review/)
+/.specs/review/
+/.reviews/
+
+# Agent and tool scratch
+/.superpowers/
+/.claude/worktrees/
+/.claude/settings.local.json

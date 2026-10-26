@@ -1,0 +1,41 @@
+# Pull request gates: everything here must pass before a PR can merge.
+# Mark "Gates (windows-latest)", "Gates (ubuntu-latest)" and "Dependency check" as required checks
+# in the repository's branch protection for main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: Gates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The same command contributors run locally: fmt, clippy -D warnings, tests.
+      - run: cargo xtask ci
+
+  dependencies:
+    name: Dependency check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Every commit goes to the Codex and GLM reviewers (scripts/review/review-commit.sh).
+# Enable once per clone: cargo xtask hooks
+"$(git rev-parse --show-toplevel)/scripts/review/review-commit.sh"
+exit 0

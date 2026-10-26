@@ -1,0 +1,102 @@
+# Contributing to open_mess
+
+open_mess connects messengers (Teams first) to AI agents through one Rust daemon, with MCP for
+agents and a CLI for people. It is in the design phase; the design is
+[`.specs/2026-10-26-open-mess-design.md`](.specs/2026-10-26-open-mess-design.md).
+
+This page covers how to build it, how the code is laid out, the rules that aren't negotiable,
+how specs and commits are reviewed, and how to send a change. [AGENTS.md](AGENTS.md) has the
+long form of the rules; it is written for AI agents but is the most complete description of the
+house style.
+
+## Get it running
+
+You need stable Rust 1.85 or newer and git.
+
+```bash
+cargo build
+cargo run -p open-mess
+cargo xtask ci
+```
+
+`cargo xtask ci` runs exactly what CI runs: `cargo fmt --check`, `cargo clippy -D warnings` and
+the tests. Run it before every commit.
+
+## How the code is laid out
+
+| Path | What |
+|---|---|
+| `crates/open-mess/` | the `om` binary: daemon and CLI |
+| `xtask/` | repository tasks (`cargo xtask ci`, `cargo xtask hooks`) |
+| `.specs/` | specs, one per non-trivial change; review output in `.specs/review/` is local |
+| `scripts/review/` | the Codex and GLM review scripts and their prompts |
+| `.githooks/` | the post-commit hook that sends each commit for review |
+| `plan/` | local notes and plans, gitignored, never committed |
+
+More crates (core, module host, Teams module) arrive with the specs that introduce them.
+
+## Rules that aren't negotiable
+
+1. **Never disturb the official clients.** open_mess is a separate device: it never touches the
+   official apps' local data, never reuses their device ids, never marks messages as read.
+2. **No token extraction.** Accounts sign in through the platform's own sign-in flow.
+3. **No secrets or message contents** in logs, fixtures, docs, issues, PRs or commits.
+4. **Never crash.** No `unwrap`, `expect`, `panic!` or unchecked indexing in non-test code
+   (the workspace lints deny them), no `unsafe` without a listed exception.
+5. **One tool registry.** Every capability is the same tool over MCP and the CLI.
+6. **Everything is tested.** New behaviour comes with tests that fail without it. CI never uses
+   real accounts.
+7. **Permissive dependencies only.** open_mess is MIT OR Apache-2.0; `deny.toml` lists the
+   accepted licences. Say in the PR which dependency you add and why.
+
+## Specs
+
+A non-trivial change starts as `.specs/<slug>.md`: goal, context, steps, touched files,
+acceptance criteria, a threat model and a rebuttal register (AGENTS.md, "Specs"). The spec is
+reviewed by Codex and GLM before any code is written:
+
+```bash
+scripts/review/review-spec.sh .specs/<slug>.md 1
+```
+
+Fix the admissible P1/P2 findings or record a rebuttal, then run round 2, and so on. The spec is
+ready when both reviewers approve, or when both report only P3 for two rounds in a row.
+
+## Reviews
+
+Every commit is reviewed by Codex and GLM. Enable the hook once per clone:
+
+```bash
+cargo xtask hooks
+```
+
+After each commit the hook writes the diff to `.reviews/<sha>.patch` and starts both reviewers in
+the background; committing is never blocked. Verdicts arrive in `.reviews/<sha>-codex.txt` and
+`.reviews/<sha>-glm.txt`. Before you push, deal with every P1/P2 (a follow-up commit, or a reason
+it doesn't apply) and write `.reviews/<sha>.processed`.
+
+The review tooling needs Windows with:
+
+- PowerShell 7 (`pwsh`),
+- the Codex CLI (`codex`), signed in,
+- `opencode` with the Z.ai coding plan (`zai-coding-plan/glm-5.3`), signed in.
+
+`scripts/review/run-reviewer.ps1` times out a stuck reviewer, retries it, and falls back to
+another model when one is unavailable. Without these tools the hook prints a notice and skips the
+review; a maintainer then reviews your commits before merge.
+
+## Sending a change
+
+1. Branch from the latest `main`; one topic per branch.
+2. Spec approved (for non-trivial changes), `cargo xtask ci` green, commits reviewed and
+   reconciled.
+3. Open a pull request and fill in the template. CI must pass: format, Clippy, tests on Windows
+   and Linux, and the dependency check. Pull requests are squash-merged.
+4. Never force-push `main`. Rebase your own branch when it conflicts; don't merge `main` into it.
+
+Commit messages are plain English with an imperative subject and a body that says why.
+
+## Licence
+
+By contributing you agree that your work is dual-licensed under MIT or Apache-2.0, like the rest
+of open_mess.

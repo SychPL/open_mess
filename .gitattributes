@@ -1,0 +1,2 @@
+# LF everywhere: shell scripts and hooks break with CRLF, and Windows and Linux CI must see the same bytes.
+* text=auto eol=lf
