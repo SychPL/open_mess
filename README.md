@@ -27,8 +27,8 @@ one syntax and real sign-in.
   integrations, daemon status. Closing it leaves the daemon running.
 - **Modules**: each platform is a WebAssembly component loaded at run time, so adding a messenger
   doesn't need a rebuild. The core does all networking, storage and secret handling for them.
-- **Triggers**: wake an agent when someone writes to you (into an open Claude Code session, as a
-  new agent run, or as a webhook), with batching, quiet hours and approval before sending.
+- **Triggers**: wake an agent when someone writes to you (into an open Claude Code session, or as
+  a new agent run), with batching, quiet hours and approval before sending.
 - **Coexistence**: open_mess acts like a separate device. Your official Teams keeps working as
   before, and reading through open_mess never marks anything as read.
 

@@ -52,7 +52,8 @@ Etap 1 jest skończony, gdy:
 - interfejs do czatowania dla człowieka,
 - Linux i macOS jako platforma produktu (nie wydajemy, nie testujemy okna, logowania WAM ani autostartu). CI uruchamia jednak testy rdzenia także na Linuksie, żeby rdzeń nie zależał od Windows,
 - sklep / podpisywanie modułów od osób trzecich,
-- oznaczanie wiadomości jako przeczytane (świadomie brak takiego narzędzia).
+- oznaczanie wiadomości jako przeczytane (świadomie brak takiego narzędzia),
+- webhooki wyzwalaczy: wysyłałyby treść wiadomości poza komputer użytkownika (AGENTS.md); jeśli kiedyś wrócą, to z osobnym specem i jawną zgodą na to, co opuszcza maszynę (recenzja R2).
 
 ## 6. Czego nie wolno (porażka, nawet jeśli reszta działa)
 
@@ -97,8 +98,8 @@ Podział odpowiedzialności:
 - **Moduł** zna protokół platformy: jakie zapytania wysłać, jak zinterpretować odpowiedzi i zdarzenia, jak przebiega logowanie.
 - **Rdzeń (host)** wykonuje wszystko, co dotyka świata zewnętrznego, i udostępnia to modułowi jako importy:
   - HTTP i WebSocket (z limitami tempa, ponawianiem po 429 / `Retry-After`, logowaniem bez sekretów),
-  - lista dozwolonych hostów sieciowych per moduł: deklarowana w manifeście (dokładne nazwy albo wzorce sufiksu, np. `*.sharepoint.com` dla domeny SharePoint organizacji, nieznanej w chwili budowy modułu), pokazywana użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie, egzekwowana przez rdzeń. Niezależnie od listy rdzeń twardo blokuje adresy pętli zwrotnej, link-local i prywatne (IPv4 i IPv6), sprawdzając adres po rozwiązaniu nazwy (ochrona przed DNS rebinding), więc żaden moduł nie dosięgnie usług lokalnych ani sieci LAN,
-  - trwałe przechowywanie danych modułu (klucz-wartość),
+  - lista dozwolonych hostów sieciowych per moduł: deklarowana w manifeście (dokładne nazwy albo wzorce sufiksu, np. `*.sharepoint.com` dla domeny SharePoint organizacji, nieznanej w chwili budowy modułu), pokazywana użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie, egzekwowana przez rdzeń. Niezależnie od listy rdzeń twardo blokuje adresy pętli zwrotnej, link-local i prywatne (IPv4 i IPv6), sprawdzając adres po rozwiązaniu nazwy (ochrona przed DNS rebinding), więc żaden moduł nie dosięgnie usług lokalnych ani sieci LAN. Rdzeń łączy się dokładnie z adresem, który sprawdził (bez drugiego rozwiązywania nazwy), i nie podąża automatycznie za przekierowaniami HTTP: każdy krok przekierowania przechodzi tę samą kontrolę listy hostów i adresu, a limit kroków jest stały,
+  - trwałe przechowywanie danych modułu (klucz-wartość) z limitem rozmiaru per moduł; zapis ponad limit zwraca błąd,
   - sekrety (tokeny odświeżania itp.) w Menedżerze poświadczeń Windows - moduł nigdy nie dostaje dostępu do sekretów innego modułu,
   - zegar i timery,
   - "prymitywy logowania" wyświetlane w oknie konfiguracji: pokaż kod urządzenia, pokaż kod QR, otwórz stronę logowania w osadzonym oknie przeglądarki i zwróć adres, na który nastąpiło przekierowanie, użyj konta Windows (WAM) - szczegóły w sekcji 9.1,
@@ -130,7 +131,7 @@ Czytanie:
 - `mentions` - wzmianki o użytkowniku,
 - `read_messages` - historia rozmowy / kanału / wątku, ze stronicowaniem,
 - `search` - wyszukiwanie wiadomości,
-- `get_attachment` - pobranie załącznika (zrzut ekranu, PDF) do pliku lokalnego, żeby agent mógł go przeczytać,
+- `get_attachment` - pobranie załącznika (zrzut ekranu, PDF) do pliku lokalnego, żeby agent mógł go przeczytać. Ścieżkę wybiera rdzeń: plik trafia do zarządzanego katalogu (`%APPDATA%\open_messttachments\`) pod oczyszczoną nazwą, nigdy nie nadpisuje istniejących plików, a narzędzie zwraca ścieżkę; agent nie podaje ścieżki docelowej (recenzja R2),
 - `writing_context` - przykłady wiadomości napisanych przez użytkownika w danej rozmowie, żeby agent pisał jego stylem (przeniesione z `teams-wrapper`, łącznie z filtrami: tylko wiadomości użytkownika, bez sekretów, kodu, samych linków, danych operacyjnych).
 
 Pisanie:
@@ -145,7 +146,7 @@ Stan:
 
 Czytanie nigdy nie oznacza wiadomości jako przeczytanych.
 
-Wyniki narzędzi czytających (`unread`, `mentions`, `read_messages`, `search`, `list_conversations`) oddzielają treść pochodzącą od innych osób (tekst, nazwy, nazwy plików) od metadanych i oznaczają ją jako niezaufaną, tak samo jak powiadomienia wyzwalaczy (AGENTS.md).
+Wyniki narzędzi czytających (`unread`, `mentions`, `read_messages`, `search`, `list_conversations`, `get_attachment`) oddzielają treść pochodzącą od innych osób (tekst, nazwy, nazwy plików) od metadanych i oznaczają ją jako niezaufaną, tak samo jak powiadomienia wyzwalaczy (AGENTS.md).
 
 Identyfikatory rozmów i wiadomości są nieprzezroczyste dla agenta i jednoznacznie wskazują platformę i konto. Treść wiadomości dla agenta: zwykły tekst / Markdown (konwersja z HTML Teams i z powrotem po stronie modułu).
 
@@ -158,10 +159,7 @@ Ustawiane w sekcji "Uprawnienia agentów" okna, per konto, opcjonalnie zawężon
 
 **Samodzielne wysyłanie jest opcją do wyboru** (decyzja użytkownika): agent może wysyłać bez potwierdzenia tylko tam, gdzie użytkownik świadomie ustawił "samodzielnie" - per konto, opcjonalnie zawężone do wybranych rozmów. Nowe konto startuje z "z potwierdzeniem" (decyzja projektowa).
 
-Kto ma jakie uprawnienia (decyzja projektowa, recenzja R1):
-- Klienci MCP i CLI używają wspólnego tokenu lokalnego API i dostają uprawnienia konta/rozmowy.
-- Agent uruchomiony przez wyzwalacz (akcja 2 w 8.7) dostaje od demona własny token zakresowy, ważny tylko do końca tego uruchomienia (zakończenie procesu albo limit czasu). Uprawnienia tego tokenu to minimum z uprawnień konta/rozmowy i uprawnień reguły. Reguła może tylko zawęzić, nigdy rozszerzyć - np. konto "samodzielnie" + reguła "tylko czytanie i przygotowanie" = wysyłka tylko przez zatwierdzenie; konto z czytaniem "nie" = brak czytania niezależnie od reguły.
-- Powiadomienie do otwartej sesji (akcja 1 w 8.7) nie zmienia uprawnień tej sesji: działa ona dalej z uprawnieniami konta. Jeśli konto ma "samodzielnie", obudzona sesja może wysłać bez zatwierdzenia - okno konfiguracji ostrzega o tym przy zapisie takiej reguły. Kto tego nie chce, ustawia na koncie albo w danej rozmowie "z potwierdzeniem" albo używa akcji 2.
+Kto ma jakie uprawnienia (decyzja projektowa, recenzje R1 i R2): **jedne zasady dla każdego wywołującego.** Rdzeń egzekwuje wyłącznie uprawnienia konta/rozmowy, tak samo dla MCP, CLI, sesji obudzonej powiadomieniem i agenta uruchomionego przez wyzwalacz. Nie ma tokenów zakresowych ani uprawnień per reguła: każdy proces na koncie użytkownika może wywołać CLI ze wspólnym tokenem, więc węższe uprawnienia dla jednego wywołującego dałoby się obejść zwykłym `om send` z narzędzia Bash. Kto nie chce, żeby agent obudzony przez wyzwalacz wysyłał bez zatwierdzenia, ustawia dla konta albo danej rozmowy "z potwierdzeniem". Okno konfiguracji ostrzega przy zapisie reguły wyzwalacza, która obejmuje konto albo rozmowę z "samodzielnie".
 
 "Z potwierdzeniem" oznacza, że działa tylko ścieżka `prepare_message` -> `send_prepared`, a `send_prepared` przechodzi dopiero po zatwierdzeniu **poza zasięgiem agenta**: powiadomienie Windows z dokładną rozmową, odbiorcami i tekstem oraz przyciskami Wyślij / Odrzuć, a także lista "Do zatwierdzenia" w oknie konfiguracji. Zgoda wyrażona w czacie z agentem nie wystarcza, bo agent mógłby ją zmyślić albo wywołać `send_prepared` sam. Dotyczy to agentów w sesji interaktywnej, agentów uruchomionych przez wyzwalacz i CLI. Decyzja projektowa.
 
@@ -176,14 +174,13 @@ Sekcja "Wyzwalacze" w oknie. Reguła = warunek + akcja.
 Warunki: DM do użytkownika, wzmianka, nowa wiadomość w wybranej rozmowie, wiadomość od wybranych osób; zawsze w ramach konkretnego konta.
 
 Akcje:
-1. **Wpis do otwartej sesji Claude Code** przez kanał MCP (`notifications/claude/channel`, z deklaracją możliwości `experimental: { "claude/channel": {} }` - mechanizm używany przez wtyczkę Telegram, potwierdzony dla transportu stdio). Jeśli kanał nie działa przez transport HTTP, budujący dodaje cienki most stdio (`om mcp-stdio`), który tylko przekazuje komunikaty do demona. Most uruchamia i kończy Claude Code; żyje tyle co sesja, która włączyła kanały - po jednym na taką sesję. To jedyny wyjątek od zasady jednego procesu (sekcja 6): bez logiki platform, bez sesji kont, bez własnego stanu. Claude Code dostarcza kanały tylko do sesji uruchomionych z włączonymi kanałami (flaga przy starcie; dla serwera spoza listy zatwierdzonych wtyczek prawdopodobnie tryb deweloperski) - to akceptowalne, okno konfiguracji pokazuje gotowe polecenie startu. Gdy takich sesji jest kilka, powiadomienie dostaje ostatnio aktywna (bez duplikatów); gdy nie ma żadnej, działa akcja 2, jeśli reguła ją ma. Decyzja projektowa (pytanie z przeglądu dokumentu).
-2. **Uruchomienie agenta od zera** gdy nie ma sesji: demon uruchamia skonfigurowany program (np. `claude -p` albo Codex) ze stałą listą argumentów ustaloną w regule, bezpośrednio, bez powłoki. Treść zdarzenia nigdy nie jest wklejana do polecenia ani argumentów: trafia do programu przez stdin albo jako ścieżka do pliku z treścią, oznaczoną jako niezaufana. Proces dostaje token zakresowy z 8.6 (np. przez konfigurację MCP przekazaną w zmiennej środowiskowej albo pliku tymczasowym). Decyzja projektowa (recenzja R1).
-3. **Webhook** HTTPS z podpisem HMAC (jak w `teams-wrapper`).
+1. **Wpis do otwartej sesji Claude Code** przez kanał MCP (`notifications/claude/channel`, z deklaracją możliwości `experimental: { "claude/channel": {} }` - mechanizm używany przez wtyczkę Telegram, potwierdzony dla transportu stdio). Jeśli kanał nie działa przez transport HTTP, budujący dodaje cienki most stdio (`om mcp-stdio`), który tylko przekazuje komunikaty do demona. Claude Code sam uruchamia most jako swój serwer MCP (stdio) i kończy go razem z sesją; most niczego nie uruchamia, tylko przekazuje komunikaty - po jednym na sesję z włączonymi kanałami. To jedyny wyjątek od zasady jednego procesu (sekcja 6): bez logiki platform, bez sesji kont, bez własnego stanu. Claude Code dostarcza kanały tylko do sesji uruchomionych z włączonymi kanałami (flaga przy starcie; dla serwera spoza listy zatwierdzonych wtyczek prawdopodobnie tryb deweloperski) - to akceptowalne, okno konfiguracji pokazuje gotowe polecenie startu. Gdy takich sesji jest kilka, powiadomienie dostaje ostatnio aktywna (bez duplikatów); gdy nie ma żadnej, działa akcja 2, jeśli reguła ją ma. Decyzja projektowa (pytanie z przeglądu dokumentu).
+2. **Uruchomienie agenta od zera** gdy nie ma sesji: demon uruchamia skonfigurowany program (np. `claude -p` albo Codex) ze stałą listą argumentów ustaloną w regule, bezpośrednio, bez powłoki. Treść zdarzenia nigdy nie jest wklejana do polecenia ani argumentów: trafia do programu przez stdin albo jako ścieżka do pliku z treścią, oznaczoną jako niezaufana. Proces korzysta z MCP/CLI na tych samych zasadach co każdy inny wywołujący (8.6). Decyzja projektowa (recenzja R1).
 
 Zabezpieczenia (decyzje projektowe):
 - grupowanie: zdarzenia z jednej rozmowy są zbierane i wysyłane jako jedno powiadomienie po chwili ciszy,
 - cisza nocna i limit pobudek na godzinę per reguła,
-- treść od innych osób jest przekazywana jako dane, wyraźnie oznaczona jako niezaufana; agent uruchomiony przez wyzwalacz (akcja 2) domyślnie może tylko czytać i przygotowywać wiadomości (wysyłka przez "Do zatwierdzenia"), chyba że reguła pozwala na więcej - nadal nie więcej niż konto (8.6).
+- treść od innych osób jest przekazywana jako dane, wyraźnie oznaczona jako niezaufana; agent obudzony albo uruchomiony przez wyzwalacz ma uprawnienia konta/rozmowy (8.6), a okno ostrzega przy regułach obejmujących "samodzielnie".
 
 ### 8.8 Okno konfiguracji
 
@@ -215,7 +212,7 @@ Sposoby logowania, w kolejności preferencji (pierwsze zadanie implementacji to 
 2. **Osadzona strona logowania** - kod autoryzacji + PKCE w oknie WebView2, rdzeń przechwytuje przekierowanie.
 3. **Kod urządzenia** - użytkownik wpisuje kod na stronie Microsoftu.
 
-Po zalogowaniu: token odświeżania w sekretach; tokeny dostępu (m.in. dla API czatów, wyszukiwania) odświeżane z wyprzedzeniem, przed wygaśnięciem. Błąd 401 -> jedna próba odświeżenia -> dopiero potem stan "zaloguj ponownie". Hasło użytkownika nigdy nie przechodzi przez open_mess poza stroną logowania Microsoftu.
+Po zalogowaniu (decyzja projektowa, recenzja R2): przy logowaniu przez WAM aplikacja nie dostaje tokenu odświeżania - sesję trzyma broker Windows, a odnowienie to ciche pobranie tokenu przez WAM; przy osadzonej stronie logowania i kodzie urządzenia token odświeżania trafia do sekretów. W obu przypadkach tokeny dostępu (m.in. dla API czatów, wyszukiwania) odświeżane z wyprzedzeniem, przed wygaśnięciem. Błąd 401 -> jedna próba odświeżenia -> dopiero potem stan "zaloguj ponownie". Hasło użytkownika nigdy nie przechodzi przez open_mess poza stroną logowania Microsoftu.
 
 ### 9.2 Współistnienie z oficjalnym Teams
 
@@ -256,7 +253,7 @@ Przyczyny problemów (analiza kodu, 2026-10-26):
 - **Wylogowania** (prawie pewne): wrapper uruchamia ukryty Chromium z pełnym Teams Web i podsłuchuje z niego nagłówki z tokenem. Sam tokenu nie odświeża - polega na tym, że ukryta strona wyśle kolejne zapytanie. Po wygaśnięciu tokenu (około godziny) dostaje 401 i przechodzi w "auth_required".
 - **Puste rozmowy w oficjalnym Teams** (niepotwierdzone, dwie hipotezy): (a) drugi pełny klient Teams działający cały czas w tle z zablokowanymi zapytaniami o potwierdzenia odczytu; (b) skrypt skilla `log-time` (`teams-peer-resolver.ps1`) kopiuje pliki IndexedDB oficjalnego Teams w trakcie jego pracy - otwarty uchwyt może uniemożliwić Teams porządkowanie bazy i doprowadzić do uznania pamięci podręcznej za uszkodzoną. Hipoteza (b) dotyczy narzędzia poza open_mess i warto ją sprawdzić niezależnie.
 
-Do przeniesienia: dwuetapowa wysyłka, czytanie bez oznaczania jako przeczytane, `writing_context` z filtrami, MCP przez HTTP w jednym procesie dla Claude i Codexa, webhook z HMAC, jawny błąd przy niezgodnym protokole.
+Do przeniesienia: dwuetapowa wysyłka, czytanie bez oznaczania jako przeczytane, `writing_context` z filtrami, MCP przez HTTP w jednym procesie dla Claude i Codexa, jawny błąd przy niezgodnym protokole. Webhook z `teams-wrapper` świadomie nie przechodzi do etapu 1 (sekcja 5).
 
 Do uniknięcia: przeglądarka w tle, podsłuchiwanie tokenów, dotykanie danych oficjalnego klienta.
 
@@ -309,7 +306,7 @@ Decyzje projektowe (moje, do sprawdzenia przy czytaniu):
 - grupowanie, cisza nocna i limity wyzwalaczy; domyślnie obudzony agent nie wysyła bez zatwierdzenia,
 - sekrety w Menedżerze poświadczeń Windows, stan w SQLite, brak lokalnego archiwum wiadomości,
 - brak narzędzia do oznaczania jako przeczytane,
-- reguły wyzwalaczy tylko zawężają uprawnienia; agent z akcji 2 dostaje token zakresowy na czas uruchomienia (8.6),
+- jedne uprawnienia (konta/rozmowy) dla każdego wywołującego, bez tokenów zakresowych i uprawnień per reguła; brak webhooków w etapie 1 (8.6, 5),
 - limity czasu i pamięci dla modułów WASM; lista hostów modułu zatwierdzana przez użytkownika, adresy lokalne i prywatne zawsze zablokowane (8.3),
 - docelowe zużycie pamięci poniżej ~60 MB,
 - nazwa pliku wykonywalnego `om.exe`, dane w `%APPDATA%\open_mess\`,
@@ -339,14 +336,14 @@ Niezaufane:
 - treść wiadomości, nazwy, załączniki i wszystko inne pochodzące od innych osób,
 - odpowiedzi serwerów platform i zdarzenia WebSocket (mogą mieć nieznany albo zepsuty kształt),
 - moduły WASM spoza repo (izolacja, lista dozwolonych hostów, brak dostępu do cudzych sekretów),
-- adresy webhooków podane w konfiguracji (tylko HTTPS, podpis HMAC, bez sekretów w treści).
 
 Granica twardnienia (zamrożona): nie bronimy się przed złośliwym kodem działającym na koncie Windows użytkownika z zamiarem obejścia open_mess - taki kod może i tak czytać Menedżer poświadczeń, symulować terminal albo klikać w powiadomienia. Bronimy się przed agentem, który przez pomyłkę albo manipulację próbuje zrobić więcej, niż pozwalają uprawnienia, używając zwykłych narzędzi (MCP, CLI z narzędzia Bash).
 
 ## 16. Rejestr rebutali
 
-Brak (przed pierwszą rundą recenzji).
+Brak odrzuconych zgłoszeń: w R1 i R2 wszystkie zgłoszenia przyjęto.
 
 ## Changelog rund
 
 - R1 (Codex REJECT, GLM REJECT): reguły wyzwalaczy tylko zawężają uprawnienia, tokeny zakresowe dla uruchomień z akcji 2, akcja 1 dziedziczy uprawnienia konta z ostrzeżeniem (Codex P1, GLM P2); limity czasu i pamięci modułów WASM (Codex P2); most stdio jako jawny, długożyjący wyjątek od zasady jednego procesu (Codex P2); akcja 2 bez powłoki i bez wklejania treści do polecenia (GLM P2); lista hostów modułu zatwierdzana przez użytkownika, wzorce sufiksu, twarda blokada adresów lokalnych i prywatnych (GLM P2, P3); oznaczanie niezaufanej treści w wynikach narzędzi (GLM P3); doprecyzowanie Linuksa w CI (GLM P3); token API przy pierwszym uruchomieniu (GLM P3).
+- R2 (Codex REJECT, GLM REJECT): usunięte tokeny zakresowe i uprawnienia per reguła - wszyscy wywołujący mają uprawnienia konta/rozmowy, bo agent może obejść węższe uprawnienia przez `om send` (Codex P1); WAM bez tokenu odświeżania, odnowienie przez broker (Codex P2); przypięcie połączenia do sprawdzonego adresu i kontrola każdego przekierowania (GLM P2); `get_attachment` zapisuje tylko do zarządzanego katalogu (GLM P2); webhooki usunięte z etapu 1, bo wysyłałyby treść poza maszynę (GLM P2); limit magazynu modułu, cykl życia mostu stdio, `get_attachment` w oznaczaniu niezaufanej treści, rejestr rebutali (GLM P3).
