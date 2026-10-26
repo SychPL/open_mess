@@ -1,7 +1,7 @@
 # Contributing to open_mess
 
 open_mess connects messengers (Teams first) to AI agents through one Rust daemon, with MCP for
-agents and a CLI for people. It is in the design phase; the design is
+agents and a CLI for people. It is in early development; the design is
 [`.specs/2026-10-26-open-mess-design.md`](.specs/2026-10-26-open-mess-design.md).
 
 This page covers how to build it, how the code is laid out, the rules that aren't negotiable,
@@ -11,11 +11,11 @@ house style.
 
 ## Get it running
 
-You need stable Rust 1.85 or newer and git.
+You need stable Rust 1.89 or newer and git.
 
 ```bash
 cargo build
-cargo run -p open-mess
+cargo run -p open-mess -- daemon
 cargo xtask ci
 ```
 
@@ -26,7 +26,16 @@ the tests. Run it before every commit.
 
 | Path | What |
 |---|---|
-| `crates/open-mess/` | the `om` binary: daemon and CLI |
+| `crates/open-mess/` | the `om` binary: daemon and CLI (library `open_mess` plus `src/main.rs`) |
+| `crates/open-mess/src/daemon.rs` | `om daemon`: start-up order, the last start error, running until Ctrl+C |
+| `crates/open-mess/src/instance.rs` | single-instance lock (`daemon.lock` in the data folder) |
+| `crates/open-mess/src/paths.rs` | the data folder: `%APPDATA%\open_mess`, or `OPEN_MESS_DATA_DIR` |
+| `crates/open-mess/src/store.rs` | SQLite state (`state.sqlite3`): schema migrations, configuration such as the port |
+| `crates/open-mess/src/secrets.rs` | secrets in Windows Credential Manager, starting with the local API token |
+| `crates/open-mess/src/tools.rs` | the tool registry: every tool, for MCP and the CLI alike |
+| `crates/open-mess/src/api.rs` | the local API on `127.0.0.1`: bearer token, `/mcp` (MCP) and `/api` (CLI) |
+| `crates/open-mess/src/cli.rs` | the `om` command line, generated from the registry |
+| `crates/open-mess/tests/` | integration tests: the API, the CLI and the daemon process |
 | `xtask/` | repository tasks (`cargo xtask ci`, `cargo xtask hooks`) |
 | `.specs/` | specs, one per non-trivial change; review output in `.specs/review/` is local |
 | `scripts/review/` | the Codex and GLM review scripts and their prompts |
