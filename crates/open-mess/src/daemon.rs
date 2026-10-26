@@ -1,5 +1,6 @@
 //! `om daemon`: the background process that serves the local API.
 
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,7 +28,8 @@ pub fn run() -> Result<(), Error> {
         let _ = std::fs::write(&error_file, format!("{}\n", err.to_string().replace(['\r', '\n'], " ")));
     })?;
     let _ = std::fs::remove_file(&error_file);
-    println!("open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
+    // Never println!: it panics when the launcher has closed stdout.
+    let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
     runtime.block_on(api::serve(listener, token, Arc::new(Registry::with_builtin(started)), ctrl_c()))
 }
 

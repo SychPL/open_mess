@@ -22,3 +22,6 @@ todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
 indexing_slicing = "deny"
+# println!/eprintln! panic when stdout/stderr is closed; write with writeln! and ignore the error.
+print_stdout = "deny"
+print_stderr = "deny"

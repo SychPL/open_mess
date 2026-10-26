@@ -142,3 +142,13 @@ fn cli_mcp_command() {
     assert!(stdout.contains("open_mess http://127.0.0.1:7400/mcp"), "{stdout}");
     assert!(stdout.contains("\"Authorization: Bearer t0ken\""), "{stdout}");
 }
+
+#[test]
+fn cli_version_and_bad_usage() {
+    let dir = data_dir();
+    let output = om(dir.path(), free_port(), TOKEN, &["--version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), format!("om {}", env!("CARGO_PKG_VERSION")));
+    let output = om(dir.path(), free_port(), TOKEN, &["--no-such-flag"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+}

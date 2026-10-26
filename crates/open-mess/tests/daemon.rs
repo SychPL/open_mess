@@ -6,11 +6,12 @@
 // Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
 #![allow(clippy::unwrap_used)]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use open_mess::store::Store;
 
@@ -37,6 +38,28 @@ fn start_daemon(data_dir: &Path) -> Child {
     let line = line_rx.recv_timeout(Duration::from_secs(20)).unwrap();
     assert!(line.starts_with("open_mess daemon listening on http://127.0.0.1:"), "{line}");
     child
+}
+
+/// A raw `GET /api/tools` without a token, retried until the daemon listens.
+fn unauthenticated_get(port: u16) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let _ = stream.write_all(
+                b"GET /api/tools HTTP/1.1
+Host: 127.0.0.1
+Connection: close
+
+",
+            );
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            return answer;
+        }
+        assert!(Instant::now() < deadline, "the daemon never listened");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -75,4 +98,22 @@ fn failed_start_leaves_its_reason_until_the_next_good_start() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     assert!(removed);
+}
+
+#[test]
+fn closed_stdout_does_not_stop_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    Store::open(&dir.path().join("state.sqlite3")).unwrap().set_config("port", &port.to_string()).unwrap();
+
+    let mut daemon = om(dir.path()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    // The launcher goes away before the daemon prints its listening line.
+    drop(daemon.stdout.take());
+    let answer = unauthenticated_get(port);
+    let exited = daemon.try_wait().unwrap();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+
+    assert!(answer.starts_with("HTTP/1.1 401"), "{answer:?}");
+    assert!(exited.is_none(), "{exited:?}");
 }

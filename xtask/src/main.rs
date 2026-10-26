@@ -3,6 +3,9 @@
 //! `cargo xtask ci` runs the same gates as CI (fmt, clippy, tests); run it before every commit.
 //! `cargo xtask hooks` points git at `.githooks/`, which sends every commit to the Codex and GLM reviewers.
 
+// A developer tool: printing here may panic, it never takes the daemon down.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::process::{Command, ExitCode};
 
 const CI_STEPS: &[&[&str]] = &[

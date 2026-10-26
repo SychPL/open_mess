@@ -4,6 +4,7 @@
 //! `om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]`. The CLI asks the running
 //! daemon which tools exist, so the CLI and MCP always offer the same tools.
 
+use std::io::Write as _;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -77,7 +78,7 @@ pub fn run() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            eprintln!("{}", failure.message);
+            let _ = writeln!(std::io::stderr(), "{}", failure.message);
             ExitCode::from(failure.code)
         }
     }
@@ -86,7 +87,11 @@ pub fn run() -> ExitCode {
 fn mcp_command() -> Result<(), Failure> {
     let port = port()?;
     let token = token()?;
-    println!("claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\"");
+    // Writes ignore errors: println! panics when stdout is closed (`om status | head -1`).
+    let _ = writeln!(
+        std::io::stdout(),
+        "claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\""
+    );
     Ok(())
 }
 
@@ -164,7 +169,8 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
     let token = token()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?;
     let result = runtime.block_on(call(port, &token, tool, &args))?;
-    print_result(&result, json_output);
+    // A closed stdout (`om status | head -1`) is not an error of the tool.
+    let _ = print_result(&result, json_output);
     Ok(())
 }
 
@@ -205,16 +211,18 @@ async fn check(response: reqwest::Response) -> Result<reqwest::Response, Failure
     }
 }
 
-fn print_result(result: &Value, json_output: bool) {
+fn print_result(result: &Value, json_output: bool) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
     match result {
         Value::Object(fields) if !json_output => {
             for (key, value) in fields {
                 match value {
-                    Value::String(text) => println!("{key}: {text}"),
-                    other => println!("{key}: {other}"),
+                    Value::String(text) => writeln!(stdout, "{key}: {text}")?,
+                    other => writeln!(stdout, "{key}: {other}")?,
                 }
             }
+            Ok(())
         }
-        _ => println!("{}", serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())),
+        _ => writeln!(stdout, "{}", serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())),
     }
 }
