@@ -23,6 +23,9 @@ pub enum ToolError {
     UnknownTool(String),
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
+    /// A module could not run the tool, or failed; the message is safe to show.
+    #[error("{0}")]
+    Module(String),
 }
 
 /// The tools of this daemon.
@@ -46,7 +49,7 @@ impl Registry {
     }
 
     /// Runs a tool. `args` is the arguments object.
-    pub fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+    pub async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
         match name {
             "status" => {
                 no_params(&args)?;
