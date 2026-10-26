@@ -119,7 +119,8 @@ async fn status_lists_modules() {
     install(dir.path(), "echo.wasm", &echo());
     install(dir.path(), "broken.wasm", b"not a component");
     approve_all(&store, &scan(&store, &engine, dir.path()).await);
-    let registry = Registry::new(Instant::now(), scan(&store, &engine, dir.path()).await);
+    let modules = scan(&store, &engine, dir.path()).await;
+    let registry = Registry::new(Instant::now(), common::accounts(dir.path(), modules, keyring_core::mock::Store::new().unwrap()));
 
     let status = registry.call("status", json!({})).await.unwrap();
     let modules = status["modules"].as_array().unwrap();

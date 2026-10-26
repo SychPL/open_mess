@@ -110,6 +110,7 @@ async fn call_tool(State(registry): State<Arc<Registry>>, Path(tool): Path<Strin
         Err(err @ ToolError::InvalidArgs(_)) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
         // The daemon is fine; the module behind the tool is not.
         Err(err @ ToolError::Module(_)) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+        Err(err @ ToolError::Failed(_)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 
@@ -152,7 +153,7 @@ impl ServerHandler for McpServer {
             // MCP: an unknown tool is a protocol error; bad arguments and module failures are tool
             // errors the model can see and act on.
             Err(err @ ToolError::UnknownTool(_)) => Err(ErrorData::invalid_params(err.to_string(), None)),
-            Err(err @ (ToolError::InvalidArgs(_) | ToolError::Module(_))) => {
+            Err(err @ (ToolError::InvalidArgs(_) | ToolError::Module(_) | ToolError::Failed(_))) => {
                 Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]).into())
             }
         }

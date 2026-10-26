@@ -3,6 +3,7 @@
 //! module only ever reaches its own service (spec 8.3). The module's storage lists the names of its
 //! secrets, which caps their number at `MAX_SECRETS`.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use keyring_core::Entry;
@@ -11,8 +12,8 @@ use keyring_core::api::CredentialStore;
 use crate::limits;
 use crate::storage::{Storage, StorageError};
 
-/// The platform credential store, set up on first use.
-pub(crate) fn platform_store() -> Result<Arc<CredentialStore>, String> {
+/// The platform credential store, set up on first use. It becomes keyring-core's default store.
+pub fn platform_store() -> Result<Arc<CredentialStore>, String> {
     keyring::Entry::store_status().as_ref().map_err(|e| format!("credential store unavailable: {e}"))?;
     keyring_core::get_default_store().ok_or_else(|| "credential store unavailable".to_string())
 }
@@ -62,6 +63,19 @@ pub(crate) fn delete(store: &CredentialStore, storage: Option<&mut Storage>, mod
     }
 }
 
+/// Deletes every secret a module stored for one of its accounts, when the account is removed
+/// (spec 8.8). The module's storage lists them. Fails when any is left.
+pub fn delete_account_secrets(store: &CredentialStore, data_dir: &Path, module: &str, account: &str) -> Result<(), String> {
+    let mut storage = Storage::open(data_dir, module).map_err(failed)?;
+    for key in storage.secret_keys(account).map_err(failed)? {
+        delete(store, Some(&mut storage), module, account, &key);
+    }
+    match storage.secret_keys(account).map_err(failed)?.len() {
+        0 => Ok(()),
+        left => Err(format!("{left} secrets could not be deleted")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +117,28 @@ mod tests {
         set(&*store, &mut storage, "m", "acct", "k0", "new").unwrap();
         delete(&*store, Some(&mut storage), "m", "acct", "k1");
         set(&*store, &mut storage, "m", "acct", "one-more", "v").unwrap();
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn account_secrets_go_with_the_account() {
+        let store: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
+        let (dir, mut storage) = temp_storage("account");
+        for (account, key) in [("a", "refresh"), ("a", "device"), ("b", "refresh")] {
+            set(&*store, &mut storage, "account", account, key, "v").unwrap();
+        }
+        delete_account_secrets(&*store, &dir, "account", "a").unwrap();
+        assert_eq!(get(&*store, "account", "a", "refresh"), None);
+        assert_eq!(get(&*store, "account", "a", "device"), None);
+        assert_eq!(get(&*store, "account", "b", "refresh").as_deref(), Some("v"));
+        assert_eq!(storage.secret_keys("a").unwrap(), Vec::<String>::new());
+        // A credential the store refuses to delete is reported, and its name kept.
+        let entry = store.build("open_mess/module/account", "b/refresh", None).unwrap();
+        let cred: &keyring_core::mock::Cred = entry.as_any().downcast_ref().unwrap();
+        cred.set_error(keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))));
+        assert!(delete_account_secrets(&*store, &dir, "account", "b").is_err());
+        assert_eq!(storage.secret_keys("b").unwrap(), ["refresh"]);
         drop(storage);
         std::fs::remove_dir_all(dir).unwrap();
     }

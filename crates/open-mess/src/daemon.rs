@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+use crate::accounts::Accounts;
 use crate::instance::InstanceLock;
 use crate::modules::Modules;
 use crate::store::Store;
@@ -61,7 +62,18 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, String, 
     let (events, _) = mpsc::channel(EVENT_QUEUE);
     let ctx = |_: &str| ModuleContext { data_dir: dir.to_path_buf(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
     let modules = runtime.block_on(Modules::scan(&store, &engine, &dir.join("modules"), ctx))?;
-    Ok((runtime, listener, token, Registry::new(started, modules)))
+    // After the local API token: from here on keyring-core's default store is the platform one.
+    let credentials = open_mess_host::credential_store().map_err(|why| Error::Secrets(keyring_core::Error::PlatformFailure(why.into())))?;
+    let accounts = Arc::new(Accounts::new(store, modules, dir.to_path_buf(), credentials));
+    // Sessions come back in the background; the tools answer meanwhile.
+    runtime.spawn({
+        let accounts = Arc::clone(&accounts);
+        async move {
+            // ponytail: a failed restore leaves the stored states; reported once a log sink exists.
+            let _ = accounts.restore().await;
+        }
+    });
+    Ok((runtime, listener, token, Registry::new(started, accounts)))
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.

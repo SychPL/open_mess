@@ -21,3 +21,4 @@ pub use net::{HttpError, Net, Request, Response};
 pub use runtime::{
     AccountInfo, Attachment, Engine, HostEvent, Manifest, ModuleContext, ModuleHandle, NewMessage, SessionState, ToolDecl, WamIdentity,
 };
+pub use secrets::{delete_account_secrets, platform_store as credential_store};

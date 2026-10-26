@@ -5,7 +5,10 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing, dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use keyring_core::api::CredentialStore;
+use open_mess::accounts::Accounts;
 use open_mess::modules::{self, Modules};
 use open_mess::store::Store;
 use open_mess_host::ip_policy::AddressPolicy;
@@ -74,4 +77,15 @@ pub fn approve_all(store: &Store, modules: &Modules) {
     for info in modules.list() {
         modules::approve(store, &info.name, &info.file_sha256, &info.manifest_sha256).unwrap();
     }
+}
+
+/// Approves every module file installed in `data_dir` and loads them.
+pub async fn running(data_dir: &Path, engine: &Engine, events: mpsc::Sender<HostEvent>) -> Modules {
+    let store = store(data_dir);
+    approve_all(&store, &scan(&store, engine, data_dir).await);
+    scan_with(&store, engine, data_dir, events).await
+}
+
+pub fn accounts(data_dir: &Path, modules: Modules, credentials: Arc<CredentialStore>) -> Arc<Accounts> {
+    Arc::new(Accounts::new(store(data_dir), modules, data_dir.to_path_buf(), credentials))
 }

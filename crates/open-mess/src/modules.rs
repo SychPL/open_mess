@@ -315,3 +315,18 @@ fn manifest_sha256(manifest: &Manifest) -> String {
     });
     sha256_hex(canonical.to_string().as_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_files_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.wasm");
+        std::fs::File::create(&path).unwrap().set_len(MAX_MODULE_FILE + 1).unwrap();
+        assert!(read_capped(&path).unwrap_err().contains("larger than 64 MiB"));
+        std::fs::File::create(&path).unwrap().set_len(16).unwrap();
+        assert_eq!(read_capped(&path).unwrap().len(), 16);
+    }
+}

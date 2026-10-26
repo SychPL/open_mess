@@ -8,9 +8,11 @@
 //! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` in
 //! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
-//! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The `restore` export succeeds only for account "known";
-//! the `sign-in` export is not supported; `get-attachment` returns fixed bytes named after the
-//! attachment id.
+//! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
+//! `read_messages` and `unread` return one synthetic message or conversation that names the
+//! account. The `restore` export succeeds only for account "known"; the `sign-in` export is not
+//! supported; `sign-out` reports the account offline; `get-attachment` returns fixed bytes named
+//! after the attachment id.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -44,7 +46,7 @@ mod guest {
         }
     }
 
-    fn call(tool: &str, args_json: &str) -> Result<String, types::ModuleError> {
+    fn call(account: &str, tool: &str, args_json: &str) -> Result<String, types::ModuleError> {
         let args: Value = serde_json::from_str(args_json).map_err(|e| types::ModuleError::InvalidArgs(e.to_string()))?;
         let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
         let result = match tool {
@@ -100,6 +102,20 @@ mod guest {
                 }
                 Err(e) => json!({ "error": http_error(&e) }),
             },
+            "read_messages" => json!({"items": [{
+                "id": "m1",
+                "conversation": text("conversation"),
+                "sent_at": "2026-10-27T10:00:00Z",
+                "edited": false,
+                "own": false,
+                "untrusted": {"sender_name": "Echo", "text": format!("hello {account}")},
+            }]}),
+            "unread" => json!({"items": [{
+                "conversation": "c",
+                "kind": "direct",
+                "unread": "unread",
+                "untrusted": {"title": format!("Echo {account}")},
+            }]}),
             "message" => {
                 host::session("a", host::SessionState::Online);
                 host::message_arrived(&host::NewMessage {
@@ -145,10 +161,12 @@ mod guest {
             if account == "known" { Ok(()) } else { Err(types::ModuleError::AuthRequired(account)) }
         }
 
-        fn sign_out(_account: String) {}
+        fn sign_out(account: String) {
+            host::session(&account, host::SessionState::Offline);
+        }
 
-        fn call(_account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
-            call(&tool, &args_json)
+        fn call(account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
+            call(&account, &tool, &args_json)
         }
 
         // Fixed bytes, named after the attachment id, so tests choose the file name.
