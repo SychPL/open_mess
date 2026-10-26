@@ -1,8 +1,11 @@
 //! Secrets in Windows Credential Manager.
 
+#[cfg(windows)]
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use keyring_core::Entry;
+use keyring_core::api::CredentialStoreApi as _;
 
 use crate::Error;
 
@@ -35,12 +38,24 @@ pub fn stored_local_api_token() -> Result<Option<String>, Error> {
 }
 
 fn local_api_entry() -> Result<Entry, Error> {
-    // Tests install the mock store first; everyone else gets Credential Manager.
-    #[cfg(windows)]
-    if keyring_core::get_default_store().is_none() {
-        keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
+    match keyring_core::get_default_store() {
+        // Only tests install a default store (the mock one).
+        Some(store) => Ok(store.build(SERVICE, LOCAL_API_USER, None)?),
+        None => credential_manager_entry(SERVICE, LOCAL_API_USER),
     }
-    Ok(Entry::new(SERVICE, LOCAL_API_USER)?)
+}
+
+/// A Credential Manager entry with Local persistence: the default, Enterprise, roams with a
+/// roaming Windows profile to the user's other machines, and secrets never leave this one.
+#[cfg(windows)]
+fn credential_manager_entry(service: &str, user: &str) -> Result<Entry, Error> {
+    let local = HashMap::from([("persistence", "local")]);
+    Ok(windows_native_keyring_store::Store::new()?.build(service, user, Some(&local))?)
+}
+
+#[cfg(not(windows))]
+fn credential_manager_entry(_service: &str, _user: &str) -> Result<Entry, Error> {
+    Err(keyring_core::Error::NotSupportedByStore("Credential Manager exists only on Windows".into()).into())
 }
 
 #[cfg(test)]
@@ -56,5 +71,15 @@ mod tests {
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(local_api_token().unwrap(), first);
         assert_eq!(stored_local_api_token().unwrap(), Some(first));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_manager_entries_stay_on_this_machine() {
+        let entry = credential_manager_entry(&format!("open_mess-test-{}", std::process::id()), "persistence").unwrap();
+        entry.set_password("not a secret").unwrap();
+        let persistence = entry.get_attributes().unwrap()["persistence"].clone();
+        entry.delete_credential().unwrap();
+        assert_eq!(persistence, "Local");
     }
 }
