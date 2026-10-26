@@ -78,7 +78,7 @@ Etap 1 jest skończony, gdy:
 
 Jeden plik `om.exe`:
 
-- `om daemon` - uruchamiany automatycznie przy logowaniu do Windows. Zawiera: środowisko modułów WASM, sesje kont, połączenia na żywo, lokalne API (MCP + API dla CLI), wyzwalacze, ikonę w zasobniku i okno konfiguracji otwierane na żądanie.
+- `om daemon` - uruchamiany automatycznie przy logowaniu do Windows. Zawiera: środowisko modułów WASM, sesje kont, połączenia na żywo, lokalne API (MCP + API dla CLI), wyzwalacze, ikonę w zasobniku i okno konfiguracji otwierane na żądanie. Zawsze działa co najwyżej jedna instancja demona na użytkownika Windows (blokada pojedynczej instancji, np. nazwany mutex): drugie uruchomienie kończy się komunikatem, że demon już działa, a równoczesne uruchomienia z CLI nie tworzą drugiej instancji (recenzja R4).
 - `om <polecenie>` - krótko żyjące wywołanie CLI, które łączy się z działającym demonem przez lokalne API. Jeśli demon nie działa, CLI go uruchamia albo zwraca czytelny błąd (wybór budującego).
 
 Lokalne API nasłuchuje wyłącznie na `127.0.0.1`, wymaga losowego tokenu Bearer (generowanego przy pierwszym uruchomieniu demona) i nigdy nie jest wystawiane w sieci.
@@ -104,10 +104,11 @@ Podział odpowiedzialności:
   - zegar i timery,
   - "prymitywy logowania" wyświetlane w oknie konfiguracji: pokaż kod urządzenia, pokaż kod QR, otwórz stronę logowania w osadzonym oknie przeglądarki i zwróć adres, na który nastąpiło przekierowanie, użyj konta Windows (WAM) - szczegóły w sekcji 9.1. Tożsamość logowania jest częścią manifestu i zgody przy instalacji (recenzja R3): moduł deklaruje hosty stron logowania, a dla WAM identyfikator aplikacji i zasoby/zakresy, o które prosi. Okno pokazuje to użytkownikowi do zatwierdzenia przy instalacji i przy każdej zmianie. Rdzeń otwiera w osadzonym oknie tylko adresy HTTPS z zatwierdzonych hostów logowania, zawsze pokazuje w oknie aktualny host strony i przerywa logowanie, gdy strona przejdzie na host spoza listy; WAM dostaje wyłącznie zatwierdzony identyfikator aplikacji i zakresy,
   - emisja zdarzeń (nowa wiadomość, zmiana stanu sesji) do rdzenia, który obsługuje wyzwalacze.
+- **Konto należy do dokładnie jednego modułu** (recenzja R4): kilka modułów może deklarować tę samą platformę, ale każde konto jest przypięte do modułu, który je zalogował; narzędzia i zdarzenia konta obsługuje tylko ten moduł.
 - **Moduł eksportuje**: manifest (nazwa, wersja, platforma, dozwolone hosty, obsługiwane operacje, dodatkowe narzędzia), logowanie i przywracanie sesji, operacje ze wspólnego zestawu (8.5), obsługę zdarzeń na żywo.
 - **Dodatkowe narzędzia modułu**: moduł może zadeklarować własne narzędzia spoza wspólnego zestawu (np. w przyszłości `teams.list_meetings`); rdzeń wystawia je w MCP i CLI z przedrostkiem modułu. To jest furtka dla modułów funkcji (spotkania) z etapów 2-3.
 
-Limity zasobów (decyzja projektowa, recenzje R1 i R3): każde wywołanie modułu ma limit czasu wykonania i limit pamięci. Limit czasu liczy się zegarowo dla całego wywołania, łącznie z czasem w importach rdzenia: epoch/fuel przerywa kod WASM, a importy HTTP i WebSocket mają własne limity połączenia i odczytu, `Retry-After` dłuższy niż ustalony maksymalny czas oczekiwania kończy się błędem zamiast czekania, a po przekroczeniu limitu całego wywołania rdzeń anuluje trwające operacje sieciowe; przekroczenie przerywa wywołanie, moduł jest wyładowywany, a stan i błąd pokazują `status` i okno. Po kilku awariach z rzędu rdzeń nie ładuje modułu ponownie automatycznie. Inne moduły i konta działają dalej. Konkretne wartości limitów - wybór budującego.
+Limity zasobów (decyzja projektowa, recenzje R1 i R3): każde wywołanie modułu ma limit czasu wykonania i limit pamięci. Limit czasu liczy się zegarowo dla całego wywołania, łącznie z czasem w importach rdzenia: epoch/fuel przerywa kod WASM, a importy HTTP i WebSocket mają własne limity połączenia i odczytu, `Retry-After` dłuższy niż ustalony maksymalny czas oczekiwania kończy się błędem zamiast czekania, a po przekroczeniu limitu całego wywołania rdzeń anuluje trwające operacje sieciowe; przekroczenie przerywa wywołanie, moduł jest wyładowywany, a stan i błąd pokazują `status` i okno. Wyjątek: czas, w którym import czeka na człowieka przy logowaniu (strona logowania, kod urządzenia, kod QR, okno WAM), nie wlicza się do tego limitu; ma osobny, długi budżet, użytkownik może przerwać logowanie w oknie, a przekroczenie budżetu albo przerwanie kończy logowanie błędem, nie licząc się jako awaria modułu (recenzja R4). Odpowiedzi HTTP i komunikaty WebSocket mają limit rozmiaru; większe są przerywane z błędem (recenzja R4). Po kilku awariach z rzędu rdzeń nie ładuje modułu ponownie automatycznie. Inne moduły i konta działają dalej. Konkretne wartości limitów - wybór budującego.
 
 Instalacja modułu: plik `.wasm` w katalogu modułów (`%APPDATA%\open_mess\modules\`) albo "Dodaj z pliku" w sekcji Moduły okna. Moduły można włączać i wyłączać bez restartu demona.
 
@@ -131,7 +132,7 @@ Czytanie:
 - `mentions` - wzmianki o użytkowniku,
 - `read_messages` - historia rozmowy / kanału / wątku, ze stronicowaniem,
 - `search` - wyszukiwanie wiadomości,
-- `get_attachment` - pobranie załącznika (zrzut ekranu, PDF) do pliku lokalnego, żeby agent mógł go przeczytać. Ścieżkę wybiera rdzeń: plik trafia do zarządzanego katalogu (`%APPDATA%\open_mess\attachments\`) pod oczyszczoną nazwą, nigdy nie nadpisuje istniejących plików, a narzędzie zwraca ścieżkę; agent nie podaje ścieżki docelowej (recenzja R2),
+- `get_attachment` - pobranie załącznika (zrzut ekranu, PDF) do pliku lokalnego, żeby agent mógł go przeczytać. Ścieżkę wybiera rdzeń: plik trafia do zarządzanego katalogu (`%APPDATA%\open_mess\attachments\`) pod oczyszczoną nazwą, nigdy nie nadpisuje istniejących plików, a narzędzie zwraca ścieżkę; agent nie podaje ścieżki docelowej (recenzja R2). Pojedynczy załącznik ma limit rozmiaru, a katalog ma limit łącznego rozmiaru i czas przechowywania: najstarsze pliki są usuwane po przekroczeniu limitu albo czasu (recenzja R4),
 - `writing_context` - przykłady wiadomości napisanych przez użytkownika w danej rozmowie, żeby agent pisał jego stylem (przeniesione z `teams-wrapper`, łącznie z filtrami: tylko wiadomości użytkownika, bez sekretów, kodu, samych linków, danych operacyjnych).
 
 Pisanie:
@@ -146,7 +147,7 @@ Stan:
 
 Czytanie nigdy nie oznacza wiadomości jako przeczytanych.
 
-Wyniki narzędzi czytających (`unread`, `mentions`, `read_messages`, `search`, `list_conversations`, `get_attachment`) oddzielają treść pochodzącą od innych osób (tekst, nazwy, nazwy plików) od metadanych i oznaczają ją jako niezaufaną, tak samo jak powiadomienia wyzwalaczy (AGENTS.md).
+Wyniki każdego narzędzia, które zwraca treść wiadomości albo dane od innych osób (m.in. `unread`, `mentions`, `read_messages`, `search`, `list_conversations`, `get_attachment`, `writing_context` - wiadomości użytkownika mogą cytować innych), oddzielają treść pochodzącą od innych osób (tekst, nazwy, nazwy plików) od metadanych i oznaczają ją jako niezaufaną, tak samo jak powiadomienia wyzwalaczy (AGENTS.md).
 
 Identyfikatory rozmów i wiadomości są nieprzezroczyste dla agenta i jednoznacznie wskazują platformę i konto. Treść wiadomości dla agenta: zwykły tekst / Markdown (konwersja z HTML Teams i z powrotem po stronie modułu).
 
@@ -178,7 +179,7 @@ Akcje:
 2. **Uruchomienie agenta od zera** gdy nie ma sesji: demon uruchamia skonfigurowany program (np. `claude -p` albo Codex) ze stałą listą argumentów ustaloną w regule, bezpośrednio, bez powłoki. Treść zdarzenia nigdy nie jest wklejana do polecenia ani argumentów: trafia do programu przez stdin albo jako ścieżka do pliku z treścią, oznaczoną jako niezaufana. Proces korzysta z MCP/CLI na tych samych zasadach co każdy inny wywołujący (8.6). Decyzja projektowa (recenzja R1).
 
 Zabezpieczenia (decyzje projektowe):
-- grupowanie: zdarzenia z jednej rozmowy są zbierane i wysyłane jako jedno powiadomienie po chwili ciszy,
+- grupowanie: zdarzenia z jednej rozmowy są zbierane i wysyłane jako jedno powiadomienie po chwili ciszy, ale nie później niż po ustalonym maksymalnym czasie od pierwszego zdarzenia, nawet jeśli rozmowa nie cichnie (recenzja R4),
 - cisza nocna i limit pobudek na godzinę per reguła,
 - treść od innych osób jest przekazywana jako dane, wyraźnie oznaczona jako niezaufana; agent obudzony albo uruchomiony przez wyzwalacz ma uprawnienia konta/rozmowy (8.6), a okno ostrzega przy regułach obejmujących "samodzielnie".
 
@@ -187,7 +188,7 @@ Zabezpieczenia (decyzje projektowe):
 Układ wybrany przez użytkownika: klasyczne ustawienia z bocznym menu (sekcje po lewej, szczegóły po prawej). Zamknięcie okna nie zatrzymuje demona (potwierdzone przez użytkownika); okno otwiera się z ikony w zasobniku albo `om config`.
 
 Sekcje:
-- **Konta** - lista kont ze stanem połączenia, "Dodaj konto", "Zaloguj ponownie", usuwanie konta,
+- **Konta** - lista kont ze stanem połączenia, "Dodaj konto", "Zaloguj ponownie", usuwanie konta (usuwa też sekrety konta z Menedżera poświadczeń, stan i dane konta z bazy, oczekujące akcje i pobrane załączniki; tam, gdzie platforma to umożliwia, wylogowuje sesję po stronie serwera - recenzja R4),
 - **Uprawnienia agentów** - sekcja 8.6,
 - **Wyzwalacze** - sekcja 8.7,
 - **Do zatwierdzenia** - akcje piszące (wysłanie, edycja, reakcja) czekające na decyzję (może być częścią innej sekcji, wybór budującego),
@@ -335,16 +336,17 @@ Częściowo zaufani - agenci (Claude Code, Codex, agenci z wyzwalaczy): działaj
 Niezaufane:
 - treść wiadomości, nazwy, załączniki i wszystko inne pochodzące od innych osób,
 - odpowiedzi serwerów platform i zdarzenia WebSocket (mogą mieć nieznany albo zepsuty kształt),
-- moduły WASM spoza repo (izolacja, lista dozwolonych hostów, brak dostępu do cudzych sekretów),
+- moduły WASM spoza repo: izolacja chroni komputer, sieć lokalną, inne moduły i inne konta (lista hostów, brak dostępu do cudzych sekretów, limity). Nie chroni konta, które użytkownik danemu modułowi powierzył: moduł z tokenami konta i dostępem do hostów platformy może wykonać na tym koncie dowolną operację, bo rdzeń nie rozumie znaczenia jego zapytań HTTP. Uprawnienia agentów (8.6) chronią przed agentami, nie przed modułem. Instalacja modułu i zalogowanie nim konta to zaufanie do jego kodu, jak instalacja aplikacji - okno mówi to wprost przy instalacji i logowaniu (rebutal R4, sekcja 16),
 
 Granica twardnienia (zamrożona): nie bronimy się przed złośliwym kodem działającym na koncie Windows użytkownika z zamiarem obejścia open_mess - taki kod może i tak czytać Menedżer poświadczeń, symulować terminal albo klikać w powiadomienia. Bronimy się przed agentem, który przez pomyłkę albo manipulację próbuje zrobić więcej, niż pozwalają uprawnienia, używając zwykłych narzędzi (MCP, CLI z narzędzia Bash).
 
 ## 16. Rejestr rebutali
 
-Brak odrzuconych zgłoszeń: w R1-R3 wszystkie zgłoszenia przyjęto.
+- R4, Codex P1 ("niezaufany moduł WASM może wysłać wiadomość zwykłym zapytaniem HTTP do zatwierdzonego hosta, omijając uprawnienia"): odrzucone jako błąd specu, przyjęte jako granica zaufania. Rdzeń nie może egzekwować uprawnień na poziomie surowych zapytań modułu do API platformy bez rozumienia każdego protokołu, co przeczy idei modułów. Moduł, któremu użytkownik powierzył konto, jest zaufany dla tego konta; izolacja chroni resztę systemu. Zapisane w threat modelu (sekcja 15). Pozostałe zgłoszenia R1-R4 przyjęto.
 
 ## Changelog rund
 
 - R1 (Codex REJECT, GLM REJECT): reguły wyzwalaczy tylko zawężają uprawnienia, tokeny zakresowe dla uruchomień z akcji 2, akcja 1 dziedziczy uprawnienia konta z ostrzeżeniem (Codex P1, GLM P2); limity czasu i pamięci modułów WASM (Codex P2); most stdio jako jawny, długożyjący wyjątek od zasady jednego procesu (Codex P2); akcja 2 bez powłoki i bez wklejania treści do polecenia (GLM P2); lista hostów modułu zatwierdzana przez użytkownika, wzorce sufiksu, twarda blokada adresów lokalnych i prywatnych (GLM P2, P3); oznaczanie niezaufanej treści w wynikach narzędzi (GLM P3); doprecyzowanie Linuksa w CI (GLM P3); token API przy pierwszym uruchomieniu (GLM P3).
 - R2 (Codex REJECT, GLM REJECT): usunięte tokeny zakresowe i uprawnienia per reguła - wszyscy wywołujący mają uprawnienia konta/rozmowy, bo agent może obejść węższe uprawnienia przez `om send` (Codex P1); WAM bez tokenu odświeżania, odnowienie przez broker (Codex P2); przypięcie połączenia do sprawdzonego adresu i kontrola każdego przekierowania (GLM P2); `get_attachment` zapisuje tylko do zarządzanego katalogu (GLM P2); webhooki usunięte z etapu 1, bo wysyłałyby treść poza maszynę (GLM P2); limit magazynu modułu, cykl życia mostu stdio, `get_attachment` w oznaczaniu niezaufanej treści, rejestr rebutali (GLM P3).
 - R3 (Codex REJECT, GLM REJECT): każda akcja pisząca (wysłanie, edycja, reakcja) przechodzi przez zatwierdzenie poza agentem, a `prepare_message`/`send_prepared` zastąpione jednym `send` i narzędziem `pending` (Codex P2, GLM P3); zegarowy limit wywołania modułu obejmuje importy sieciowe, limit `Retry-After` (Codex P2, GLM P2); hosty stron logowania i tożsamość WAM w manifeście i zgodzie przy instalacji, kontrola hosta strony logowania (GLM P2); naprawiona ścieżka katalogu załączników (GLM P3, Codex P2 w recenzji commita 3f7dacc).
+- R4 (Codex REJECT, GLM REJECT): grupowanie z maksymalnym opóźnieniem (Codex P2); limit rozmiaru i retencja katalogu załączników, limit rozmiaru odpowiedzi HTTP i WebSocket (Codex P2, GLM P3); oznaczanie niezaufanej treści dla każdego narzędzia zwracającego treść, w tym `writing_context` (GLM P2); jedna instancja demona (GLM P2); czekanie na człowieka przy logowaniu poza limitem czasu wywołania (GLM P2 w recenzji commita ef8d7e8); usuwanie konta czyści sekrety i dane (GLM P3); konto przypięte do jednego modułu (GLM P3); granica zaufania modułu wobec powierzonego konta (Codex P1 - rebutal, sekcja 16).
