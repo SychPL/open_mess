@@ -128,6 +128,17 @@ fn cli_without_daemon_shows_the_last_start_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cli_ignores_a_stale_start_error_while_the_daemon_runs() {
+    let (port, _stop) = start().await;
+    let dir = data_dir();
+    // A good start could not delete the file (say, a virus scanner held it open).
+    std::fs::write(dir.path().join("last-start-error.txt"), "port 7341 is already in use\n").unwrap();
+    let _daemon = open_mess::instance::InstanceLock::acquire(dir.path()).unwrap();
+    let output = om(dir.path(), port, TOKEN, &["status"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cli_ignores_proxy_settings() {
     let (port, _stop) = start().await;
     let dir = data_dir();

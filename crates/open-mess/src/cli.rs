@@ -13,6 +13,7 @@ use reqwest::StatusCode;
 use serde_json::{Map, Value};
 
 use crate::daemon::{self, LAST_START_ERROR_FILE};
+use crate::instance::InstanceLock;
 use crate::store::{DEFAULT_PORT, Store};
 use crate::tools::ToolInfo;
 use crate::{paths, secrets};
@@ -61,6 +62,12 @@ fn not_running() -> Failure {
         message.push_str(&reason);
     }
     Failure { code: 2, message }
+}
+
+/// Whether a daemon runs on this data folder. Takes the lock for a moment when none does.
+// ponytail: a daemon starting in that moment exits "already running"; only checked after a failed start.
+fn daemon_holds_the_lock() -> bool {
+    paths::data_dir().is_ok_and(|dir| InstanceLock::acquire(&dir).is_err())
 }
 
 /// Why the daemon's last start failed, if it did. A successful start deletes the file.
@@ -181,9 +188,9 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
         return Err(bad_usage("missing tool name"));
     };
     let ToolArgs { args, json_output } = parse_tool_args(rest)?;
-    // The last start failed and none has succeeded since, so whatever holds the port now is not
-    // the daemon: don't send it the token.
-    if last_start_error().is_some() {
+    // After a failed start, whatever holds the port may be another program: don't send it the token
+    // unless a daemon holds the lock (a good start may have failed to delete the file).
+    if last_start_error().is_some() && !daemon_holds_the_lock() {
         return Err(not_running());
     }
     let port = port()?;
