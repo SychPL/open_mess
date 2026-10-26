@@ -81,10 +81,8 @@ used. Those facts cite chunk name and the module or function they sit in instead
 - **CONFIRMED** the native side uses WAM through OneAuth: `ms-teams.exe` contains (UTF-16)
   `Windows.Security.Authentication.Web.Core` and `WebAuthenticationCoreManager`, and (ASCII)
   `msauth://Microsoft.AAD.BrokerPlugin` and `Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy`.
-- **UNCONFIRMED** whether a process that is not the MSTeams package can call WAM with
-  `1fec8e78-...`. WAM binds tokens to the calling app's identity and redirect URI; the official
-  client calls it from its own package identity. This is the biggest open question for spec 9.1
-  option 1.
+- **CONFIRMED LIVE (2026-10-26)** a process that is not the MSTeams package can get Teams tokens
+  from WAM with `1fec8e78-...`, silently and without any dialog. See "Live results", item 1.
 
 ### 1.3 Redirect URIs and embedded WebView
 
@@ -431,8 +429,7 @@ Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
 Static analysis could not settle these; each needs one redacted capture on the user's account, with
 the user present (spec 9.5):
 
-1. WAM with `1fec8e78-...` from a non-MSTeams process: accepted, refused, or needs a different
-   redirect.
+1. ~~WAM with `1fec8e78-...` from a non-MSTeams process~~ - done, accepted (see "Live results").
 2. Embedded WebView2 auth code + PKCE with `1fec8e78-...` and the `nativeclient` redirect: accepted by
    the tenant's conditional access? Refresh token lifetime?
 3. Device code with `1fec8e78-...` (only with explicit consent, spec 9.5).
@@ -454,3 +451,28 @@ the user present (spec 9.5):
 11. AMS image download: header token vs cookie, and which view names exist for received images.
 12. Whether the public `teams.microsoft.com/v2` build differs from the packaged build analysed here
     (fetching the CDN bundle without signing in and diffing it with REA `compare_bundles` is enough).
+
+## Live results
+
+Captured on the user's corporate account with the user present (spec 9.5). Nothing here contains a
+token, tenant id, user id or account name.
+
+1. **WAM from a non-MSTeams process - accepted** (2026-10-26). An unpackaged Rust console program
+   (`windows` crate 0.62, scratch probe, not in the repo) asked WAM for a token:
+   - provider: `FindAccountProviderWithAuthorityAsync("https://login.microsoft.com", "organizations")`;
+   - request: `WebTokenRequest(provider, "https://ic3.teams.office.com/.default", "1fec8e78-...")`
+     with properties `wam_compat=2.0` and `authority=https://login.microsoftonline.com/organizations`;
+   - `GetTokenSilentlyAsync(request)` without an account: `UserInteractionRequired`
+     (`0xCAA10001`, `interaction_required`) - expected, no account chosen;
+   - `FindAllAccountsWithClientIdAsync(provider, "1fec8e78-...")`: status success, the work
+     accounts known to Windows are visible to this client id;
+   - `GetTokenSilentlyWithWebAccountAsync(request, account)`: **success, no dialog**. Token claims:
+     `aud = https://ic3.teams.office.com`, `appid = 1fec8e78-bce4-4aaf-ab1b-5451cc387264`,
+     `scp = Teams.AccessAsUser.All`, lifetime 60-90 minutes, no `xms_cc` (CAE was not requested).
+
+   Consequence for spec 9.1: option 1 (WAM) works for open_mess as a separate program. The sign-in
+   flow is: find the provider, list the accounts visible to the client id, let the user pick one in
+   the configuration window, then get every token silently with that account; the interactive WAM
+   dialog (`IWebAuthenticationCoreManagerInterop::RequestTokenForWindowAsync`) is needed only when
+   a silent call returns `UserInteractionRequired`. Requesting CAE (`claims` with `cp1`) is still to
+   be tried.
