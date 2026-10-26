@@ -1,0 +1,181 @@
+// The contract between the open_mess core (host) and a platform module (guest).
+// Spec: .specs/2026-10-26-open-mess-design.md, section 8.3.
+//
+// Guests are WebAssembly components built for wasm32-wasip2. Besides the imports below they get
+// only wasi:clocks and wasi:random from the host - no filesystem, no sockets, no environment.
+// Calls look synchronous to the guest; the host runs them asynchronously with time, memory and
+// size limits. Tool arguments and results cross the boundary as JSON text, validated by the core
+// against the shared tool schemas (spec 8.5) or the module's declared extra tools.
+
+package open-mess:module@0.1.0;
+
+interface types {
+    // A platform account as the module knows it; `id` is stable and unique within the module.
+    record account-info {
+        id: string,
+        display-name: string,
+    }
+
+    record tool-decl {
+        name: string,
+        description: string,
+        // JSON Schema of the arguments object.
+        input-schema: string,
+        writes: bool,
+    }
+
+    record wam-identity {
+        client-id: string,
+        scopes: list<string>,
+    }
+
+    record manifest {
+        // Unique module name; accounts are bound to it (spec 8.3).
+        name: string,
+        version: string,
+        // Platform shown to the user, e.g. "teams".
+        platform: string,
+        // Exact host names or suffix patterns like "*.sharepoint.com".
+        hosts: list<string>,
+        sign-in-hosts: list<string>,
+        wam: option<wam-identity>,
+        extra-tools: list<tool-decl>,
+    }
+
+    variant module-error {
+        // The session is gone; the user must sign in again.
+        auth-required(string),
+        // The server answered in a shape the module does not understand (spec 9.3).
+        incompatible(string),
+        // The platform refused or failed; the message is safe to show.
+        platform(string),
+        invalid-args(string),
+        not-supported(string),
+    }
+}
+
+interface http {
+    record request {
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    variant http-error {
+        // Host or address not allowed (host list, private ranges, redirect target).
+        blocked(string),
+        timeout,
+        too-large,
+        // Retry-After was longer than the host's maximum wait.
+        throttled(u32),
+        network(string),
+    }
+
+    // The host follows no redirect by itself; 3xx responses come back to the module (spec 8.3).
+    fetch: func(req: request) -> result<response, http-error>;
+}
+
+interface websocket {
+    use http.{http-error};
+
+    // Connections are held by the core; frames arrive through the `events` export.
+    open: func(url: string, headers: list<tuple<string, string>>) -> result<u32, http-error>;
+    send: func(conn: u32, text: string) -> result<_, http-error>;
+    close: func(conn: u32);
+}
+
+interface storage {
+    variant storage-error {
+        quota-exceeded,
+        failed(string),
+    }
+
+    // Per-module key-value store with a size quota.
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>) -> result<_, storage-error>;
+    delete: func(key: string);
+}
+
+interface secrets {
+    // Secrets of this module's accounts, kept in Windows Credential Manager.
+    get: func(account: string, key: string) -> option<string>;
+    set: func(account: string, key: string, value: string) -> result<_, string>;
+    delete: func(account: string, key: string);
+}
+
+interface sign-in {
+    variant sign-in-error {
+        cancelled,
+        timed-out,
+        refused(string),
+        // Host not approved by the user (spec 8.3).
+        blocked(string),
+    }
+
+    show-device-code: func(code: string, verification-url: string);
+    show-qr: func(data: string);
+    // Opens an approved HTTPS sign-in page in the configuration window and returns the URL of
+    // the first navigation that starts with `redirect-prefix`.
+    open-page: func(url: string, redirect-prefix: string) -> result<string, sign-in-error>;
+    // Silent or interactive token from Windows WAM for the manifest's approved identity.
+    wam-token: func(scopes: list<string>, interactive: bool) -> result<string, sign-in-error>;
+}
+
+interface host {
+    enum session-state {
+        online,
+        offline,
+        auth-required,
+    }
+
+    record new-message {
+        account: string,
+        conversation: string,
+        message: string,
+        // True when the message is from the signed-in user; such messages never fire triggers.
+        own: bool,
+        mentions-me: bool,
+        direct: bool,
+    }
+
+    log: func(level: u8, message: string);
+    set-timer: func(id: u32, after-ms: u32);
+    session: func(account: string, state: session-state);
+    message-arrived: func(msg: new-message);
+}
+
+interface module {
+    use types.{manifest, account-info, module-error};
+
+    manifest: func() -> manifest;
+    sign-in: func() -> result<account-info, module-error>;
+    // Restores a session from stored secrets at daemon start.
+    restore: func(account: string) -> result<_, module-error>;
+    sign-out: func(account: string);
+    // Runs a shared tool (spec 8.5) or one of the manifest's extra tools.
+    call: func(account: string, tool: string, args-json: string) -> result<string, module-error>;
+}
+
+interface events {
+    on-ws-message: func(conn: u32, text: string);
+    on-ws-closed: func(conn: u32, reason: string);
+    on-timer: func(id: u32);
+}
+
+world platform-module {
+    import http;
+    import websocket;
+    import storage;
+    import secrets;
+    import sign-in;
+    import host;
+    export module;
+    export events;
+}
