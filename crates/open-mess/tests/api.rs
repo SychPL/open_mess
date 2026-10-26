@@ -20,6 +20,8 @@ const TOKEN: &str = "t0ken";
 
 /// Serves the API on an ephemeral loopback port until the returned sender is dropped.
 async fn start() -> (SocketAddr, oneshot::Sender<()>) {
+    // The test clients use reqwest, built without a crypto provider in this workspace.
+    rustls::crypto::ring::default_provider().install_default().ok();
     let listener = open_mess::api::bind(0).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = oneshot::channel::<()>();

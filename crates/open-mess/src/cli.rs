@@ -204,6 +204,9 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
 }
 
 async fn call(port: u16, token: &str, tool: &str, args: &Value) -> Result<Value, Failure> {
+    // reqwest is built without a TLS crypto provider (see Cargo.toml); install ring once.
+    // Err only means one is already installed.
+    rustls::crypto::ring::default_provider().install_default().ok();
     let client = reqwest::Client::builder()
         // HTTP_PROXY and friends would hand the token to a proxy.
         .no_proxy()

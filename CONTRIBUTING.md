@@ -21,7 +21,8 @@ cargo xtask ci
 ```
 
 `cargo xtask ci` runs exactly what CI runs: `cargo fmt --check`, `cargo clippy -D warnings`, the
-tests and the `wasm32-wasip2` build of the Teams module. Run it before every commit.
+`wasm32-wasip2` build of the modules (the host's tests load them) and the tests. Run it before every
+commit.
 
 ## How the code is laid out
 
@@ -37,7 +38,9 @@ tests and the `wasm32-wasip2` build of the Teams module. Run it before every com
 | `crates/open-mess/src/api.rs` | the local API on `127.0.0.1`: bearer token, `/mcp` (MCP) and `/api` (CLI) |
 | `crates/open-mess/src/cli.rs` | the `om` command line, generated from the registry |
 | `crates/open-mess/tests/` | integration tests: the API, the CLI and the daemon process |
+| `crates/open-mess-host/` | the module host: loads platform modules and runs them under limits |
 | `modules/teams/` | the Teams platform module, a WebAssembly component implementing `wit/module.wit` |
+| `modules/test-*/` | small guest modules the module host's tests load (`publish = false`) |
 | `wit/` | the contract between the core and platform modules |
 | `xtask/` | repository tasks (`cargo xtask ci`, `cargo xtask hooks`) |
 | `.specs/` | specs, one per non-trivial change; review output in `.specs/review/` is local |
@@ -45,7 +48,7 @@ tests and the `wasm32-wasip2` build of the Teams module. Run it before every com
 | `.githooks/` | the post-commit hook that sends each commit for review |
 | `plan/` | local notes and plans, gitignored, never committed |
 
-More crates (core, module host) arrive with the specs that introduce them.
+More crates (core) arrive with the specs that introduce them.
 
 ## Rules that aren't negotiable
 

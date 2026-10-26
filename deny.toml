@@ -7,6 +7,9 @@ yanked = "warn"
 # Permissive licences only; open_mess is MIT OR Apache-2.0. No GPL/LGPL/AGPL.
 allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
 private = { ignore = true }
+# Mozilla's root certificates as data. reqwest's rustls-platform-verifier depends on it only when
+# built for wasm32, which the module host never is; on Windows and Linux it uses the system store.
+exceptions = [{ crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] }]
 
 [bans]
 multiple-versions = "warn"
