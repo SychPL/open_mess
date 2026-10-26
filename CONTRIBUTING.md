@@ -35,7 +35,7 @@ commit.
 | `crates/open-mess/src/store.rs` | SQLite state (`state.sqlite3`): schema migrations, configuration such as the port |
 | `crates/open-mess/src/secrets.rs` | secrets in Windows Credential Manager, starting with the local API token |
 | `crates/open-mess/src/modules.rs` | the modules folder: module files, their approval and the running modules |
-| `crates/open-mess/src/tools.rs` | the tool registry: every tool, for MCP and the CLI alike |
+| `crates/open-mess/src/tools/` | the tool registry: every tool, for MCP and the CLI alike; `shared.rs` has the shared tools' schemas and results |
 | `crates/open-mess/src/api.rs` | the local API on `127.0.0.1`: bearer token, `/mcp` (MCP) and `/api` (CLI) |
 | `crates/open-mess/src/cli.rs` | the `om` command line, generated from the registry |
 | `crates/open-mess/tests/` | integration tests: the API, the CLI and the daemon process |

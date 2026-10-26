@@ -52,6 +52,21 @@ pub struct AccountInfo {
     pub display_name: String,
 }
 
+/// Mirrors `attachment` in `wit/module.wit`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub file_name: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+// Hand-written so that a `{:?}` never prints the file name or the bytes.
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attachment").field("content_type", &self.content_type).field("len", &self.data.len()).finish_non_exhaustive()
+    }
+}
+
 /// Mirrors `session-state` in `wit/module.wit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -303,6 +318,12 @@ impl ModuleHandle {
     /// Runs a tool: a shared one (spec 8.5) or one of the manifest's extra tools.
     pub async fn call(&self, account: &str, tool: &str, args_json: &str) -> Result<String, HostError> {
         self.request(|reply| Request::Call { account: account.to_string(), tool: tool.to_string(), args: args_json.to_string(), reply }).await
+    }
+
+    /// The bytes of an attachment, for the core to save (the `get_attachment` tool).
+    pub async fn get_attachment(&self, account: &str, conversation: &str, message: &str, attachment: &str) -> Result<Attachment, HostError> {
+        let ids = [account, conversation, message, attachment].map(str::to_string);
+        self.request(|reply| Request::GetAttachment { ids, reply }).await
     }
 }
 

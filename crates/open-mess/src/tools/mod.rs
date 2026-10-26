@@ -3,6 +3,8 @@
 //! Every capability is a tool here, with one name, one parameter schema and one result shape for
 //! both front ends (AGENTS.md, "One tool registry").
 
+pub mod shared;
+
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};

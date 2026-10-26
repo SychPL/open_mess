@@ -41,6 +41,15 @@ mod guest {
 
         fn sign_out(_account: String) {}
 
+        fn get_attachment(
+            _account: String,
+            _conversation: String,
+            _message: String,
+            _attachment: String,
+        ) -> Result<types::Attachment, types::ModuleError> {
+            Err(types::ModuleError::NotSupported("get-attachment".to_string()))
+        }
+
         fn call(_account: String, _tool: String, _args_json: String) -> Result<String, types::ModuleError> {
             let mut kept = Vec::new();
             loop {

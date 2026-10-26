@@ -18,4 +18,6 @@ mod ws;
 pub use actor::ModuleState;
 pub use error::{HostError, ModuleError};
 pub use net::{HttpError, Net, Request, Response};
-pub use runtime::{AccountInfo, Engine, HostEvent, Manifest, ModuleContext, ModuleHandle, NewMessage, SessionState, ToolDecl, WamIdentity};
+pub use runtime::{
+    AccountInfo, Attachment, Engine, HostEvent, Manifest, ModuleContext, ModuleHandle, NewMessage, SessionState, ToolDecl, WamIdentity,
+};

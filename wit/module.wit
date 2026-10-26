@@ -42,6 +42,14 @@ interface types {
         extra-tools: list<tool-decl>,
     }
 
+    // An attachment's bytes, which the module fetches with `http.fetch`. The core writes them to
+    // a file it names; a module never writes files (spec 8.5).
+    record attachment {
+        file-name: string,
+        content-type: string,
+        data: list<u8>,
+    }
+
     variant module-error {
         // The session is gone; the user must sign in again.
         auth-required(string),
@@ -154,7 +162,7 @@ interface host {
 
 interface module {
     // Aliased: a type and a function can't share the name `manifest` in one interface.
-    use types.{manifest as module-manifest, account-info, module-error};
+    use types.{manifest as module-manifest, account-info, attachment, module-error};
 
     manifest: func() -> module-manifest;
     sign-in: func() -> result<account-info, module-error>;
@@ -163,6 +171,8 @@ interface module {
     sign-out: func(account: string);
     // Runs a shared tool (spec 8.5) or one of the manifest's extra tools.
     call: func(account: string, tool: string, args-json: string) -> result<string, module-error>;
+    // The `get_attachment` tool: the attachment's bytes, for the core to save.
+    get-attachment: func(account: string, conversation: string, message: string, attachment: string) -> result<attachment, module-error>;
 }
 
 interface events {

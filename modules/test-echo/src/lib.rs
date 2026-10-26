@@ -9,7 +9,8 @@
 //! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
 //! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The `restore` export succeeds only for account "known";
-//! the `sign-in` export is not supported.
+//! the `sign-in` export is not supported; `get-attachment` returns fixed bytes named after the
+//! attachment id.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -148,6 +149,16 @@ mod guest {
 
         fn call(_account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
             call(&tool, &args_json)
+        }
+
+        // Fixed bytes, named after the attachment id, so tests choose the file name.
+        fn get_attachment(
+            _account: String,
+            _conversation: String,
+            _message: String,
+            attachment: String,
+        ) -> Result<types::Attachment, types::ModuleError> {
+            Ok(types::Attachment { file_name: attachment, content_type: "text/plain".to_string(), data: b"attachment bytes from test-echo".to_vec() })
         }
     }
 

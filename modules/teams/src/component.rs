@@ -51,6 +51,15 @@ impl module::Guest for Teams {
     fn call(_account: String, _tool: String, _args_json: String) -> Result<String, types::ModuleError> {
         Err(not_yet())
     }
+
+    fn get_attachment(
+        _account: String,
+        _conversation: String,
+        _message: String,
+        _attachment: String,
+    ) -> Result<types::Attachment, types::ModuleError> {
+        Err(not_yet())
+    }
 }
 
 impl events::Guest for Teams {
