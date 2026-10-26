@@ -39,19 +39,21 @@ impl Storage {
         Ok(Storage { db })
     }
 
-    /// Records a secret's name; false when it is new and `MAX_SECRETS` are recorded already.
-    pub(crate) fn add_secret(&mut self, account: &str, key: &str) -> Result<bool, StorageError> {
+    /// Records a secret's name: `Some(true)` when it is new, `Some(false)` when it was recorded
+    /// already, `None` when it is new and `MAX_SECRETS` are recorded.
+    pub(crate) fn add_secret(&mut self, account: &str, key: &str) -> Result<Option<bool>, StorageError> {
         let tx = self.db.transaction()?;
         let known: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM secrets WHERE account = ?1 AND key = ?2)", [account, key], |row| row.get(0))?;
-        if !known {
-            let count: i64 = tx.query_row("SELECT COUNT(*) FROM secrets", [], |row| row.get(0))?;
-            if usize::try_from(count).unwrap_or(usize::MAX) >= limits::MAX_SECRETS {
-                return Ok(false);
-            }
-            tx.execute("INSERT INTO secrets (account, key) VALUES (?1, ?2)", [account, key])?;
+        if known {
+            return Ok(Some(false));
         }
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM secrets", [], |row| row.get(0))?;
+        if usize::try_from(count).unwrap_or(usize::MAX) >= limits::MAX_SECRETS {
+            return Ok(None);
+        }
+        tx.execute("INSERT INTO secrets (account, key) VALUES (?1, ?2)", [account, key])?;
         tx.commit()?;
-        Ok(true)
+        Ok(Some(true))
     }
 
     pub(crate) fn remove_secret(&self, account: &str, key: &str) -> Result<(), StorageError> {

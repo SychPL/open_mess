@@ -108,8 +108,8 @@ impl secrets::Host for HostState {
 
     async fn delete(&mut self, account: String, key: String) {
         let env = self.env.clone();
-        if let (Ok(store), Ok(storage)) = (self.secret_store(), self.storage()) {
-            crate::secrets::delete(&*store, storage, &env.name, &account, &key);
+        if let Ok(store) = self.secret_store() {
+            crate::secrets::delete(&*store, self.storage().ok(), &env.name, &account, &key);
         }
     }
 }

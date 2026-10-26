@@ -45,12 +45,9 @@ async fn direct(addrs: &[SocketAddr]) -> Result<TcpStream, HttpError> {
     Ok(stream)
 }
 
-/// An HTTP CONNECT tunnel through `proxy` to `host:port`. The proxy's own address is set by the
-/// system or the organisation and is not checked (spec 8.3, R5).
+/// An HTTP CONNECT tunnel through the http:// `proxy` to `host:port`. The proxy's own address is
+/// set by the system or the organisation and is not checked (spec 8.3, R5).
 async fn tunnel(proxy: &Uri, auth: Option<&HeaderValue>, host: &str, port: u16) -> Result<TcpStream, HttpError> {
-    if proxy.scheme_str() != Some("http") {
-        return Err(network("only http:// proxies carry WebSockets"));
-    }
     let proxy_host = proxy.host().ok_or_else(|| network("the proxy has no host"))?.trim_matches(['[', ']']);
     let mut stream = TcpStream::connect((proxy_host, proxy.port_u16().unwrap_or(80))).await.map_err(network)?;
     let mut request = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
@@ -75,8 +72,10 @@ async fn tunnel(proxy: &Uri, auth: Option<&HeaderValue>, host: &str, port: u16) 
 }
 
 /// Connects the way the system proxy settings say: through the proxy (HTTP CONNECT) when they
-/// send this host through one, else directly to a checked address.
-/// ponytail: the static settings, as for http.fetch; PAC/WPAD needs WinHTTP (see net.rs).
+/// send this host through an http:// one, else directly to a checked address.
+/// ponytail: the static settings, as for http.fetch; PAC/WPAD needs WinHTTP (see net.rs). An
+/// https:// or SOCKS proxy is not spoken here and the socket goes direct, as it did before proxies
+/// were read at all; speak them if a network needs that.
 async fn tcp(url: &url::Url, addrs: &[SocketAddr]) -> Result<TcpStream, HttpError> {
     let host = url.host_str().ok_or_else(|| blocked("the URL has no host"))?;
     let port = url.port_or_known_default().ok_or_else(|| blocked("the URL has no port"))?;
@@ -84,8 +83,8 @@ async fn tcp(url: &url::Url, addrs: &[SocketAddr]) -> Result<TcpStream, HttpErro
     let scheme = if url.scheme() == "wss" { "https" } else { "http" };
     let target: Uri = format!("{scheme}://{host}:{port}/").parse().map_err(network)?;
     match Matcher::from_system().intercept(&target) {
-        Some(proxy) => tunnel(proxy.uri(), proxy.basic_auth(), host, port).await,
-        None => direct(addrs).await,
+        Some(proxy) if proxy.uri().scheme_str() == Some("http") => tunnel(proxy.uri(), proxy.basic_auth(), host, port).await,
+        _ => direct(addrs).await,
     }
 }
 
@@ -149,8 +148,12 @@ async fn serve(conn: u32, mut ws: Stream, mut outgoing: mpsc::Receiver<String>, 
             },
         }
     };
-    // Sends fail from here on instead of waiting for a socket that is gone.
+    // Sends fail from here on instead of waiting for a socket that is gone. A frame that arrived
+    // before the end still goes to the module, ahead of the close.
     drop(outgoing);
+    if let Some(event) = waiting {
+        events.send(event).await.ok();
+    }
     events.send(GuestEvent::WsClosed { conn, reason }).await.ok();
 }
 
