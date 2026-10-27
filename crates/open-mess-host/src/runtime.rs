@@ -13,7 +13,7 @@ use crate::error::HostError;
 use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
 use crate::net::Net;
-use crate::sign_in::{Caller, SignInPrompts};
+use crate::sign_in::{Caller, CodeShown, SignInPrompts};
 use crate::storage::Storage;
 use crate::timers::Timers;
 use crate::wam::WamAccount;
@@ -181,6 +181,8 @@ pub(crate) struct HostState {
     pub(crate) caller: Caller,
     /// The Windows account picked during the `sign-in` call that runs.
     pub(crate) pick: Option<WamAccount>,
+    /// A device or QR code on screen, which the `sign-in` call that runs polls for.
+    pub(crate) code_shown: Option<CodeShown>,
 }
 
 impl HostState {
@@ -206,6 +208,7 @@ impl HostState {
             guest_events,
             caller: Caller::default(),
             pick: None,
+            code_shown: None,
         }
     }
 }

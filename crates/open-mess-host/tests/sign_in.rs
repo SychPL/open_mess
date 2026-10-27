@@ -8,8 +8,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{context, wasm};
-use open_mess_host::{Engine, ModuleContext, ModuleHandle, Prompt, SignInPrompts, SignInReply, SignInRequest, limits};
+use common::{context, context_in, wasm};
+use open_mess_host::{
+    AccountInfo, Engine, HostError, ModuleContext, ModuleError, ModuleHandle, ModuleState, Prompt, SignInPrompts, SignInReply, SignInRequest, limits,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -56,6 +58,49 @@ async fn budget_expires_as_timed_out() {
     // Nobody answers the page.
     let (_unanswered, _reply) = prompts.recv().await.unwrap();
     assert_eq!(call.await.unwrap(), format!(r#"{{"open-page":"timed-out","wam-token":"{WAM}"}}"#));
+}
+
+/// test-echo signing in with a device code (in its own data folder), and its prompts.
+async fn device_code(
+    data_dir: &std::path::Path,
+    budget: Duration,
+) -> (ModuleHandle, JoinHandle<Result<AccountInfo, HostError>>, mpsc::Receiver<Prompt>) {
+    let engine = Engine::with_limits(limits::for_tests()).unwrap();
+    let (sender, prompts) = mpsc::channel(8);
+    let ctx = ModuleContext { sign_in: SignInPrompts::with_budget(sender, budget), ..context_in(data_dir.to_path_buf()) };
+    let echo = engine.load(&wasm("open_mess_test_echo"), ctx).await.unwrap();
+    echo.call("a", "sign-in-with", r#"{"how": "device-code"}"#).await.unwrap();
+    let signing_in = tokio::spawn({
+        let echo = echo.clone();
+        async move { echo.sign_in().await }
+    });
+    (echo, signing_in, prompts)
+}
+
+#[tokio::test]
+async fn code_on_screen_does_not_count_and_cancel_stops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (echo, signing_in, mut prompts) = device_code(dir.path(), Duration::from_secs(30)).await;
+    let (code, reply) = prompts.recv().await.unwrap();
+    assert!(matches!(&code, SignInRequest::DeviceCode { code, .. } if code == "WXYZ-5678"), "{code:?}");
+    // The module polls while the user takes longer than the call limit.
+    tokio::time::sleep(limits::for_tests().call_timeout + Duration::from_secs(1)).await;
+    assert!(!signing_in.is_finished());
+    reply.send(SignInReply::Cancelled).unwrap();
+    let result = signing_in.await.unwrap();
+    assert!(matches!(&result, Err(HostError::Module(ModuleError::Platform(why))) if why == "sign-in cancelled"), "{result:?}");
+    // Not a crash.
+    assert_eq!(echo.state(), ModuleState::Running);
+}
+
+#[tokio::test]
+async fn code_budget_expires_as_timed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (echo, signing_in, mut prompts) = device_code(dir.path(), Duration::from_millis(500)).await;
+    let (_code, _unanswered) = prompts.recv().await.unwrap();
+    let result = signing_in.await.unwrap();
+    assert!(matches!(&result, Err(HostError::Module(ModuleError::Platform(why))) if why == "sign-in timed out"), "{result:?}");
+    assert_eq!(echo.state(), ModuleState::Running);
 }
 
 #[tokio::test]

@@ -102,6 +102,21 @@ pub(crate) struct Deadline(Arc<Mutex<DeadlineState>>);
 struct DeadlineState {
     at: Option<Instant>,
     paused_since: Option<Instant>,
+    /// The latest the call may run however long it is paused: set while a sign-in code waits on
+    /// screen.
+    limit: Option<Instant>,
+}
+
+impl DeadlineState {
+    /// Starts the clock again; the paused time is added back.
+    fn resume(&mut self) {
+        self.limit = None;
+        if let Some(since) = self.paused_since.take()
+            && let Some(at) = &mut self.at
+        {
+            *at += since.elapsed();
+        }
+    }
 }
 
 /// While paused, the actor looks at the deadline this often.
@@ -113,13 +128,17 @@ impl Deadline {
     }
 
     fn set(&self, at: Option<Instant>) {
-        *self.state() = DeadlineState { at, paused_since: None };
+        *self.state() = DeadlineState { at, paused_since: None, limit: None };
     }
 
     /// When the actor should look at the deadline again; None outside a call.
     fn wake_at(&self) -> Option<Instant> {
         let state = self.state();
-        if state.paused_since.is_some() { state.at.map(|_| Instant::now() + PAUSED_POLL) } else { state.at }
+        if state.paused_since.is_none() {
+            return state.at;
+        }
+        let poll = Instant::now() + PAUSED_POLL;
+        state.at.map(|_| state.limit.map_or(poll, |limit| limit.min(poll)))
     }
 
     /// Time left in the call in progress; `None` outside a call.
@@ -128,29 +147,43 @@ impl Deadline {
     }
 
     pub(crate) fn expired(&self) -> bool {
-        let state = self.state();
-        state.paused_since.is_none() && state.at.is_some_and(|at| Instant::now() >= at)
+        let (state, now) = (self.state(), Instant::now());
+        state.limit.is_some_and(|limit| now >= limit) || (state.paused_since.is_none() && state.at.is_some_and(|at| now >= at))
     }
 
     /// Stops the clock until the returned guard is dropped; the paused time is added back.
     pub(crate) fn pause(&self) -> Paused<'_> {
         let mut state = self.state();
-        if state.paused_since.is_none() {
+        let started = state.paused_since.is_none();
+        if started {
             state.paused_since = Some(Instant::now());
         }
-        Paused(self)
+        Paused { deadline: self, started }
+    }
+
+    /// Stops the clock until [`Deadline::resume`] (or the call's end), but lets the call run no
+    /// later than `limit`: a sign-in code on screen, which the module polls for (spec 8.3, R4).
+    pub(crate) fn pause_until(&self, limit: Instant) {
+        let mut state = self.state();
+        state.paused_since.get_or_insert_with(Instant::now);
+        state.limit = Some(limit);
+    }
+
+    pub(crate) fn resume(&self) {
+        self.state().resume();
     }
 }
 
-pub(crate) struct Paused<'a>(&'a Deadline);
+pub(crate) struct Paused<'a> {
+    deadline: &'a Deadline,
+    /// Whether this guard paused the clock; a pause it found in place is not its to end.
+    started: bool,
+}
 
 impl Drop for Paused<'_> {
     fn drop(&mut self) {
-        let mut state = self.0.state();
-        if let Some(since) = state.paused_since.take()
-            && let Some(at) = &mut state.at
-        {
-            *at += since.elapsed();
+        if self.started {
+            self.deadline.state().resume();
         }
     }
 }
@@ -267,6 +300,7 @@ impl Actor {
         let data = store.data_mut();
         data.caller = std::mem::take(&mut self.caller);
         data.pick = None;
+        data.code_shown = None;
         let value = within(&self.deadline, export(&module, &mut store)).await?;
         self.instance = Some((store, module));
         Ok(value)
@@ -418,6 +452,30 @@ mod tests {
             assert!(!deadline.expired());
         }
         // The 100 ms paused were added back: 50 ms are still left.
+        assert!(!deadline.expired());
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(deadline.expired());
+    }
+
+    #[test]
+    fn code_on_screen_pauses_up_to_its_limit() {
+        let deadline = Deadline::default();
+        deadline.set(Some(Instant::now() + Duration::from_millis(50)));
+        deadline.pause_until(Instant::now() + Duration::from_millis(150));
+        {
+            // A wait inside it does not end it.
+            let _paused = deadline.pause();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!deadline.expired());
+        std::thread::sleep(Duration::from_millis(80));
+        // Past the limit, paused or not.
+        assert!(deadline.expired());
+        // Resumed before the limit, the call's own time goes on.
+        deadline.set(Some(Instant::now() + Duration::from_millis(50)));
+        deadline.pause_until(Instant::now() + Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(100));
+        deadline.resume();
         assert!(!deadline.expired());
         std::thread::sleep(Duration::from_millis(80));
         assert!(deadline.expired());

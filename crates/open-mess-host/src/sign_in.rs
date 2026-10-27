@@ -12,7 +12,7 @@
 //! account gets its tokens silently with it.
 
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use keyring_core::api::CredentialStore;
 use tokio::sync::{mpsc, oneshot};
@@ -104,11 +104,15 @@ impl SignInPrompts {
         SignInPrompts { sender, budget }
     }
 
-    /// Shows a prompt that needs no answer.
-    fn show(&self, request: SignInRequest) {
-        let (reply, _) = oneshot::channel();
-        if self.sender.try_send((request, reply)).is_err() {
-            tracing::debug!("sign-in prompt not shown: {UNAVAILABLE}");
+    /// Shows a prompt the user only acts on (a code): the answer comes only when they cancel it.
+    fn show(&self, request: SignInRequest) -> Option<oneshot::Receiver<SignInReply>> {
+        let (reply, answer) = oneshot::channel();
+        match self.sender.try_send((request, reply)) {
+            Ok(()) => Some(answer),
+            Err(_) => {
+                tracing::debug!("sign-in prompt not shown: {UNAVAILABLE}");
+                None
+            }
         }
     }
 
@@ -124,6 +128,19 @@ impl SignInPrompts {
         }
     }
 }
+
+/// A device or QR code on screen, which the module's `sign-in` polls for (with `http.fetch`) while
+/// the user uses it elsewhere: the call's clock stops meanwhile, up to the budget.
+pub(crate) struct CodeShown {
+    /// Answered (or dropped) once the user cancels or the sign-in ends.
+    answer: oneshot::Receiver<SignInReply>,
+    /// When the budget runs out.
+    until: Instant,
+}
+
+/// After a code's budget, a module that still polls (fetch is refused by then) has this long
+/// before the call is stopped.
+const CODE_GRACE: Duration = Duration::from_secs(60);
 
 /// Runs a sign-in step that waits for the user, with the call deadline paused meanwhile.
 pub(crate) async fn wait_for_user<T>(deadline: &Deadline, step: impl Future<Output = T>) -> T {
@@ -259,7 +276,10 @@ impl Wam<'_> {
             _ => return Err(SignInError::Cancelled),
         };
         let (dialog, client, scopes) = (self.calls.interactive, client.to_string(), scopes.to_vec());
-        let (token, account) = wait_for_user(self.deadline, blocking(move || dialog(window, &client, &scopes))).await?;
+        // The dialog has the sign-in budget too; one left open past it is abandoned (it closes with
+        // the configuration window, its owner).
+        let waiting = tokio::time::timeout(self.prompts.budget, blocking(move || dialog(window, &client, &scopes)));
+        let (token, account) = wait_for_user(self.deadline, waiting).await.map_err(|_| SignInError::TimedOut)??;
         Ok((account, Some(token)))
     }
 }
@@ -277,6 +297,39 @@ impl HostState {
             return Err(SignInError::Refused(UNAVAILABLE.to_string()));
         }
         Ok(&self.env.sign_in)
+    }
+
+    /// Shows a device or QR code. In a sign-in the clock stops until the user cancels it, the
+    /// budget runs out or the module moves on (spec 8.3, R4).
+    fn show_code(&mut self, request: SignInRequest) {
+        self.code_done();
+        let Ok(prompts) = self.prompts() else { return };
+        let (answer, budget) = (prompts.show(request), prompts.budget);
+        if let (Some(answer), Caller::SignIn) = (answer, &self.caller) {
+            let until = Instant::now() + budget;
+            self.deadline.pause_until(until + CODE_GRACE);
+            self.code_shown = Some(CodeShown { answer, until });
+        }
+    }
+
+    /// The module moved on from a code on screen: the clock runs again.
+    fn code_done(&mut self) {
+        if self.code_shown.take().is_some() {
+            self.deadline.resume();
+        }
+    }
+
+    /// Why the module should stop polling for the code on screen: the user cancelled it (or the
+    /// sign-in ended), or its budget ran out. The clock runs again from then on.
+    pub(crate) fn code_abandoned(&mut self) -> Option<&'static str> {
+        let shown = self.code_shown.as_mut()?;
+        let why = match shown.answer.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) if Instant::now() < shown.until => return None,
+            Err(oneshot::error::TryRecvError::Empty) => "sign-in timed out",
+            _ => "sign-in cancelled",
+        };
+        self.code_done();
+        Some(why)
     }
 
     /// Ends a `sign-in` call: the Windows account picked in it becomes the secret of the account
@@ -299,24 +352,23 @@ impl HostState {
 
 impl Host for HostState {
     async fn show_device_code(&mut self, code: String, verification_url: String) {
-        let Ok(prompts) = self.prompts() else { return };
         if too_long(&[&code, &verification_url]) {
             tracing::warn!(module = %self.env.name, "device code not shown: over {MAX_PROMPT_TEXT} bytes");
             return;
         }
-        prompts.show(SignInRequest::DeviceCode { module: self.env.name.clone(), code, url: verification_url });
+        self.show_code(SignInRequest::DeviceCode { module: self.env.name.clone(), code, url: verification_url });
     }
 
     async fn show_qr(&mut self, data: String) {
-        let Ok(prompts) = self.prompts() else { return };
         if too_long(&[&data]) {
             tracing::warn!(module = %self.env.name, "QR code not shown: over {MAX_PROMPT_TEXT} bytes");
             return;
         }
-        prompts.show(SignInRequest::Qr { module: self.env.name.clone(), data });
+        self.show_code(SignInRequest::Qr { module: self.env.name.clone(), data });
     }
 
     async fn open_page(&mut self, url: String, redirect_prefix: String) -> Result<String, SignInError> {
+        self.code_done();
         if too_long(&[&url, &redirect_prefix]) {
             return Err(SignInError::Refused(format!("the URL is over {MAX_PROMPT_TEXT} bytes")));
         }
@@ -333,6 +385,7 @@ impl Host for HostState {
     /// which only a sign-in from the window may do. A silent request that needs the dialog fails
     /// with `refused("interaction required")`.
     async fn wam_token(&mut self, scopes: Vec<String>, interactive: bool, _claims: Option<String>) -> Result<String, SignInError> {
+        self.code_done();
         #[cfg(any(test, feature = "test-support"))]
         if let Some(wam) = &self.env.fake_wam {
             return wam(&scopes, interactive, _claims.as_deref()).map_err(SignInError::Refused);
@@ -497,6 +550,30 @@ mod tests {
         assert_eq!(pick, Some(account("w3")));
         let mut asked = user.await.unwrap();
         assert!(asked.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dialog_has_the_budget() {
+        let mut t = setup();
+        let (sender, mut asked) = mpsc::channel::<Prompt>(8);
+        t.prompts = SignInPrompts::with_budget(sender, Duration::from_millis(200));
+        tokio::spawn(async move {
+            while let Some((request, reply)) = asked.recv().await {
+                let _ = reply.send(if matches!(request, SignInRequest::WamWindow { .. }) { SignInReply::Window(1) } else { SignInReply::Done(None) });
+            }
+        });
+        // The user leaves the WAM dialog open.
+        let slow = WamCalls {
+            interactive: |_, _, _| {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(("late".into(), account("w9")))
+            },
+            ..FAKE
+        };
+        let mut pick = None;
+        let result = t.wam(slow).token(&[], &Caller::SignIn, &mut pick, &scopes(), true).await;
+        assert!(matches!(result, Err(SignInError::TimedOut)), "{result:?}");
+        assert_eq!(pick, None);
     }
 
     #[tokio::test]

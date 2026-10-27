@@ -47,6 +47,10 @@ impl types::Host for HostState {}
 
 impl http::Host for HostState {
     async fn fetch(&mut self, req: http::Request) -> Result<http::Response, http::HttpError> {
+        // A module polling for a sign-in code stops once the user cancelled it or its time is up.
+        if let Some(why) = self.code_abandoned() {
+            return Err(http::HttpError::Blocked(why.to_string()));
+        }
         let req = net::Request { method: req.method, url: req.url, headers: req.headers, body: req.body };
         let fetch = self.env.net.fetch_up_to(&self.env.hosts, req, self.max_body);
         // A body that keeps trickling in never trips the read timeout: the fetch ends before the

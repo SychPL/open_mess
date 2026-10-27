@@ -1,7 +1,9 @@
 //! Sign-in prompts on their way from modules to the configuration window (spec 8.3, 8.8). Sign-in
 //! starts only from the window, one at a time: a prompt from a module that is not signing in from
 //! the window is refused. The window shows the one prompt that waits, and answers it; a newer
-//! prompt, the end of the sign-in or the window closing cancel it.
+//! prompt, the end of the sign-in or the window closing cancel it. Once the user cancelled (or
+//! closed the window), every later prompt of that sign-in is cancelled at once, so a module that
+//! keeps asking runs into its call limit instead of holding the sign-in open.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -36,20 +38,20 @@ struct State {
     next_id: u64,
     /// The configuration window's handle while it is open: the owner of the WAM dialog.
     owner: Option<isize>,
+    /// The user cancelled the sign-in in progress, or closed the window.
+    cancelled: bool,
 }
 
-/// The prompt on screen; `reply` is None once nothing waits for its answer.
+/// The prompt on screen and where its answer goes.
 struct Shown {
     id: u64,
     request: SignInRequest,
-    reply: Option<oneshot::Sender<SignInReply>>,
+    reply: oneshot::Sender<SignInReply>,
 }
 
 impl Shown {
     fn cancel(self) {
-        if let Some(reply) = self.reply {
-            let _ = reply.send(SignInReply::Cancelled);
-        }
+        let _ = self.reply.send(SignInReply::Cancelled);
     }
 }
 
@@ -92,6 +94,7 @@ impl SignIns {
             return Err(BUSY.into());
         }
         state.module = Some(module.into());
+        state.cancelled = false;
         Ok(Active(self.clone()))
     }
 
@@ -110,6 +113,10 @@ impl SignIns {
                 let _ = reply.send(SignInReply::Refused(NOT_FROM_WINDOW.into()));
                 return;
             }
+            if state.cancelled {
+                let _ = reply.send(SignInReply::Cancelled);
+                return;
+            }
             // Answered here: the user sees the WAM dialog itself.
             if let SignInRequest::WamWindow { .. } = request {
                 let _ = reply.send(state.owner.map_or_else(|| SignInReply::Refused(NO_WINDOW.into()), SignInReply::Window));
@@ -117,7 +124,7 @@ impl SignIns {
             }
             state.next_id += 1;
             let id = state.next_id;
-            state.shown.replace(Shown { id, request, reply: Some(reply) })
+            state.shown.replace(Shown { id, request, reply })
         };
         if let Some(old) = replaced {
             old.cancel();
@@ -130,18 +137,20 @@ impl SignIns {
         self.state().shown.as_ref().map(|shown| (shown.id, shown.request.clone()))
     }
 
-    /// The user's answer to prompt `id`. The prompt goes off the screen.
+    /// The user's answer to prompt `id`. The prompt goes off the screen; a cancel cancels the rest
+    /// of the sign-in too.
     pub fn answer(&self, id: u64, reply: SignInReply) -> Result<(), String> {
         let shown = {
             let mut state = self.state();
-            match &state.shown {
-                Some(shown) if shown.id == id => state.shown.take(),
-                _ => return Err(GONE.into()),
+            match state.shown.take_if(|shown| shown.id == id) {
+                Some(shown) => {
+                    state.cancelled |= reply == SignInReply::Cancelled;
+                    shown
+                }
+                None => return Err(GONE.into()),
             }
         };
-        if let Some(waiting) = shown.and_then(|shown| shown.reply) {
-            let _ = waiting.send(reply);
-        }
+        let _ = shown.reply.send(reply);
         self.changed();
         Ok(())
     }
@@ -156,6 +165,7 @@ impl SignIns {
         let shown = {
             let mut state = self.state();
             state.owner = None;
+            state.cancelled = state.module.is_some();
             state.shown.take()
         };
         if let Some(shown) = shown {

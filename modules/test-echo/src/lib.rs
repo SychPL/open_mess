@@ -21,7 +21,9 @@
 //! `https://login.example.com/done` and signs in the account named by the redirect's `account=`
 //! parameter (a sign-in error ends it as a platform error naming the case); after the tool
 //! `sign-in-with` `{"how": "windows"}` it signs in account "windows" with a WAM token for the
-//! manifest's identity (the Teams client id; for the manual check only) instead; `sign-out` reports the
+//! manifest's identity (the Teams client id; for the manual check only) instead, and after
+//! `{"how": "device-code"}` it shows a device code and polls `http.fetch` until the host refuses
+//! with "sign-in ...", which it returns as a platform error; `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
 //! named after any other.
 
@@ -208,6 +210,24 @@ mod guest {
         }
 
         fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
+            if storage::get("sign-in-with").as_deref() == Some(b"device-code") {
+                // Polls, as a device-code sign-in would, until the host says the code is abandoned.
+                sign_in::show_device_code("WXYZ-5678", "https://login.example.com/device");
+                loop {
+                    let poll = http::Request {
+                        method: "POST".to_string(),
+                        url: "https://login.example.com/token".to_string(),
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    };
+                    if let Err(http::HttpError::Blocked(why)) = http::fetch(&poll)
+                        && why.starts_with("sign-in")
+                    {
+                        return Err(types::ModuleError::Platform(why));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
             if storage::get("sign-in-with").as_deref() == Some(b"windows") {
                 // The manual check of WAM: only the token's length is logged.
                 let token =

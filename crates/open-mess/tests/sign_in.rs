@@ -120,6 +120,37 @@ async fn cancel_reaches_the_module() {
 }
 
 #[tokio::test]
+async fn cancelling_ends_the_whole_sign_in() {
+    let d = daemon(&[]).await;
+    let state = state(&d);
+    let offer = |request| {
+        let (reply, answer) = oneshot::channel();
+        state.sign_ins.offer(request, reply);
+        answer
+    };
+    let qr = || SignInRequest::Qr { module: "m".into(), data: "x".into() };
+    let active = state.sign_ins.begin("m").unwrap();
+    let first = offer(qr());
+    let id = commands::sign_in_request(&state).unwrap().id;
+    commands::sign_in_answer(&state, id, AnswerDto::Cancelled).unwrap();
+    assert_eq!(first.await, Ok(SignInReply::Cancelled));
+    // A module that asks again gets cancelled at once; nothing waits on screen.
+    assert_eq!(offer(qr()).await, Ok(SignInReply::Cancelled));
+    assert!(commands::sign_in_request(&state).is_none());
+    drop(active);
+
+    // Closing the window before the module's first prompt cancels it too.
+    let active = state.sign_ins.begin("m").unwrap();
+    state.sign_ins.window_closed();
+    assert_eq!(offer(qr()).await, Ok(SignInReply::Cancelled));
+    drop(active);
+    // The next sign-in starts afresh.
+    let _active = state.sign_ins.begin("m").unwrap();
+    let _waiting = offer(qr());
+    assert!(commands::sign_in_request(&state).is_some());
+}
+
+#[tokio::test]
 async fn windows_accounts_are_picked_in_the_window() {
     let d = daemon(&[]).await;
     let state = state(&d);
@@ -143,8 +174,9 @@ async fn windows_accounts_are_picked_in_the_window() {
     state.sign_ins.window_opened(7);
     assert_eq!(offer(SignInRequest::WamWindow { module: "m".into() }).await, Ok(SignInReply::Window(7)));
     assert!(commands::sign_in_request(&state).is_none());
+    // Closing the window ends the sign-in.
     state.sign_ins.window_closed();
-    assert_eq!(offer(SignInRequest::WamWindow { module: "m".into() }).await, Ok(SignInReply::Refused(NO_WINDOW.into())));
+    assert_eq!(offer(SignInRequest::WamWindow { module: "m".into() }).await, Ok(SignInReply::Cancelled));
     // Not for a module that is not signing in.
     state.sign_ins.window_opened(7);
     assert_eq!(offer(SignInRequest::WamWindow { module: "other".into() }).await, Ok(SignInReply::Refused(NOT_FROM_WINDOW.into())));
@@ -153,11 +185,16 @@ async fn windows_accounts_are_picked_in_the_window() {
 /// The manual check of WAM (plan E2, Task 2): test-echo signs in with the Teams client id, the
 /// first Windows account is picked as the user would in the window, and the module gets a token,
 /// of which only the length is shown. Talks to Windows, never to Teams; leaves no secret behind.
-/// `cargo test -p open-mess --test sign_in -- --ignored --nocapture`
+/// Only with the user present and asked for (spec 9.5):
+/// `OPEN_MESS_LIVE_WAM=1 cargo test -p open-mess --test sign_in -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "talks to Windows' account manager; run by hand"]
 #[allow(clippy::print_stdout)]
 async fn windows_account_live() {
+    if std::env::var_os("OPEN_MESS_LIVE_WAM").is_none() {
+        println!("skipped: set OPEN_MESS_LIVE_WAM=1 to sign in with a Windows account");
+        return;
+    }
     let d = daemon(&[ECHO]).await;
     let state = state(&d);
     let echo = d.accounts.modules().handle("test-echo").unwrap();
