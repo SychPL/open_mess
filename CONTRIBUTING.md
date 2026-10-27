@@ -69,6 +69,13 @@ More crates (core) arrive with the specs that introduce them.
 7. **Permissive dependencies only.** open_mess is MIT OR Apache-2.0; `deny.toml` lists the
    accepted licences. Say in the PR which dependency you add and why.
 
+### Running the daemon from Claude Desktop
+
+Claude Desktop is an MSIX package, so processes started by its built-in tools see a virtualized
+`%APPDATA%`: files they write there land in `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\`
+and a daemon started elsewhere does not see them. Copy modules into
+`%APPDATA%\open_mess\modules\` from the same terminal that starts `om daemon` (or from Explorer).
+
 ## Specs
 
 A non-trivial change starts as `.specs/<slug>.md`: goal, context, steps, touched files,

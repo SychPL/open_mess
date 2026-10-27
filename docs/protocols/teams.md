@@ -528,6 +528,27 @@ token, tenant id, user id or account name.
      formatVariant: "TEAMS"}}`: HTTP 201 with `OriginalArrivalTime`.
    No endpoint registration, Trouter connection or skype token was needed to send.
 
-All checks in items 1-4 were read-only: no endpoint registration, no property write, no Trouter
+6. **open_mess end to end** (2026-10-27, release build, the owner at the computer):
+   - module approval in the window, WAM sign-in from the window (account picker), the account back
+     online after a daemon restart with no prompt;
+   - `list_conversations` (50 conversations: group, meeting, direct, channel), `read_messages` on a
+     1:1 chat in about 1 s, `mentions`, `unread` (every item `unknown`, as designed until the
+     account-wide horizon is found);
+   - `send` to a 1:1 chat with `confirm`: toast, `Show all`, approved in the dialog, state `done`,
+     the message arrived and was answered.
+   Found: `read_messages` on `48:notes` timed out in the module (the service answers that page in
+   330 ms, see item 7), every `mentions` item carried the same conversation id, and the approval
+   showed raw MRIs because the members list has no display names (item 7).
+7. **Members and the self-chat** (read-only, 2026-10-27):
+   - `GET v1/threads/<id>/members?view=msnp24Equivalent` and `GET v1/threads/<id>`: member keys are
+     `capabilities, cid, hidden, id, isFollowing, linkedMri, role, type, userLink` (thread view adds
+     `meetingRole, rangeEnd, rangeStart`) - **no display name**. Names must come from elsewhere:
+     Graph `users/<oid>` (works with the Teams client id, item 5) or messages' `imdisplayname`.
+   - `GET v1/users/ME/conversations/48:notes/messages?...&pageSize=5&startTime=1`: HTTP 200 in
+     330 ms; message keys include `fromDisplayNameInToken`, `fromGivenNameInToken`,
+     `fromFamilyNameInToken`, `imdisplayname`, `amsreferences`; `_metadata` has `backwardLink`,
+     `syncState`, `lastCompleteSegmentStartTime`, `lastCompleteSegmentEndTime`.
+
+All checks in items 1-4 and 7 were read-only: no endpoint registration, no property write, no Trouter
 connection. Values printed during the checks were limited to status codes, key names, counts and
 service URLs.
