@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,12 +33,14 @@ fn local_time() -> NaiveTime {
 #[derive(Default)]
 struct Recorder {
     calls: Mutex<Vec<(String, Batch, Instant)>>,
+    /// Answer that no session took the batch.
+    no_session: AtomicBool,
 }
 
 impl Delivery for Recorder {
     async fn deliver(&self, rule: Rule, batch: Batch) -> DeliveryResult {
         self.calls.lock().unwrap().push((rule.id, batch, Instant::now()));
-        DeliveryResult::Delivered
+        if self.no_session.load(Ordering::SeqCst) { DeliveryResult::NoSession } else { DeliveryResult::Delivered }
     }
 }
 
@@ -48,7 +50,7 @@ struct Setup {
     recorder: Arc<Recorder>,
     counters: Counters,
     started: Instant,
-    _engine: JoinHandle<()>,
+    engine: JoinHandle<()>,
 }
 
 impl Setup {
@@ -72,7 +74,7 @@ async fn setup(rules: &[Rule]) -> Setup {
     let bus = Bus::default();
     let (recorder, counters) = (Arc::new(Recorder::default()), Counters::default());
     let engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::clone(&recorder), counters.clone(), local_time);
-    Setup { d, bus, recorder, counters, started: Instant::now(), _engine: engine }
+    Setup { d, bus, recorder, counters, started: Instant::now(), engine }
 }
 
 fn rule(id: &str, condition: Condition) -> Rule {
@@ -331,4 +333,86 @@ async fn open_batches_are_capped() {
     assert_eq!(counters.dropped_queue, 1);
     // The rest went out, as far as the hourly cap let them.
     assert_eq!(counters.delivered + counters.dropped_rate, engine::MAX_OPEN as u64);
+}
+
+fn held(batch: &Batch) -> usize {
+    batch.messages.iter().map(|message| message.id.len() + message.sender.len()).sum()
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_bytes_are_capped() {
+    // Ids as long as a module may send (64 KiB): ten rules, each with more than its share.
+    let rules: Vec<Rule> = (0..10).map(|n| rule(&format!("r{n}"), Condition::Conversation { id: format!("c{n}") })).collect();
+    let t = setup(&rules).await;
+    let long = "p".repeat(64 * 1024);
+    for n in 0..10 {
+        for m in 0..40 {
+            t.bus.publish(from(&format!("c{n}"), &format!("m{m}"), &long, Kind::Plain));
+        }
+        // Let the engine take them in before the bus is full.
+        tokio::task::yield_now().await;
+    }
+    sleep(Duration::from_secs(61)).await;
+    let calls = t.calls();
+    // A rule's batch keeps its newest messages within its share, and counts them all.
+    let first = calls.iter().find(|(rule, ..)| rule == "r0").map(|(_, batch, _)| batch).unwrap();
+    assert!(held(first) <= engine::MAX_RULE_BYTES, "{}", held(first));
+    assert!(first.messages.len() > 20 && first.messages.len() < 40, "{}", first.messages.len());
+    assert_eq!((first.count, first.messages.last().map(|message| message.id.as_str())), (40, Some("m39")));
+    // All of them together within the engine's.
+    assert!(calls.iter().map(|(_, batch, _)| held(batch)).sum::<usize>() <= engine::MAX_BYTES);
+    // What did not fit at all was dropped and counted.
+    let dropped: u64 = (0..10).map(|n| t.counters.rule(&format!("r{n}")).dropped_queue).sum();
+    assert!(dropped > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_message_reported_again_fires_once() {
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    // Twice while its batch is collected, and again once it went out.
+    t.bus.publish(message("c1", "m1", Kind::Direct));
+    t.bus.publish(message("c1", "m1", Kind::Direct));
+    sleep(Duration::from_secs(61)).await;
+    t.bus.publish(message("c1", "m1", Kind::Direct));
+    sleep(Duration::from_secs(61)).await;
+    let calls = t.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!((ids(&calls[0].1), calls[0].1.count), (vec!["m1"], 1));
+    // After a restart, the module's or the daemon's, it still fires nothing; the same id in
+    // another conversation is another message.
+    t.engine.abort();
+    let bus = Bus::default();
+    let _engine = engine::spawn(&bus, Arc::clone(&t.d.accounts), Arc::clone(&t.recorder), t.counters.clone(), local_time);
+    bus.publish(message("c1", "m1", Kind::Direct));
+    bus.publish(message("c2", "m1", Kind::Direct));
+    sleep(Duration::from_secs(61)).await;
+    assert_eq!(t.calls().iter().map(|(_, batch, _)| batch.conversation.as_str()).collect::<Vec<_>>(), ["c1", "c2"]);
+    // What was handled long ago is forgotten when the next batch goes out.
+    let db = rusqlite::Connection::open(t.d.dir.path().join("state.sqlite3")).unwrap();
+    db.execute("UPDATE trigger_seen SET at_ms = 0 WHERE message IN (SELECT message FROM trigger_seen LIMIT 1)", []).unwrap();
+    bus.publish(message("c3", "m1", Kind::Direct));
+    sleep(Duration::from_secs(61)).await;
+    let count = |sql: &str| db.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+    assert_eq!((count("SELECT count(*) FROM trigger_seen"), count("SELECT count(*) FROM trigger_seen WHERE at_ms = 0")), (2, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn deliveries_that_woke_nobody_leave_the_hourly_cap() {
+    let mut capped = rule("r", Condition::Direct);
+    (capped.max_per_hour, capped.quiet_ms, capped.max_delay_ms) = (2, 5_000, 5_000);
+    let t = setup(&[capped]).await;
+    // No session to notify for a while.
+    t.recorder.no_session.store(true, Ordering::SeqCst);
+    for n in 0..4 {
+        t.bus.publish(message(&format!("c{n}"), &format!("m{n}"), Kind::Direct));
+        sleep(Duration::from_secs(6)).await;
+    }
+    // Then one opens: the next DMs reach it, as many as the cap allows.
+    t.recorder.no_session.store(false, Ordering::SeqCst);
+    for n in 4..7 {
+        t.bus.publish(message(&format!("c{n}"), &format!("m{n}"), Kind::Direct));
+    }
+    sleep(Duration::from_secs(10)).await;
+    let counters = t.counters.rule("r");
+    assert_eq!((counters.dropped_no_session, counters.delivered, counters.dropped_rate), (4, 2, 1));
 }

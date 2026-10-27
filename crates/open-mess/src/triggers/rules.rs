@@ -137,6 +137,7 @@ pub fn put(store: &Store, rule: &Rule) -> Result<Option<&'static str>, Error> {
 
 /// Deletes a rule; false when there was none.
 pub fn delete(store: &Store, id: &str) -> Result<bool, Error> {
+    store.conn().execute("DELETE FROM trigger_seen WHERE rule = ?1", [id])?;
     Ok(store.conn().execute("DELETE FROM trigger_rules WHERE id = ?1", [id])? > 0)
 }
 

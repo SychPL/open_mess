@@ -2,15 +2,18 @@
 //! rule's messages per conversation into a batch, and hands the batch to the rule's action once the
 //! conversation has been quiet for the rule's quiet period, but never later than its longest delay
 //! after the first message (spec 8.7, R4). Quiet hours and the hourly cap drop batches; every drop
-//! is counted for `status`.
+//! is counted for `status`. What the batches hold is capped in count and in bytes, per rule and
+//! in all: ids come from modules, which may send long ones.
 //!
-//! Never fired: the user's own messages, accounts that are unknown or being removed, and
-//! conversations the agent may not read (spec 8.6, 8.7). The account and the permission are checked
-//! again when a batch goes out, so taking the read permission away mutes it at once (R7).
+//! Never fired: the user's own messages, messages a rule has handled already (a module may report
+//! one again after a restart; they are kept in the database for [`SEEN_FOR`]), accounts that are
+//! unknown or being removed, and conversations the agent may not read (spec 8.4, 8.6, 8.7). The
+//! account and the permission are checked again when a batch goes out, so taking the read
+//! permission away mutes it at once (R7).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveTime;
@@ -30,6 +33,16 @@ pub const MAX_BATCH: usize = 100;
 /// Batches collected at once over all rules and conversations; a message that would open one more
 /// is dropped and counted.
 pub const MAX_OPEN: usize = 1000;
+/// Bytes of ids the open batches of one rule hold. A message past it pushes the oldest messages of
+/// its own batch out (the batch's `count` still counts them); with none to push out it is dropped
+/// and counted.
+pub const MAX_RULE_BYTES: usize = 2 * 1024 * 1024;
+/// The same over all rules.
+pub const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// How long a rule remembers the messages it handled.
+pub const SEEN_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Messages remembered over all rules; the oldest go first.
+pub const MAX_SEEN: i64 = 50_000;
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
 /// The messages of one rule in one conversation, delivered together.
@@ -66,6 +79,13 @@ pub struct BatchedMessage {
     pub untrusted: Option<serde_json::Value>,
 }
 
+impl BatchedMessage {
+    /// What it holds, as counted against [`MAX_RULE_BYTES`] and [`MAX_BYTES`].
+    fn bytes(&self) -> usize {
+        self.id.len() + self.sender.len()
+    }
+}
+
 /// Where batches go: the rules' actions, or a recorder in tests.
 pub trait Delivery: Send + Sync + 'static {
     fn deliver(&self, rule: Rule, batch: Batch) -> impl Future<Output = DeliveryResult> + Send;
@@ -85,9 +105,12 @@ pub enum DeliveryResult {
 /// of day, for quiet hours.
 pub fn spawn<D: Delivery>(bus: &Bus, accounts: Arc<Accounts>, delivery: Arc<D>, counters: Counters, local_time: fn() -> NaiveTime) -> JoinHandle<()> {
     let events = bus.subscribe();
-    let engine = Engine { accounts, delivery, counters, local_time, open: HashMap::new(), sent: HashMap::new() };
+    let engine = Engine { accounts, delivery, counters, local_time, open: HashMap::new(), sent: Arc::default() };
     tokio::spawn(engine.run(events))
 }
+
+/// When each rule's batches of the last hour went out, by rule id.
+type Sent = Arc<Mutex<HashMap<String, VecDeque<Instant>>>>;
 
 struct Engine<D> {
     accounts: Arc<Accounts>,
@@ -96,8 +119,8 @@ struct Engine<D> {
     local_time: fn() -> NaiveTime,
     /// Batches being collected, by rule id and conversation.
     open: HashMap<(String, String), Open>,
-    /// When each rule's batches of the last hour went out.
-    sent: HashMap<String, VecDeque<Instant>>,
+    /// Shared with the deliveries: one that woke nobody gives its place back.
+    sent: Sent,
 }
 
 struct Open {
@@ -106,11 +129,21 @@ struct Open {
     last: Instant,
     quiet: Duration,
     max_delay: Duration,
+    /// The batch's ids, its messages' and its own.
+    bytes: usize,
 }
 
 impl Open {
     fn due(&self) -> Instant {
         (self.last + self.quiet).min(self.first + self.max_delay)
+    }
+
+    /// Lets the oldest message go; it stays counted in `count`.
+    fn drop_oldest(&mut self) {
+        if !self.batch.messages.is_empty() {
+            let gone = self.batch.messages.remove(0);
+            self.bytes = self.bytes.saturating_sub(gone.bytes());
+        }
     }
 }
 
@@ -160,12 +193,20 @@ impl<D: Delivery> Engine<D> {
             if fired.is_empty() || !readable(&store, account, conversation) {
                 return;
             }
-            fired
+            let hash = seen_hash(conversation, &message.id);
+            fired.into_iter().filter(|rule| !seen(&store, &rule.id, &hash)).collect()
         };
         let now = Instant::now();
         for rule in fired {
             let key = (rule.id.clone(), conversation.to_owned());
-            if !self.open.contains_key(&key) && self.open.len() >= MAX_OPEN {
+            let open = self.open.get(&key);
+            // Reported again while its batch is still collected.
+            if open.is_some_and(|open| open.batch.messages.iter().any(|kept| kept.id == message.id)) {
+                continue;
+            }
+            let new = open.is_none();
+            let cost = message.bytes() + if new { account.len() + conversation.len() } else { 0 };
+            if (new && self.open.len() >= MAX_OPEN) || !self.make_room(&key, cost) {
                 self.counters.count(&rule.id, |counters| &mut counters.dropped_queue);
                 continue;
             }
@@ -183,14 +224,34 @@ impl<D: Delivery> Engine<D> {
                 last: now,
                 quiet: Duration::from_millis(rule.quiet_ms),
                 max_delay: Duration::from_millis(rule.max_delay_ms),
+                bytes: account.len() + conversation.len(),
             });
             open.last = now;
             open.batch.last_ms = message.at_ms;
             open.batch.count = open.batch.count.saturating_add(1);
             if open.batch.messages.len() >= MAX_BATCH {
-                open.batch.messages.remove(0);
+                open.drop_oldest();
             }
+            open.bytes = open.bytes.saturating_add(message.bytes());
             open.batch.messages.push(message.clone());
+        }
+    }
+
+    /// Makes room for `cost` more bytes in the batch at `key` within its rule's budget and the
+    /// engine's, by letting that batch's own oldest messages go; false when that is not enough.
+    // ponytail: every open batch is summed for each message; keep running totals if that shows.
+    fn make_room(&mut self, key: &(String, String), cost: usize) -> bool {
+        loop {
+            let (rule, all) = self.open.iter().fold((0usize, 0usize), |(rule, all), (other, open)| {
+                (if other.0 == key.0 { rule.saturating_add(open.bytes) } else { rule }, all.saturating_add(open.bytes))
+            });
+            if rule.saturating_add(cost) <= MAX_RULE_BYTES && all.saturating_add(cost) <= MAX_BYTES {
+                return true;
+            }
+            match self.open.get_mut(key) {
+                Some(open) if !open.batch.messages.is_empty() => open.drop_oldest(),
+                _ => return false,
+            }
         }
     }
 
@@ -210,21 +271,27 @@ impl<D: Delivery> Engine<D> {
         let Some(rule) = current_rule(&self.accounts, rule_id, &batch.account, &batch.conversation) else {
             return;
         };
+        // Handled from here on, whether it goes out or is dropped.
+        // ponytail: a failed write only means a message reported again may wake the rule again.
+        let _ = remember(&self.accounts.store(), &rule.id, &batch);
         if in_quiet_hours(rule.quiet_hours, (self.local_time)()) {
             self.counters.count(&rule.id, |counters| &mut counters.dropped_quiet_hours);
             return;
         }
-        let sent = self.sent.entry(rule.id.clone()).or_default();
-        while sent.front().is_some_and(|at| now.duration_since(*at) >= HOUR) {
-            sent.pop_front();
+        {
+            let mut sent = self.sent.lock().unwrap_or_else(PoisonError::into_inner);
+            let sent = sent.entry(rule.id.clone()).or_default();
+            while sent.front().is_some_and(|at| now.duration_since(*at) >= HOUR) {
+                sent.pop_front();
+            }
+            if sent.len() >= usize::try_from(rule.max_per_hour).unwrap_or(usize::MAX) {
+                self.counters.count(&rule.id, |counters| &mut counters.dropped_rate);
+                return;
+            }
+            sent.push_back(now);
         }
-        if sent.len() >= usize::try_from(rule.max_per_hour).unwrap_or(usize::MAX) {
-            self.counters.count(&rule.id, |counters| &mut counters.dropped_rate);
-            return;
-        }
-        sent.push_back(now);
         // In its own task: an action may wait for a module, and the bus must keep moving.
-        let (delivery, counters) = (Arc::clone(&self.delivery), self.counters.clone());
+        let (delivery, counters, sent) = (Arc::clone(&self.delivery), self.counters.clone(), Arc::clone(&self.sent));
         tokio::spawn(async move {
             let id = rule.id.clone();
             match delivery.deliver(rule, batch).await {
@@ -233,7 +300,16 @@ impl<D: Delivery> Engine<D> {
                     counters.count(&id, |counters| &mut counters.delivered);
                     counters.count(&id, |counters| &mut counters.dropped_queue);
                 }
-                DeliveryResult::NoSession => counters.count(&id, |counters| &mut counters.dropped_no_session),
+                DeliveryResult::NoSession => {
+                    counters.count(&id, |counters| &mut counters.dropped_no_session);
+                    // Nobody was woken, so it does not count against the hourly cap.
+                    let mut sent = sent.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(sent) = sent.get_mut(&id)
+                        && let Some(at) = sent.iter().position(|at| *at == now)
+                    {
+                        sent.remove(at);
+                    }
+                }
             }
         });
     }
@@ -263,6 +339,34 @@ fn known(accounts: &Accounts, account: &str) -> bool {
 
 fn readable(store: &Store, account: &str, conversation: &str) -> bool {
     permissions::effective(store, account, Some(conversation)).is_ok_and(|effective| effective.read)
+}
+
+/// How a handled message is kept: its ids can be long, the hash is not.
+fn seen_hash(conversation: &str, message: &str) -> String {
+    crate::modules::sha256_hex(format!("{conversation}\n{message}").as_bytes())
+}
+
+/// Whether the rule has handled the message. A database that can't say lets it through.
+fn seen(store: &Store, rule: &str, hash: &str) -> bool {
+    let found = store.conn().query_row("SELECT 1 FROM trigger_seen WHERE rule = ?1 AND message = ?2", [rule, hash], |_| Ok(()));
+    found.is_ok()
+}
+
+/// Keeps the batch's messages as handled by the rule, in one transaction, and forgets those past
+/// [`SEEN_FOR`] or [`MAX_SEEN`].
+fn remember(store: &Store, rule: &str, batch: &Batch) -> Result<(), rusqlite::Error> {
+    let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+    let cutoff = now.saturating_sub(i64::try_from(SEEN_FOR.as_millis()).unwrap_or(i64::MAX));
+    let tx = store.conn().unchecked_transaction()?;
+    for message in &batch.messages {
+        tx.execute(
+            "INSERT OR REPLACE INTO trigger_seen (rule, account, message, at_ms) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![rule, batch.account, seen_hash(&batch.conversation, &message.id), now],
+        )?;
+    }
+    tx.execute("DELETE FROM trigger_seen WHERE at_ms < ?1", [cutoff])?;
+    tx.execute("DELETE FROM trigger_seen WHERE rowid IN (SELECT rowid FROM trigger_seen ORDER BY at_ms DESC LIMIT -1 OFFSET ?1)", [MAX_SEEN])?;
+    tx.commit()
 }
 
 /// Whether `now` falls in the quiet hours; a window that starts later than it ends wraps midnight.

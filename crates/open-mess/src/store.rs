@@ -30,6 +30,11 @@ const MIGRATIONS: &[&str] = &[
     // Trigger rules (spec 8.7, triggers/rules.rs); `rule` is the condition, action and limits as JSON.
     "CREATE TABLE trigger_rules (id TEXT PRIMARY KEY, account TEXT NOT NULL, rule TEXT NOT NULL, enabled INTEGER NOT NULL,
          created_ms INTEGER NOT NULL);",
+    // Messages each rule has handled (triggers/engine.rs), so one reported again never wakes an
+    // agent twice; `message` is the SHA-256 of the conversation and message ids.
+    "CREATE TABLE trigger_seen (rule TEXT NOT NULL, account TEXT NOT NULL, message TEXT NOT NULL, at_ms INTEGER NOT NULL,
+         PRIMARY KEY (rule, message));
+     CREATE INDEX trigger_seen_at ON trigger_seen (at_ms);",
 ];
 
 /// Configuration and state in `state.sqlite3`.
