@@ -21,8 +21,8 @@ const NAMED_PARTICIPANTS: usize = 5;
 /// at the default text size, so what a toast can approve is never cut off.
 const TOAST_LINES: usize = 4;
 const TOAST_WIDTH: usize = 24;
-/// The dialog has no scroll bar: what it approves must fit a small screen. Longer content can't be
-/// approved before the configuration window (milestone E) shows it.
+/// The dialog has no scroll bar: what it approves must fit a small screen. Longer content can only
+/// be rejected there; approving it waits for the configuration window (milestone E).
 const DIALOG_LINES: usize = 25;
 const DIALOG_WIDTH: usize = 40;
 const APPROVE: &[(&str, &str)] = &[("Approve", "approve"), ("Reject", "reject")];
@@ -231,14 +231,15 @@ mod toast {
     }
 
     /// Everything in a modal dialog: Yes approves, No rejects, closing decides nothing. Content too
-    /// long to show in full is only explained. (Buttons named Approve and Reject would need common
-    /// controls 6 and an application manifest.)
+    /// long to show in full can only be rejected. (Buttons named Approve and Reject would need
+    /// common controls 6 and an application manifest.)
     fn ask(prompt: &Prompt) -> Option<bool> {
         let dialog = rfd::MessageDialog::new().set_level(rfd::MessageLevel::Warning).set_title(&prompt.title);
         let Some(text) = prompt.dialog() else {
-            let why = "This is too long to show here in full, so it can't be approved here. It stays waiting until it expires.";
-            dialog.set_description(why).set_buttons(rfd::MessageButtons::Ok).show();
-            return None;
+            let why = "This is too long to show here in full, so it can't be approved here.\n\n\
+                       Reject it? Yes rejects it, No leaves it waiting until it expires.";
+            let answer = dialog.set_description(why).set_buttons(rfd::MessageButtons::YesNo).show();
+            return (answer == rfd::MessageDialogResult::Yes).then_some(false);
         };
         let answer =
             dialog.set_description(format!("{text}\n\nApprove this? Yes approves it, No rejects it.")).set_buttons(rfd::MessageButtons::YesNo).show();

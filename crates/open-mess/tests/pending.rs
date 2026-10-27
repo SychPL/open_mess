@@ -222,18 +222,21 @@ async fn an_account_keeps_a_bounded_number_of_actions() {
     let mut db = db(&d);
     let tx = db.transaction().unwrap();
     for n in 1..=MAX_KEPT + 5 {
+        // The oldest one may have reached the platform: it is the last to go.
+        let state = if n == 1 { "uncertain" } else { "done" };
         tx.execute(
-            "INSERT INTO pending (id, account, conversation, kind, args, fingerprint, state, created_ms) VALUES (?1, 'test-echo:a', 'c1', 'send', '', '', 'done', ?2)",
-            (format!("old{n}"), n),
+            "INSERT INTO pending (id, account, conversation, kind, args, fingerprint, state, created_ms) VALUES (?1, 'test-echo:a', 'c1', 'send', '', '', ?2, ?3)",
+            (format!("old{n}"), state, n),
         )
         .unwrap();
     }
     tx.commit().unwrap();
     assert_eq!(pending.create(Kind::Send, "test-echo:a", "c1", send("one more")).await.unwrap().state, State::Done);
     let count = |sql: &str| db.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
-    // The oldest went; the new one is kept.
+    // The oldest done ones went; the uncertain one and the new one are kept.
     assert_eq!(count("SELECT COUNT(*) FROM pending"), MAX_KEPT + 1);
-    assert_eq!(count("SELECT COUNT(*) FROM pending WHERE created_ms <= 5"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM pending WHERE created_ms BETWEEN 2 AND 6"), 0);
+    assert_eq!(pending.state("old1").unwrap(), State::Uncertain);
 }
 
 #[tokio::test]
