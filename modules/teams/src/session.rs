@@ -40,6 +40,17 @@ pub fn claims(token: &str) -> Option<Claims> {
     })
 }
 
+/// The claims a 401's `WWW-Authenticate` asks for (CAE, docs/protocols/teams.md 1.3:
+/// `Bearer ..., error="insufficient_claims", claims="<base64 JSON>"`), decoded; `None` without any.
+pub fn challenge_claims(www_authenticate: &str) -> Option<String> {
+    const KEY: &str = "claims=\"";
+    // Lowercasing ASCII keeps every byte offset.
+    let start = www_authenticate.to_ascii_lowercase().find(KEY)? + KEY.len();
+    let value = www_authenticate.get(start..)?.split('"').next()?;
+    let decoded = base64_decode(value).and_then(|bytes| String::from_utf8(bytes).ok());
+    Some(decoded.unwrap_or_else(|| value.to_string())).filter(|claims| !claims.is_empty())
+}
+
 /// Base64 in either alphabet (standard or URL-safe), padding optional.
 pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() * 3 / 4);
@@ -142,6 +153,18 @@ mod tests {
         assert_eq!(base64_decode("aGk_Pz8+"), Some(b"hi???>".to_vec()));
         assert_eq!(base64_decode("aGk="), Some(b"hi".to_vec()));
         assert_eq!(base64_decode("a b"), None);
+    }
+
+    #[test]
+    fn challenge_claims_are_decoded() {
+        // base64 of {"access_token":{"nbf":{"essential":true}}}
+        let header = r#"Bearer realm="", authorization_uri="https://login.example/", error="insufficient_claims", Claims="eyJhY2Nlc3NfdG9rZW4iOnsibmJmIjp7ImVzc2VudGlhbCI6dHJ1ZX19fQ==""#;
+        assert_eq!(challenge_claims(header).as_deref(), Some(r#"{"access_token":{"nbf":{"essential":true}}}"#));
+        // Plain JSON is passed on as it is; no claims, or empty ones, are none.
+        assert_eq!(challenge_claims(r#"Bearer claims="{x}""#).as_deref(), Some("{x}"));
+        for none in ["Bearer realm=\"\"", "Bearer claims=\"\"", "", "claims=\""] {
+            assert_eq!(challenge_claims(none), None, "{none}");
+        }
     }
 
     #[test]

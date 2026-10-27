@@ -92,7 +92,7 @@ mod guest {
                 sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
                 json!({
                     "open-page": describe(sign_in::open_page("https://login.example.com/", "https://login.example.com/done")),
-                    "wam-token": describe(sign_in::wam_token(&["scope".to_string()], true)),
+                    "wam-token": describe(sign_in::wam_token(&["scope".to_string()], true, None)),
                 })
             }
             "trap" => std::process::abort(),

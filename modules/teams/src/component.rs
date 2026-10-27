@@ -13,6 +13,8 @@ pub(crate) mod bindings {
 use bindings::exports::open_mess::module::{events, module};
 use bindings::open_mess::module::types;
 
+use crate::api;
+
 struct Teams;
 
 fn not_yet() -> types::ModuleError {
@@ -38,19 +40,22 @@ impl module::Guest for Teams {
     }
 
     fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
-        crate::api::sign_in()
+        api::begin();
+        api::sign_in()
     }
 
     fn restore(account: String) -> Result<(), types::ModuleError> {
-        crate::api::restore(&account)
+        api::begin();
+        api::restore(&account)
     }
 
     fn sign_out(account: String) {
-        crate::api::sign_out(&account);
+        api::sign_out(&account);
     }
 
-    fn call(_account: String, _tool: String, _args_json: String) -> Result<String, types::ModuleError> {
-        Err(not_yet())
+    fn call(account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
+        api::begin();
+        crate::tools::call(&account, &tool, &args_json)
     }
 
     fn get_attachment(

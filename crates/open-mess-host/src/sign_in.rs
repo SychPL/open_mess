@@ -6,10 +6,11 @@ use std::future::Future;
 
 use crate::actor::Deadline;
 
-/// Test support: answers `wam-token` in place of Windows. It gets the scopes and whether the call
-/// is interactive, and returns a token or the reason it refuses (`sign-in-error::refused`).
+/// Test support: answers `wam-token` in place of Windows. It gets the scopes, whether the call is
+/// interactive and the claims asked for, and returns a token or the reason it refuses
+/// (`sign-in-error::refused`).
 #[cfg(any(test, feature = "test-support"))]
-pub type FakeWam = std::sync::Arc<dyn Fn(&[String], bool) -> Result<String, String> + Send + Sync>;
+pub type FakeWam = std::sync::Arc<dyn Fn(&[String], bool, Option<&str>) -> Result<String, String> + Send + Sync>;
 
 /// The refusal every sign-in import answers with for now.
 pub(crate) const UNAVAILABLE: &str = "sign-in UI not available";

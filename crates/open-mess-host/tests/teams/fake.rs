@@ -163,6 +163,36 @@ pub fn authz() -> Value {
     })
 }
 
+/// A page of the chat service: `key` (`conversations`, `messages`) and the paging links.
+pub fn page(key: &str, items: Vec<Value>, backward: Option<&str>) -> Value {
+    json!({ key: items, "_metadata": {"backwardLink": backward, "syncState": "c3luYw"} })
+}
+
+/// A conversation whose last message is `last`, as the list returns it.
+pub fn conversation(id: &str, topic: Option<&str>, last: Option<Value>) -> Value {
+    json!({
+        "id": id,
+        "threadProperties": {"topic": topic},
+        "properties": {"consumptionhorizon": "1800000000000;1800000000000;1"},
+        "lastMessage": last.unwrap_or_else(|| json!({})),
+    })
+}
+
+/// A message as the chat service sends it; `from` is an MRI, `ms` the arrival time.
+pub fn message(id: &str, conversation: &str, from: &str, html: &str, ms: i64) -> Value {
+    json!({
+        "id": id,
+        "conversationid": conversation,
+        "from": format!("{CHAT}/v1/users/ME/contacts/{from}"),
+        "imdisplayname": if from == ME { ME_NAME } else { "Synthetic Person Two" },
+        "messagetype": "RichText/Html",
+        "contenttype": "text",
+        "content": html,
+        "originalarrivaltime": ms,
+        "properties": {},
+    })
+}
+
 fn default_reply(seen: &Seen) -> Reply {
     if seen.method == "POST" && seen.path == AUTHZ_PATH { Reply::json(authz()) } else { Reply::status(404) }
 }
@@ -172,6 +202,13 @@ fn default_reply(seen: &Seen) -> Reply {
 pub struct WamCall {
     pub scopes: Vec<String>,
     pub interactive: bool,
+    pub claims: Option<String>,
+}
+
+impl WamCall {
+    pub fn silent(scope: &str) -> WamCall {
+        WamCall { scopes: vec![scope.to_string()], interactive: false, claims: None }
+    }
 }
 
 struct WamState {
@@ -209,9 +246,9 @@ impl Wam {
 
     pub fn hook(&self) -> FakeWam {
         let wam = self.clone();
-        Arc::new(move |scopes: &[String], interactive: bool| {
+        Arc::new(move |scopes: &[String], interactive: bool, claims: Option<&str>| {
             let mut state = wam.0.lock().unwrap();
-            state.calls.push(WamCall { scopes: scopes.to_vec(), interactive });
+            state.calls.push(WamCall { scopes: scopes.to_vec(), interactive, claims: claims.map(str::to_string) });
             if !interactive && !state.silent {
                 return Err("interaction required".to_string());
             }
