@@ -44,39 +44,65 @@ Klucz publiczny leży w repo (`keys/release.pub`) i jest wkompilowany w `om` (st
 ## 6. Zgoda użytkownika
 
 - Domyślnie aktualizacja **nie** instaluje się sama. Po pobraniu i weryfikacji: powiadomienie Windows "open_mess <wersja> jest gotowy - Zainstaluj / Później" oraz w oknie sekcja Demon i logi -> Aktualizacje: bieżąca wersja, znaleziona wersja, "Sprawdź teraz", "Zainstaluj", ostatni wynik.
-- Opcja w oknie "Instaluj aktualizacje automatycznie" (domyślnie wyłączona): wtedy instalacja rusza po pobraniu, gdy nie ma akcji oczekujących na zatwierdzenie i żadne wywołanie narzędzia nie trwa.
-- Żadne narzędzie MCP ani polecenie CLI nie uruchamia instalacji ani nie zmienia tej opcji (jak zatwierdzenia, spec 8.6). `status` pokazuje tylko stan aktualizacji.
+- Kliknięcie "Zainstaluj" (w powiadomieniu albo w oknie) zapisuje w SQLite zgodę: wersja, SHA-256 podpisanego manifestu, czas; zgoda jest ważna 10 minut i jednorazowa. Bez takiej zgody `apply-update` odmawia (sekcja 7), więc uruchomienie pomocnika z CLI przez agenta niczego nie instaluje (recenzja R1).
+- Opcja w oknie "Instaluj aktualizacje automatycznie" (domyślnie wyłączona): wtedy demon sam zapisuje zgodę po pobraniu, ale tylko gdy w `pending.rs` nie ma akcji w stanie `waiting` (czeka na zatwierdzenie) ani `approved` (zatwierdzona, wysyłana), żadne wywołanie narzędzia nie trwa i żadne uruchomienie z wyzwalacza nie działa (recenzja R1).
+- Żadne narzędzie MCP ani polecenie CLI nie zapisuje zgody ani nie zmienia tej opcji (jak zatwierdzenia, spec 8.6). `status` pokazuje tylko stan aktualizacji.
 
 ## 7. Instalacja
 
-1. Demon kopiuje zweryfikowany `om.exe` z katalogu aktualizacji do `%LOCALAPPDATA%\open_mess\bin\om.update.exe`, sprawdza jego SHA-256 jeszcze raz i uruchamia go bezpośrednio (bez powłoki): `om.update.exe apply-update --from <katalog> --wait-pid <pid demona>`, po czym kończy pracę.
-2. `apply-update` czeka (do 60 s) na zakończenie procesu demona, weryfikuje ponownie podpis manifestu i sumy wszystkich plików w katalogu, przenosi `om.exe` na `om.old.exe` (poprzedni `om.old.exe` usuwa), kopiuje nowy `om.exe`, zachowuje kopie obecnych plików modułów, kopiuje nowe moduły do `%APPDATA%\open_mess\modules\`, uruchamia zadanie `open_mess`.
-3. Jeśli nowy demon nie odpowie na lokalne API w 60 s, `apply-update` przywraca `om.old.exe` i poprzednie moduły i uruchamia zadanie ponownie. Wynik (zainstalowano / przywrócono, z przyczyną) trafia do `%APPDATA%\open_mess\last-update.txt` i do okna.
-4. Moduły z podpisanego wydania (decyzja projektowa, zmiana wobec spec 8.3): nowy plik modułu, którego manifest (nazwa, hosty, hosty logowania, tożsamość WAM, dodatkowe narzędzia) jest identyczny z zatwierdzonym, jest zatwierdzany automatycznie, bo jego pochodzenie potwierdza podpis wydania; zmieniony manifest nadal wymaga zgody w oknie. Moduł dodany ręcznie do folderu (nie z wydania) zawsze wymaga zgody.
+Zadania Harmonogramu (rejestruje je `scripts/install.ps1` i - przy pierwszym starcie po tej zmianie - demon, jeśli brakuje drugiego):
+- `open_mess` - jak dziś: demon przy logowaniu;
+- `open_mess-update` - bez wyzwalacza, akcja `conhost.exe --headless %LOCALAPPDATA%\open_mess\bin\om.update.exe apply-update --data-dir <folder danych demona>`. Osobne zadanie ma własny obiekt zadania (job), więc pomocnik nie należy do instancji zadania demona i `open_mess` da się po aktualizacji uruchomić ponownie (recenzja R1: proces potomny demona dziedziczyłby job zadania `open_mess`, a jego `MultipleInstances IgnoreNew` zignorowałby ponowny start).
+
+Kroki:
+1. Demon (po zgodzie z sekcji 6) kopiuje zweryfikowany `om.exe` z katalogu aktualizacji do `bin\om.update.exe`, sprawdza jego SHA-256, zapisuje w `<folder danych>\update-pending.json` wersję i katalog aktualizacji, uruchamia zadanie `open_mess-update` i kończy pracę.
+2. `apply-update` (z `--data-dir`, więc działa też przy `OPEN_MESS_DATA_DIR` - recenzja R1):
+   - czeka do 60 s, aż demon zwolni blokadę instancji (`daemon.lock`) i zakończy proces;
+   - sprawdza w SQLite ważną, niewykorzystaną zgodę dla tej wersji i tego manifestu i oznacza ją jako wykorzystaną; brak zgody = koniec bez zmian;
+   - weryfikuje ponownie podpis manifestu i sumy wszystkich plików w katalogu aktualizacji;
+   - robi kopię zapasową: `state.sqlite3` (demon jest zatrzymany, więc kopia jest spójna), obecnych plików modułów i `om.exe` (kopia do `om.old.exe`; `om.exe` nie znika ani na chwilę);
+   - kopiuje nowy `om.exe` do `bin\om.new.exe` i podmienia nim `om.exe` jednym `rename` z zastąpieniem (atomowe w obrębie folderu), więc zanik zasilania zostawia albo starą, albo nową wersję, nigdy brak pliku (recenzja R1);
+   - kopiuje nowe moduły do folderu modułów i zapisuje `<katalog aktualizacji>\installed.json` (wersja wydania, nazwy i SHA-256 zainstalowanych modułów);
+   - uruchamia zadanie `open_mess`.
+3. Jeśli nowy demon nie odpowie na lokalne API w 60 s, `apply-update` zatrzymuje go (procesy `om.exe daemon` z folderu `bin`), przywraca `om.old.exe` jako `om.exe`, poprzednie pliki modułów i kopię `state.sqlite3` (cofa migracje schematu i wszystko, co zapisał nieudany demon, w tym automatyczne zatwierdzenia modułów z punktu 4 - recenzja R1), i uruchamia `open_mess` ponownie. Wynik (zainstalowano / przywrócono, z przyczyną) trafia do `<folder danych>\last-update.txt` i do okna.
+4. Moduły z podpisanego wydania (decyzja projektowa, zmiana wobec spec 8.3): demon przy skanie zatwierdza automatycznie plik modułu, gdy (a) jego SHA-256 jest w `installed.json` ostatniej zainstalowanej wersji, a ten plik powstał z manifestu, którego podpis był zweryfikowany, oraz (b) manifest modułu z pominięciem pola `version` (nazwa, platforma, hosty, hosty logowania, tożsamość WAM, dodatkowe narzędzia) jest identyczny z zatwierdzonym. Zmiana czegokolwiek poza `version` wymaga zgody w oknie. Plik dodany ręcznie (nie ma go w `installed.json`) zawsze wymaga zgody (recenzja R1).
+5. Po udanej instalacji demon usuwa katalogi aktualizacji starszych wersji i `om.update.exe`; zostaje tylko katalog bieżącej wersji do czasu następnej (recenzja R1, P3).
 
 ## 8. Threat model
 
 - Zaufany: klucz prywatny wydań (tylko u właściciela, poza repo), klucz publiczny wkompilowany w `om`, użytkownik klikający w oknie / powiadomieniu.
 - Niezaufane: GitHub jako transport i hosting (konto, repozytorium albo CDN mogą zostać przejęte), zawartość wydań, nazwy i rozmiary plików, sieć.
-- Obrona: obowiązkowy podpis manifestu, sumy SHA-256 każdego pliku, biała lista nazw, limity rozmiaru, brak downgrade, weryfikacja przed uruchomieniem i drugi raz w `apply-update`, wycofanie przy nieudanym starcie.
+- Obrona: obowiązkowy podpis manifestu, sumy SHA-256 każdego pliku, biała lista nazw, limity rozmiaru, brak downgrade, weryfikacja przed uruchomieniem i drugi raz w `apply-update`, jednorazowa zgoda w SQLite zapisywana tylko przez okno / powiadomienie, wycofanie przy nieudanym starcie razem z kopią bazy.
 - Poza zakresem (zamrożone): kradzież klucza prywatnego właściciela; złośliwy kod działający już na koncie Windows użytkownika (spec 15).
 - Publiczne repo: każdy widzi wydania i klucz publiczny; bez klucza prywatnego nie podpisze wydania.
 
-## 9. Poza zakresem
+## 9. Dotknięte pliki
+
+- `crates/open-mess/src/update/` (nowy): sprawdzanie, pobieranie, weryfikacja (minisign), stan i zgoda, uruchamianie `open_mess-update`;
+- `crates/open-mess/src/cli.rs`: polecenie `apply-update` (ukryte w pomocy);
+- `crates/open-mess/src/store.rs`: migracja z tabelą zgód i stanu aktualizacji;
+- `crates/open-mess/src/modules.rs`: automatyczne zatwierdzanie z punktu 7.4;
+- `crates/open-mess/src/ui/` i `ui/app.js`: sekcja Aktualizacje, opcja automatycznej instalacji; `approval.rs`: powiadomienie o gotowej wersji;
+- `xtask/src/main.rs`: `release`, `release-keygen`; `keys/release.pub` (nowy);
+- `scripts/install.ps1`: drugie zadanie `open_mess-update`;
+- `CONTRIBUTING.md`: proces wydania.
+
+## 10. Poza zakresem
 
 Aktualizacje różnicowe, kanał beta, stopniowe wdrażanie, Linux/macOS, rotacja klucza wydań (do osobnego specu, gdy będzie potrzebna), aktualizacje bez zadania Harmonogramu.
 
-## 10. Kryteria akceptacji
+## 11. Kryteria akceptacji
 
-- Wydanie z dobrym podpisem i wyższą wersją: pobrane, zweryfikowane, po kliknięciu "Zainstaluj" demon wraca w nowej wersji, konto online bez ponownej zgody na niezmieniony moduł Teams.
+- Wydanie z dobrym podpisem i wyższą wersją: pobrane, zweryfikowane, po kliknięciu "Zainstaluj" demon wraca w nowej wersji, konto online bez ponownej zgody na moduł Teams przebudowany w tym wydaniu z manifestem różnym tylko w `version`.
 - Zły podpis, brak podpisu, zła suma, niedozwolona nazwa pliku, za duży plik, niższa albo równa wersja: nic nie jest instalowane, okno pokazuje przyczynę.
-- Nowy demon nie startuje: przywrócona poprzednia wersja, okno pokazuje "przywrócono".
+- Nowy demon nie startuje albo nie odpowiada (także po migracji schematu): przywrócona poprzednia wersja, moduły i baza, poprzedni demon działa, okno pokazuje "przywrócono".
+- `om.update.exe apply-update` uruchomione bez zgody z okna nie zmienia niczego.
 - Żadne narzędzie MCP/CLI nie instaluje aktualizacji.
 
-## 11. Rejestr rebutali
+## 12. Rejestr rebutali
 
 Brak (przed pierwszą rundą).
 
 ## Changelog rund
 
-Brak (przed pierwszą rundą).
+- R1 (Codex REJECT, GLM REJECT): kopia `state.sqlite3` i przywracanie jej przy wycofaniu (oba P1); jednorazowa zgoda w SQLite sprawdzana przez `apply-update` (Codex P2); automatyczna instalacja tylko bez akcji w toku i uruchomień wyzwalaczy (Codex P2); osobne zadanie `open_mess-update` zamiast procesu potomnego demona (GLM P1); zatrzymanie wiszącego nowego demona przed przywracaniem (GLM P2); atomowa podmiana `om.exe` (Codex P2); `--data-dir` dla `apply-update` (Codex P2); dokładna reguła automatycznego zatwierdzania modułów z `installed.json` i manifestem bez `version` (Codex P2, GLM P2); sprzątanie katalogów aktualizacji i lista dotkniętych plików (GLM P3).
