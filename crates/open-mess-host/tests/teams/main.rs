@@ -266,7 +266,7 @@ async fn list_conversations_maps_kinds() {
     let last = numbered(101, GROUP, OTHER, "<p>hi</p>");
     teams.fake.on(conversations_page(vec![
         conversation(GROUP, Some("Synthetic group"), Some(last)),
-        conversation(DIRECT, None, None),
+        conversation(DIRECT, None, Some(numbered(102, DIRECT, OTHER, "<p>hi</p>"))),
         conversation(CHANNEL, Some("Synthetic channel"), None),
         conversation(MEETING, Some("Synthetic meeting"), None),
         conversation("48:notes", None, None),
@@ -280,7 +280,11 @@ async fn list_conversations_maps_kinds() {
     // Filters by kind and by part of the name.
     assert_eq!(ids(&teams.call("list_conversations", json!({"kind": "channel"})).await.unwrap(), "id"), [CHANNEL]);
     assert_eq!(ids(&teams.call("list_conversations", json!({"query": "MEETING"})).await.unwrap(), "id"), [MEETING]);
-    assert_eq!(ids(&teams.call("list_conversations", json!({"limit": 2})).await.unwrap(), "id"), [GROUP, DIRECT]);
+    // A 1:1 chat has no topic: the other person's name stands in, and finds it.
+    assert_eq!(result["items"][1]["untrusted"], json!({"title": "Synthetic Person Two"}));
+    assert_eq!(ids(&teams.call("list_conversations", json!({"query": "person two"})).await.unwrap(), "id"), [DIRECT]);
+    // The core applies the limit after its read filter, so the module leaves no match out.
+    assert_eq!(ids(&teams.call("list_conversations", json!({"limit": 2})).await.unwrap(), "id").len(), 5);
 }
 
 #[tokio::test]

@@ -119,19 +119,30 @@ fn message_item(m: &Message, me: &str) -> Value {
     })
 }
 
+/// The conversation's topic. A 1:1 chat has none: the other person's name from their last message
+/// stands in. ponytail: a 1:1 chat whose last message is the user's own stays nameless; the
+/// members request of `describe-target` names everyone, at one request per chat.
+fn title(c: &Conversation, me: &str) -> Option<String> {
+    let other = || c.last_message.as_ref().filter(|m| m.sender_id != me).and_then(|m| m.sender_name.clone());
+    c.title.clone().or_else(|| if c.kind == ConversationKind::Direct { other() } else { None })
+}
+
+/// Every matching conversation within the pages read: `limit` is not applied here, because the
+/// core cuts the list to it only after leaving out what the agent may not read.
 fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let kind = text(args, "kind");
     let query = text(args, "query").map(str::to_lowercase);
-    let limit = limit(args, 50);
+    let me = session.me();
     let mut items = Vec::new();
     conversations(session, 1, |c| {
-        let title_matches = query.as_deref().is_none_or(|q| c.title.as_deref().is_some_and(|t| t.to_lowercase().contains(q)));
+        let title = title(&c, &me);
+        let title_matches = query.as_deref().is_none_or(|q| title.as_deref().is_some_and(|t| t.to_lowercase().contains(q)));
         if kind.is_none_or(|k| k == kind_name(c.kind)) && title_matches {
             // Absent values go as null, which the core reads as left out.
             let last_activity = c.horizons.last_message_ms.map(time::rfc3339);
-            items.push(json!({"id": c.id, "kind": kind_name(c.kind), "last_activity": last_activity, "untrusted": {"title": c.title}}));
+            items.push(json!({"id": c.id, "kind": kind_name(c.kind), "last_activity": last_activity, "untrusted": {"title": title}}));
         }
-        items.len() < limit
+        true
     })?;
     Ok(json!({ "items": items }))
 }
@@ -153,7 +164,10 @@ fn unread(session: &mut Session, _args: &Value) -> Result<Value, ModuleError> {
             UnreadState::Unknown => "unknown",
         };
         let last_activity = c.horizons.last_message_ms.map(time::rfc3339);
-        items.push(json!({"conversation": c.id, "kind": kind_name(c.kind), "unread": state, "last_activity": last_activity, "untrusted": {"title": c.title}}));
+        let title = title(&c, &me);
+        items.push(
+            json!({"conversation": c.id, "kind": kind_name(c.kind), "unread": state, "last_activity": last_activity, "untrusted": {"title": title}}),
+        );
         true
     })?;
     Ok(json!({ "items": items }))

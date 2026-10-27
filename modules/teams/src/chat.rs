@@ -43,6 +43,9 @@ pub struct Conversation {
     pub kind: ConversationKind,
     pub title: Option<String>,
     pub last_message_id: Option<String>,
+    /// The last message when it is a text message the decoder reads; a conversation is listed
+    /// even when its last message is not.
+    pub last_message: Option<Message>,
     pub horizons: Horizons,
 }
 
@@ -144,11 +147,16 @@ fn conversation(c: &Value, path: &str) -> Result<Conversation, ProtoError> {
     };
     let call = opt_str(last, &last_path, "messagetype")?.is_some_and(|t| t.starts_with("Event/Call"));
     let last_call_initiator = if call { opt_str(last, &last_path, "content")?.and_then(initiator) } else { None };
+    let last_message = match opt_str(last, &last_path, "messagetype")? {
+        Some(kind @ ("RichText/Html" | "Text")) => message(last, &last_path, kind == "Text").ok(),
+        _ => None,
+    };
     Ok(Conversation {
         id: id.to_string(),
         kind: kind(id),
         title: opt_str(thread, &thread_path, "topic")?.map(str::to_string),
         last_message_id: opt_str(last, &last_path, "id")?.map(str::to_string),
+        last_message,
         horizons: Horizons {
             consumption: horizon_at("consumptionhorizon")?,
             bookmark,
@@ -415,6 +423,10 @@ mod tests {
         let group = &page.items[0];
         assert_eq!(group.id, GROUP);
         assert_eq!(group.last_message_id.as_deref(), Some("1800000000100"));
+        let last = group.last_message.as_ref().unwrap();
+        assert_eq!((last.sender_name.as_deref(), last.html.as_str()), (Some("Synthetic Person Two"), "<p>synthetic text</p>"));
+        // An empty last message, or one that is not text, is none.
+        assert!(page.items[1].last_message.is_none() && page.items[3].last_message.is_none());
         let consumption = Horizon { arrival_ms: 1_800_000_000_000, timestamp_ms: 1_800_000_000_050, client_message_id: "1111".to_string() };
         assert_eq!(group.horizons.consumption, Some(consumption));
         assert_eq!(group.horizons.bookmark.as_ref().map(|b| b.timestamp_ms), Some(1_800_000_000_060));

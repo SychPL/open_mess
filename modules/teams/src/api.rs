@@ -236,6 +236,12 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
     let mut url = req.url.clone();
     let (mut attempt, mut hops) = (0u8, 0u8);
     loop {
+        // No request starts past the budget, so the last one has the rest of the host's limit.
+        // ponytail: one answer slower than that still ends in the host's timeout; the host's read
+        // timeout (30 s) is as long as its call limit.
+        if !has_time() {
+            return Err(ModuleError::Platform("Teams answers too slowly; try again later".to_string()));
+        }
         let mut headers = req.headers.clone();
         headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         let request = http::Request { method: req.method.clone(), url: url.clone(), headers, body: req.body.clone() };
