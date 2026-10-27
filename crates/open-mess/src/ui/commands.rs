@@ -16,6 +16,7 @@ use crate::accounts::Account;
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
 use crate::triggers::RuleCounters;
 use crate::triggers::rules::{self, Rule};
+use crate::update::release::Version;
 use crate::{approval, cli, permissions};
 
 /// Why an approval is refused when the file on disk is not the one the window showed.
@@ -278,8 +279,9 @@ fn list_changes(changes: &mut Vec<String>, what: &str, new: &Value, old: &Value)
 
 /// Approves the module file the window showed, by the hashes it showed, and loads it (a module
 /// stopped after repeated crashes starts again). Refused with [`MODULE_CHANGED`] when the file is
-/// no longer that one. Once it is the module, the file it replaced is deleted, so that the module
-/// has one file (spec 2026-10-27-self-update, 7.4).
+/// no longer that one. Once a file an update placed beside the module is the module, the approved
+/// file it replaced is deleted, so that the module has one file (spec 2026-10-27-self-update, 7.4);
+/// a file added by hand deletes nothing.
 pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, manifest_sha256: &str) -> Result<(), String> {
     changes_allowed(state)?;
     let list = state.accounts.modules().list();
@@ -287,11 +289,13 @@ pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, mani
     let Some((file, Some(manifest))) = shown.map(|info| (info.file.clone(), info.manifest.clone())) else {
         return Err(MODULE_CHANGED.into());
     };
-    // The module's file now, when it is another one.
+    // The module's approved file now, when the one approved is an update's file beside it.
+    let approved = |state: &ModuleState| matches!(state, ModuleState::Active | ModuleState::Disabled | ModuleState::Crashed);
     let replaced = list
         .iter()
-        .find(|info| info.name == name && info.state != ModuleState::PendingReplacement && info.file != file)
-        .map(|info| info.file.clone());
+        .filter(|_| placed_beside(&file))
+        .find(|info| info.name == name && info.file != file && approved(&info.state))
+        .map(|info| (info.file.clone(), info.file_sha256.clone()));
     let accounts = Arc::clone(&state.accounts);
     let shown_file = file.clone();
     let on_disk = tokio::task::spawn_blocking(move || accounts.modules().file_sha256(&shown_file)).await.map_err(text)?;
@@ -304,16 +308,29 @@ pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, mani
         modules::remember_approved(store.conn(), &manifest).map_err(text)?;
     }
     rescan(state, Some(name)).await?;
-    let is_module =
-        state.accounts.modules().list().iter().any(|info| info.name == name && info.file == file && info.state != ModuleState::PendingReplacement);
-    if let Some(replaced) = replaced.filter(|_| is_module)
-        && std::fs::remove_file(state.accounts.data_dir().join("modules").join(replaced)).is_ok()
+    let now = state.accounts.modules().list();
+    let is_module = now.iter().any(|info| info.name == name && info.file == file && info.state != ModuleState::PendingReplacement);
+    // Still the same file of the same module: nothing put in its place meanwhile is deleted.
+    let unchanged = |(old, sha): &(String, String)| now.iter().any(|info| info.name == name && info.file == *old && info.file_sha256 == *sha);
+    if let Some((old, _)) = replaced.filter(|replaced| is_module && unchanged(replaced))
+        && std::fs::remove_file(state.accounts.data_dir().join("modules").join(old)).is_ok()
     {
         // ponytail: reads the folder once more so the window stops listing the deleted file; a
         // Modules method that drops one entry would save loading every module again.
         rescan(state, None).await?;
     }
     Ok(())
+}
+
+/// Whether `file` is named as an update places a module beside the one it replaces:
+/// `<stem>-<version>.wasm` or `<stem>-<version>-<n>.wasm` (update/apply.rs).
+fn placed_beside(file: &str) -> bool {
+    let Some(stem) = file.strip_suffix(".wasm") else {
+        return false;
+    };
+    let versioned = |stem: &str| stem.rsplit_once('-').is_some_and(|(name, version)| !name.is_empty() && Version::parse(version).is_ok());
+    let numbered = stem.rsplit_once('-').filter(|(_, n)| !n.is_empty() && n.bytes().all(|byte| byte.is_ascii_digit()));
+    versioned(stem) || numbered.is_some_and(|(stem, _)| versioned(stem))
 }
 
 /// Turns a module on or off, at once; turning it on also restarts it after repeated crashes.
@@ -703,3 +720,18 @@ pub fn channel_setup(state: &UiState) -> Result<ChannelSetupDto, String> {
 
 /// The channel setup's MCP configuration, in the data folder.
 pub const CHANNEL_CONFIG: &str = "channel-mcp.json";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_update_s_names_are_placed_beside() {
+        for file in ["teams-1.2.3.wasm", "teams-1.2.3-4.wasm", "open-mess-teams-10.0.1-100.wasm"] {
+            assert!(placed_beside(file), "{file}");
+        }
+        for file in ["teams.wasm", "teams-dev.wasm", "-1.2.3.wasm", "teams-1.2.wasm", "teams-1.2.3-.wasm", "teams-1.2.3-x.wasm", "teams-1.2.3.exe"] {
+            assert!(!placed_beside(file), "{file}");
+        }
+    }
+}

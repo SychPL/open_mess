@@ -204,29 +204,67 @@ fn daemon_exits_while_helper_changes_files() {
 }
 
 #[test]
-fn daemon_exits_when_the_stage_file_cannot_be_read() {
+fn stage_file_that_cannot_be_read_starts_held_unless_the_helper_is_alive() {
     let (_dir, paths) = paths();
-    // A folder in its place fails to open on every try, like a file an antivirus holds: everything
-    // stays as it is, whether a helper is alive or not.
+    // A folder in its place fails to open on every try, like a file an antivirus holds. The helper
+    // does nothing with it, so without one the daemon starts, held until the file reads again.
     std::fs::create_dir(paths.pending_file()).unwrap();
-    assert_eq!(probation::on_start(&paths), Start::Exit);
+    assert_eq!(probation::on_start(&paths), Start::Probation);
+    // A helper that is alive decides.
     let _helper = helper_alive(&paths);
     assert_eq!(probation::on_start(&paths), Start::Exit);
 }
 
+/// Started on a stage file it could not read: the daemon keeps everything held, lets go of
+/// `update.lock` between its tries, and once the file reads again does what the stage asks.
+#[tokio::test(start_paused = true)]
+async fn probation_waits_for_a_stage_file_that_cannot_be_read() {
+    for stage in [Stage::Installed, Stage::RollingBack] {
+        let t = setup().await;
+        std::fs::create_dir(t.paths.pending_file()).unwrap();
+        let watching = t.watch(Instant::now()).await;
+        sleep(5 * SECOND).await;
+        assert!(!watching.is_finished());
+        assert!(t.on() && t.held() && t.write_refused().await);
+        assert!(!state::helper_alive(&t.paths), "update.lock held between tries");
+        assert!(t.task.launched().is_empty());
+
+        std::fs::remove_dir(t.paths.pending_file()).unwrap();
+        let file = write_stage(&t.paths, stage);
+        ended(watching, 2 * SECOND).await;
+        if stage == Stage::Installed {
+            // Healthy by its own status: installed.
+            assert_eq!(stage_file(&t.paths), None);
+            assert!(!t.on() && !notified(&t.exit).await);
+        } else {
+            assert_eq!(stage_file(&t.paths), Some(file));
+            assert_eq!(t.task.launched(), [t.helper_program()]);
+            assert!(t.on() && notified(&t.exit).await);
+        }
+    }
+}
+
 /// `om daemon` itself, with a helper restoring the files: it exits at once, before it opens the
-/// state database or takes its lock.
+/// state database or takes its lock, and says why.
 #[cfg(windows)]
 #[test]
 fn om_daemon_exits_before_opening_anything_while_helper_restores() {
     use std::process::{Command, Stdio};
 
-    let (_dir, paths) = paths();
+    let (dir, paths) = paths();
     let file = write_stage(&paths, Stage::RollingBack);
     let _helper = helper_alive(&paths);
+    // Never the real Task Scheduler, even if this start went wrong: without USERNAME the daemon's
+    // launcher fails before it writes or runs anything, and with SystemRoot here there is no
+    // schtasks.exe to run. LOCALAPPDATA keeps the programs and updates folders in the temp dir.
+    let no_system = dir.path().join("no-system");
+    std::fs::create_dir_all(&no_system).unwrap();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_om"))
         .arg("daemon")
         .env("OPEN_MESS_DATA_DIR", &paths.data)
+        .env("LOCALAPPDATA", dir.path())
+        .env("SystemRoot", &no_system)
+        .env_remove("USERNAME")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -246,7 +284,10 @@ fn om_daemon_exits_before_opening_anything_while_helper_restores() {
     assert!(exited.success(), "{exited:?}");
     assert!(!paths.data.join("state.sqlite3").exists());
     assert!(!paths.data.join("daemon.lock").exists());
+    assert!(!paths.data.join("update-task.xml").exists(), "the helper's task was registered");
     assert_eq!(stage_file(&paths), Some(file));
+    let why = std::fs::read_to_string(paths.data.join("last-start-error.txt")).unwrap();
+    assert!(why.contains("being installed or rolled back"), "{why}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -541,16 +582,60 @@ async fn approving_a_side_by_side_module_deletes_the_predecessor() {
     common::install(d.dir.path(), "echo-rebuilt.wasm", &common::echo_rebuilt());
     let ui = ui_state(&d);
     commands::rescan_modules(&ui).await.unwrap();
-    let list = commands::modules(&ui).unwrap();
-    let new = list.iter().find(|module| module.file == "echo-9.9.9.wasm").unwrap();
-    assert_eq!(new.status, "replacement");
-    commands::approve_module(&ui, "test-echo", &new.file_sha256, &new.manifest_sha256).await.unwrap();
+    assert_eq!(approve(&ui, "echo-9.9.9.wasm").await, "replacement");
     let modules = d.dir.path().join("modules");
     assert!(!modules.join("echo.wasm").exists());
     assert!(modules.join("echo-rebuilt.wasm").exists());
     let list: Vec<(String, &str)> = commands::modules(&ui).unwrap().into_iter().map(|module| (module.file, module.status)).collect();
     assert_eq!(list, [("echo-9.9.9.wasm".to_string(), "active"), ("echo-rebuilt.wasm".to_string(), "replacement")]);
     assert_eq!(d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap().version, "9.9.9");
+}
+
+/// Only a file an update placed beside an approved module, which is still the file it was, takes
+/// that file's place on disk.
+#[tokio::test]
+async fn approving_a_hand_added_module_deletes_nothing() {
+    let echo = |d: &common::Daemon| d.dir.path().join("modules").join("echo.wasm");
+
+    // Added by hand beside the approved module: not an update's name.
+    let d = common::daemon(&[common::ECHO]).await;
+    common::install(d.dir.path(), "echo-dev.wasm", &common::echo_with_version("9.9.9"));
+    let ui = ui_state(&d);
+    commands::rescan_modules(&ui).await.unwrap();
+    assert_eq!(approve(&ui, "echo-dev.wasm").await, "replacement");
+    assert!(echo(&d).exists());
+    assert_eq!(d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap().version, "9.9.9");
+
+    // An update's file beside a module file that is not approved: it changed while the module was
+    // off.
+    let d = common::daemon(&[common::ECHO]).await;
+    let ui = ui_state(&d);
+    commands::set_module_enabled(&ui, "test-echo", false).await.unwrap();
+    common::install(d.dir.path(), "echo.wasm", &common::echo_rebuilt());
+    common::install(d.dir.path(), "echo-9.9.9.wasm", &common::echo_with_version("9.9.9"));
+    commands::rescan_modules(&ui).await.unwrap();
+    let list = commands::modules(&ui).unwrap();
+    assert_eq!(list.iter().find(|module| module.file == "echo.wasm").unwrap().status, "awaiting-approval");
+    approve(&ui, "echo-9.9.9.wasm").await;
+    assert!(echo(&d).exists());
+
+    // An update's file beside the running module, whose file on disk changed meanwhile: what is
+    // there now is not what was approved.
+    let d = common::daemon(&[common::ECHO]).await;
+    let ui = ui_state(&d);
+    common::install(d.dir.path(), "echo-9.9.9.wasm", &common::echo_with_version("9.9.9"));
+    commands::rescan_modules(&ui).await.unwrap();
+    common::install(d.dir.path(), "echo.wasm", &common::echo_rebuilt());
+    approve(&ui, "echo-9.9.9.wasm").await;
+    assert_eq!(std::fs::read(echo(&d)).unwrap(), common::echo_rebuilt());
+}
+
+/// Approves `file` as the window shows it; returns its status before.
+async fn approve(ui: &UiState, file: &str) -> &'static str {
+    let list = commands::modules(ui).unwrap();
+    let module = list.iter().find(|module| module.file == file).unwrap();
+    commands::approve_module(ui, &module.name, &module.file_sha256, &module.manifest_sha256).await.unwrap();
+    module.status
 }
 
 fn ui_state(d: &common::Daemon) -> UiState {

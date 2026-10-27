@@ -449,6 +449,32 @@ fn rollback_waits_for_the_daemon_to_let_go() {
     assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
 }
 
+/// A stage that cannot be written leaves everything as it is: at `installed`, a daemon started
+/// meanwhile would run in probation and open its files in the middle of the restore. The next run
+/// rolls back.
+#[test]
+fn rollback_that_cannot_write_its_stage_touches_nothing() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    s.crash(&Machine::crashing());
+    assert_eq!(s.pending().stage, Stage::Installed);
+    // The stage file is written beside itself first: a folder in that place fails every write.
+    let blocked = s.paths.data.join("update-pending.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    let machine = Machine::new(true, Health::Healthy);
+    let Outcome::RollbackFailed(why) = s.run(&machine) else { panic!("rolled back without writing its stage") };
+    assert!(why.contains("tried again"), "{why}");
+    assert!(machine.log().is_empty(), "nothing stopped, nothing started: {:?}", machine.log());
+    assert_eq!(s.pending().stage, Stage::Installed);
+    assert_eq!(s.om(), NEW_OM);
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo_with_version("9.9.9"));
+
+    std::fs::remove_dir(&blocked).unwrap();
+    let machine = Machine::new(true, Health::Healthy);
+    assert_eq!(s.run(&machine), Outcome::RolledBack("the update was interrupted".into()));
+    assert_eq!(s.om(), OLD_OM);
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
+}
+
 #[test]
 fn failed_rollback_keeps_and_names_the_backup() {
     let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);

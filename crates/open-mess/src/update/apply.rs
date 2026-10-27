@@ -281,11 +281,14 @@ fn start(system: &dyn System, why: String) -> String {
 /// Puts back everything the backup holds (spec 7.3). The stage is `rolling-back` first, so that a
 /// run cut short starts over. Then the stage file goes and the daemon starts, whatever came of it.
 /// A daemon that does not let go of its lock after two stops would keep its files open: nothing is
-/// restored then, and the stage file stays for the next run.
+/// restored then, and the stage file stays for the next run. So too when the stage cannot be
+/// written: at `installed` a daemon started meanwhile would run in probation and open its files in
+/// the middle of the restore.
 fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: String, now: fn() -> i64) -> Outcome {
     pending.stage = Stage::RollingBack;
-    // Not written, the stage on disk means a rollback all the same.
-    let _ = state::write(&paths.pending_file(), &pending);
+    if let Err(err) = state::write(&paths.pending_file(), &pending) {
+        return Outcome::RollbackFailed(format!("{why}; the stage could not be written ({err}), the rollback is tried again at the next run"));
+    }
     let stopped = (0..2).any(|_| {
         let _ = system.stop_daemon();
         system.wait_daemon_lock_free(STOP_WAIT)

@@ -39,6 +39,8 @@ pub const LAST_START_ERROR_FILE: &str = "last-start-error.txt";
 pub fn run() -> Result<(), Error> {
     let started = Instant::now();
     let dir = paths::data_dir()?;
+    let error_file = dir.join(LAST_START_ERROR_FILE);
+    let record = |why: &str| drop(std::fs::write(&error_file, format!("{}\n", why.replace(['\r', '\n'], " "))));
     // First of all: an update's helper may be changing the files, or waiting for this daemon to be
     // gone (spec 2026-10-27-self-update, 7.6).
     let mut probation = None;
@@ -46,17 +48,26 @@ pub fn run() -> Result<(), Error> {
         match probation::on_start(&paths) {
             Start::Normal => {}
             Start::Probation => probation = Some((paths, launcher)),
-            Start::Exit => return Ok(()),
-            Start::LaunchHelperAndExit => return probation::launch_helper(&paths, &*launcher).map_err(|err| Error::Io(std::io::Error::other(err))),
+            Start::Exit => {
+                record("an update of open_mess is being installed or rolled back; its helper starts the daemon when it is done");
+                return Ok(());
+            }
+            Start::LaunchHelperAndExit => {
+                let launched = probation::launch_helper(&paths, &*launcher);
+                record(&match &launched {
+                    Ok(()) => "an interrupted update of open_mess is being rolled back; its helper starts the daemon when it is done".to_owned(),
+                    Err(err) => {
+                        format!("an interrupted update of open_mess is not rolled back yet ({err}); the scheduled tasks try again within 5 minutes")
+                    }
+                });
+                return launched.map_err(|err| Error::Io(std::io::Error::other(err)));
+            }
         }
     }
     // A second daemon fails here and leaves the running one's error file alone.
     let _lock = acquire_lock(&dir)?;
-    let error_file = dir.join(LAST_START_ERROR_FILE);
     let window = Opener::default();
-    let (runtime, listener, registry, ui) = start(&dir, started, &window, probation.is_some()).inspect_err(|err| {
-        let _ = std::fs::write(&error_file, format!("{}\n", err.to_string().replace(['\r', '\n'], " ")));
-    })?;
+    let (runtime, listener, registry, ui) = start(&dir, started, &window, probation.is_some()).inspect_err(|err| record(&err.to_string()))?;
     let _ = std::fs::remove_file(&error_file);
     let exit = Arc::clone(&ui.exit);
     let registry = Arc::new(registry);

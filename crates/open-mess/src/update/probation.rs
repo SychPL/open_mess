@@ -47,10 +47,11 @@ impl Flag {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start {
     Normal,
-    /// The helper is changing the files, or the stage file could not be read: the daemon exits
-    /// before it opens anything.
+    /// The helper is changing the files, or is alive and the stage file could not be read: the
+    /// daemon exits before it opens anything.
     Exit,
-    /// The helper checks this new version: the daemon starts in probation, [`watch`].
+    /// The helper checks this new version, or no helper is alive and the stage file could not be
+    /// read: the daemon starts in probation, [`watch`].
     Probation,
     /// The helper died: its task starts it again, and it rolls back what it finds (spec 7.6).
     LaunchHelperAndExit,
@@ -60,8 +61,11 @@ pub enum Start {
 pub fn on_start(paths: &Paths) -> Start {
     match state::read(&paths.pending_file()) {
         Read::Missing => Start::Normal,
-        // Not read is not broken: the helper, or the next start 5 minutes later, decides.
-        Read::Error(_) => Start::Exit,
+        // Not read is not broken: a helper that is alive decides. Without one the daemon starts
+        // held, and the probation decides once the file reads again; the helper does nothing with a
+        // file it cannot read, so exiting would leave open_mess off for as long as that lasts.
+        Read::Error(_) if state::helper_alive(paths) => Start::Exit,
+        Read::Error(_) => Start::Probation,
         _ if !state::helper_alive(paths) => Start::LaunchHelperAndExit,
         Read::Found(file) if file.stage == Stage::Installed => Start::Probation,
         // Changing the files, or a file only the helper knows what to do with.
@@ -78,6 +82,7 @@ pub fn launch_helper(paths: &Paths, launcher: &dyn Launcher) -> Result<(), Updat
 /// are refused and trigger deliveries are held. Every second it takes `update.lock` if it is free,
 /// then reads the file again:
 /// - gone: the helper found this version healthy; everything is let go, and the old files go;
+/// - not read: looked at again, `update.lock` let go meanwhile;
 /// - `installed`, helper alive: the helper is checking;
 /// - `installed`, helper gone: the daemon judges its own `status` as the helper would, keeping
 ///   `update.lock` so that a helper the task starts meanwhile leaves the check to it. Healthy: it
@@ -99,8 +104,12 @@ pub async fn watch(paths: &Paths, activity: &Activity, launcher: &dyn Launcher, 
         // Read after the lock: the stage the helper left when it let go, not one seen before.
         let file = match state::read(&paths.pending_file()) {
             Read::Missing => break,
-            // Not read: looked at again.
-            Read::Error(_) => continue,
+            // Not read: looked at again in a second, with `update.lock` let go meanwhile, so that
+            // a helper the task starts is never kept out by a daemon that cannot read the file.
+            Read::Error(_) => {
+                lock = None;
+                continue;
+            }
             Read::Found(file) if file.stage == Stage::Installed => file,
             Read::Unreadable | Read::Found(_) => return make_way(paths, launcher, lock, exit),
         };
@@ -157,7 +166,9 @@ pub fn cleanup(paths: &Paths, keep: &Version) {
     for entry in fs::read_dir(paths.updates()).into_iter().flatten().flatten() {
         let older = entry.file_name().to_str().and_then(|name| Version::parse(name).ok()).is_some_and(|version| version < *keep);
         let dir = entry.path();
-        if older && entry.file_type().is_ok_and(|kind| kind.is_dir()) && !dir.join("backup").exists() {
+        // A folder that cannot be looked into counts as one with a backup.
+        let backup = dir.join("backup").try_exists().unwrap_or(true);
+        if older && entry.file_type().is_ok_and(|kind| kind.is_dir()) && !backup {
             let _ = fs::remove_dir_all(dir);
         }
     }
