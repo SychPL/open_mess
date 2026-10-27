@@ -1,16 +1,18 @@
-//! Approval of waiting writes in Windows notifications (spec 8.6). One action at a time: the next
-//! toast appears only once the shown action is decided or expires, so a burst of writes never piles
-//! up toasts to approve blindly. Nothing is approved that was not on screen in full: a toast offers
-//! `Approve` only when every participant is named and all of it fits the lines Windows shows,
-//! otherwise only `Show all`, which opens a dialog with everything. No toast or dialog decides more
-//! than one action, and only the user's click reaches [`Pending::decide`]: no tool does. Other
-//! platforms leave the actions waiting until they expire.
+//! Approval of waiting writes in Windows notifications (spec 8.6). One notification at a time: a
+//! single waiting action gets its own toast; while several wait, one toast says how many and only
+//! opens the configuration window, whose list shows each of them, so a burst of writes never piles
+//! up toasts to approve blindly and none waits unannounced. Nothing is approved that was not on
+//! screen in full: an action's toast offers `Approve` only when every participant is named and all
+//! of it fits the lines Windows shows, otherwise only `Show all`, which opens a dialog with
+//! everything. No toast or dialog decides more than one action, and only the user's click reaches
+//! [`Pending::decide`]: no tool does. Other platforms leave the actions waiting until they expire.
 
 use std::sync::Arc;
 
 use tokio::runtime::Runtime;
 
 use crate::pending::{Kind, Pending, Preview};
+use crate::ui::Opener;
 
 /// The AppUserModelID the toasts show under, registered for the current user at daemon start.
 pub const APP_ID: &str = "open_mess.daemon";
@@ -128,42 +130,81 @@ pub(crate) fn clean(text: &str) -> String {
         .collect()
 }
 
-/// Which waiting action is on screen.
+/// What a notification shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Shown {
+    /// One action, by id.
+    Action(String),
+    /// That several wait, however many.
+    Several,
+}
+
+/// What is to change on screen.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Change<'a> {
+    /// Take the notification on screen away.
+    pub withdraw: bool,
+    pub show: Option<Notice<'a>>,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum Notice<'a> {
+    Action(&'a Preview),
+    /// This many actions wait.
+    Several(usize),
+}
+
+// Hand-written: a preview carries message text, which never reaches a log.
+impl std::fmt::Debug for Notice<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Notice::Action(preview) => f.debug_tuple("Action").field(&preview.action).finish(),
+            Notice::Several(count) => f.debug_tuple("Several").field(count).finish(),
+        }
+    }
+}
+
+/// Which notification is on screen.
 #[derive(Default)]
 pub struct Queue {
-    shown: Option<String>,
+    shown: Option<Shown>,
 }
 
 impl Queue {
-    /// The action to show now: the oldest waiting one, once the one on screen is no longer waiting.
-    pub fn next<'a>(&mut self, waiting: &'a [Preview]) -> Option<&'a Preview> {
-        if self.shown.as_ref().is_some_and(|shown| waiting.iter().any(|preview| &preview.action == shown)) {
-            return None;
+    /// What changes on screen for these waiting actions: one action's toast for a single one, one
+    /// notice for several, none for none. Nothing changes while the same one still holds, so a
+    /// notice is not shown again for each action that joins.
+    pub fn update<'a>(&mut self, waiting: &'a [Preview]) -> Change<'a> {
+        let (wanted, show) = match waiting {
+            [] => (None, None),
+            [one] => (Some(Shown::Action(one.action.clone())), Some(Notice::Action(one))),
+            several => (Some(Shown::Several), Some(Notice::Several(several.len()))),
+        };
+        if wanted == self.shown {
+            return Change { withdraw: false, show: None };
         }
-        let next = waiting.first();
-        self.shown = next.map(|preview| preview.action.clone());
-        next
-    }
-
-    /// Whether the action on screen is no longer waiting: decided elsewhere, expired or removed
-    /// with its account.
-    pub fn shown_is_gone(&self, waiting: &[Preview]) -> bool {
-        self.shown.as_ref().is_some_and(|shown| !waiting.iter().any(|preview| &preview.action == shown))
+        let withdraw = self.shown.is_some();
+        self.shown = wanted;
+        Change { withdraw, show }
     }
 }
 
-/// Hands the waiting actions to `present` one at a time, for as long as `pending` lives, and calls
-/// `withdraw` when the one on screen is no longer waiting, so its toast goes away.
-pub async fn run(pending: Arc<Pending>, present: impl Fn(&Preview), withdraw: impl Fn()) {
+/// Hands what the waiting actions need on screen to `present` (one action) and `several` (how many
+/// wait), for as long as `pending` lives, and calls `withdraw` first when what is on screen no
+/// longer holds, so its toast goes away.
+pub async fn run(pending: Arc<Pending>, present: impl Fn(&Preview), several: impl Fn(usize), withdraw: impl Fn()) {
     let mut changed = pending.subscribe();
     let mut queue = Queue::default();
     loop {
         let waiting = pending.waiting();
-        if queue.shown_is_gone(&waiting) {
+        let change = queue.update(&waiting);
+        if change.withdraw {
             withdraw();
         }
-        if let Some(preview) = queue.next(&waiting) {
-            present(preview);
+        match change.show {
+            Some(Notice::Action(preview)) => present(preview),
+            Some(Notice::Several(count)) => several(count),
+            None => {}
         }
         if changed.changed().await.is_err() {
             return;
@@ -171,9 +212,10 @@ pub async fn run(pending: Arc<Pending>, present: impl Fn(&Preview), withdraw: im
     }
 }
 
-/// Registers the toasts' AppUserModelID and shows the waiting actions for the daemon's lifetime.
+/// Registers the toasts' AppUserModelID and shows the waiting actions for the daemon's lifetime;
+/// the notice of several opens the configuration window through `window`.
 #[cfg(windows)]
-pub fn start(runtime: &Runtime, pending: Arc<Pending>) {
+pub fn start(runtime: &Runtime, pending: Arc<Pending>, window: Opener) {
     // ponytail: without the registration Windows may show no toast; reported once a log sink exists.
     let _ = toast::register();
     // Toasts are shown and taken away one after the other on one thread (showing waits for
@@ -182,18 +224,19 @@ pub fn start(runtime: &Runtime, pending: Arc<Pending>) {
     // ponytail: without the thread no toast shows (the window still lists the actions); reported
     // once a log sink exists.
     let _ = std::thread::Builder::new().name("open-mess-toasts".into()).spawn(move || queue.into_iter().for_each(|job| job()));
-    let (handle, shown, withdrawn) = (runtime.handle().clone(), Arc::clone(&pending), jobs.clone());
+    let (handle, shown, several, withdrawn) = (runtime.handle().clone(), Arc::clone(&pending), jobs.clone(), jobs.clone());
+    let open_on = runtime.handle().clone();
     runtime.spawn(run(
         pending,
         move |preview| drop(jobs.send(toast::show(&shown, &handle, Prompt::new(preview), preview.action.clone()))),
+        move |count| drop(several.send(toast::several(count, window.clone(), open_on.clone()))),
         move || drop(withdrawn.send(Box::new(toast::withdraw))),
     ));
 }
 
-/// No notifications here yet: actions wait until they expire (the configuration window of
-/// milestone E lists them).
+/// No notifications here: actions wait until they expire.
 #[cfg(not(windows))]
-pub fn start(_runtime: &Runtime, _pending: Arc<Pending>) {}
+pub fn start(_runtime: &Runtime, _pending: Arc<Pending>, _window: Opener) {}
 
 #[cfg(windows)]
 mod toast {
@@ -208,6 +251,7 @@ mod toast {
 
     use super::{APP_ID, Prompt};
     use crate::pending::Pending;
+    use crate::ui::Opener;
 
     /// `HKCU\Software\Classes\AppUserModelId\open_mess.daemon` with the name toasts show.
     pub(super) fn register() -> std::io::Result<()> {
@@ -255,8 +299,30 @@ mod toast {
         })
     }
 
-    /// Takes open_mess's toasts off the screen and out of the notification center. One action is
-    /// on screen at a time, so this is the toast of the action that is no longer waiting.
+    /// Shows that `count` actions wait; it only opens the configuration window, where each is shown
+    /// in full and decided on its own.
+    pub(super) fn several(count: usize, window: Opener, runtime: Handle) -> Job {
+        Box::new(move || {
+            let toast = Toast::new(APP_ID)
+                .title(&format!("open_mess: {count} actions wait for your approval"))
+                .text1("Open the list to read each one before you decide.")
+                .scenario(Scenario::Reminder)
+                .add_button("Open the list", "open")
+                .on_activated(move |_| {
+                    let window = window.clone();
+                    // ponytail: a window that fails to open says nothing here; reported once a log
+                    // sink exists (the tray opens it too).
+                    runtime.spawn(async move { window.open().await });
+                    Ok(())
+                });
+            // ponytail: a toast Windows refuses leaves the actions to the window's list; reported
+            // once a log sink exists.
+            let _ = toast.show();
+        })
+    }
+
+    /// Takes open_mess's toasts off the screen and out of the notification center. One
+    /// notification is on screen at a time, so this is the one that no longer holds.
     pub(super) fn withdraw() {
         // ponytail: a toast Windows keeps stays until the user dismisses it (clicking it decides
         // nothing then); reported once a log sink exists.
@@ -374,24 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn queue_shows_one_at_a_time() {
-        let [a, b, c, d] = ["a", "b", "c", "d"].map(|id| preview(id, Kind::Send));
+    fn one_notification_at_a_time() {
+        let [a, b, c] = ["a", "b", "c"].map(|id| preview(id, Kind::Send));
         let mut queue = Queue::default();
-        let shown = |preview: Option<&Preview>| preview.map(|preview| preview.action.clone());
-        assert_eq!(shown(queue.next(&[])), None);
-        assert_eq!(shown(queue.next(&[a.clone(), b.clone(), c.clone()])), Some("a".into()));
-        // While "a" waits nothing else shows, however many come.
-        assert_eq!(shown(queue.next(&[a.clone(), b.clone(), c.clone(), d.clone()])), None);
-        // "a" decided or expired: the oldest of the rest.
-        assert_eq!(shown(queue.next(&[b.clone(), c.clone(), d.clone()])), Some("b".into()));
-        assert_eq!(shown(queue.next(&[b.clone(), c.clone(), d.clone()])), None);
-        assert_eq!(shown(queue.next(&[])), None);
-        assert_eq!(shown(queue.next(std::slice::from_ref(&d))), Some("d".into()));
-
-        // The toast on screen goes when its action does, however that happened.
-        assert!(!queue.shown_is_gone(std::slice::from_ref(&d)));
-        assert!(queue.shown_is_gone(&[a.clone(), b.clone()]));
-        assert!(queue.shown_is_gone(&[]));
-        assert!(!Queue::default().shown_is_gone(&[]));
+        let nothing = Change { withdraw: false, show: None };
+        assert_eq!(queue.update(&[]), nothing);
+        // One waits: its own toast.
+        assert_eq!(queue.update(std::slice::from_ref(&a)), Change { withdraw: false, show: Some(Notice::Action(&a)) });
+        assert_eq!(queue.update(std::slice::from_ref(&a)), nothing);
+        // Another joins: one notice instead, not shown again for each one more.
+        let two = [a.clone(), b.clone()];
+        assert_eq!(queue.update(&two), Change { withdraw: true, show: Some(Notice::Several(2)) });
+        assert_eq!(queue.update(&[a.clone(), b.clone(), c.clone()]), nothing);
+        // Down to one, whichever: its own toast again; none left: nothing on screen.
+        assert_eq!(queue.update(std::slice::from_ref(&c)), Change { withdraw: true, show: Some(Notice::Action(&c)) });
+        assert_eq!(queue.update(std::slice::from_ref(&b)), Change { withdraw: true, show: Some(Notice::Action(&b)) });
+        assert_eq!(queue.update(&[]), Change { withdraw: true, show: None });
+        assert_eq!(queue.update(&[]), nothing);
+        // Several at once from nothing: the notice alone.
+        assert_eq!(queue.update(&two), Change { withdraw: false, show: Some(Notice::Several(2)) });
     }
 }

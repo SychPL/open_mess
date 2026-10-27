@@ -285,7 +285,7 @@ async fn removing_account_clears_its_waiting_actions() {
     d.accounts.add("test-echo", info("a")).unwrap();
     d.accounts.add("test-echo", info("b")).unwrap();
     let state = state(&d);
-    let (shown, withdrawn) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(0)));
+    let (shown, several, withdrawn) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(0)), Arc::new(Mutex::new(0)));
     tokio::spawn(approval::run(
         Arc::clone(&state.pending),
         {
@@ -293,23 +293,28 @@ async fn removing_account_clears_its_waiting_actions() {
             move |preview: &Preview| shown.lock().unwrap().push(preview.action.clone())
         },
         {
+            let several = Arc::clone(&several);
+            move |_| *several.lock().unwrap() += 1
+        },
+        {
             let withdrawn = Arc::clone(&withdrawn);
             move || *withdrawn.lock().unwrap() += 1
         },
     ));
     let send = |account: &str| d.registry.call("send", json!({"account": account, "conversation": "c1", "text": "hi"}));
-    let a1 = send("test-echo:a").await.unwrap()["action"].as_str().unwrap().to_owned();
+    send("test-echo:a").await.unwrap();
     send("test-echo:a").await.unwrap();
     let b1 = send("test-echo:b").await.unwrap()["action"].as_str().unwrap().to_owned();
-    wait_for(|| shown.lock().unwrap().len() == 1).await;
-    assert_eq!(*shown.lock().unwrap(), std::slice::from_ref(&a1));
+    // Three wait: one notice says so.
+    wait_for(|| *several.lock().unwrap() == 1).await;
+    let withdrawn_before = *withdrawn.lock().unwrap();
 
     commands::remove_account(&state, "test-echo:a").await.unwrap();
-    // Gone from the list, its toast taken off the screen, and the next account's shown.
+    // Gone from the list, the notice taken off the screen, and the one left shown on its own.
     assert_eq!(commands::waiting(&state).iter().map(|preview| preview.action.clone()).collect::<Vec<_>>(), std::slice::from_ref(&b1));
-    wait_for(|| shown.lock().unwrap().len() == 2).await;
-    assert_eq!(*shown.lock().unwrap(), [a1, b1]);
-    assert_eq!(*withdrawn.lock().unwrap(), 1);
+    wait_for(|| shown.lock().unwrap().last() == Some(&b1)).await;
+    assert_eq!(*withdrawn.lock().unwrap(), withdrawn_before + 1);
+    assert_eq!(*several.lock().unwrap(), 1);
 }
 
 async fn wait_for(done: impl Fn() -> bool) {

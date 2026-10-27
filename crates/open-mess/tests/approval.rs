@@ -1,4 +1,5 @@
-//! The approval queue over real pending actions: one action on screen at a time.
+//! The approval notifications over real pending actions: one notification on screen at a time, an
+//! action's own when it waits alone, one notice when several wait.
 
 // Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
@@ -13,32 +14,44 @@ use open_mess::approval;
 use open_mess::pending::Preview;
 use serde_json::json;
 
-/// What the presenter was handed so far, once the queue has caught up with `count` of them.
-async fn shown(shown: &Mutex<Vec<String>>, count: usize) -> Vec<String> {
+type Events = Arc<Mutex<Vec<String>>>;
+
+/// Waits until `done` holds for what was put on and taken off the screen, then a little longer,
+/// so a wrong extra notification has the chance to show up too.
+async fn events(events: &Events, done: impl Fn(&[String]) -> bool) -> Vec<String> {
     for _ in 0..100 {
-        if shown.lock().unwrap().len() >= count {
+        if done(&events.lock().unwrap()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // Give a wrong extra toast the chance to show up too.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    shown.lock().unwrap().clone()
+    events.lock().unwrap().clone()
+}
+
+fn notices(events: &[String]) -> usize {
+    events.iter().filter(|event| event.ends_with(" wait")).count()
 }
 
 #[tokio::test]
-async fn one_toast_at_a_time() {
+async fn several_waiting_actions_share_one_notice() {
     let d = daemon(&[ECHO]).await;
     d.accounts.add("test-echo", info("a")).unwrap();
     let pending = Arc::clone(d.registry.pending().unwrap());
-    let presented = Arc::new(Mutex::new(Vec::new()));
-    let present = {
-        let presented = Arc::clone(&presented);
-        move |preview: &Preview| presented.lock().unwrap().push(preview.action.clone())
+    let log: Events = Arc::default();
+    let record = |event: fn(String) -> String| {
+        let log = Arc::clone(&log);
+        move |what: String| log.lock().unwrap().push(event(what))
     };
-    tokio::spawn(approval::run(Arc::clone(&pending), present, || {}));
+    let (present, several, withdraw) = (record(|action| action), record(|count| format!("{count} wait")), record(|_| "withdrawn".into()));
+    tokio::spawn(approval::run(
+        Arc::clone(&pending),
+        move |preview: &Preview| present(preview.action.clone()),
+        move |count| several(count.to_string()),
+        move || withdraw(String::new()),
+    ));
 
-    // An agent sends in a loop: 20 wait, one is on screen.
+    // An agent sends in a loop: 20 wait, and one notice says so, shown once however many join.
     let mut actions = Vec::new();
     for n in 0..25 {
         if let Ok(result) = d.registry.call("send", json!({"account": "test-echo:a", "conversation": "c1", "text": format!("message {n}")})).await {
@@ -46,14 +59,23 @@ async fn one_toast_at_a_time() {
         }
     }
     assert_eq!(actions.len(), 20);
-    assert_eq!(shown(&presented, 1).await, actions[..1]);
+    let seen = events(&log, |events| notices(events) == 1).await;
+    assert_eq!(notices(&seen), 1, "{seen:?}");
+    // At most the first action had its own toast, before the second came; it was taken away.
+    let toasts = seen.iter().filter(|event| actions.contains(event)).count();
+    assert!(toasts <= 1, "{seen:?}");
+    assert_eq!(seen.iter().filter(|event| *event == "withdrawn").count(), toasts);
 
-    // The next one appears once the shown one is decided.
-    pending.decide(&actions[0], false).await.unwrap();
-    assert_eq!(shown(&presented, 2).await, actions[..2]);
-    // Deciding one that is not on screen (in the configuration window, later) shows nothing new.
-    pending.decide(&actions[5], false).await.unwrap();
-    assert_eq!(shown(&presented, 2).await, actions[..2]);
-    pending.decide(&actions[1], false).await.unwrap();
-    assert_eq!(shown(&presented, 3).await, actions[..3]);
+    // Decided one by one in the window: no notice again on the way, and the last one left gets its
+    // own toast, with its buttons.
+    for action in &actions[..19] {
+        pending.decide(action, false).await.unwrap();
+    }
+    let seen = events(&log, |events| events.last() == Some(&actions[19])).await;
+    assert_eq!(seen[seen.len() - 2..], ["withdrawn".to_string(), actions[19].clone()]);
+    assert_eq!(notices(&seen), 1);
+    // Decided too: its toast goes.
+    pending.decide(&actions[19], false).await.unwrap();
+    let seen = events(&log, |events| events.last().is_some_and(|event| event == "withdrawn")).await;
+    assert_eq!(seen.last().map(String::as_str), Some("withdrawn"));
 }
