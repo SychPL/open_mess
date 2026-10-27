@@ -40,6 +40,23 @@ struct State {
     owner: Option<isize>,
     /// The user cancelled the sign-in in progress, or closed the window.
     cancelled: bool,
+    /// A question about the shown prompt's sign-in page; it goes with the prompt.
+    question: Option<Question>,
+}
+
+impl State {
+    /// Takes the prompt off the screen, with its question.
+    fn take_shown(&mut self) -> Option<Shown> {
+        self.question = None;
+        self.shown.take()
+    }
+}
+
+/// May the sign-in page of the shown prompt go on to `host`? (spec 8.3, R10)
+struct Question {
+    id: u64,
+    host: String,
+    allow: oneshot::Sender<bool>,
 }
 
 /// The prompt on screen and where its answer goes.
@@ -64,7 +81,7 @@ impl Drop for Active {
         let shown = {
             let mut state = self.0.state();
             state.module = None;
-            state.shown.take()
+            state.take_shown()
         };
         if let Some(shown) = shown {
             shown.cancel();
@@ -124,7 +141,9 @@ impl SignIns {
             }
             state.next_id += 1;
             let id = state.next_id;
-            state.shown.replace(Shown { id, request, reply })
+            let replaced = state.take_shown();
+            state.shown = Some(Shown { id, request, reply });
+            replaced
         };
         if let Some(old) = replaced {
             old.cancel();
@@ -137,22 +156,56 @@ impl SignIns {
         self.state().shown.as_ref().map(|shown| (shown.id, shown.request.clone()))
     }
 
-    /// The user's answer to prompt `id`. The prompt goes off the screen; a cancel cancels the rest
-    /// of the sign-in too.
+    /// Asks the user whether the sign-in page of prompt `page` may go on to `host`; false when the
+    /// user says no, or the prompt ends first.
+    pub async fn ask_host(&self, page: u64, host: &str) -> bool {
+        let allowed = {
+            let mut state = self.state();
+            if state.shown.as_ref().is_none_or(|shown| shown.id != page) {
+                return false;
+            }
+            state.next_id += 1;
+            let (allow, allowed) = oneshot::channel();
+            state.question = Some(Question { id: state.next_id, host: host.into(), allow });
+            allowed
+        };
+        self.changed();
+        allowed.await.unwrap_or(false)
+    }
+
+    /// The question to show instead of the prompt, with the id its answer names, and the host.
+    pub fn question(&self) -> Option<(u64, String)> {
+        self.state().question.as_ref().map(|question| (question.id, question.host.clone()))
+    }
+
+    /// The user's answer to prompt or question `id`. A prompt goes off the screen, and a cancel
+    /// cancels the rest of the sign-in too; a question is answered yes by anything but a cancel.
     pub fn answer(&self, id: u64, reply: SignInReply) -> Result<(), String> {
         let shown = {
             let mut state = self.state();
-            match state.shown.take_if(|shown| shown.id == id) {
-                Some(shown) => {
-                    state.cancelled |= reply == SignInReply::Cancelled;
-                    shown
-                }
+            if let Some(question) = state.question.take_if(|question| question.id == id) {
+                drop(state);
+                let _ = question.allow.send(reply != SignInReply::Cancelled);
+                self.changed();
+                return Ok(());
+            }
+            if state.shown.as_ref().is_none_or(|shown| shown.id != id) {
+                return Err(GONE.into());
+            }
+            state.cancelled |= reply == SignInReply::Cancelled;
+            match state.take_shown() {
+                Some(shown) => shown,
                 None => return Err(GONE.into()),
             }
         };
         let _ = shown.reply.send(reply);
         self.changed();
         Ok(())
+    }
+
+    /// The sign-in window of prompt `page` closed: if the prompt still waits, the user cancelled.
+    pub fn page_closed(&self, page: u64) {
+        let _ = self.answer(page, SignInReply::Cancelled);
     }
 
     /// The configuration window opened, with this handle (`HWND`).
@@ -166,7 +219,7 @@ impl SignIns {
             let mut state = self.state();
             state.owner = None;
             state.cancelled = state.module.is_some();
-            state.shown.take()
+            state.take_shown()
         };
         if let Some(shown) = shown {
             shown.cancel();

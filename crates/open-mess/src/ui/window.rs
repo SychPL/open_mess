@@ -10,7 +10,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::runtime::Runtime;
 
-use super::{Opener, UiState};
+use open_mess_host::{SignInReply, SignInRequest};
+
+use super::{Opener, UiState, sign_in_page};
 use crate::Error;
 
 /// The window's label; the capability file grants its commands to this label only.
@@ -47,6 +49,7 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
         .build(tauri::generate_context!())
         .map_err(failed)?;
     tray(&app, profile.clone()).map_err(failed)?;
+    let page_profile = profile.clone();
 
     let handle = app.handle().clone();
     runtime.spawn(async move {
@@ -66,10 +69,33 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             dispatch(&handle, "pending-changed");
         }
     });
-    let (handle, mut prompts) = (app.handle().clone(), sign_ins.subscribe());
+    let (handle, mut prompts, watched) = (app.handle().clone(), sign_ins.subscribe(), sign_ins.clone());
     runtime.spawn(async move {
+        // The prompt whose sign-in page has a window.
+        let mut page_open = None;
         while prompts.changed().await.is_ok() {
             dispatch(&handle, "sign-in-request");
+            let page = match watched.shown() {
+                Some((id, SignInRequest::OpenPage { module, url, redirect_prefix })) => Some((id, module, url, redirect_prefix)),
+                _ => None,
+            };
+            if page.as_ref().map(|(id, ..)| *id) == page_open {
+                continue;
+            }
+            // The prompt changed: its page's window goes, the new one's opens.
+            if let Some(old) = page_open.take() {
+                let app = handle.clone();
+                let _ = handle.run_on_main_thread(move || sign_in_page::close(&app, old));
+            }
+            if let Some((id, module, url, prefix)) = page {
+                page_open = Some(id);
+                let (app, profile, sign_ins) = (handle.clone(), page_profile.clone(), watched.clone());
+                let _ = handle.run_on_main_thread(move || {
+                    if let Err(why) = sign_in_page::open(&app, &profile, id, &module, &url, &prefix) {
+                        let _ = sign_ins.answer(id, SignInReply::Refused(why));
+                    }
+                });
+            }
         }
     });
     let handle = app.handle().clone();
@@ -83,6 +109,12 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
         RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
         // Nobody can answer what the closed window showed.
         RunEvent::WindowEvent { label, event: WindowEvent::Destroyed, .. } if label == LABEL => sign_ins.window_closed(),
+        // The user closed a sign-in page: that sign-in is cancelled, if it still waits.
+        RunEvent::WindowEvent { label, event: WindowEvent::Destroyed, .. } => {
+            if let Some(page) = sign_in_page::page_of(&label) {
+                sign_ins.page_closed(page);
+            }
+        }
         _ => {}
     });
     Ok(())

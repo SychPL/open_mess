@@ -451,11 +451,12 @@ pub fn mcp_command(state: &UiState) -> McpCommandsDto {
 pub struct SignInPromptDto {
     /// What [`sign_in_answer`] names.
     pub id: u64,
-    /// `device-code`, `qr`, `page` or `wam-pick`.
+    /// `device-code`, `qr`, `page`, `wam-pick` or `ask-host` (the sign-in page went on to the host
+    /// in `url`: may it?).
     pub kind: &'static str,
     pub module: String,
     pub code: Option<String>,
-    /// Where the device code is entered; the host of a sign-in page.
+    /// Where the device code is entered; the host of a sign-in page or of the question.
     pub url: Option<String>,
     /// The QR code, as an SVG image.
     pub qr_svg: Option<String>,
@@ -494,6 +495,10 @@ pub async fn sign_in_start(state: &UiState, module: &str) -> Result<AccountDto, 
 pub fn sign_in_request(state: &UiState) -> Option<SignInPromptDto> {
     let (id, request) = state.sign_ins.shown()?;
     let module = request.module().to_owned();
+    // The sign-in page went on to a host that is not approved: the window asks first.
+    if let Some((id, host)) = state.sign_ins.question() {
+        return Some(SignInPromptDto { id, kind: "ask-host", module, code: None, url: Some(host), qr_svg: None, accounts: Vec::new() });
+    }
     let dto = |kind| SignInPromptDto { id, kind, module, code: None, url: None, qr_svg: None, accounts: Vec::new() };
     Some(match request {
         SignInRequest::DeviceCode { code, url, .. } => SignInPromptDto { code: Some(code), url: Some(url), ..dto("device-code") },

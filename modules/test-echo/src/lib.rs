@@ -23,7 +23,8 @@
 //! `sign-in-with` `{"how": "windows"}` it signs in account "windows" with a WAM token for the
 //! manifest's identity (the Teams client id; for the manual check only) instead, and after
 //! `{"how": "device-code"}` it shows a device code and polls `http.fetch` until the host refuses
-//! with "sign-in ...", which it returns as a platform error; `sign-out` reports the
+//! with "sign-in ...", which it returns as a platform error, and after `{"how": "microsoft"}` its
+//! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
 //! named after any other.
 
@@ -203,7 +204,7 @@ mod guest {
                 platform: "test".to_string(),
                 // black_box: the padded string stays in the file as written.
                 hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),
-                sign_in_hosts: vec!["login.example.com".to_string()],
+                sign_in_hosts: vec!["login.example.com".to_string(), "login.microsoftonline.com".to_string()],
                 wam: Some(types::WamIdentity { client_id: TEAMS_CLIENT.to_string(), scopes: vec![CHAT_SCOPE.to_string()] }),
                 extra_tools: Vec::new(),
             }
@@ -236,8 +237,12 @@ mod guest {
                 return Ok(types::AccountInfo { id: "windows".to_string(), display_name: format!("Windows token of {} bytes", token.len()) });
             }
             sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
-            let url = sign_in::open_page("https://login.example.com/start", "https://login.example.com/done")
-                .map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
+            // The manual check of the sign-in window opens Microsoft's real sign-in page.
+            let (start, redirect) = match storage::get("sign-in-with").as_deref() {
+                Some(b"microsoft") => ("https://login.microsoftonline.com/", "https://login.microsoftonline.com/common/oauth2/nativeclient"),
+                _ => ("https://login.example.com/start", "https://login.example.com/done"),
+            };
+            let url = sign_in::open_page(start, redirect).map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
             let id = url.split_once("account=").map(|(_, id)| id.split('&').next().unwrap_or(id)).unwrap_or_default();
             Ok(types::AccountInfo { id: id.to_string(), display_name: format!("Echo {id}") })
         }

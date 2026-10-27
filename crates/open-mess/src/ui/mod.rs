@@ -5,6 +5,7 @@
 
 pub mod commands;
 pub mod sign_in;
+pub mod sign_in_page;
 #[cfg(windows)]
 mod window;
 

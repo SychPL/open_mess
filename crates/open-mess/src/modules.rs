@@ -434,6 +434,33 @@ pub fn remember_approved(store: &Store, manifest: &Manifest) -> Result<(), Error
     store.set_config(&approved_manifest_key(&manifest.name), &canonical(manifest).to_string())
 }
 
+fn sign_in_hosts_key(name: &str) -> String {
+    format!("sign_in_hosts:{name}")
+}
+
+/// The hosts the user allowed for module `name`'s sign-in pages during a sign-in (spec 8.3, R10).
+fn allowed_sign_in_hosts(store: &Store, name: &str) -> Result<Vec<String>, Error> {
+    Ok(store.get_config(&sign_in_hosts_key(name))?.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default())
+}
+
+/// The approved sign-in hosts of a module: its manifest's and the ones the user allowed.
+pub fn approved_sign_in_hosts(store: &Store, manifest: &Manifest) -> Result<Vec<String>, Error> {
+    let mut hosts = manifest.sign_in_hosts.clone();
+    hosts.extend(allowed_sign_in_hosts(store, &manifest.name)?);
+    Ok(hosts)
+}
+
+/// Adds a host to module `name`'s approved sign-in hosts, when the user allows its sign-in page to
+/// go there (spec 8.3, R10). Only the configuration window calls it.
+pub fn allow_sign_in_host(store: &Store, name: &str, host: &str) -> Result<(), Error> {
+    let mut hosts = allowed_sign_in_hosts(store, name)?;
+    if !hosts.iter().any(|known| known == host) {
+        hosts.push(host.to_owned());
+        store.set_config(&sign_in_hosts_key(name), &Value::from(hosts).to_string())?;
+    }
+    Ok(())
+}
+
 /// The manifest last approved in the window for module `name`, as [`canonical`] gives it.
 pub fn approved_manifest(store: &Store, name: &str) -> Result<Option<Value>, Error> {
     Ok(store.get_config(&approved_manifest_key(name))?.and_then(|json| serde_json::from_str(&json).ok()))

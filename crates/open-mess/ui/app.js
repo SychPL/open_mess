@@ -486,6 +486,18 @@ async function refreshSignIn() {
     }
   } else if (prompt.kind === "page") {
     dialog.append(el("p", "Zaloguj się w osobnym oknie strony logowania (" + prompt.url + "). Hasło wpisujesz tylko tam."));
+  } else if (prompt.kind === "ask-host") {
+    dialog.append(el("p", "Strona logowania przechodzi na " + prompt.url + ". Zezwolić?"));
+    dialog.append(
+      el("p", "Zgoda doda ten host do zatwierdzonych hostów logowania modułu (np. firmowy serwer logowania). Odmowa przerwie logowanie.", "muted"),
+    );
+    const row = el("div", null, "row");
+    row.append(
+      button("Zezwól", () => call("sign_in_answer", { request_id: prompt.id, reply: { done: "allow" } }), "primary"),
+      button("Nie zezwalaj", () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"),
+    );
+    dialog.append(row);
+    return;
   } else if (prompt.kind === "wam-pick") {
     const answer = (done) => () => call("sign_in_answer", { request_id: prompt.id, reply: { done } });
     dialog.append(el("p", "Wybierz konto Windows, którym moduł ma się zalogować:"));

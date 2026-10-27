@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{Daemon, ECHO, daemon};
-use open_mess::ui::UiState;
+use open_mess::modules;
 use open_mess::ui::commands::{self, AccountDto, AnswerDto, SignInPromptDto};
 use open_mess::ui::sign_in::{BUSY, NO_WINDOW, NOT_FROM_WINDOW};
+use open_mess::ui::{UiState, sign_in_page};
 use open_mess_host::{SignInReply, SignInRequest, WamAccount};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -211,6 +212,61 @@ async fn windows_account_live() {
     let added = signed_in.unwrap();
     println!("signed in: {}", added.display_name);
     assert!(added.display_name.starts_with("Windows token of "));
+}
+
+#[tokio::test]
+async fn unknown_sign_in_host_asks_and_remembers() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    let echo = d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap();
+    let approved = |module: &str| {
+        let manifest = open_mess_host::Manifest { name: module.into(), sign_in_hosts: Vec::new(), ..echo.clone() };
+        modules::approved_sign_in_hosts(&common::store(d.dir.path()), &manifest).unwrap()
+    };
+    let _active = state.sign_ins.begin("test-echo").unwrap();
+    let page = |url: &str| {
+        let (reply, answer) = oneshot::channel();
+        let (url, redirect_prefix) = (url.into(), "https://login.example.com/done".into());
+        state.sign_ins.offer(SignInRequest::OpenPage { module: "test-echo".into(), url, redirect_prefix }, reply);
+        (state.sign_ins.shown().unwrap().0, answer)
+    };
+
+    // The page goes to the company's own sign-in server: the window asks.
+    let (id, mut answer) = page("https://login.example.com/start");
+    let asking = tokio::spawn({
+        let (sign_ins, accounts) = (state.sign_ins.clone(), Arc::clone(&state.accounts));
+        async move { sign_in_page::unknown_host(&sign_ins, &accounts, id, "test-echo", "login.contoso-adfs.example").await }
+    });
+    let question = prompt(&state, "ask-host").await;
+    assert_eq!((question.url.as_deref(), question.module.as_str()), (Some("login.contoso-adfs.example"), "test-echo"));
+    commands::sign_in_answer(&state, question.id, AnswerDto::Done(Some("allow".into()))).unwrap();
+    assert!(asking.await.unwrap());
+    // Yes: the page goes on and the host is approved for this module only, from now on.
+    assert!(answer.try_recv().is_err());
+    assert_eq!(commands::sign_in_request(&state).unwrap().kind, "page");
+    assert_eq!(approved("test-echo"), ["login.contoso-adfs.example"]);
+    assert!(approved("teams").is_empty());
+
+    // No: the sign-in ends as refused.
+    let asking = tokio::spawn({
+        let (sign_ins, accounts) = (state.sign_ins.clone(), Arc::clone(&state.accounts));
+        async move { sign_in_page::unknown_host(&sign_ins, &accounts, id, "test-echo", "evil.example").await }
+    });
+    let question = prompt(&state, "ask-host").await;
+    commands::sign_in_answer(&state, question.id, AnswerDto::Cancelled).unwrap();
+    assert!(!asking.await.unwrap());
+    assert!(matches!(answer.await, Ok(SignInReply::Refused(_))));
+    assert_eq!(approved("test-echo"), ["login.contoso-adfs.example"]);
+}
+
+#[tokio::test]
+async fn sign_in_page_closed_by_the_user_cancels() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    let signing_in = add_account(&state);
+    let page = prompt(&state, "page").await;
+    state.sign_ins.page_closed(page.id);
+    assert!(signing_in.await.unwrap().unwrap_err().contains("cancelled"));
 }
 
 #[tokio::test]
