@@ -6,7 +6,8 @@
 //! in all: ids come from modules, which may send long ones.
 //!
 //! Never fired: the user's own messages, messages a rule has handled already (a module may report
-//! one again after a restart; they are kept in the database for [`SEEN_FOR`]), accounts that are
+//! one again after a restart; they are kept in the database for [`SEEN_FOR`], except those of a
+//! batch the daemon stopped before sending, which can fire again), accounts that are
 //! unknown or being removed, and conversations the agent may not read (spec 8.4, 8.6, 8.7). The
 //! account and the permission are checked again when a batch goes out, so taking the read
 //! permission away mutes it at once (R7).
@@ -107,7 +108,11 @@ pub enum DeliveryResult {
 /// of day, for quiet hours.
 pub fn spawn<D: Delivery>(bus: &Bus, accounts: Arc<Accounts>, delivery: Arc<D>, counters: Counters, local_time: fn() -> NaiveTime) -> JoinHandle<()> {
     let events = bus.subscribe();
-    let engine = Engine { accounts, delivery, counters, local_time, open: HashMap::new(), sent: Arc::default(), remembered: 0 };
+    // Batches collected when the daemon stopped never went out: a module that reports their
+    // messages again wakes the rules for them.
+    // ponytail: a failed delete leaves them muted until they are forgotten (SEEN_FOR).
+    let _ = accounts.store().conn().execute("DELETE FROM trigger_seen WHERE batch IS NOT NULL", []);
+    let engine = Engine { accounts, delivery, counters, local_time, open: HashMap::new(), sent: Arc::default(), remembered: 0, batches: 0 };
     tokio::spawn(engine.run(events))
 }
 
@@ -125,9 +130,13 @@ struct Engine<D> {
     sent: Sent,
     /// Messages remembered as handled since the engine started.
     remembered: usize,
+    /// Batches opened since the engine started; the last one's number.
+    batches: i64,
 }
 
 struct Open {
+    /// Its number, under which its messages are remembered until it goes out.
+    id: i64,
     batch: Batch,
     first: Instant,
     last: Instant,
@@ -209,7 +218,11 @@ impl<D: Delivery> Engine<D> {
                 self.counters.count(&rule.id, |counters| &mut counters.dropped_queue);
                 continue;
             }
+            if new {
+                self.batches = self.batches.wrapping_add(1);
+            }
             let open = self.open.entry(key).or_insert_with(|| Open {
+                id: self.batches,
                 batch: Batch {
                     account: account.to_owned(),
                     conversation: conversation.to_owned(),
@@ -233,10 +246,11 @@ impl<D: Delivery> Engine<D> {
             }
             open.bytes = open.bytes.saturating_add(message.bytes());
             open.batch.messages.push(message.clone());
+            let batch = open.id;
             // Handled from here on, even if pushed out of its batch later or dropped with it.
             // ponytail: a failed write only means a message reported again may wake the rule again.
             let store = self.accounts.store();
-            let _ = remember(&store, &rule.id, account, &hash);
+            let _ = remember(&store, &rule.id, account, &hash, batch);
             // Also between batches, which a flood of messages may keep open for minutes.
             self.remembered = self.remembered.wrapping_add(1);
             if self.remembered.is_multiple_of(PRUNE_EVERY) {
@@ -278,19 +292,24 @@ impl<D: Delivery> Engine<D> {
         let due: Vec<(String, String)> = self.open.iter().filter(|(_, open)| open.due() <= now).map(|(key, _)| key.clone()).collect();
         for key in due {
             if let Some(open) = self.open.remove(&key) {
-                self.flush(&key.0, open.batch, now);
+                self.flush(&key.0, open.id, open.batch, now);
             }
         }
     }
 
     /// Hands a batch to its rule's action, unless the rule, the account or the read permission is
     /// gone by now, or quiet hours or the hourly cap stop it.
-    fn flush(&mut self, rule_id: &str, batch: Batch, now: Instant) {
+    fn flush(&mut self, rule_id: &str, id: i64, batch: Batch, now: Instant) {
+        {
+            // Its messages are handled now, whatever happens to it, and a daemon stopping from here
+            // on does not bring them back. ponytail: failed writes are tried again with the next batch.
+            let store = self.accounts.store();
+            let _ = store.conn().execute("UPDATE trigger_seen SET batch = NULL WHERE batch = ?1", [id]);
+            let _ = forget_old(&store);
+        }
         let Some(rule) = current_rule(&self.accounts, rule_id, &batch.account, &batch.conversation) else {
             return;
         };
-        // ponytail: a failed prune is tried again with the next batch.
-        let _ = forget_old(&self.accounts.store());
         if in_quiet_hours(rule.quiet_hours, (self.local_time)()) {
             self.counters.count(&rule.id, |counters| &mut counters.dropped_quiet_hours);
             return;
@@ -369,12 +388,12 @@ fn seen(store: &Store, rule: &str, hash: &str) -> bool {
     found.is_ok()
 }
 
-/// Keeps the message as handled by the rule.
-fn remember(store: &Store, rule: &str, account: &str, hash: &str) -> Result<(), rusqlite::Error> {
+/// Keeps the message as handled by the rule, in the open batch `batch`.
+fn remember(store: &Store, rule: &str, account: &str, hash: &str, batch: i64) -> Result<(), rusqlite::Error> {
     let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
     store.conn().execute(
-        "INSERT OR REPLACE INTO trigger_seen (rule, account, message, at_ms) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![rule, account, hash, now],
+        "INSERT OR REPLACE INTO trigger_seen (rule, account, message, at_ms, batch) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![rule, account, hash, now, batch],
     )?;
     Ok(())
 }

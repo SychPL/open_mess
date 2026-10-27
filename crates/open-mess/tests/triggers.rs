@@ -399,6 +399,21 @@ async fn a_message_pushed_out_of_its_batch_still_fires_once() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_batch_lost_with_the_daemon_fires_when_reported_again() {
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    t.bus.publish(message("c1", "m1", Kind::Direct));
+    sleep(Duration::from_secs(10)).await;
+    // The daemon stops before the batch goes out; the module reports the message again after it
+    // starts.
+    t.engine.abort();
+    let bus = Bus::default();
+    let _engine = engine::spawn(&bus, Arc::clone(&t.d.accounts), Arc::clone(&t.recorder), t.counters.clone(), local_time);
+    bus.publish(message("c1", "m1", Kind::Direct));
+    sleep(Duration::from_secs(61)).await;
+    assert_eq!(t.calls().iter().map(|(_, batch, _)| ids(batch)).collect::<Vec<_>>(), [vec!["m1"]]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_message_reported_again_fires_once() {
     let t = setup(&[rule("r", Condition::Direct)]).await;
     // Twice while its batch is collected, and again once it went out.
