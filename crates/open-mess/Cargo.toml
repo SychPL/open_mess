@@ -18,8 +18,9 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
-# RFC 3339 times in the `pending` tool; rmcp builds it already.
-chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
+# RFC 3339 times in the `pending` tool and the quiet hours of trigger rules; rmcp builds it
+# already, serde included.
+chrono = { version = "0.4.45", default-features = false, features = ["alloc", "serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom = "0.4.3"
 # keyring 4's own facade always installs the platform store on first use, so tests can't swap in

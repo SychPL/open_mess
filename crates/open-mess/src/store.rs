@@ -27,6 +27,9 @@ const MIGRATIONS: &[&str] = &[
     // is emptied once the action can no longer run.
     "CREATE TABLE pending (id TEXT PRIMARY KEY, account TEXT NOT NULL, conversation TEXT NOT NULL, kind TEXT NOT NULL, args TEXT NOT NULL,
          fingerprint TEXT NOT NULL, state TEXT NOT NULL, created_ms INTEGER NOT NULL, decided_ms INTEGER, detail TEXT);",
+    // Trigger rules (spec 8.7, triggers/rules.rs); `rule` is the condition, action and limits as JSON.
+    "CREATE TABLE trigger_rules (id TEXT PRIMARY KEY, account TEXT NOT NULL, rule TEXT NOT NULL, enabled INTEGER NOT NULL,
+         created_ms INTEGER NOT NULL);",
 ];
 
 /// Configuration and state in `state.sqlite3`.

@@ -13,6 +13,7 @@ use open_mess::modules;
 use open_mess::permissions::{self, Write};
 use open_mess::tools::shared::{UNTRUSTED_NOTICE, attachments_dir};
 use open_mess::tools::{Registry, ToolError};
+use open_mess::triggers::rules::{self, Action, Condition, Rule};
 use open_mess_host::{Engine, HostEvent, SessionState, limits};
 use serde_json::{Value, json};
 
@@ -145,10 +146,14 @@ async fn remove_account_deletes_secrets_and_signs_out() {
     let (attachment_a, attachment_b) = (attachment(&d.registry, "test-echo:a").await, attachment(&d.registry, "test-echo:b").await);
     let store = common::store(d.dir.path());
     permissions::set(&store, "test-echo:a", Some("c1"), true, Write::Autonomous).unwrap();
+    let rule = |id: &str, account: &str| Rule::new(id, account, Condition::Direct, Action::Channel { fallback_spawn: None });
+    rules::put(&store, &rule("ra", "test-echo:a")).unwrap();
+    rules::put(&store, &rule("rb", "test-echo:b")).unwrap();
 
     d.accounts.remove("test-echo:a").await.unwrap();
-    // The same account signed in again starts from the defaults (spec 8.6).
+    // The same account signed in again starts from the defaults (spec 8.6), without triggers.
     assert_eq!(permissions::effective(&store, "test-echo:a", Some("c1")).unwrap(), permissions::DEFAULT);
+    assert_eq!(rules::list(&store).unwrap(), [rule("rb", "test-echo:b")]);
 
     // test-echo reports an account it signs out as offline.
     let event = tokio::time::timeout(Duration::from_secs(5), d.events.recv()).await.unwrap().unwrap();

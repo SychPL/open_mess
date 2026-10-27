@@ -70,6 +70,14 @@ pub fn readable_anywhere(store: &Store, account: &str) -> Result<bool, Error> {
     Ok(store.conn().query_row(any, [account], |row| row.get(0))?)
 }
 
+/// Whether an agent may write without approval anywhere in `account`: the account, or one of its
+/// conversations.
+pub fn autonomous_anywhere(store: &Store, account: &str) -> Result<bool, Error> {
+    let any = "SELECT EXISTS(SELECT 1 FROM permissions WHERE account = ?1 AND write = ?2)";
+    Ok(effective(store, account, None)?.write == Write::Autonomous
+        || store.conn().query_row(any, [account, Write::Autonomous.name()], |row| row.get(0))?)
+}
+
 /// Sets the permissions of an account (`conversation` None) or of one of its conversations.
 pub fn set(store: &Store, account: &str, conversation: Option<&str>, read: bool, write: Write) -> Result<(), Error> {
     store.conn().execute(
