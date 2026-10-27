@@ -432,10 +432,10 @@ pub async fn decide(state: &UiState, action: &str, approve: bool) -> Result<Stri
 pub struct McpCommandsDto {
     /// `claude mcp add ...`, as `om mcp-command` prints it.
     pub claude: String,
-    /// `codex mcp add ...` reading the token from `OPEN_MESS_TOKEN`, run once, and the PowerShell
-    /// line that starts Codex with that variable set for its window only. Set for good (setx), it
-    /// would reach every program the user starts, agents' shells and their output included; a fixed
-    /// header in Codex's config.toml is printed by `codex mcp list --json`.
+    /// The `[mcp_servers.open_mess]` table for Codex's `config.toml`, the token in a fixed header,
+    /// kept in Codex's own configuration as Claude Code keeps it in its own. `codex mcp add` takes a
+    /// token only from an environment variable, which Codex hands on to the commands it runs (and
+    /// setx to every program); a line typed into a shell also lands in its history and logs.
     pub codex: String,
 }
 
@@ -444,7 +444,7 @@ pub fn mcp_command(state: &UiState) -> McpCommandsDto {
     McpCommandsDto {
         claude: cli::mcp_add_command(state.port, &state.token),
         codex: format!(
-            "codex mcp add open_mess --url http://127.0.0.1:{}/mcp --bearer-token-env-var OPEN_MESS_TOKEN\n$env:OPEN_MESS_TOKEN = \"{}\"; codex",
+            "[mcp_servers.open_mess]\nurl = \"http://127.0.0.1:{}/mcp\"\nhttp_headers = {{ Authorization = \"Bearer {}\" }}",
             state.port, state.token
         ),
     }
