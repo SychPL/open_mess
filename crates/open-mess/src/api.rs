@@ -197,26 +197,36 @@ impl McpSessions {
     }
 }
 
-/// A request's answer on its way; while it is, its session counts as answering.
-struct Answering {
-    stream: Pin<Box<dyn Stream<Item = ServerSseMessage> + Send + Sync>>,
-    count: Option<Arc<AtomicUsize>>,
-}
+/// One request of a session being answered, from when it reaches the session until its answer
+/// stream is dropped.
+struct Busy(Option<Arc<AtomicUsize>>);
 
-impl Answering {
-    fn new(stream: impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, count: Option<Arc<AtomicUsize>>) -> Answering {
+impl Busy {
+    fn new(count: Option<Arc<AtomicUsize>>) -> Busy {
         if let Some(count) = &count {
             count.fetch_add(1, Ordering::Relaxed);
         }
-        Answering { stream: Box::pin(stream), count }
+        Busy(count)
     }
 }
 
-impl Drop for Answering {
+impl Drop for Busy {
     fn drop(&mut self) {
-        if let Some(count) = &self.count {
+        if let Some(count) = &self.0 {
             count.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// A request's answer on its way; while it is, its session counts as answering.
+struct Answering {
+    stream: Pin<Box<dyn Stream<Item = ServerSseMessage> + Send + Sync>>,
+    _busy: Busy,
+}
+
+impl Answering {
+    fn new(stream: impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, busy: Busy) -> Answering {
+        Answering { stream: Box::pin(stream), _busy: busy }
     }
 }
 
@@ -267,8 +277,9 @@ impl SessionManager for McpSessions {
         id: &SessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        let answering = self.touch(id);
-        Ok(Answering::new(self.inner.create_stream(id, message).await?, answering))
+        // Busy before the request reaches the session, not only once its answer stream exists.
+        let busy = Busy::new(self.touch(id));
+        Ok(Answering::new(self.inner.create_stream(id, message).await?, busy))
     }
 
     async fn accept_message(&self, id: &SessionId, message: ClientJsonRpcMessage) -> Result<(), Self::Error> {
@@ -286,8 +297,10 @@ impl SessionManager for McpSessions {
         id: &SessionId,
         last_event_id: String,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        self.touch(id);
-        self.inner.resume(id, last_event_id).await
+        // The rest of an answer, after a lost connection. (Resuming the session's own stream
+        // spares the session the same way: the safe side.)
+        let busy = Busy::new(self.touch(id));
+        Ok(Answering::new(self.inner.resume(id, last_event_id).await?, busy))
     }
 }
 
@@ -391,7 +404,7 @@ mod tests {
         assert_eq!(sessions.used.lock().unwrap().1.len(), MAX_MCP_SESSIONS);
 
         // The one unused the longest is answering a request (a long tool call): the next one goes.
-        let answering = Answering::new(Empty, sessions.touch(&ids[2]));
+        let answering = Answering::new(Empty, Busy::new(sessions.touch(&ids[2])));
         for id in &ids[3..] {
             sessions.touch(id);
         }
@@ -414,6 +427,18 @@ mod tests {
         fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<ServerSseMessage>> {
             Poll::Ready(None)
         }
+    }
+
+    #[tokio::test]
+    async fn when_every_session_is_answering_the_one_unused_longest_goes() {
+        let sessions = McpSessions::default();
+        let mut open = Vec::new();
+        for _ in 0..MAX_MCP_SESSIONS {
+            open.push(sessions.create_session().await.unwrap());
+        }
+        let busy: Vec<Busy> = open.iter().map(|(id, _)| Busy::new(sessions.touch(id))).collect();
+        assert_eq!(sessions.to_close(), Some(open[0].0.clone()));
+        drop(busy);
     }
 
     #[tokio::test(flavor = "multi_thread")]
