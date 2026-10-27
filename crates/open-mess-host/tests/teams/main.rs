@@ -806,12 +806,62 @@ async fn new_message_emits_an_event() {
     assert_eq!(event, expected);
     // Once only, and polling only reads: the list of conversations updated lately.
     assert_eq!(teams.next_message().await, None);
-    let polls = teams.fake.requests(CHAT_PATH);
+    let polls: Vec<_> = teams.fake.seen().into_iter().filter(|s| s.path == CHAT_PATH).collect();
+    assert!(!polls.is_empty());
     for poll in &polls {
         let start: i64 = poll.query.split("startTime=").nth(1).unwrap().split('&').next().unwrap().parse().unwrap();
         assert!(start > started - 10 * 60_000 && start < started + 60_000, "{}", poll.query);
     }
     assert!(teams.fake.seen().iter().all(|s| s.method == "GET" || s.path == AUTHZ_PATH));
+}
+
+#[tokio::test]
+async fn messages_between_polls_all_arrive() {
+    // A mention, then another message, in one interval: the list shows only the last one, and the
+    // poll reads the conversation for the rest.
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let mention = mentioning(message("1900000000011", GROUP, OTHER, "<p>hey One</p>", at), ME);
+    let plain = message("1900000000012", GROUP, OTHER, "<p>and more</p>", at + 1);
+    let (list, path) = (vec![conversation(GROUP, None, Some(plain.clone()))], messages_path(GROUP));
+    teams.fake.on(move |s| match s.path.as_str() {
+        CHAT_PATH => Some(Reply::json(page("conversations", list.clone(), None))),
+        p if p == path => Some(Reply::json(page("messages", vec![plain.clone(), mention.clone()], None))),
+        _ => None,
+    });
+    let first = teams.next_message().await.unwrap();
+    let second = teams.next_message().await.unwrap();
+    assert_eq!((first.message.as_str(), first.mentions_me), ("1900000000011", true));
+    assert_eq!((second.message.as_str(), second.mentions_me), ("1900000000012", false));
+    assert_eq!(teams.next_message().await, None);
+}
+
+#[tokio::test]
+async fn a_failed_poll_is_tried_again() {
+    // The second page of the list fails: nothing is reported, and nothing is skipped either.
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail = failing.clone();
+    let next = format!("{CHAT}/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=two");
+    let first_page = vec![conversation(GROUP, None, Some(message("1900000000021", GROUP, OTHER, "<p>a</p>", at)))];
+    let second_page = vec![conversation(CHANNEL, None, Some(message("1900000000022", CHANNEL, OTHER, "<p>b</p>", at)))];
+    teams.fake.on(move |s| {
+        (s.path == CHAT_PATH).then(|| {
+            if !s.query.contains("syncState=two") {
+                Reply::json(page("conversations", first_page.clone(), Some(&next)))
+            } else if fail.load(Ordering::SeqCst) {
+                Reply::status(403)
+            } else {
+                Reply::json(page("conversations", second_page.clone(), None))
+            }
+        })
+    });
+    assert_eq!(teams.next_message().await, None);
+    failing.store(false, Ordering::SeqCst);
+    let mut arrived = vec![teams.next_message().await.unwrap().message, teams.next_message().await.unwrap().message];
+    arrived.sort();
+    assert_eq!(arrived, ["1900000000021", "1900000000022"]);
 }
 
 #[tokio::test]
@@ -841,7 +891,8 @@ async fn mentions_and_direct_are_set() {
 async fn restart_does_not_replay_old_messages() {
     let data = tempfile::tempdir().unwrap();
     let (fake, wam) = (Fake::start().await, Wam::new());
-    let old = conversation(GROUP, None, Some(message("1900000000005", GROUP, OTHER, "<p>old</p>", now_ms() + 1000)));
+    // Sent after the sign-in below, which starts the count once the module has loaded.
+    let old = conversation(GROUP, None, Some(message("1900000000005", GROUP, OTHER, "<p>old</p>", now_ms() + 60_000)));
     let listed = Arc::new(std::sync::Mutex::new(vec![old]));
     let list = listed.clone();
     fake.on(move |s| (s.path == CHAT_PATH).then(|| Reply::json(page("conversations", list.lock().unwrap().clone(), None))));
@@ -854,7 +905,7 @@ async fn restart_does_not_replay_old_messages() {
     let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL)).await;
     module.restore(ME_OID).await.unwrap();
     assert_eq!(next_message(&mut events).await, None);
-    let new = conversation(GROUP, None, Some(message("1900000000006", GROUP, OTHER, "<p>new</p>", now_ms() + 1000)));
+    let new = conversation(GROUP, None, Some(message("1900000000006", GROUP, OTHER, "<p>new</p>", now_ms() + 61_000)));
     *listed.lock().unwrap() = vec![new];
     assert_eq!(next_message(&mut events).await.map(|m| m.message).as_deref(), Some("1900000000006"));
 }

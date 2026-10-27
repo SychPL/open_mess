@@ -99,6 +99,9 @@ fn conversations(session: &mut Session, start_ms: i64, partial: bool, mut keep: 
             }
         }
         match page.backward_link {
+            Some(_) if !empty && !api::has_time() && !partial => {
+                return Err(ModuleError::Platform("Teams answers too slowly; try again later".to_string()));
+            }
             Some(next) if !empty && api::has_time() => link = Some(next),
             _ => return Ok(()),
         }
@@ -465,13 +468,33 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
     api::with_session(account, |session| {
         let key = crate::poll::key(account);
         let started = api::now_ms();
-        let mut state = storage::get(&key).and_then(|bytes| PollState::decode(&bytes)).unwrap_or_else(|| PollState::new(started));
+        // No state (it could not be read or stored at sign-in): count from one interval back.
+        let fallback = || PollState::new(started.saturating_sub(i64::from(crate::poll::INTERVAL_MS)));
+        let mut state = storage::get(&key).and_then(|bytes| PollState::decode(&bytes)).unwrap_or_else(fallback);
         let me = session.me();
-        let mut arrivals = Vec::new();
+        let mut changed = Vec::new();
         conversations(session, state.start_ms(), false, |c| {
-            arrivals.extend(state.arrival(&c, &me));
+            if state.changed(&c) {
+                changed.push(c);
+            }
             true
         })?;
+        // All or nothing: a poll cut short stores and reports nothing, and the next one starts
+        // from the same floor.
+        let mut arrivals = Vec::new();
+        for c in changed {
+            if !api::has_time() {
+                return Err(ModuleError::Platform("Teams answers too slowly; polling again later".to_string()));
+            }
+            let request = chat::read_messages(&session.directory, &c.id, None, PAGE_SIZE, None).map_err(api::proto)?;
+            // Messages that cannot be read leave the last one, which the list gave.
+            let newest_first = match api::read(session, Service::Chat, &request) {
+                Ok(body) => chat::decode_messages(&body).map(|page| page.items).unwrap_or_default(),
+                Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
+                Err(_) => Vec::new(),
+            };
+            arrivals.extend(state.arrivals(&c, &newest_first, &me));
+        }
         state.finish(started);
         // Stored before they are reported, so a crash in between loses them rather than
         // reporting them twice.

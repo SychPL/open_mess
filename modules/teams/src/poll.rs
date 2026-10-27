@@ -1,11 +1,13 @@
-//! New-message events by polling the conversation list (docs/protocols/teams.md 3.2): each
-//! conversation whose last message is new reports one `message-arrived`. Read-only: nothing here
-//! touches read state. What was reported is kept in module storage, so a restarted instance does
-//! not report it again. Trouter (live events) needs live checks first (F2b).
+//! New-message events by polling (docs/protocols/teams.md 3.2): each poll lists the conversations
+//! updated since the previous one; a conversation whose last message is new has its newest page of
+//! messages read, and each new message reports one `message-arrived`, so a mention followed by
+//! another message is not lost. Read-only: nothing here touches read state. What was reported is
+//! kept in module storage, so a restarted instance does not report it again. Trouter (live
+//! events) needs live checks first (F2b).
 
 use serde_json::{Value, json};
 
-use crate::chat::{Conversation, ConversationKind};
+use crate::chat::{Conversation, ConversationKind, Message};
 
 /// The host timer that runs the poll, and its interval.
 pub const TIMER: u32 = 1;
@@ -41,9 +43,9 @@ pub struct PollState {
 }
 
 impl PollState {
-    /// An account polled for the first time: messages from before the last interval are old.
+    /// An account whose messages count from `now_ms` on: when it signs in or is restored.
     pub fn new(now_ms: i64) -> PollState {
-        PollState { floor_ms: now_ms.saturating_sub(i64::from(INTERVAL_MS)), seen: Vec::new() }
+        PollState { floor_ms: now_ms, seen: Vec::new() }
     }
 
     /// The stored state; `None` when there is none or it does not read.
@@ -62,28 +64,46 @@ impl PollState {
         self.floor_ms
     }
 
-    /// The conversation's last message, if it is new; it is remembered either way.
-    pub fn arrival(&mut self, c: &Conversation, me: &str) -> Option<Arrival> {
-        let m = c.last_message.as_ref()?;
-        if self.seen.iter().any(|(conversation, id)| *conversation == c.id && *id == m.id) {
-            return None;
-        }
+    fn seen(&self, conversation: &str) -> Option<&str> {
+        self.seen.iter().find(|(c, _)| c == conversation).map(|(_, id)| id.as_str())
+    }
+
+    /// Whether the conversation's last message may be new: after the floor and not the one seen.
+    pub fn changed(&self, c: &Conversation) -> bool {
+        c.last_message.as_ref().is_some_and(|m| m.sent_ms > self.floor_ms && self.seen(&c.id) != Some(m.id.as_str()))
+    }
+
+    /// The new messages of a changed conversation, oldest first, from its newest messages
+    /// (`newest_first`; empty when they could not be read, and then only the last message
+    /// counts). The last message is remembered.
+    pub fn arrivals(&mut self, c: &Conversation, newest_first: &[Message], me: &str) -> Vec<Arrival> {
+        let Some(last) = &c.last_message else { return Vec::new() };
+        let seen = self.seen(&c.id).map(str::to_string);
+        let fresh = |m: &&Message| m.sent_ms > self.floor_ms && seen.as_deref() != Some(m.id.as_str());
+        let page: Vec<&Message> = if newest_first.is_empty() { vec![last] } else { newest_first.iter().take_while(fresh).collect() };
+        let direct = c.kind == ConversationKind::Direct;
+        let mut arrivals: Vec<Arrival> = page
+            .into_iter()
+            .filter(|m| fresh(m) && !m.deleted)
+            .map(|m| Arrival {
+                conversation: c.id.clone(),
+                message: m.id.clone(),
+                sender: m.sender_id.clone(),
+                own: m.sender_id == me,
+                mentions_me: m.mentions.iter().any(|mention| mention.mri == me),
+                direct,
+            })
+            .collect();
+        arrivals.reverse();
         self.seen.retain(|(conversation, _)| *conversation != c.id);
-        self.seen.push((c.id.clone(), m.id.clone()));
+        self.seen.push((c.id.clone(), last.id.clone()));
         if self.seen.len() > MAX_SEEN {
             self.seen.remove(0);
         }
-        (m.sent_ms > self.floor_ms).then(|| Arrival {
-            conversation: c.id.clone(),
-            message: m.id.clone(),
-            sender: m.sender_id.clone(),
-            own: m.sender_id == me,
-            mentions_me: m.mentions.iter().any(|mention| mention.mri == me),
-            direct: c.kind == ConversationKind::Direct,
-        })
+        arrivals
     }
 
-    /// After a poll that started at `started_ms`.
+    /// After a complete poll that started at `started_ms`.
     pub fn finish(&mut self, started_ms: i64) {
         self.floor_ms = self.floor_ms.max(started_ms.saturating_sub(OVERLAP_MS));
     }
@@ -92,48 +112,70 @@ impl PollState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::decode_conversations;
+    use crate::chat::{decode_conversations, decode_messages};
 
     const ME: &str = "8:orgid:00000000-0000-0000-0000-000000000001";
+    const OTHER: &str = "8:orgid:00000000-0000-0000-0000-000000000002";
     const NOW: i64 = 1_800_000_000_000;
 
-    /// A conversation whose last message `id` came from `from` at `at`, mentioning `mention`.
-    fn conversation(conv: &str, id: &str, from: &str, at: i64, mention: Option<&str>) -> Conversation {
+    fn message(conv: &str, id: &str, from: &str, at: i64, mention: Option<&str>) -> Value {
         let mentions = mention.map(|mri| json!([{"mri": mri}]).to_string());
-        let last = json!({"id": id, "conversationid": conv, "from": from, "messagetype": "RichText/Html", "content": "<p>x</p>",
-                          "originalarrivaltime": at, "properties": {"mentions": mentions}});
+        json!({"id": id, "conversationid": conv, "from": from, "messagetype": "RichText/Html", "content": "<p>x</p>",
+               "originalarrivaltime": at, "properties": {"mentions": mentions}})
+    }
+
+    /// A conversation whose last message is `last`.
+    fn conversation(conv: &str, last: Value) -> Conversation {
         let body = json!({"conversations": [{"id": conv, "lastMessage": last}], "_metadata": {}});
         decode_conversations(body.to_string().as_bytes()).unwrap().items.remove(0)
     }
 
-    #[test]
-    fn new_messages_arrive_once() {
-        let mut state = PollState::new(NOW);
-        let c = conversation("19:a@thread.v2", "1", "8:orgid:2", NOW + 1, None);
-        let a = state.arrival(&c, ME).unwrap();
-        assert_eq!((a.conversation.as_str(), a.message.as_str(), a.sender.as_str()), ("19:a@thread.v2", "1", "8:orgid:2"));
-        assert!(!a.own && !a.mentions_me && !a.direct);
-        assert!(state.arrival(&c, ME).is_none());
-        // The next message in the same conversation is new again.
-        assert!(state.arrival(&conversation("19:a@thread.v2", "2", "8:orgid:2", NOW + 2, None), ME).is_some());
+    fn page(messages: Vec<Value>) -> Vec<Message> {
+        decode_messages(json!({"messages": messages, "_metadata": {}}).to_string().as_bytes()).unwrap().items
     }
 
     #[test]
-    fn old_messages_are_remembered_not_reported() {
+    fn every_new_message_arrives_once_oldest_first() {
         let mut state = PollState::new(NOW);
-        let old = conversation("19:a@thread.v2", "1", "8:orgid:2", NOW - i64::from(INTERVAL_MS) - 1, None);
-        assert!(state.arrival(&old, ME).is_none());
-        assert_eq!(state.seen, [("19:a@thread.v2".to_string(), "1".to_string())]);
+        let mention = message("19:a@thread.v2", "2", OTHER, NOW + 2, Some(ME));
+        let plain = message("19:a@thread.v2", "3", OTHER, NOW + 3, None);
+        let c = conversation("19:a@thread.v2", plain.clone());
+        assert!(state.changed(&c));
+        let old = message("19:a@thread.v2", "1", OTHER, NOW - 1, Some(ME));
+        let arrivals = state.arrivals(&c, &page(vec![plain, mention, old]), ME);
+        let got: Vec<_> = arrivals.iter().map(|a| (a.message.as_str(), a.mentions_me)).collect();
+        // The mention before the last message is not lost; the one before the floor is old.
+        assert_eq!(got, [("2", true), ("3", false)]);
+        assert!(!state.changed(&c));
     }
 
     #[test]
-    fn flags_follow_the_message() {
+    fn reading_stops_at_the_message_seen() {
+        let mut state = PollState::new(NOW);
+        let first = message("19:a@thread.v2", "2", OTHER, NOW + 2, None);
+        state.arrivals(&conversation("19:a@thread.v2", first.clone()), &page(vec![first.clone()]), ME);
+        let second = message("19:a@thread.v2", "3", ME, NOW + 3, None);
+        let c = conversation("19:a@thread.v2", second.clone());
+        let arrivals = state.arrivals(&c, &page(vec![second, first]), ME);
+        assert_eq!(arrivals.iter().map(|a| (a.message.as_str(), a.own)).collect::<Vec<_>>(), [("3", true)]);
+    }
+
+    #[test]
+    fn unreadable_messages_leave_the_last_one() {
         let mut state = PollState::new(NOW);
         let direct = "19:00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002@unq.gbl.spaces";
-        let mine = state.arrival(&conversation(direct, "1", ME, NOW + 1, None), ME).unwrap();
-        assert!(mine.own && mine.direct && !mine.mentions_me);
-        let mention = state.arrival(&conversation("19:b@thread.v2", "2", "8:orgid:2", NOW + 1, Some(ME)), ME).unwrap();
-        assert!(mention.mentions_me && !mention.direct && !mention.own);
+        let c = conversation(direct, message(direct, "5", OTHER, NOW + 5, Some(ME)));
+        let arrivals = state.arrivals(&c, &[], ME);
+        assert_eq!(arrivals.len(), 1);
+        let a = &arrivals[0];
+        assert!(a.direct && a.mentions_me && !a.own && a.sender == OTHER && a.message == "5");
+    }
+
+    #[test]
+    fn old_and_unchanged_conversations_are_not_read() {
+        let state = PollState::new(NOW);
+        assert!(!state.changed(&conversation("19:a@thread.v2", message("19:a@thread.v2", "1", OTHER, NOW, None))));
+        assert!(!state.changed(&conversation("19:a@thread.v2", json!({}))));
     }
 
     #[test]
@@ -150,7 +192,8 @@ mod tests {
     fn state_survives_storage_and_stays_bounded() {
         let mut state = PollState::new(NOW);
         for i in 0..=MAX_SEEN {
-            state.arrival(&conversation(&format!("19:{i}@thread.v2"), "1", "8:orgid:2", NOW + 1, None), ME);
+            let conv = format!("19:{i}@thread.v2");
+            state.arrivals(&conversation(&conv, message(&conv, "1", OTHER, NOW + 1, None)), &[], ME);
         }
         assert_eq!(state.seen.len(), MAX_SEEN);
         assert_eq!(state.seen[0].0, "19:1@thread.v2");

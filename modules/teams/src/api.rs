@@ -27,6 +27,8 @@ const MAX_REDIRECTS: u8 = 10;
 thread_local! {
     /// Signed-in accounts by id. A module instance runs one call at a time, on one thread.
     static SESSIONS: RefCell<HashMap<String, Session>> = RefCell::new(HashMap::new());
+    /// Whether the poll timer is set; setting it again would postpone every account's poll.
+    static POLLING: Cell<bool> = const { Cell::new(false) };
     /// When the current call's budget ends.
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -138,10 +140,33 @@ pub fn accounts() -> Vec<String> {
     SESSIONS.with(|s| s.borrow().keys().cloned().collect())
 }
 
-/// Keeps a new session and starts polling for its messages (the timer is replaced if set).
+/// Keeps a new session and polls for its messages from now on.
 fn keep(session: Session) {
+    start_polling(&session.account);
     SESSIONS.with(|s| s.borrow_mut().insert(session.account.clone(), session));
-    host::set_timer(poll::TIMER, poll::INTERVAL_MS);
+}
+
+/// Messages of `account` count from now, unless a poll state is stored already; the poll timer is
+/// set unless it is pending.
+fn start_polling(account: &str) {
+    let key = poll::key(account);
+    if storage::get(&key).is_none() && storage::set(&key, &poll::PollState::new(now_ms()).encode()).is_err() {
+        host::log(1, "the poll state was not stored");
+    }
+    if !POLLING.replace(true) {
+        host::set_timer(poll::TIMER, poll::INTERVAL_MS);
+    }
+}
+
+/// The poll timer fired; `polling_again` sets it for the next round.
+pub fn timer_fired() {
+    POLLING.set(false);
+}
+
+pub fn polling_again() {
+    if !POLLING.replace(true) {
+        host::set_timer(poll::TIMER, poll::INTERVAL_MS);
+    }
 }
 
 fn open(account: &str) -> Result<Session, ModuleError> {
@@ -175,7 +200,7 @@ pub fn with_session<T>(account: &str, f: impl FnOnce(&mut Session) -> Result<T, 
     let result = match taken {
         Some(session) => Ok(session),
         // A reloaded instance lost its timer with its memory: polling starts again.
-        None => open(account).inspect(|_| host::set_timer(poll::TIMER, poll::INTERVAL_MS)),
+        None => open(account).inspect(|s| start_polling(&s.account)),
     }
     .and_then(|mut session| {
         let result = f(&mut session);

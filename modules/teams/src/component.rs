@@ -17,6 +17,11 @@ use crate::api;
 
 struct Teams;
 
+thread_local! {
+    /// Poll rounds so far, which pick the account each round starts with.
+    static ROUND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl module::Guest for Teams {
     fn manifest() -> types::Manifest {
         let m = crate::manifest::manifest();
@@ -70,19 +75,29 @@ impl events::Guest for Teams {
 
     fn on_ws_closed(_conn: u32, _reason: String) {}
 
-    /// The poll (`poll`): every signed-in account, then the timer again.
+    /// The poll (`poll`): every signed-in account, each round starting with the next one so a
+    /// slow account cannot keep the others from their turn, then the timer again.
     fn on_timer(id: u32) {
         if id != crate::poll::TIMER {
             return;
         }
+        api::timer_fired();
         api::begin();
-        for account in api::accounts() {
-            if crate::tools::poll(&account).is_err() {
+        let mut accounts = api::accounts();
+        accounts.sort();
+        let first = ROUND.get();
+        ROUND.set(first.wrapping_add(1));
+        let count = accounts.len();
+        if count > 0 {
+            accounts.rotate_left(first % count);
+        }
+        for account in &accounts {
+            if crate::tools::poll(account).is_err() {
                 host::log(1, "polling an account for new messages failed");
             }
         }
         if !api::accounts().is_empty() {
-            host::set_timer(crate::poll::TIMER, crate::poll::INTERVAL_MS);
+            api::polling_again();
         }
     }
 }
