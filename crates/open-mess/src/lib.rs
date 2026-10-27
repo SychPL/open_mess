@@ -2,6 +2,7 @@
 
 pub mod accounts;
 pub mod api;
+pub mod approval;
 pub mod cli;
 pub mod daemon;
 pub mod events;
