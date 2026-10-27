@@ -111,6 +111,9 @@ fn wam(scope: &str, interactive: bool, claims: Option<&str>) -> Result<(String, 
 /// Signs in through WAM, interactively, and checks the account with Teams.
 pub fn sign_in() -> Result<AccountInfo, ModuleError> {
     let (token, claims) = wam(AUTHSVC_SCOPE, true, None)?;
+    // The user's time in the WAM dialog does not count against the host's limit (spec 8.3, R4),
+    // so it does not count against the budget either.
+    begin();
     let session = establish(token, claims)?;
     let info = AccountInfo { id: session.account.clone(), display_name: session.name.clone() };
     SESSIONS.with(|s| s.borrow_mut().insert(session.account.clone(), session));

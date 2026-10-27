@@ -288,6 +288,25 @@ async fn list_conversations_maps_kinds() {
 }
 
 #[tokio::test]
+async fn a_failing_later_page_keeps_what_was_found() {
+    let teams = Teams::signed_in().await;
+    let next = format!("{CHAT}/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=two");
+    teams.fake.on(move |s| {
+        (s.path == CHAT_PATH).then(|| {
+            if s.query.contains("syncState=two") {
+                Reply::status(403)
+            } else {
+                Reply::json(page("conversations", vec![conversation(GROUP, Some("Synthetic group"), None)], Some(&next)))
+            }
+        })
+    });
+    assert_eq!(ids(&teams.call("list_conversations", json!({})).await.unwrap(), "id"), [GROUP]);
+    // The first page failing is still an error.
+    teams.fake.on(|s| (s.path == CHAT_PATH).then(|| Reply::status(403)));
+    assert!(matches!(module_error(teams.call("list_conversations", json!({})).await), ModuleError::Platform(_)));
+}
+
+#[tokio::test]
 async fn read_messages_pages_backwards() {
     let teams = Teams::signed_in().await;
     let path = messages_path(GROUP);
@@ -295,7 +314,12 @@ async fn read_messages_pages_backwards() {
     let newer =
         vec![numbered(105, GROUP, OTHER, "<p>five</p>"), numbered(104, GROUP, ME, "<p><b>four</b></p>"), numbered(103, GROUP, OTHER, "three")];
     let rest = vec![numbered(102, GROUP, OTHER, "two"), numbered(101, GROUP, OTHER, "one")];
+    let one = format!("{path}/103");
+    let message_103 = numbered(103, GROUP, OTHER, "three");
     teams.fake.on(move |s| {
+        if s.path == one {
+            return Some(Reply::json(message_103.clone()));
+        }
         (s.path == path).then(|| {
             let (items, link) = if s.query.contains("syncState=older") { (rest.clone(), None) } else { (newer.clone(), Some(older.as_str())) };
             Reply::json(page("messages", items, link))
@@ -313,8 +337,10 @@ async fn read_messages_pages_backwards() {
     let pages = teams.fake.requests(&messages_path(GROUP));
     assert_eq!(pages.len(), 2);
     assert!(pages[1].query.contains("syncState=older") && pages[1].host == "teams.microsoft.com");
-    // The next page after a message, and only what came after a time.
+    // The next page after a message, asked for by its time, and only what came after a time.
     assert_eq!(ids(&teams.call("read_messages", json!({"conversation": GROUP, "before": "103"})).await.unwrap(), "id"), ["102", "101"]);
+    let after_103 = teams.fake.requests(&messages_path(GROUP)).into_iter().filter(|s| s.query.contains("endTime=")).collect::<Vec<_>>();
+    assert!(after_103[0].query.contains(&format!("endTime={}", T0 + 3 * 60_000)), "{}", after_103[0].query);
     let since = json!({"conversation": GROUP, "since": "2027-01-15T09:03:30+01:00"});
     assert_eq!(ids(&teams.call("read_messages", since).await.unwrap(), "id"), ["105", "104"]);
     let unknown = teams.call("read_messages", json!({"conversation": GROUP, "before": "999"})).await;

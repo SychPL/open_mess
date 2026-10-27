@@ -333,8 +333,11 @@ pub fn list_conversations(dir: &ServiceDirectory, page: Option<&str>, start_ms: 
     Ok(request("GET", paged(dir, endpoint(dir, &[]), page, &first)?, None))
 }
 
-pub fn read_messages(dir: &ServiceDirectory, conv: &str, page: Option<&str>, limit: u16) -> Result<HttpRequest, ProtoError> {
-    let first = format!("view={VIEW_MESSAGES}&pageSize={limit}&startTime=1");
+/// Messages newest first; with `end_ms`, those before it (the client's `endTime`, docs 3.2; its
+/// meaning is to be confirmed live, so callers still filter by time).
+pub fn read_messages(dir: &ServiceDirectory, conv: &str, page: Option<&str>, limit: u16, end_ms: Option<i64>) -> Result<HttpRequest, ProtoError> {
+    let end = end_ms.map(|ms| format!("&endTime={ms}")).unwrap_or_default();
+    let first = format!("view={VIEW_MESSAGES}&pageSize={limit}&startTime=1{end}");
     Ok(request("GET", paged(dir, endpoint(dir, &[conv, "messages"]), page, &first)?, None))
 }
 
@@ -588,14 +591,16 @@ mod tests {
         assert!(since.url.ends_with("&startTime=1800000000000"));
         let first = list_conversations(&dir(), None, 1).unwrap();
         assert_eq!((first.method.as_str(), first.url.as_str()), ("GET", &*format!("{BASE}?view=msnp24Equivalent&pageSize=50&startTime=1")));
-        let first = read_messages(&dir(), GROUP, None, 20).unwrap();
+        let before = read_messages(&dir(), GROUP, None, 20, Some(1_800_000_000_000)).unwrap();
+        assert!(before.url.ends_with("&startTime=1&endTime=1800000000000"), "{}", before.url);
+        let first = read_messages(&dir(), GROUP, None, 20, None).unwrap();
         assert_eq!(first.url, format!("{BASE}/{GROUP}/messages?view=msnp24Equivalent|supportsMessageProperties&pageSize=20&startTime=1"));
         // The next page keeps the link's paging query on our own host and path.
         let link = messages().backward_link.unwrap();
-        let next = read_messages(&dir(), GROUP, Some(&link), 20).unwrap();
+        let next = read_messages(&dir(), GROUP, Some(&link), 20, None).unwrap();
         assert!(next.url.starts_with(&format!("{BASE}/{GROUP}/messages?startTime=1&")), "{}", next.url);
         assert!(next.url.ends_with("syncState=b2xkZXI"));
-        assert!(matches!(read_messages(&dir(), GROUP, Some("not a link"), 20), Err(ProtoError::Incompatible(_))));
+        assert!(matches!(read_messages(&dir(), GROUP, Some("not a link"), 20, None), Err(ProtoError::Incompatible(_))));
         let one = one_message(&dir(), GROUP, "1800000000300");
         assert_eq!(one.url, format!("{BASE}/{GROUP}/messages/1800000000300?view=msnp24Equivalent|supportsMessageProperties"));
     }

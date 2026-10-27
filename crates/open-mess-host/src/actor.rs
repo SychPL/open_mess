@@ -108,6 +108,11 @@ impl Deadline {
         if state.paused_since.is_some() { state.at.map(|_| Instant::now() + PAUSED_POLL) } else { state.at }
     }
 
+    /// Time left in the call in progress; `None` outside a call.
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        self.state().at.map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
     pub(crate) fn expired(&self) -> bool {
         let state = self.state();
         state.paused_since.is_none() && state.at.is_some_and(|at| Instant::now() >= at)

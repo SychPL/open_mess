@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::api::{self, Service};
 use crate::chat::{self, Conversation, ConversationKind, Message};
+use crate::component::bindings::open_mess::module::host;
 use crate::component::bindings::open_mess::module::types::{Attachment, ModuleError, Participant, Target};
 use crate::http::HttpRequest;
 use crate::session::Session;
@@ -77,7 +78,17 @@ fn conversations(session: &mut Session, start_ms: i64, mut keep: impl FnMut(Conv
     let mut link: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let request = chat::list_conversations(&session.directory, link.as_deref(), start_ms).map_err(api::proto)?;
-        let page = chat::decode_conversations(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+        let body = match api::read(session, Service::Chat, &request) {
+            Ok(body) => body,
+            // A later page that fails leaves what the earlier ones found, as the page limit does;
+            // a session that needs sign-in still ends the call.
+            Err(e) if link.is_some() && !matches!(e, ModuleError::AuthRequired(_)) => {
+                host::log(1, "a later page of the conversation list failed; the list is cut short");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let page = chat::decode_conversations(&body).map_err(api::proto)?;
         let empty = page.items.is_empty();
         for conversation in page.items {
             if !keep(conversation) {
@@ -94,10 +105,11 @@ fn conversations(session: &mut Session, start_ms: i64, mut keep: impl FnMut(Conv
 
 /// Walks a conversation's text messages, newest first, while `keep` returns true, within
 /// `MAX_PAGES` and the call's time.
-fn messages(session: &mut Session, conversation: &str, mut keep: impl FnMut(Message) -> bool) -> Result<(), ModuleError> {
+/// With `end_ms`, the walk starts at messages before then.
+fn messages(session: &mut Session, conversation: &str, end_ms: Option<i64>, mut keep: impl FnMut(Message) -> bool) -> Result<(), ModuleError> {
     let mut link: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let request = chat::read_messages(&session.directory, conversation, link.as_deref(), PAGE_SIZE).map_err(api::proto)?;
+        let request = chat::read_messages(&session.directory, conversation, link.as_deref(), PAGE_SIZE, end_ms).map_err(api::proto)?;
         let page = chat::decode_messages(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
         let empty = page.items.is_empty() && page.skipped.is_empty();
         for message in page.items {
@@ -194,7 +206,7 @@ fn mentions(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
         if !api::has_time() {
             break;
         }
-        messages(session, &conversation, |m| {
+        messages(session, &conversation, None, |m| {
             if m.sent_ms <= since {
                 return false;
             }
@@ -212,11 +224,20 @@ fn read_messages(session: &mut Session, args: &Value) -> Result<Value, ModuleErr
     let conversation = required(args, "conversation")?;
     let (limit, before, since) = (limit(args, 30), text(args, "before"), since(args)?);
     let me = session.me();
-    let mut found_before = before.is_none();
+    // `before` by its time, so the history behind it is reached however deep it is.
+    let before_ms = match before {
+        None => None,
+        Some(id) => {
+            let response = api::send(session, Service::Chat, &chat::one_message(&session.directory, conversation, id), false)?;
+            if response.status == 404 {
+                return Err(ModuleError::InvalidArgs("the message in before was not found in the conversation".to_string()));
+            }
+            Some(chat::decode_message(&api::ok(response)?).map_err(api::proto)?.sent_ms)
+        }
+    };
     let mut items = Vec::new();
-    messages(session, conversation, |m| {
-        if !found_before {
-            found_before = Some(m.id.as_str()) == before;
+    messages(session, conversation, before_ms, |m| {
+        if before_ms.is_some_and(|b| m.sent_ms >= b) {
             return true;
         }
         if since.is_some_and(|s| m.sent_ms <= s) {
@@ -227,9 +248,6 @@ fn read_messages(session: &mut Session, args: &Value) -> Result<Value, ModuleErr
         }
         items.len() < limit
     })?;
-    if !found_before {
-        return Err(ModuleError::InvalidArgs("the message in before is not among the conversation's recent messages".to_string()));
-    }
     Ok(json!({ "items": items }))
 }
 
@@ -267,7 +285,7 @@ fn writing_context(session: &mut Session, args: &Value) -> Result<Value, ModuleE
     };
     let me = session.me();
     let (mut seen, mut candidates) = (0, Vec::new());
-    messages(session, conversation, |m| {
+    messages(session, conversation, None, |m| {
         seen += 1;
         if m.sender_id == me && !m.deleted {
             candidates.extend(writing::candidate(&m.html, m.sent_ms));

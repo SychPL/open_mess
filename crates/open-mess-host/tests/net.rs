@@ -16,11 +16,11 @@ use axum::routing::get;
 use common::load;
 use open_mess_host::hosts::HostList;
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{Engine, HttpError, Net, Request, limits};
+use open_mess_host::{Engine, HttpError, ModuleState, Net, Request, limits};
 
 /// Serves `/ok`, `/redirect` (302 to its own `/ok`), `/endless` (a body that never ends),
-/// `/slow` (answers after 10 s), `/throttle/<secs>` (429 with Retry-After) and `/big` (one byte
-/// over the general body limit).
+/// `/slow` (answers after 10 s), `/trickle` (a byte every 300 ms, forever), `/throttle/<secs>`
+/// (429 with Retry-After) and `/big` (one byte over the general body limit).
 async fn server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -38,6 +38,15 @@ async fn server() -> SocketAddr {
                 get(|| async {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     "late"
+                }),
+            )
+            .route(
+                "/trickle",
+                get(|| async {
+                    Body::from_stream(futures_util::stream::unfold((), |()| async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Some((Ok::<_, Infallible>(Bytes::from_static(b"x")), ()))
+                    }))
                 }),
             )
             .route(
@@ -145,6 +154,20 @@ async fn module_fetch_follows_its_host_list() {
     assert_eq!(echo.call("a", "fetch", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap(), r#"{"status":200}"#);
     let url = format!("http://{addr}/ok");
     assert_eq!(echo.call("a", "fetch", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap(), r#"{"error":"blocked"}"#);
+}
+
+#[tokio::test]
+async fn module_fetch_ends_before_the_call_limit() {
+    // Each byte comes within the read timeout, so only the call's own limit can end the fetch:
+    // it ends as `timeout` before the call does, and the module answers and keeps running.
+    let addr = server().await;
+    let engine = Engine::with_limits(limits::for_tests()).unwrap();
+    let echo = load(&engine, "open_mess_test_echo").await;
+    let url = format!("http://localhost:{}/trickle", addr.port());
+    let started = Instant::now();
+    assert_eq!(echo.call("a", "fetch", &format!(r#"{{"url":"{url}"}}"#)).await.unwrap(), r#"{"error":"timeout"}"#);
+    assert!(started.elapsed() < limits::for_tests().call_timeout, "{:?}", started.elapsed());
+    assert_eq!(echo.state(), ModuleState::Running);
 }
 
 #[tokio::test]

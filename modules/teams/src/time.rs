@@ -51,7 +51,8 @@ pub fn rfc3339_ms(text: &str) -> Option<i64> {
         _ => return None,
     };
     let (hours, minutes) = offset.get(1..)?.split_once(':')?;
-    let offset_ms = (digits(hours, 2)? * 60 + digits(minutes, 2)?) * 60_000;
+    let (hours, minutes) = (digits(hours, 2).filter(|h| *h <= 23)?, digits(minutes, 2).filter(|m| *m <= 59)?);
+    let offset_ms = (hours * 60 + minutes) * 60_000;
     Some(iso8601_ms(&format!("{local}Z"))? - sign * offset_ms)
 }
 
@@ -117,9 +118,17 @@ mod tests {
         assert_eq!(rfc3339_ms("2027-01-15T08:00:00Z"), Some(1_800_000_000_000));
         assert_eq!(rfc3339_ms("2027-01-15T09:30:00+01:30"), Some(1_800_000_000_000));
         assert_eq!(rfc3339_ms("2027-01-15T07:00:00.5-01:00"), Some(1_800_000_000_500));
-        for bad in
-            ["", "Z", "2027-01-15T08:00:00", "2027-01-15T08:00:00*01:00", "2027-01-15T08:00:00+1:000", "x+01:00", "2027-01-15T08:00:00+0\u{e9}:0"]
-        {
+        for bad in [
+            "",
+            "Z",
+            "2027-01-15T08:00:00",
+            "2027-01-15T08:00:00*01:00",
+            "2027-01-15T08:00:00+1:000",
+            "x+01:00",
+            "2027-01-15T08:00:00+24:00",
+            "2027-01-15T08:00:00+01:60",
+            "2027-01-15T08:00:00+0\u{e9}:0",
+        ] {
             assert_eq!(rfc3339_ms(bad), None, "{bad}");
         }
     }

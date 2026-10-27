@@ -49,7 +49,13 @@ impl types::Host for HostState {}
 impl http::Host for HostState {
     async fn fetch(&mut self, req: http::Request) -> Result<http::Response, http::HttpError> {
         let req = net::Request { method: req.method, url: req.url, headers: req.headers, body: req.body };
-        let response = self.env.net.fetch_up_to(&self.env.hosts, req, self.max_body).await?;
+        let fetch = self.env.net.fetch_up_to(&self.env.hosts, req, self.max_body);
+        // A body that keeps trickling in never trips the read timeout: the fetch ends before the
+        // call does, so a slow server costs the module an error, not an unload.
+        let response = match self.deadline.remaining() {
+            Some(left) => tokio::time::timeout(left.saturating_sub(limits::FETCH_MARGIN), fetch).await.map_err(|_| net::HttpError::Timeout)??,
+            None => fetch.await?,
+        };
         Ok(http::Response { status: response.status, headers: response.headers, body: response.body })
     }
 }
