@@ -4,7 +4,7 @@
 #   pwsh -NoProfile -File scripts\install.ps1 -NoStart   # install without starting
 #
 # What it does: stops a running daemon, copies om.exe to %LOCALAPPDATA%\open_mess\bin, copies the
-# platform modules (not the test guests) into %APPDATA%\open_mess\modules, registers the scheduled
+# platform modules (not the test guests) into the data folder's modules, registers the scheduled
 # task "open_mess" that starts the daemon hidden at every logon of this user and every 5 minutes
 # (a running daemon makes that a no-op, a stopped one comes back), and starts it.
 # A changed module file waits for approval again in the configuration window (spec 8.3).
@@ -19,7 +19,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $bin = Join-Path $env:LOCALAPPDATA 'open_mess\bin'
-$modules = Join-Path $env:APPDATA 'open_mess\modules'
+# The data folder the task's daemon will use: a persistent OPEN_MESS_DATA_DIR of this user (the task
+# inherits it; one set only in this shell does not count), else the default (paths.rs).
+$dataDir = [Environment]::GetEnvironmentVariable('OPEN_MESS_DATA_DIR', 'User')
+if (-not $dataDir) { $dataDir = Join-Path $env:APPDATA 'open_mess' }
+$modules = Join-Path $dataDir 'modules'
 $exe = Join-Path $Source 'target\release\om.exe'
 $wasmDir = Join-Path $Source 'target\wasm32-wasip2\release'
 $taskName = 'open_mess'
