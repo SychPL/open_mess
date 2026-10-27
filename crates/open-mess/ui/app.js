@@ -238,10 +238,16 @@ async function renderIntegrations() {
     button("Pokaż polecenie", async () => {
       const commands = await call("mcp_command");
       shown.replaceChildren();
-      for (const [label, command] of [["Claude Code", commands.claude], ["Codex", commands.codex]]) {
+      for (const [label, command] of [["Claude Code", commands.claude], ["Codex (do pliku %USERPROFILE%\\.codex\\config.toml)", commands.codex]]) {
         shown.append(el("h2", label), el("pre", command, "content-text"), button("Kopiuj", () => navigator.clipboard.writeText(command)));
       }
-      shown.append(el("p", "setx zapisuje token dla nowych okien terminala: uruchom Codex w nowym oknie.", "muted"));
+      shown.append(
+        el(
+          "p",
+          "Codex dostaje token z pliku config.toml, tak jak Claude Code ze swojej konfiguracji. Nie zapisuj go w zmiennych środowiskowych (setx): dziedziczy je każdy uruchomiony program, także powłoki agentów.",
+          "muted",
+        ),
+      );
     }),
   );
   root.append(shown);
@@ -292,7 +298,8 @@ const WRITE_OPTIONS = [
 
 /**
  * The read box and write list for one account (conversation null) or conversation, saving both
- * on every change; a change that fails is put back.
+ * on every change; a change that fails is put back. Both are disabled while a save runs, so two
+ * quick changes can't be saved in the wrong order and leave the agent more than the window shows.
  */
 function permissionControls(account, conversation, current) {
   const box = el("input");
@@ -315,6 +322,7 @@ function permissionControls(account, conversation, current) {
         return;
       }
     }
+    box.disabled = write.disabled = true;
     try {
       await call("set_permissions", { account, conversation, read: box.checked, write: write.value });
       current = { read: box.checked, write: write.value };
@@ -322,6 +330,8 @@ function permissionControls(account, conversation, current) {
       box.checked = current.read;
       write.value = current.write;
       showError(err);
+    } finally {
+      box.disabled = write.disabled = false;
     }
   };
   box.addEventListener("change", save);

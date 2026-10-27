@@ -432,8 +432,9 @@ pub async fn decide(state: &UiState, action: &str, approve: bool) -> Result<Stri
 pub struct McpCommandsDto {
     /// `claude mcp add ...`, as `om mcp-command` prints it.
     pub claude: String,
-    /// `codex mcp add ...`, which reads the token from `OPEN_MESS_TOKEN`, and the `setx` that sets
-    /// it for the user.
+    /// The `[mcp_servers.open_mess]` table for Codex's `config.toml`, the token in a fixed header.
+    /// `codex mcp add` takes a token only from an environment variable, and one set for good (setx)
+    /// would reach every program the user starts, agents' shells and their output included.
     pub codex: String,
 }
 
@@ -442,8 +443,8 @@ pub fn mcp_command(state: &UiState) -> McpCommandsDto {
     McpCommandsDto {
         claude: cli::mcp_add_command(state.port, &state.token),
         codex: format!(
-            "setx OPEN_MESS_TOKEN \"{}\"\ncodex mcp add open_mess --url http://127.0.0.1:{}/mcp --bearer-token-env-var OPEN_MESS_TOKEN",
-            state.token, state.port
+            "[mcp_servers.open_mess]\nurl = \"http://127.0.0.1:{}/mcp\"\nhttp_headers = {{ Authorization = \"Bearer {}\" }}",
+            state.port, state.token
         ),
     }
 }
