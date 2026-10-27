@@ -35,6 +35,8 @@ const ATTACHMENT_FRESH: Duration = Duration::from_secs(10 * 60);
 pub const MAX_TEXT: usize = 28_000;
 /// The longest reaction, in characters.
 const MAX_REACTION: usize = 64;
+/// The longest conversation or message id a write takes, in characters: actions keep them.
+const MAX_ID: usize = 1024;
 
 /// The shared tools, as both front ends list them.
 pub fn tools() -> Vec<ToolInfo> {
@@ -233,7 +235,7 @@ impl<'de, const MAX: usize> Deserialize<'de> for Text<MAX> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         if !(1..=MAX).contains(&text.chars().count()) {
-            return Err(D::Error::custom(format!("a text must be 1 to {MAX} characters")));
+            return Err(D::Error::custom(format!("texts and ids here must be 1 to {MAX} characters")));
         }
         Ok(Text(text))
     }
@@ -332,18 +334,18 @@ struct WritingContextArgs {
 #[serde(deny_unknown_fields)]
 struct SendArgs {
     account: String,
-    conversation: String,
+    conversation: Text<MAX_ID>,
     text: Text<MAX_TEXT>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to: Option<String>,
+    reply_to: Option<Text<MAX_ID>>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EditArgs {
     account: String,
-    conversation: String,
-    message: String,
+    conversation: Text<MAX_ID>,
+    message: Text<MAX_ID>,
     text: Text<MAX_TEXT>,
 }
 
@@ -351,8 +353,8 @@ struct EditArgs {
 #[serde(deny_unknown_fields)]
 struct ReactArgs {
     account: String,
-    conversation: String,
-    message: String,
+    conversation: Text<MAX_ID>,
+    message: Text<MAX_ID>,
     reaction: Text<MAX_REACTION>,
 }
 

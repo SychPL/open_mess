@@ -150,6 +150,8 @@ fn token() -> Result<String, Failure> {
 struct ToolArgs {
     args: Value,
     json_output: bool,
+    /// Given as `--<name> <value>`: the values are text until the tool's schema types them.
+    from_flags: bool,
 }
 
 fn parse_tool_args(words: &[String]) -> Result<ToolArgs, Failure> {
@@ -169,10 +171,10 @@ fn parse_tool_args(words: &[String]) -> Result<ToolArgs, Failure> {
         if name == "json-args" {
             json_args = Some(value);
         } else {
-            // A value that parses as JSON (a number, true, a list...) is passed as such.
-            params.insert(name.into(), serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.clone())));
+            params.insert(name.into(), Value::String(value.clone()));
         }
     }
+    let from_flags = json_args.is_none();
     let args = match json_args {
         None => Value::Object(params),
         Some(_) if !params.is_empty() => return Err(bad_usage("use either --json-args or --<name> <value> parameters, not both")),
@@ -182,14 +184,31 @@ fn parse_tool_args(words: &[String]) -> Result<ToolArgs, Failure> {
             Err(err) => return Err(bad_usage(format!("--json-args is not valid JSON: {err}"))),
         },
     };
-    Ok(ToolArgs { args, json_output })
+    Ok(ToolArgs { args, json_output, from_flags })
+}
+
+/// Types flag values by the tool's schema: a value for a parameter that is not a string there (a
+/// number, true, a list...) is passed as JSON when it parses as such, so `--limit 5` is a number
+/// while `--message 1800000000300` stays the id it is.
+fn typed(schema: &Value, args: Value) -> Value {
+    let Value::Object(params) = args else {
+        return args;
+    };
+    let typed = params.into_iter().map(|(name, value)| {
+        let string = schema.get("properties").and_then(|properties| properties.get(&name)).and_then(|property| property.get("type"));
+        match value {
+            Value::String(text) if string != Some(&Value::from("string")) => (name, serde_json::from_str(&text).unwrap_or(Value::String(text))),
+            value => (name, value),
+        }
+    });
+    Value::Object(typed.collect())
 }
 
 fn run_tool(words: &[String]) -> Result<(), Failure> {
     let Some((tool, rest)) = words.split_first() else {
         return Err(bad_usage("missing tool name"));
     };
-    let ToolArgs { args, json_output } = parse_tool_args(rest)?;
+    let ToolArgs { args, json_output, from_flags } = parse_tool_args(rest)?;
     // After a failed start, whatever holds the port may be another program: don't send it the token
     // unless a daemon holds the lock (a good start may have failed to delete the file).
     // ponytail: a daemon still starting holds the lock for the milliseconds before its bind fails;
@@ -200,11 +219,11 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
     let port = port()?;
     let token = token()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?;
-    let result = runtime.block_on(call(port, &token, tool, &args))?;
+    let result = runtime.block_on(call(port, &token, tool, args, from_flags))?;
     written(print_result(&result, json_output))
 }
 
-async fn call(port: u16, token: &str, tool: &str, args: &Value) -> Result<Value, Failure> {
+async fn call(port: u16, token: &str, tool: &str, args: Value, from_flags: bool) -> Result<Value, Failure> {
     // reqwest is built without a TLS crypto provider (see Cargo.toml); install ring once.
     // Err only means one is already installed.
     rustls::crypto::ring::default_provider().install_default().ok();
@@ -220,12 +239,13 @@ async fn call(port: u16, token: &str, tool: &str, args: &Value) -> Result<Value,
     let response = client.get(format!("{base}/tools")).bearer_auth(token).send().await.map_err(request_failed)?;
     let tools: Vec<ToolInfo> =
         check(response).await?.json().await.map_err(|_| failed(format!("unexpected answer from 127.0.0.1:{port} - is it open_mess?")))?;
-    if !tools.iter().any(|known| known.name == tool) {
+    let Some(info) = tools.iter().find(|known| known.name == tool) else {
         let names: Vec<&str> = tools.iter().map(|known| known.name.as_str()).collect();
         return Err(bad_usage(format!("unknown tool {tool:?} - available: {}", names.join(", "))));
-    }
+    };
+    let args = if from_flags { typed(&info.input_schema, args) } else { args };
 
-    let response = client.post(format!("{base}/call/{tool}")).bearer_auth(token).json(args).send().await.map_err(request_failed)?;
+    let response = client.post(format!("{base}/call/{tool}")).bearer_auth(token).json(&args).send().await.map_err(request_failed)?;
     check(response).await?.json().await.map_err(|err| failed(format!("unreadable result: {err}")))
 }
 

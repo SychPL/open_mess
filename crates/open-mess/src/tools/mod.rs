@@ -114,6 +114,9 @@ impl Registry {
         match (name, args.account) {
             ("accounts", _) => list_accounts(accounts),
             ("pending", account) => {
+                if let Some(id) = &account {
+                    find(accounts, id)?;
+                }
                 let state = args.module_args.get("state").and_then(Value::as_str).map(State::parse).transpose().map_err(failed)?;
                 let limit = args.module_args.get("limit").and_then(Value::as_u64).and_then(|limit| u32::try_from(limit).ok()).unwrap_or(20);
                 pending.list(account.as_deref(), state, limit)

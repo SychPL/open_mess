@@ -30,6 +30,9 @@ pub const APPROVAL_TTL: Duration = Duration::from_secs(10 * 60);
 pub const MAX_WAITING: i64 = 20;
 /// Actions in any state are deleted this long after they were created.
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Finished actions kept per account; past it the oldest go first, so an agent writing in a loop
+/// can't fill the disk (spec 15).
+pub const MAX_KEPT: i64 = 1000;
 const EXPIRY_SWEEP: Duration = Duration::from_secs(30);
 const RETENTION_SWEEP: Duration = Duration::from_secs(24 * 60 * 60);
 /// What the approval shows of the module's description: titles and names, and the target text.
@@ -247,6 +250,15 @@ impl Pending {
         if inserted == 0 {
             return Err(too_many());
         }
+        self.accounts
+            .store()
+            .conn()
+            .execute(
+                "DELETE FROM pending WHERE rowid IN (SELECT rowid FROM pending WHERE account = ?1 AND state NOT IN ('waiting', 'approved')
+                 ORDER BY created_ms DESC, rowid DESC LIMIT -1 OFFSET ?2)",
+                rusqlite::params![account.id, MAX_KEPT],
+            )
+            .map_err(failed)?;
         Ok(action)
     }
 

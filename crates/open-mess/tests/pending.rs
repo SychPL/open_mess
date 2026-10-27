@@ -9,7 +9,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{Daemon, ECHO, daemon, info};
-use open_mess::pending::{APPROVAL_TTL, Kind, Pending, State};
+use open_mess::pending::{APPROVAL_TTL, Kind, MAX_KEPT, Pending, RETENTION, State};
 use open_mess::permissions::{self, Write};
 use open_mess::tools::ToolError;
 use serde_json::{Value, json};
@@ -36,6 +36,15 @@ async fn writes(d: &Daemon) -> Vec<Value> {
 
 async fn set_target(d: &Daemon, target: Value) {
     echo(d, "set-target", target).await;
+}
+
+/// The daemon's state database, as another process would open it.
+fn db(d: &Daemon) -> rusqlite::Connection {
+    rusqlite::Connection::open(d.dir.path().join("state.sqlite3")).unwrap()
+}
+
+fn millis(duration: std::time::Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap()
 }
 
 fn send(text: &str) -> Value {
@@ -159,6 +168,72 @@ async fn timeout_after_send_is_uncertain() {
     let texts: Vec<Value> = writes(&d).await.iter().map(|write| write["args"]["text"].clone()).collect();
     assert_eq!(texts, ["slow", "uncertain", "fail"]);
     assert_eq!(pending.state(&slow.action).unwrap(), State::Uncertain);
+}
+
+#[tokio::test]
+async fn restart_expires_waiting_and_marks_running_uncertain() {
+    let (d, pending) = setup(Write::Confirm).await;
+    let waiting = pending.create(Kind::Send, "test-echo:a", "c1", send("left")).await.unwrap();
+    let running = pending.create(Kind::Send, "test-echo:a", "c1", send("running")).await.unwrap();
+    // The daemon stopped while `running` ran.
+    db(&d).execute("UPDATE pending SET state = 'approved' WHERE id = ?1", [&running.action]).unwrap();
+
+    let restarted = Pending::new(Arc::clone(&d.accounts));
+    restarted.recover().unwrap();
+    assert_eq!(restarted.state(&waiting.action).unwrap(), State::Expired);
+    assert_eq!(restarted.state(&running.action).unwrap(), State::Uncertain);
+    // A late click runs nothing, and no text is kept.
+    assert_eq!(restarted.decide(&waiting.action, true).await.unwrap(), State::Expired);
+    let texts: i64 = db(&d).query_row("SELECT COUNT(*) FROM pending WHERE args <> ''", [], |row| row.get(0)).unwrap();
+    assert_eq!(texts, 0);
+    assert!(writes(&d).await.is_empty());
+}
+
+#[tokio::test]
+async fn sweep_expires_and_deletes_old_actions() {
+    let (d, pending) = setup(Write::Confirm).await;
+    let pending = Arc::new(pending);
+    let waiting = pending.create(Kind::Send, "test-echo:a", "c1", send("waiting")).await.unwrap();
+    let old = pending.create(Kind::Send, "test-echo:a", "c1", send("old")).await.unwrap();
+    pending.decide(&old.action, false).await.unwrap();
+    let kept = pending.create(Kind::Send, "test-echo:a", "c1", send("kept")).await.unwrap();
+    pending.decide(&kept.action, false).await.unwrap();
+    db(&d).execute("UPDATE pending SET created_ms = created_ms - ?2 WHERE id = ?1", (&waiting.action, millis(APPROVAL_TTL))).unwrap();
+    db(&d).execute("UPDATE pending SET created_ms = created_ms - ?2 WHERE id = ?1", (&old.action, millis(RETENTION) + 1)).unwrap();
+
+    // Both sweeps run when the sweeper starts.
+    tokio::spawn(Arc::clone(&pending).sweep());
+    for _ in 0..100 {
+        if pending.state(&old.action).is_err() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(pending.state(&old.action).is_err());
+    assert_eq!(pending.state(&waiting.action).unwrap(), State::Expired);
+    assert_eq!(pending.state(&kept.action).unwrap(), State::Rejected);
+    assert!(pending.waiting().is_empty());
+}
+
+#[tokio::test]
+async fn an_account_keeps_a_bounded_number_of_actions() {
+    let (d, pending) = setup(Write::Autonomous).await;
+    // Finished actions of an agent writing in a loop, oldest first.
+    let mut db = db(&d);
+    let tx = db.transaction().unwrap();
+    for n in 1..=MAX_KEPT + 5 {
+        tx.execute(
+            "INSERT INTO pending (id, account, conversation, kind, args, fingerprint, state, created_ms) VALUES (?1, 'test-echo:a', 'c1', 'send', '', '', 'done', ?2)",
+            (format!("old{n}"), n),
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(pending.create(Kind::Send, "test-echo:a", "c1", send("one more")).await.unwrap().state, State::Done);
+    let count = |sql: &str| db.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
+    // The oldest went; the new one is kept.
+    assert_eq!(count("SELECT COUNT(*) FROM pending"), MAX_KEPT + 1);
+    assert_eq!(count("SELECT COUNT(*) FROM pending WHERE created_ms <= 5"), 0);
 }
 
 #[tokio::test]

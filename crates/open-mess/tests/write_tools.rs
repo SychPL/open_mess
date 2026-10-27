@@ -46,6 +46,9 @@ async fn send_returns_waiting_on_confirm() {
         ("send", json!({"account": "test-echo:a", "conversation": "c1"})),
         ("send", json!({"account": "test-echo:a", "conversation": "c1", "text": "hi", "approved": true})),
         ("react", json!({"account": "test-echo:a", "conversation": "c1", "message": "m1"})),
+        ("send", json!({"account": "test-echo:a", "conversation": "c".repeat(1025), "text": "hi"})),
+        ("react", json!({"account": "test-echo:a", "conversation": "c1", "message": "m".repeat(1025), "reaction": "like"})),
+        ("pending", json!({"account": "test-echo:nobody"})),
         ("pending", json!({"limit": 101})),
         ("pending", json!({"state": "sent"})),
     ] {

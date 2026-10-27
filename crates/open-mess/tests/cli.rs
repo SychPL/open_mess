@@ -125,6 +125,19 @@ async fn cli_bad_args() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_types_flags_by_the_schema() {
+    let (port, _stop) = start().await;
+    let dir = data_dir();
+    // A string parameter keeps a value that looks like a number, as Teams message ids do.
+    let output = om(dir.path(), port, TOKEN, &["pending", "--account", "1800000000300"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains(r#"unknown account "1800000000300""#), "{}", stderr(&output));
+    // An integer parameter gets a number.
+    let output = om(dir.path(), port, TOKEN, &["pending", "--limit", "5", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
 #[test]
 fn cli_without_daemon() {
     let dir = data_dir();
