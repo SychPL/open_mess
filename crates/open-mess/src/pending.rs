@@ -392,6 +392,17 @@ impl Pending {
         Ok(())
     }
 
+    /// Expires the waiting actions of a module's accounts: the module stopped or was replaced, so
+    /// it is no longer the one that described them for their approvals (spec 8.3).
+    pub fn expire_module(&self, module: &str) -> Result<(), Error> {
+        self.accounts.store().conn().execute(
+            "UPDATE pending SET state = 'expired', args = '', detail = 'its module stopped or was replaced before it was approved'
+             WHERE state = 'waiting' AND account IN (SELECT id FROM accounts WHERE module = ?1)",
+            [module],
+        )?;
+        self.expire_due()
+    }
+
     /// Deletes actions older than [`RETENTION`].
     pub fn delete_old(&self) -> Result<(), Error> {
         let cutoff = now_ms().saturating_sub(i64::try_from(RETENTION.as_millis()).unwrap_or(i64::MAX));

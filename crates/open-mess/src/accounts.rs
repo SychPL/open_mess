@@ -129,11 +129,25 @@ impl Accounts {
 
     /// Restores every account's session at daemon start, all modules at once.
     pub async fn restore(&self) -> Result<(), Error> {
+        self.restore_where(|_| true).await
+    }
+
+    /// Reads the modules folder again (spec 8.3; the configuration window asks for it). Returns
+    /// the modules that stopped, started or were replaced; their accounts' sessions are restored,
+    /// or marked offline when the module no longer runs.
+    pub async fn rescan_modules(&self) -> Result<Vec<String>, Error> {
+        let found = self.modules.load().await?;
+        let changed = self.modules.adopt(&self.store(), found)?;
+        self.restore_where(|module| changed.iter().any(|name| name == module)).await?;
+        Ok(changed)
+    }
+
+    /// Restores the sessions of the accounts of the modules `module` picks.
+    async fn restore_where(&self, module: impl Fn(&str) -> bool) -> Result<(), Error> {
         let mut restores = JoinSet::new();
-        for account in self.list()?.into_iter().filter(|account| account.state != REMOVING) {
+        for account in self.list()?.into_iter().filter(|account| account.state != REMOVING && module(&account.module)) {
             match self.modules.handle(&account.module) {
                 Some(handle) => {
-                    let handle = handle.clone();
                     restores.spawn(async move {
                         let state = match handle.restore(&account.module_account).await {
                             Ok(()) => SessionState::Online,

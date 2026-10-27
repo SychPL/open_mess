@@ -196,7 +196,8 @@ impl WasiView for HostState {
     }
 }
 
-/// The WebAssembly engine; one per process.
+/// The WebAssembly engine; one per process. Clones share it.
+#[derive(Clone)]
 pub struct Engine {
     engine: wasmtime::Engine,
     linker: Linker<HostState>,

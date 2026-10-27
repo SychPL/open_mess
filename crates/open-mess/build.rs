@@ -3,7 +3,8 @@
 
 /// The configuration window's commands (src/ui/window.rs); each gets an `allow-<name>` permission.
 #[cfg(windows)]
-const COMMANDS: &[&str] = &[];
+const COMMANDS: &[&str] =
+    &["status", "accounts", "remove_account", "modules", "approve_module", "set_module_enabled", "rescan_modules", "mcp_command"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]

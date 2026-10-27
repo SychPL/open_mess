@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-modules"
+description = "Enables the modules command without any pre-configured scope."
+commands.allow = ["modules"]
+
+[[permission]]
+identifier = "deny-modules"
+description = "Denies the modules command without any pre-configured scope."
+commands.deny = ["modules"]

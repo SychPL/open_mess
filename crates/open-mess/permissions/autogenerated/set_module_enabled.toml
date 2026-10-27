@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-module-enabled"
+description = "Enables the set_module_enabled command without any pre-configured scope."
+commands.allow = ["set_module_enabled"]
+
+[[permission]]
+identifier = "deny-set-module-enabled"
+description = "Denies the set_module_enabled command without any pre-configured scope."
+commands.deny = ["set_module_enabled"]

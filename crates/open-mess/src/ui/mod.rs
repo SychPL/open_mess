@@ -3,6 +3,7 @@
 //! window exists only while it is open. Elsewhere there is no tray and no window: [`run`] only waits
 //! for the daemon to be stopped.
 
+pub mod commands;
 #[cfg(windows)]
 mod window;
 

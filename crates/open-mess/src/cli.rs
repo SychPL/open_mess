@@ -108,10 +108,13 @@ pub fn run() -> ExitCode {
 fn mcp_command() -> Result<(), Failure> {
     let port = port()?;
     let token = token()?;
-    written(writeln!(
-        std::io::stdout(),
-        "claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\""
-    ))
+    written(writeln!(std::io::stdout(), "{}", mcp_add_command(port, &token)))
+}
+
+/// The command that connects Claude Code to open_mess, as `om mcp-command` prints it and the
+/// configuration window shows it.
+pub fn mcp_add_command(port: u16, token: &str) -> String {
+    format!("claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\"")
 }
 
 /// Output goes through writeln!, never println!, which panics when stdout is closed. A reader that

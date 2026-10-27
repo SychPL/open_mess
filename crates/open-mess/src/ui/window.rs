@@ -21,7 +21,20 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     tauri::async_runtime::set(runtime.handle().clone());
     // The webview's profile stays in the data folder (spec 8.4), not in a folder of its own.
     let profile = state.accounts.data_dir().join("webview");
-    let app = tauri::Builder::default().manage(state).build(tauri::generate_context!()).map_err(failed)?;
+    let app = tauri::Builder::default()
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            ipc::status,
+            ipc::accounts,
+            ipc::remove_account,
+            ipc::modules,
+            ipc::approve_module,
+            ipc::set_module_enabled,
+            ipc::rescan_modules,
+            ipc::mcp_command
+        ])
+        .build(tauri::generate_context!())
+        .map_err(failed)?;
     tray(&app, profile.clone()).map_err(failed)?;
 
     let handle = app.handle().clone();
@@ -50,6 +63,58 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
 
 fn failed(err: tauri::Error) -> Error {
     Error::Ui(err.to_string())
+}
+
+/// The commands: commands.rs behind Tauri's IPC, with the arguments named as in Rust. Each one is
+/// listed in build.rs and granted in capabilities/main.json.
+mod ipc {
+    // The glue `tauri::command` generates uses unreachable!; nothing written here does.
+    #![allow(clippy::unreachable)]
+
+    use tauri::State;
+
+    use crate::ui::UiState;
+    use crate::ui::commands::{self, AccountDto, ModuleDto, StatusDto};
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn status(state: State<'_, UiState>) -> Result<StatusDto, String> {
+        commands::status(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn accounts(state: State<'_, UiState>) -> Result<Vec<AccountDto>, String> {
+        commands::accounts(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn remove_account(state: State<'_, UiState>, id: String) -> Result<(), String> {
+        commands::remove_account(&state, &id).await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn modules(state: State<'_, UiState>) -> Result<Vec<ModuleDto>, String> {
+        Ok(commands::modules(&state))
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn approve_module(state: State<'_, UiState>, name: String, file_sha256: String, manifest_sha256: String) -> Result<(), String> {
+        commands::approve_module(&state, &name, &file_sha256, &manifest_sha256).await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn set_module_enabled(state: State<'_, UiState>, name: String, enabled: bool) -> Result<(), String> {
+        commands::set_module_enabled(&state, &name, enabled).await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn rescan_modules(state: State<'_, UiState>) -> Result<(), String> {
+        commands::rescan_modules(&state).await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn mcp_command(state: State<'_, UiState>) -> Result<String, String> {
+        Ok(commands::mcp_command(&state))
+    }
 }
 
 fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {

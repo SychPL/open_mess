@@ -239,7 +239,7 @@ fn list_accounts(accounts: &Accounts) -> Result<Value, ToolError> {
 /// The account's running module, or an error naming the module's state.
 pub(crate) fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolError> {
     let modules = accounts.modules();
-    modules.handle(&account.module).cloned().ok_or_else(|| {
+    modules.handle(&account.module).ok_or_else(|| {
         ToolError::Module(match modules.state(&account.module) {
             Some(state) => format!("module {} is {state}", account.module),
             None => format!("module {} is not installed", account.module),

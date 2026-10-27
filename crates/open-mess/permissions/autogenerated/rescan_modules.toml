@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rescan-modules"
+description = "Enables the rescan_modules command without any pre-configured scope."
+commands.allow = ["rescan_modules"]
+
+[[permission]]
+identifier = "deny-rescan-modules"
+description = "Denies the rescan_modules command without any pre-configured scope."
+commands.deny = ["rescan_modules"]

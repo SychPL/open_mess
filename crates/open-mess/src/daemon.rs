@@ -72,10 +72,11 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, Registry
     let token = secrets::local_api_token()?;
     let runtime = Runtime::new()?;
     let listener = runtime.block_on(api::bind(port))?;
-    // One engine for the process; the modules it runs keep it alive.
+    // One engine for the process; the modules keep it for loading files again.
     let engine = Engine::new()?;
     let (events, host_events) = mpsc::channel(EVENT_QUEUE);
-    let ctx = |_: &str| ModuleContext { data_dir: dir.to_path_buf(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
+    let data_dir = dir.to_path_buf();
+    let ctx = move |_: &str| ModuleContext { data_dir: data_dir.clone(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
     let modules = runtime.block_on(Modules::scan(&store, &engine, &dir.join("modules"), ctx))?;
     // After the local API token: from here on keyring-core's default store is the platform one.
     let credentials = open_mess_host::credential_store().map_err(|why| Error::Secrets(keyring_core::Error::PlatformFailure(why.into())))?;
