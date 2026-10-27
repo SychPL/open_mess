@@ -215,8 +215,8 @@ mod ipc {
     }
 
     #[tauri::command(rename_all = "snake_case")]
-    pub async fn sign_in_start(state: State<'_, UiState>, module: String) -> Result<AccountDto, String> {
-        commands::sign_in_start(&state, &module).await
+    pub async fn sign_in_start(state: State<'_, UiState>, module: String, account: Option<String>) -> Result<AccountDto, String> {
+        commands::sign_in_start(&state, &module, account.as_deref()).await
     }
 
     #[tauri::command(rename_all = "snake_case")]

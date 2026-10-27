@@ -10,10 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{Daemon, ECHO, daemon};
+use open_mess::accounts::OTHER_ACCOUNT;
 use open_mess::modules;
 use open_mess::ui::commands::{self, AccountDto, AnswerDto, SignInPromptDto};
 use open_mess::ui::sign_in::{BUSY, NO_WINDOW, NOT_FROM_WINDOW};
 use open_mess::ui::{UiState, sign_in_page};
+use open_mess_host::SessionState;
 use open_mess_host::{SignInReply, SignInRequest, WamAccount};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -32,7 +34,7 @@ fn state(d: &Daemon) -> Arc<UiState> {
 /// `Dodaj konto` for test-echo, running.
 fn add_account(state: &Arc<UiState>) -> JoinHandle<Result<AccountDto, String>> {
     let state = Arc::clone(state);
-    tokio::spawn(async move { commands::sign_in_start(&state, "test-echo").await })
+    tokio::spawn(async move { commands::sign_in_start(&state, "test-echo", None).await })
 }
 
 /// Waits until the window shows a prompt of `kind`.
@@ -90,7 +92,7 @@ async fn sign_in_from_window_adds_the_account() {
     let signing_in = add_account(&state);
     let page = prompt(&state, "page").await;
     // One sign-in at a time.
-    assert_eq!(commands::sign_in_start(&state, "test-echo").await.unwrap_err(), BUSY);
+    assert_eq!(commands::sign_in_start(&state, "test-echo", None).await.unwrap_err(), BUSY);
     // The sign-in window saw the redirect.
     state.sign_ins.answer(page.id, SignInReply::Done(Some("https://login.example.com/done?account=a&code=1".into()))).unwrap();
     let added = signing_in.await.unwrap().unwrap();
@@ -267,6 +269,67 @@ async fn sign_in_page_closed_by_the_user_cancels() {
     let page = prompt(&state, "page").await;
     state.sign_ins.page_closed(page.id);
     assert!(signing_in.await.unwrap().unwrap_err().contains("cancelled"));
+}
+
+/// Signs in through test-echo's page as the account the redirect names; `again` re-signs one.
+async fn sign_in_as(state: &Arc<UiState>, again: Option<&str>, account: &str) -> Result<AccountDto, String> {
+    let signing_in = {
+        let (state, again) = (Arc::clone(state), again.map(str::to_owned));
+        tokio::spawn(async move { commands::sign_in_start(&state, "test-echo", again.as_deref()).await })
+    };
+    let page = prompt(state, "page").await;
+    let redirect = format!("https://login.example.com/done?account={account}&code=1");
+    state.sign_ins.answer(page.id, SignInReply::Done(Some(redirect))).unwrap();
+    signing_in.await.unwrap()
+}
+
+fn listed(state: &UiState) -> Vec<(String, String)> {
+    commands::accounts(state).unwrap().into_iter().map(|account| (account.id, account.state)).collect()
+}
+
+#[tokio::test]
+async fn add_account_from_sign_in() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    let added = sign_in_as(&state, None, "a").await.unwrap();
+    assert_eq!((added.id.as_str(), added.display_name.as_str()), ("test-echo:a", "Echo a"));
+    assert_eq!(listed(&state), [("test-echo:a".to_string(), "online".to_string())]);
+    // Its session lapses; `Zaloguj ponownie` with the same account brings it back.
+    d.accounts.set_state("test-echo", "a", SessionState::AuthRequired).unwrap();
+    sign_in_as(&state, Some("test-echo:a"), "a").await.unwrap();
+    assert_eq!(listed(&state), [("test-echo:a".to_string(), "online".to_string())]);
+}
+
+#[tokio::test]
+async fn re_sign_in_must_match_the_account() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    sign_in_as(&state, None, "a").await.unwrap();
+    d.accounts.set_state("test-echo", "a", SessionState::AuthRequired).unwrap();
+    // Signed in again, the module returns another account: refused, nothing changes.
+    assert_eq!(sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err(), OTHER_ACCOUNT);
+    assert_eq!(listed(&state), [("test-echo:a".to_string(), "auth-required".to_string())]);
+    // Removed first, the other account can be added.
+    commands::remove_account(&state, "test-echo:a").await.unwrap();
+    sign_in_as(&state, None, "b").await.unwrap();
+    assert_eq!(listed(&state), [("test-echo:b".to_string(), "online".to_string())]);
+}
+
+#[tokio::test]
+async fn failed_sign_in_adds_nothing() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    // Cancelled.
+    let signing_in = add_account(&state);
+    let page = prompt(&state, "page").await;
+    commands::sign_in_answer(&state, page.id, AnswerDto::Cancelled).unwrap();
+    assert!(signing_in.await.unwrap().is_err());
+    // A page that names no account.
+    assert!(sign_in_as(&state, None, "").await.is_err());
+    // An account that is not there, or a module that does not run.
+    assert!(commands::sign_in_start(&state, "test-echo", Some("test-echo:nobody")).await.is_err());
+    assert!(commands::sign_in_start(&state, "nope", None).await.unwrap_err().contains("nie działa"));
+    assert!(listed(&state).is_empty());
 }
 
 #[tokio::test]

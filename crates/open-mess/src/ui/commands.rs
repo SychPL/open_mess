@@ -481,13 +481,11 @@ pub enum AnswerDto {
     Cancelled,
 }
 
-/// Signs in an account of `module`, from the window only (spec 8.8); the module's prompts reach
-/// the window meanwhile. Returns the account added.
-pub async fn sign_in_start(state: &UiState, module: &str) -> Result<AccountDto, String> {
-    let handle = state.accounts.modules().handle(module).ok_or_else(|| format!("moduł {module} nie działa"))?;
+/// Signs in an account of `module` (`Dodaj konto`), or `account` again (`Zaloguj ponownie`), from
+/// the window only (spec 8.8); the module's prompts reach the window meanwhile. Returns the account.
+pub async fn sign_in_start(state: &UiState, module: &str, account: Option<&str>) -> Result<AccountDto, String> {
     let _active = state.sign_ins.begin(module)?;
-    let info = handle.sign_in().await.map_err(|err| format!("logowanie nie powiodło się: {err}"))?;
-    let account = state.accounts.add(module, info).map_err(text)?;
+    let account = state.accounts.sign_in(module, account).await.map_err(text)?;
     Ok(account_dto(state, &state.accounts.modules().list(), account))
 }
 

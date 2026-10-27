@@ -78,12 +78,15 @@ function stateDot(state) {
 /** The module signing in from this window, while it does. */
 let signingIn = null;
 
-/** Signs in an account of `module` (the module's prompts appear in the sign-in dialog meanwhile). */
-async function signIn(module) {
+/**
+ * Signs in an account of `module`, or `account` again (the module's prompts appear in the sign-in
+ * dialog meanwhile).
+ */
+async function signIn(module, account) {
   signingIn = module;
   renderAccounts().catch(showError);
   try {
-    await call("sign_in_start", { module });
+    await call("sign_in_start", { module, account: account || null });
   } finally {
     signingIn = null;
     await renderAccounts();
@@ -117,6 +120,9 @@ async function renderAccounts() {
     const who = el("div", null, "grow");
     who.append(el("strong", account.display_name), el("div", (account.platform || account.module) + " - " + account.id, "muted"));
     card.append(who, stateDot(account.state));
+    if (!signingIn && modules.some((module) => module.name === account.module)) {
+      card.append(button("Zaloguj ponownie", () => signIn(account.module, account.id)));
+    }
     card.append(
       button("Usuń", async () => {
         const sure = confirm(

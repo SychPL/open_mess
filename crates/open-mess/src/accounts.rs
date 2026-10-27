@@ -23,6 +23,8 @@ const MAX_DISPLAY_NAME: usize = 256;
 /// The state of an account being removed: no tool reaches it, no module report changes it, and a
 /// removal cut short (the daemon stopped) can be run again.
 pub const REMOVING: &str = "removing";
+/// Why signing in an account again with another one is refused.
+pub const OTHER_ACCOUNT: &str = "to jest inne konto - zaloguj się kontem, które ponownie logujesz, albo najpierw usuń stare konto i dodaj nowe";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
@@ -106,6 +108,36 @@ impl Accounts {
             [&account.id, &account.module, &account.module_account, &account.display_name, &account.state],
         )?;
         Ok(account)
+    }
+
+    /// Signs in an account through its module's own sign-in and adds it (`Dodaj konto`), or signs
+    /// in `again` an account the module has (`Zaloguj ponownie`): then the module must sign in
+    /// that same account, else nothing changes. A failed sign-in adds nothing. The configuration
+    /// window calls it; no tool starts a sign-in (spec 8.8).
+    pub async fn sign_in(&self, module: &str, again: Option<&str>) -> Result<Account, Error> {
+        let handle = self.modules.handle(module).ok_or_else(|| Error::Account(format!("moduł {module} nie działa")))?;
+        let expected = match again {
+            Some(id) => match self.get(id)? {
+                Some(account) if account.module == module && account.state != REMOVING => Some(account),
+                _ => return Err(Error::Account(format!("nie ma konta {id} w module {module}"))),
+            },
+            None => None,
+        };
+        let info = handle.sign_in().await.map_err(|err| Error::Account(format!("logowanie nie powiodło się: {err}")))?;
+        if let Some(expected) = expected
+            && info.id != expected.module_account
+        {
+            // The module may have kept secrets for the account it signed in; they go unless it
+            // is an account open_mess has.
+            if self.get(&format!("{module}:{}", info.id))?.is_none() {
+                let _ = handle.sign_out(&info.id).await;
+                let (credentials, data_dir, module, account) = (Arc::clone(&self.credentials), self.data_dir.clone(), module.to_owned(), info.id);
+                let _ =
+                    tokio::task::spawn_blocking(move || open_mess_host::delete_account_secrets(&*credentials, &data_dir, &module, &account)).await;
+            }
+            return Err(Error::Account(OTHER_ACCOUNT.into()));
+        }
+        self.add(module, info)
     }
 
     /// Records what a module reported about one of its accounts. Unknown accounts and accounts
