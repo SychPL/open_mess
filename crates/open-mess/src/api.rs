@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::task::{Context, Poll};
 
 use axum::Json;
 use axum::Router;
@@ -148,22 +151,80 @@ fn error_response(status: StatusCode, message: String) -> Response {
 pub const MAX_MCP_SESSIONS: usize = 64;
 
 /// rmcp's session manager, with at most [`MAX_MCP_SESSIONS`] sessions: a new one closes the session
-/// unused the longest. Its client opens another when it next asks for something.
+/// unused the longest, one that is answering no request if there is one. Its client opens another
+/// when it next asks for something.
 #[derive(Default)]
 pub struct McpSessions {
     inner: LocalSessionManager,
-    /// Each session and when it was last used, in uses of any session.
-    used: Mutex<(u64, HashMap<SessionId, u64>)>,
+    /// Each session, and the clock of uses of any session.
+    used: Mutex<(u64, HashMap<SessionId, Session>)>,
+    /// One session opens at a time, so sessions opened together can't pass the cap.
+    opening: tokio::sync::Mutex<()>,
+}
+
+struct Session {
+    /// When it was last used, by the clock of uses.
+    at: u64,
+    /// Its requests whose answer is still on its way.
+    answering: Arc<AtomicUsize>,
 }
 
 impl McpSessions {
-    fn touch(&self, id: &SessionId) {
+    /// Notes a use of the session; its count of requests answering, if it is known.
+    fn touch(&self, id: &SessionId) -> Option<Arc<AtomicUsize>> {
         let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
         let (clock, sessions) = &mut *used;
         *clock += 1;
-        if let Some(at) = sessions.get_mut(id) {
-            *at = *clock;
+        sessions.get_mut(id).map(|session| {
+            session.at = *clock;
+            Arc::clone(&session.answering)
+        })
+    }
+
+    /// The session a new one closes, at the cap: unused the longest, among those answering no
+    /// request if any is.
+    fn to_close(&self) -> Option<SessionId> {
+        let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        let sessions = &used.1;
+        if sessions.len() < MAX_MCP_SESSIONS {
+            return None;
         }
+        let oldest = |idle: bool| {
+            let candidates = sessions.iter().filter(|(_, session)| !idle || session.answering.load(Ordering::Relaxed) == 0);
+            candidates.min_by_key(|(_, session)| session.at).map(|(id, _)| id.clone())
+        };
+        oldest(true).or_else(|| oldest(false))
+    }
+}
+
+/// A request's answer on its way; while it is, its session counts as answering.
+struct Answering {
+    stream: Pin<Box<dyn Stream<Item = ServerSseMessage> + Send + Sync>>,
+    count: Option<Arc<AtomicUsize>>,
+}
+
+impl Answering {
+    fn new(stream: impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, count: Option<Arc<AtomicUsize>>) -> Answering {
+        if let Some(count) = &count {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        Answering { stream: Box::pin(stream), count }
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        if let Some(count) = &self.count {
+            count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Stream for Answering {
+    type Item = ServerSseMessage;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<ServerSseMessage>> {
+        self.stream.as_mut().poll_next(cx)
     }
 }
 
@@ -172,12 +233,8 @@ impl SessionManager for McpSessions {
     type Transport = <LocalSessionManager as SessionManager>::Transport;
 
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
-        let idle = {
-            let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
-            let sessions = &used.1;
-            (sessions.len() >= MAX_MCP_SESSIONS).then(|| sessions.iter().min_by_key(|(_, at)| **at).map(|(id, _)| id.clone())).flatten()
-        };
-        if let Some(idle) = idle {
+        let _opening = self.opening.lock().await;
+        if let Some(idle) = self.to_close() {
             // One that would not close is the inner manager's to end; the new one opens anyway.
             let _ = self.close_session(&idle).await;
         }
@@ -186,7 +243,7 @@ impl SessionManager for McpSessions {
             let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
             let (clock, sessions) = &mut *used;
             *clock += 1;
-            sessions.insert(id.clone(), *clock);
+            sessions.insert(id.clone(), Session { at: *clock, answering: Arc::default() });
         }
         Ok((id, transport))
     }
@@ -210,8 +267,8 @@ impl SessionManager for McpSessions {
         id: &SessionId,
         message: ClientJsonRpcMessage,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        self.touch(id);
-        self.inner.create_stream(id, message).await
+        let answering = self.touch(id);
+        Ok(Answering::new(self.inner.create_stream(id, message).await?, answering))
     }
 
     async fn accept_message(&self, id: &SessionId, message: ClientJsonRpcMessage) -> Result<(), Self::Error> {
@@ -330,6 +387,47 @@ mod tests {
         assert!(!sessions.has_session(&ids[1]).await.unwrap());
         for id in [&ids[0], &ids[2], &newest] {
             assert!(sessions.has_session(id).await.unwrap());
+        }
+        assert_eq!(sessions.used.lock().unwrap().1.len(), MAX_MCP_SESSIONS);
+
+        // The one unused the longest is answering a request (a long tool call): the next one goes.
+        let answering = Answering::new(Empty, sessions.touch(&ids[2]));
+        for id in &ids[3..] {
+            sessions.touch(id);
+        }
+        sessions.touch(&ids[0]);
+        sessions.touch(&newest);
+        let _another = sessions.create_session().await.unwrap();
+        assert!(sessions.has_session(&ids[2]).await.unwrap());
+        assert!(!sessions.has_session(&ids[3]).await.unwrap());
+        // Answered: it counts as idle again.
+        drop(answering);
+        assert_eq!(sessions.to_close(), Some(ids[2].clone()));
+    }
+
+    /// An answer that is over at once.
+    struct Empty;
+
+    impl Stream for Empty {
+        type Item = ServerSseMessage;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<ServerSseMessage>> {
+            Poll::Ready(None)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_sessions_opened_together_stay_within_the_cap() {
+        let sessions = Arc::new(McpSessions::default());
+        let opening: Vec<_> = (0..MAX_MCP_SESSIONS + 16)
+            .map(|_| {
+                let sessions = Arc::clone(&sessions);
+                tokio::spawn(async move { sessions.create_session().await.unwrap() })
+            })
+            .collect();
+        let mut open = Vec::new();
+        for task in opening {
+            open.push(task.await.unwrap());
         }
         assert_eq!(sessions.used.lock().unwrap().1.len(), MAX_MCP_SESSIONS);
     }
