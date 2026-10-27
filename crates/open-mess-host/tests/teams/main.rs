@@ -320,7 +320,9 @@ async fn a_failing_later_page_keeps_what_was_found() {
         })
     });
     assert_eq!(ids(&teams.call("list_conversations", json!({})).await.unwrap(), "id"), [GROUP]);
-    // The first page failing is still an error.
+    // unread must not pass a failure off as nothing unread.
+    assert!(matches!(module_error(teams.call("unread", json!({})).await), ModuleError::Platform(_)));
+    // The first page failing is an error for a listing too.
     teams.fake.on(|s| (s.path == CHAT_PATH).then(|| Reply::status(403)));
     assert!(matches!(module_error(teams.call("list_conversations", json!({})).await), ModuleError::Platform(_)));
 }
@@ -600,13 +602,28 @@ async fn send_posts_the_live_accepted_body() {
 #[tokio::test]
 async fn reply_goes_to_the_channel_thread() {
     let teams = Teams::signed_in().await;
-    teams.fake.on(|s| (s.method == "POST").then(|| Reply::status(201)));
-    teams.call("send", json!({"conversation": CHANNEL, "text": "ok", "reply_to": "1800000000100"})).await.unwrap();
-    assert_eq!(writes(&teams.fake)[0].path, format!("{CHAT_PATH}/{CHANNEL};messageid=1800000000100/messages"));
+    let old_channel = "19:dddddddddddddddddddddddddddddddd@thread.skype";
+    teams.fake.on(move |s| {
+        if s.method == "POST" {
+            return Some(Reply::status(201));
+        }
+        // 101 is itself a reply in the thread of 100; 100 is a root.
+        let (conversation, id) = s.path.strip_prefix(&format!("{CHAT_PATH}/"))?.split_once("/messages/")?;
+        let mut replied = message(id, conversation, OTHER, "<p>x</p>", T0);
+        replied["rootMessageId"] = "1800000000100".into();
+        Some(Reply::json(replied))
+    });
+    for reply_to in ["1800000000100", "1800000000101"] {
+        teams.call("send", json!({"conversation": CHANNEL, "text": "ok", "reply_to": reply_to})).await.unwrap();
+    }
+    teams.call("send", json!({"conversation": old_channel, "text": "ok", "reply_to": "1800000000100"})).await.unwrap();
+    let paths: Vec<String> = writes(&teams.fake).into_iter().map(|s| s.path).collect();
+    let thread = |c: &str| format!("{CHAT_PATH}/{c};messageid=1800000000100/messages");
+    assert_eq!(paths, [thread(CHANNEL), thread(CHANNEL), thread(old_channel)]);
     // A quote reply in a chat has no confirmed format yet: refused, nothing sent.
     let quote = teams.call("send", json!({"conversation": GROUP, "text": "ok", "reply_to": "1800000000100"})).await;
     assert!(matches!(module_error(quote), ModuleError::NotSupported(_)));
-    assert_eq!(writes(&teams.fake).len(), 1);
+    assert_eq!(writes(&teams.fake).len(), 3);
 }
 
 #[tokio::test]
@@ -698,7 +715,15 @@ async fn describe_target_reads_the_target_text() {
 async fn timeout_after_post_is_uncertain() {
     // The answer comes after the host's read timeout (1 s in tests), or the service fails: the
     // message may have been taken, and it is never sent twice.
-    for reply in [Reply::status(201).delayed(Duration::from_millis(1500)), Reply::status(503)] {
+    let replies = [
+        Reply::status(201).delayed(Duration::from_millis(1500)),
+        Reply::status(503),
+        // Asking for a long wait does not make it a refusal: the host ends this one as throttled,
+        // and the module gives up on the other.
+        Reply::status(503).header("Retry-After", "1000"),
+        Reply::status(500).header("Retry-After", "Fri, 01 Jan 2100 00:00:00 GMT"),
+    ];
+    for reply in replies {
         let teams = Teams::signed_in().await;
         let reply = std::sync::Mutex::new(Some(reply));
         teams.fake.on(move |s| (s.method == "POST").then(|| reply.lock().unwrap().take().unwrap_or_else(|| Reply::status(201))));
@@ -725,19 +750,22 @@ async fn one_to_one_id_checks_both_orders() {
             None
         }
     });
-    teams.call("send", json!({"conversation": OTHER, "text": "hi"})).await.unwrap();
+    // A person's id finds the 1:1 chat with them, whichever order its id has.
+    let found = teams.call("list_conversations", json!({"query": OTHER})).await.unwrap();
+    assert_eq!(ids(&found, "id"), std::slice::from_ref(&theirs_first));
+    assert_eq!(found["items"][0]["kind"], "direct");
     let probes: Vec<String> = teams.fake.seen().into_iter().filter(|s| s.method == "GET").map(|s| s.path).collect();
     assert_eq!(probes, [format!("{CHAT_PATH}/{mine_first}"), format!("{CHAT_PATH}/{theirs_first}")]);
-    assert_eq!(writes(&teams.fake)[0].path, messages_path(&theirs_first));
-    // The approval shows the same chat.
-    let target = teams.module.describe_target(ME_OID, OTHER, None).await.unwrap();
-    assert_eq!(target.conversation_title, "Synthetic Person Two");
+    // No chat with this person yet: nothing found.
+    let none = teams.call("list_conversations", json!({"query": "8:orgid:00000000-0000-0000-0000-000000000004"})).await.unwrap();
+    assert_eq!(ids(&none, "id"), Vec::<String>::new());
 
-    // No chat with this person yet: refused, nothing sent.
-    teams.fake.on(|s| (s.method == "POST").then(|| Reply::status(201)));
-    let none = teams.call("send", json!({"conversation": "8:orgid:00000000-0000-0000-0000-000000000004", "text": "hi"})).await;
-    assert!(matches!(module_error(none), ModuleError::Platform(_)));
-    assert_eq!(writes(&teams.fake).len(), 1);
+    // A person's id never stands in for the chat in a write or its approval: the core's
+    // permissions for the chat apply to the chat's id only.
+    let send = teams.call("send", json!({"conversation": OTHER, "text": "hi"})).await;
+    assert!(matches!(module_error(send), ModuleError::InvalidArgs(_)));
+    assert!(matches!(module_error(teams.module.describe_target(ME_OID, OTHER, None).await), ModuleError::InvalidArgs(_)));
+    assert!(writes(&teams.fake).is_empty());
 }
 
 // Task 5: polling events.

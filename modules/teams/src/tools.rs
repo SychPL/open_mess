@@ -74,8 +74,10 @@ fn kind_name(kind: ConversationKind) -> &'static str {
 }
 
 /// Walks the conversations updated since `start_ms`, newest first, while `keep` returns true,
-/// within `MAX_PAGES` and the call's time.
-fn conversations(session: &mut Session, start_ms: i64, mut keep: impl FnMut(Conversation) -> bool) -> Result<(), ModuleError> {
+/// within `MAX_PAGES` and the call's time. With `partial`, a later page that fails ends the walk
+/// with what the earlier ones gave (a listing); without, it is an error (unread, mentions and the
+/// poll must not pass a failure off as "nothing there").
+fn conversations(session: &mut Session, start_ms: i64, partial: bool, mut keep: impl FnMut(Conversation) -> bool) -> Result<(), ModuleError> {
     let mut link: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let request = chat::list_conversations(&session.directory, link.as_deref(), start_ms).map_err(api::proto)?;
@@ -83,7 +85,7 @@ fn conversations(session: &mut Session, start_ms: i64, mut keep: impl FnMut(Conv
             Ok(body) => body,
             // A later page that fails leaves what the earlier ones found, as the page limit does;
             // a session that needs sign-in still ends the call.
-            Err(e) if link.is_some() && !matches!(e, ModuleError::AuthRequired(_)) => {
+            Err(e) if partial && link.is_some() && !matches!(e, ModuleError::AuthRequired(_)) => {
                 host::log(1, "a later page of the conversation list failed; the list is cut short");
                 return Ok(());
             }
@@ -151,18 +153,28 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
     let kind = text(args, "kind");
     let query = text(args, "query").map(str::to_lowercase);
     let me = session.me();
+    // A person's MRI finds the 1:1 chat with them.
+    if let Some(other) = query.as_deref().and_then(|q| q.strip_prefix("8:orgid:")) {
+        let found = one_to_one(session, other)?;
+        let items: Vec<Value> = found.iter().map(|c| conversation_item(c, &me)).collect();
+        return Ok(json!({ "items": items }));
+    }
     let mut items = Vec::new();
-    conversations(session, 1, |c| {
+    conversations(session, 1, true, |c| {
         let title = title(&c, &me);
         let title_matches = query.as_deref().is_none_or(|q| title.as_deref().is_some_and(|t| t.to_lowercase().contains(q)));
         if kind.is_none_or(|k| k == kind_name(c.kind)) && title_matches {
-            // Absent values go as null, which the core reads as left out.
-            let last_activity = c.horizons.last_message_ms.map(time::rfc3339);
-            items.push(json!({"id": c.id, "kind": kind_name(c.kind), "last_activity": last_activity, "untrusted": {"title": title}}));
+            items.push(conversation_item(&c, &me));
         }
         true
     })?;
     Ok(json!({ "items": items }))
+}
+
+fn conversation_item(c: &Conversation, me: &str) -> Value {
+    // Absent values go as null, which the core reads as left out.
+    let last_activity = c.horizons.last_message_ms.map(time::rfc3339);
+    json!({"id": c.id, "kind": kind_name(c.kind), "last_activity": last_activity, "untrusted": {"title": title(c, me)}})
 }
 
 /// The official client's rule (docs/protocols/teams.md 3.4), reading horizons only. Where the
@@ -171,7 +183,7 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
 fn unread(session: &mut Session, _args: &Value) -> Result<Value, ModuleError> {
     let me = session.me();
     let mut items = Vec::new();
-    conversations(session, 1, |c| {
+    conversations(session, 1, false, |c| {
         // A conversation without a message has nothing to read.
         if c.last_message_id.is_none() && c.horizons.last_message_ms.is_none() {
             return true;
@@ -196,7 +208,7 @@ fn mentions(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let since = since(args)?.unwrap_or_else(|| api::now_ms().saturating_sub(MENTIONS_DEFAULT_MS));
     let me = session.me();
     let mut active = Vec::new();
-    conversations(session, since, |c| {
+    conversations(session, since, false, |c| {
         if c.horizons.last_message_ms.is_some_and(|t| t > since) {
             active.push(c.id);
         }
@@ -329,23 +341,33 @@ pub fn get_attachment(account: &str, conversation: &str, message: &str, attachme
     })
 }
 
-/// A conversation id, or a person's MRI (`8:orgid:<oid>`) for the 1:1 chat with them. That chat's
-/// id joins both object ids in an order not settled yet ("Live results" 5), so both orders are
-/// looked up; a chat is never created here.
-fn resolve(session: &mut Session, conversation: &str) -> Result<String, ModuleError> {
-    let Some(other) = conversation.strip_prefix("8:orgid:") else { return Ok(conversation.to_string()) };
+/// The 1:1 chat with the person whose object id is `other`, if there is one. Its id joins both
+/// object ids in an order not settled yet ("Live results" 5), so both orders are looked up; a chat
+/// is never created. Only `list_conversations` uses it: the id it returns is what the core's
+/// per-conversation permissions apply to, so a person's id never stands in for a conversation.
+fn one_to_one(session: &mut Session, other: &str) -> Result<Option<Conversation>, ModuleError> {
     if other.is_empty() || !other.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-        return Err(ModuleError::InvalidArgs("not a conversation id or a person's id".to_string()));
+        return Err(ModuleError::InvalidArgs("not a person's id".to_string()));
     }
     let me = session.account.clone();
     for id in [format!("19:{me}_{other}@unq.gbl.spaces"), format!("19:{other}_{me}@unq.gbl.spaces")] {
         let response = api::send(session, Service::Chat, &chat::one_conversation(&session.directory, &id), false)?;
         if response.status != 404 {
-            api::ok(response)?;
-            return Ok(id);
+            return chat::decode_conversation(&api::ok(response)?).map(Some).map_err(api::proto);
         }
     }
-    Err(ModuleError::Platform("there is no chat with this person yet".to_string()))
+    Ok(None)
+}
+
+/// The `conversation` argument of a write or a target: a conversation id. A person's id would
+/// dodge the permissions set for the chat it stands for.
+fn conversation_id(conversation: &str) -> Result<&str, ModuleError> {
+    if conversation.starts_with("8:") {
+        return Err(ModuleError::InvalidArgs(
+            "a person's id is not a conversation; list_conversations with it as query finds the 1:1 chat".to_string(),
+        ));
+    }
+    Ok(conversation)
 }
 
 /// Sends a write once (spec 8.5: one that may have been taken is `uncertain`, never repeated) and
@@ -360,10 +382,16 @@ fn write(session: &mut Session, request: &HttpRequest) -> Result<Option<String>,
 /// A message, or in a channel a reply in the thread of `reply_to`. A quoted reply in a chat has no
 /// confirmed format yet, so it is refused rather than sent without its quote.
 fn send(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
-    let conversation = resolve(session, required(args, "conversation")?)?;
+    let conversation = conversation_id(required(args, "conversation")?)?;
     let target = match text(args, "reply_to") {
-        None => conversation,
-        Some(root) if chat::kind(&conversation) == ConversationKind::Channel => format!("{conversation};messageid={root}"),
+        None => conversation.to_string(),
+        // Old channels are `@thread.skype` too, like old group chats: they are tried as a channel.
+        Some(reply_to) if matches!(chat::kind(conversation), ConversationKind::Channel | ConversationKind::Other) => {
+            // A reply to a reply goes into the same thread: the thread is its root's.
+            let request = chat::one_message(&session.directory, conversation, reply_to);
+            let replied = chat::decode_message(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+            format!("{conversation};messageid={}", replied.reply_to.as_deref().unwrap_or(reply_to))
+        }
         Some(_) => return Err(ModuleError::NotSupported("a reply to a chat message; send it without reply_to".to_string())),
     };
     let html = markdown_to_html(required(args, "text")?);
@@ -375,8 +403,8 @@ fn send(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
 }
 
 fn edit_message(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
-    let conversation = resolve(session, required(args, "conversation")?)?;
-    let request = chat::edit(&session.directory, &conversation, required(args, "message")?, &markdown_to_html(required(args, "text")?));
+    let conversation = conversation_id(required(args, "conversation")?)?;
+    let request = chat::edit(&session.directory, conversation, required(args, "message")?, &markdown_to_html(required(args, "text")?));
     write(session, &request)?;
     Ok(json!({}))
 }
@@ -395,9 +423,9 @@ fn reaction_key(reaction: &str) -> &str {
 }
 
 fn react(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
-    let conversation = resolve(session, required(args, "conversation")?)?;
+    let conversation = conversation_id(required(args, "conversation")?)?;
     let key = reaction_key(required(args, "reaction")?);
-    let request = chat::react(&session.directory, &conversation, required(args, "message")?, key, api::now_ms()).map_err(api::proto)?;
+    let request = chat::react(&session.directory, conversation, required(args, "message")?, key, api::now_ms()).map_err(api::proto)?;
     write(session, &request)?;
     Ok(json!({}))
 }
@@ -405,14 +433,14 @@ fn react(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
 /// What a write in `conversation` is about (spec 8.6): its title, its members (none for a
 /// channel, which is the target itself) and the text of `message`. Reads only.
 pub fn describe_target(account: &str, conversation: &str, message: Option<&str>) -> Result<Target, ModuleError> {
+    let conversation = conversation_id(conversation)?;
     api::with_session(account, |session| {
-        let conversation = resolve(session, conversation)?;
-        let request = chat::one_conversation(&session.directory, &conversation);
+        let request = chat::one_conversation(&session.directory, conversation);
         let c = chat::decode_conversation(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
         let participants: Vec<Participant> = if c.kind == ConversationKind::Channel {
             Vec::new()
         } else {
-            let request = chat::members(&session.directory, &conversation);
+            let request = chat::members(&session.directory, conversation);
             let members = chat::decode_members(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
             members.into_iter().map(|m| Participant { display_name: m.name.unwrap_or_else(|| m.id.clone()), id: m.id }).collect()
         };
@@ -422,7 +450,7 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
         let target_text = match message {
             None => None,
             Some(id) => {
-                let request = chat::one_message(&session.directory, &conversation, id);
+                let request = chat::one_message(&session.directory, conversation, id);
                 let m = chat::decode_message(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
                 Some(html_to_markdown(&m.html))
             }
@@ -440,7 +468,7 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
         let mut state = storage::get(&key).and_then(|bytes| PollState::decode(&bytes)).unwrap_or_else(|| PollState::new(started));
         let me = session.me();
         let mut arrivals = Vec::new();
-        conversations(session, state.start_ms(), |c| {
+        conversations(session, state.start_ms(), false, |c| {
             arrivals.extend(state.arrival(&c, &me));
             true
         })?;

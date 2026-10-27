@@ -277,7 +277,8 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
         let status = response.status;
         match retry::decide(status, header(&response.headers, "retry-after"), attempt, now_ms()) {
             Retry::Done => return Ok(response),
-            Retry::After(_) if write && status != 429 => return Err(ModuleError::Uncertain(format!("the service failed (HTTP {status})"))),
+            // A 5xx may come after the service took the write, whatever its Retry-After says.
+            _ if write && (500..=599).contains(&status) => return Err(ModuleError::Uncertain(format!("the service failed (HTTP {status})"))),
             Retry::After(ms) => {
                 if !pause(ms) {
                     return Err(ModuleError::Platform(format!("the service asks to wait {} s; try again later", ms.div_ceil(1000))));
@@ -313,8 +314,10 @@ fn transport(e: &http::HttpError, write: bool) -> ModuleError {
         http::HttpError::Throttled(secs) => format!("the service asks to wait {secs} s; try again later"),
         http::HttpError::Network(why) => format!("network error: {why}"),
     };
+    // `throttled` is a 429 or a 503 with a long Retry-After; after a 503 the write may be taken.
     match e {
-        http::HttpError::Timeout | http::HttpError::Network(_) | http::HttpError::TooLarge if write => ModuleError::Uncertain(why),
+        http::HttpError::Blocked(_) => ModuleError::Platform(why),
+        _ if write => ModuleError::Uncertain(why),
         _ => ModuleError::Platform(why),
     }
 }
