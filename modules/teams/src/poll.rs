@@ -216,10 +216,11 @@ impl PollState {
     }
 
     /// Older pages to read in a later poll: what is left of them, or the same after a failure,
-    /// for an hour from when the conversation fell behind. False when that hour is over and they
-    /// are given up.
+    /// for an hour from when the conversation fell behind. False when that hour is over, or
+    /// [`MAX_BEHIND`] conversations wait already (those that fell behind in this poll first), and
+    /// they are given up.
     pub fn keep_behind(&mut self, b: Behind, now_ms: i64) -> bool {
-        if now_ms.saturating_sub(b.since_ms) >= MAX_HOLD_MS {
+        if now_ms.saturating_sub(b.since_ms) >= MAX_HOLD_MS || self.behind.len() >= MAX_BEHIND {
             return false;
         }
         self.behind.push(b);
@@ -422,7 +423,14 @@ mod tests {
             let kept = stored.fall_behind(&format!("19:{i}@thread.v2"), "https://link".into(), NOW);
             assert_eq!(kept, i < MAX_BEHIND);
         }
-        assert_eq!(stored.take_behind().len(), MAX_BEHIND);
+        let mut taken = stored.take_behind();
+        assert_eq!(taken.len(), MAX_BEHIND);
+        // Those that fell behind in this poll come first: one kept from earlier is given up past it.
+        let earlier = taken.pop().unwrap();
+        for i in 0..MAX_BEHIND {
+            stored.fall_behind(&format!("19:new{i}@thread.v2"), "https://link".into(), NOW);
+        }
+        assert!(!stored.keep_behind(earlier, NOW));
     }
 
     #[test]
