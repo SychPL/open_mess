@@ -8,45 +8,13 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{install, running, wasm};
-use keyring_core::api::CredentialStore;
-use open_mess::accounts::Accounts;
+use common::{ECHO, daemon, info};
 use open_mess::modules;
+use open_mess::permissions::{self, Write};
 use open_mess::tools::shared::{UNTRUSTED_NOTICE, attachments_dir};
 use open_mess::tools::{Registry, ToolError};
-use open_mess_host::{AccountInfo, Engine, HostEvent, SessionState, limits};
+use open_mess_host::{Engine, HostEvent, SessionState, limits};
 use serde_json::{Value, json};
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-struct Daemon {
-    dir: TempDir,
-    accounts: Arc<Accounts>,
-    registry: Registry,
-    events: mpsc::Receiver<HostEvent>,
-    credentials: Arc<CredentialStore>,
-}
-
-/// A daemon's accounts and tools over module files (file name, built module), all approved.
-async fn daemon(files: &[(&str, &str)]) -> Daemon {
-    let dir = tempfile::tempdir().unwrap();
-    for (file, module) in files {
-        install(dir.path(), file, &std::fs::read(wasm(module)).unwrap());
-    }
-    let engine = Engine::with_limits(limits::for_tests()).unwrap();
-    let (sender, events) = mpsc::channel(64);
-    let modules = running(dir.path(), &engine, sender).await;
-    let credentials: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
-    let accounts = common::accounts(dir.path(), modules, Arc::clone(&credentials));
-    let registry = Registry::new(Instant::now(), Arc::clone(&accounts));
-    Daemon { dir, accounts, registry, events, credentials }
-}
-
-const ECHO: (&str, &str) = ("echo.wasm", "open_mess_test_echo");
-
-fn info(id: &str) -> AccountInfo {
-    AccountInfo { id: id.into(), display_name: format!("User {id}") }
-}
 
 async fn read_messages(registry: &Registry, account: &str) -> Result<Value, ToolError> {
     registry.call("read_messages", json!({"account": account, "conversation": "c1"})).await
@@ -175,8 +143,12 @@ async fn remove_account_deletes_secrets_and_signs_out() {
     }
 
     let (attachment_a, attachment_b) = (attachment(&d.registry, "test-echo:a").await, attachment(&d.registry, "test-echo:b").await);
+    let store = common::store(d.dir.path());
+    permissions::set(&store, "test-echo:a", Some("c1"), true, Write::Autonomous).unwrap();
 
     d.accounts.remove("test-echo:a").await.unwrap();
+    // The same account signed in again starts from the defaults (spec 8.6).
+    assert_eq!(permissions::effective(&store, "test-echo:a", Some("c1")).unwrap(), permissions::DEFAULT);
 
     // test-echo reports an account it signs out as offline.
     let event = tokio::time::timeout(Duration::from_secs(5), d.events.recv()).await.unwrap().unwrap();

@@ -3,13 +3,18 @@
 // Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
 #![allow(clippy::unwrap_used)]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use open_mess::tools::Registry;
-use serde_json::Value;
+use rmcp::ServiceExt;
+use rmcp::model::ClientConfig;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
@@ -81,6 +86,29 @@ async fn cli_unknown_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_tools_exist_over_mcp_and_cli() {
+    let (port, _stop) = start().await;
+    let dir = data_dir();
+    // The CLI names the tools the daemon offers when asked for one it doesn't.
+    let unknown = stderr(&om(dir.path(), port, TOKEN, &["nope"]));
+    let cli: BTreeSet<String> = unknown.split("available: ").nth(1).unwrap().trim().split(", ").map(str::to_owned).collect();
+
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let config = StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")).auth_header(TOKEN);
+    let client = ClientConfig::default().serve(StreamableHttpClientTransport::from_config(config)).await.unwrap();
+    let mcp: BTreeSet<String> = client.list_all_tools().await.unwrap().into_iter().map(|tool| tool.name.to_string()).collect();
+    client.cancel().await.unwrap();
+
+    assert_eq!(cli, mcp);
+    for tool in ["send", "edit_message", "react", "pending"] {
+        assert!(cli.contains(tool), "{tool}: {cli:?}");
+    }
+    let output = om(dir.path(), port, TOKEN, &["pending", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(serde_json::from_slice::<Value>(&output.stdout).unwrap(), json!({"items": []}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cli_bad_args() {
     let (port, _stop) = start().await;
     let dir = data_dir();
@@ -94,6 +122,19 @@ async fn cli_bad_args() {
         assert_eq!(output.status.code(), Some(3), "{args:?}: {}", stderr(&output));
     }
     let output = om(dir.path(), port, TOKEN, &["status", "--json-args", "{}"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_types_flags_by_the_schema() {
+    let (port, _stop) = start().await;
+    let dir = data_dir();
+    // A string parameter keeps a value that looks like a number, as Teams message ids do.
+    let output = om(dir.path(), port, TOKEN, &["pending", "--account", "1800000000300"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains(r#"unknown account "1800000000300""#), "{}", stderr(&output));
+    // An integer parameter gets a number.
+    let output = om(dir.path(), port, TOKEN, &["pending", "--limit", "5", "--json"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 }
 

@@ -33,4 +33,7 @@ pub enum ModuleError {
     InvalidArgs(String),
     #[error("not supported: {0}")]
     NotSupported(String),
+    /// A write may have reached the platform; it is never run again by itself (spec 8.5).
+    #[error("uncertain: {0}")]
+    Uncertain(String),
 }

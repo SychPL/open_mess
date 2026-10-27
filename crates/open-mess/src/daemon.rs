@@ -17,7 +17,7 @@ use crate::instance::InstanceLock;
 use crate::modules::Modules;
 use crate::store::Store;
 use crate::tools::Registry;
-use crate::{Error, api, paths, secrets};
+use crate::{Error, api, approval, paths, secrets};
 
 /// Why the last `om daemon` failed to start, one line, in the data folder. The CLI shows it when
 /// it can't reach the daemon; a successful start deletes it.
@@ -75,7 +75,13 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, String, 
             let _ = accounts.restore().await;
         }
     });
-    Ok((runtime, listener, token, Registry::new(started, accounts)))
+    let registry = Registry::new(started, accounts);
+    if let Some(pending) = registry.pending() {
+        pending.recover()?;
+        runtime.spawn(Arc::clone(pending).sweep());
+        approval::start(&runtime, Arc::clone(pending));
+    }
+    Ok((runtime, listener, token, registry))
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.

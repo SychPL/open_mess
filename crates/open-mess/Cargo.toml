@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+# RFC 3339 times in the `pending` tool; rmcp builds it already.
+chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom = "0.4.3"
 # keyring 4's own facade always installs the platform store on first use, so tests can't swap in
@@ -40,7 +42,13 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
+# The `Show all` dialog of an approval.
+rfd = { version = "0.17.2", default-features = false }
+# Approval toasts with buttons, activated in this process.
+tauri-winrt-notification = "0.8.1"
 windows-native-keyring-store = "1.1.0"
+# Registers the toasts' AppUserModelID for the current user.
+winreg = "0.56.0"
 
 [dev-dependencies]
 # Short call limits, so the tests of slow and crashing modules finish quickly.

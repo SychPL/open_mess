@@ -3,7 +3,10 @@
 //! Every capability is a tool here, with one name, one parameter schema and one result shape for
 //! both front ends (AGENTS.md, "One tool registry"). The shared tools (`shared.rs`) run on the
 //! module of the account they name; without an account, `list_conversations`, `unread` and
-//! `mentions` ask every account at once.
+//! `mentions` ask every account at once. Read tools see only what the agent permissions allow
+//! (spec 8.6): an account or conversation the agent may not read is refused when named and left
+//! out of lists. The writes never reach a module from here: they become pending actions
+//! (pending.rs), which run under the write permission.
 
 pub mod shared;
 
@@ -19,6 +22,8 @@ use tokio::task::JoinSet;
 
 use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::ModuleState;
+use crate::pending::{Kind, Pending, State};
+use crate::permissions;
 
 /// A tool as both front ends describe it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,6 +43,9 @@ pub enum ToolError {
     /// A module could not run the tool, or failed; the message is safe to show.
     #[error("{0}")]
     Module(String),
+    /// The agent permissions (spec 8.6) refuse the call.
+    #[error("{0}")]
+    NotAllowed(String),
     /// The daemon itself failed (its database, a file).
     #[error("{0}")]
     Failed(String),
@@ -52,17 +60,25 @@ pub struct Registry {
     started: Instant,
     /// None when the daemon runs no modules and has no accounts.
     accounts: Option<Arc<Accounts>>,
+    /// The accounts' writes; None with the accounts.
+    pending: Option<Arc<Pending>>,
 }
 
 impl Registry {
     /// The tools with no modules and no accounts; `started` is when the daemon started, for
     /// `status`.
     pub fn with_builtin(started: Instant) -> Registry {
-        Registry { started, accounts: None }
+        Registry { started, accounts: None, pending: None }
     }
 
     pub fn new(started: Instant, accounts: Arc<Accounts>) -> Registry {
-        Registry { started, accounts: Some(accounts) }
+        let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
+        Registry { started, accounts: Some(accounts), pending: Some(pending) }
+    }
+
+    /// The pending actions, for the approval UI and the configuration window.
+    pub fn pending(&self) -> Option<&Arc<Pending>> {
+        self.pending.as_ref()
     }
 
     pub fn list(&self) -> Vec<ToolInfo> {
@@ -82,17 +98,34 @@ impl Registry {
             return self.status();
         }
         let args = shared::validate(name, args)?;
-        let Some(accounts) = &self.accounts else {
+        let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending) else {
             return match args.account {
                 Some(id) => Err(unknown_account(&id)),
                 None => Ok(json!({"items": []})),
             };
         };
+        if let Some(kind) = Kind::for_tool(name) {
+            // The schema makes `account` and `conversation` required.
+            let account = args.account.unwrap_or_default();
+            let conversation = args.module_args.get("conversation").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let outcome = pending.create(kind, &account, &conversation, args.module_args).await?;
+            return serde_json::to_value(outcome).map_err(failed);
+        }
         match (name, args.account) {
             ("accounts", _) => list_accounts(accounts),
+            ("pending", account) => {
+                if let Some(id) = &account {
+                    find(accounts, id)?;
+                }
+                let state = args.module_args.get("state").and_then(Value::as_str).map(State::parse).transpose().map_err(failed)?;
+                let limit = args.module_args.get("limit").and_then(Value::as_u64).and_then(|limit| u32::try_from(limit).ok()).unwrap_or(20);
+                pending.list(account.as_deref(), state, limit)
+            }
             (_, None) => fan_out(accounts, name, &args.module_args).await,
             ("get_attachment", Some(id)) => get_attachment(accounts, &id, &args.module_args).await,
-            (_, Some(id)) => Ok(shared::with_notice(call_account(accounts, &find(accounts, &id)?, name, &args.module_args).await?)),
+            (_, Some(id)) => {
+                Ok(shared::with_notice(call_account(accounts, &readable(accounts, &id, &args.module_args)?, name, &args.module_args).await?))
+            }
         }
     }
 
@@ -137,13 +170,42 @@ fn no_params(args: &Value) -> Result<(), ToolError> {
     }
 }
 
-fn unknown_account(id: &str) -> ToolError {
+pub(crate) fn unknown_account(id: &str) -> ToolError {
     ToolError::InvalidArgs(format!("unknown account {id:?} - the accounts tool lists them"))
 }
 
 /// An account a tool may use: one being removed is unknown to the tools.
-fn find(accounts: &Accounts, id: &str) -> Result<Account, ToolError> {
+pub(crate) fn find(accounts: &Accounts, id: &str) -> Result<Account, ToolError> {
     accounts.get(id).map_err(failed)?.filter(|account| account.state != REMOVING).ok_or_else(|| unknown_account(id))
+}
+
+/// An account a read tool may use with `args`: the conversation they name, or anything of the
+/// account when they name none (spec 8.6).
+fn readable(accounts: &Accounts, id: &str, args: &Value) -> Result<Account, ToolError> {
+    let account = find(accounts, id)?;
+    let store = accounts.store();
+    let (allowed, what) = match args.get("conversation").and_then(Value::as_str) {
+        Some(conversation) => (permissions::effective(&store, &account.id, Some(conversation)).map_err(failed)?.read, "conversation"),
+        None => (permissions::readable_anywhere(&store, &account.id).map_err(failed)?, "account"),
+    };
+    if allowed { Ok(account) } else { Err(ToolError::NotAllowed(format!("reading this {what} is not allowed"))) }
+}
+
+/// Drops the items of conversations the agent may not read.
+fn drop_unreadable(accounts: &Accounts, account: &str, tool: &str, result: &mut Value) -> Result<(), ToolError> {
+    let Some(items) = result.get_mut("items").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let key = if tool == "list_conversations" { "id" } else { "conversation" };
+    let store = accounts.store();
+    let mut kept = Vec::new();
+    for item in std::mem::take(items) {
+        if permissions::effective(&store, account, item.get(key).and_then(Value::as_str)).map_err(failed)?.read {
+            kept.push(item);
+        }
+    }
+    *items = kept;
+    Ok(())
 }
 
 fn list_accounts(accounts: &Accounts) -> Result<Value, ToolError> {
@@ -169,7 +231,7 @@ fn list_accounts(accounts: &Accounts) -> Result<Value, ToolError> {
 }
 
 /// The account's running module, or an error naming the module's state.
-fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolError> {
+pub(crate) fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolError> {
     let modules = accounts.modules();
     modules.handle(&account.module).cloned().ok_or_else(|| {
         ToolError::Module(match modules.state(&account.module) {
@@ -181,7 +243,7 @@ fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolEr
 
 /// A module call under the call limit, counted from now: a call waiting behind others on the same
 /// module counts its wait too.
-async fn within<T>(module: &str, call: impl Future<Output = Result<T, HostError>>) -> Result<T, ToolError> {
+pub(crate) async fn within<T>(module: &str, call: impl Future<Output = Result<T, HostError>>) -> Result<T, ToolError> {
     match tokio::time::timeout(CALL_TIMEOUT, call).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(ToolError::Module(format!("module {module}: {err}"))),
@@ -189,12 +251,13 @@ async fn within<T>(module: &str, call: impl Future<Output = Result<T, HostError>
     }
 }
 
-/// Runs a shared tool on one account's module: the result parsed, cut to the limit and labelled
-/// with the account, without the untrusted notice.
+/// Runs a shared tool on one account's module: the result parsed, without what the agent may not
+/// read, cut to the limit and labelled with the account, without the untrusted notice.
 async fn call_account(accounts: &Accounts, account: &Account, tool: &str, args: &Value) -> Result<Value, ToolError> {
     let handle = module(accounts, account)?;
     let json = within(&account.module, handle.call(&account.module_account, tool, &args.to_string())).await?;
     let mut result = shared::parse(tool, &json)?;
+    drop_unreadable(accounts, &account.id, tool, &mut result)?;
     if let Some(limit) = args.get("limit").and_then(Value::as_u64).and_then(|limit| usize::try_from(limit).ok()) {
         for key in ["items", "examples"] {
             if let Some(list) = result.get_mut(key).and_then(Value::as_array_mut) {
@@ -209,12 +272,16 @@ async fn call_account(accounts: &Accounts, account: &Account, tool: &str, args: 
 }
 
 /// Asks every account at once, each under the call limit; an account that fails or is not online
-/// becomes an entry in `errors` and the others still answer.
+/// becomes an entry in `errors` and the others still answer. An account the agent may not read is
+/// left out without an entry.
 async fn fan_out(accounts: &Arc<Accounts>, tool: &str, args: &Value) -> Result<Value, ToolError> {
     let mut calls = JoinSet::new();
     let mut errors = Vec::new();
     let list = accounts.list().map_err(failed)?.into_iter().filter(|account| account.state != REMOVING);
     for (index, account) in list.enumerate() {
+        if !permissions::readable_anywhere(&accounts.store(), &account.id).map_err(failed)? {
+            continue;
+        }
         if let Err(err) = module(accounts, &account) {
             errors.push((index, account.id, err.to_string()));
             continue;
@@ -256,7 +323,7 @@ async fn fan_out(accounts: &Arc<Accounts>, tool: &str, args: &Value) -> Result<V
 
 /// The module fetches the bytes; the core writes the file (spec 8.5).
 async fn get_attachment(accounts: &Arc<Accounts>, id: &str, args: &Value) -> Result<Value, ToolError> {
-    let account = find(accounts, id)?;
+    let account = readable(accounts, id, args)?;
     let handle = module(accounts, &account)?;
     let arg = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
     let attachment =

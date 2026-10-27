@@ -67,6 +67,28 @@ impl std::fmt::Debug for Attachment {
     }
 }
 
+/// Mirrors `participant` in `wit/module.wit`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Participant {
+    pub id: String,
+    pub display_name: String,
+}
+
+/// Mirrors `target` in `wit/module.wit`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Target {
+    pub conversation_title: String,
+    pub participants: Vec<Participant>,
+    pub target_text: Option<String>,
+}
+
+// Hand-written so that a `{:?}` never prints names or text.
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target").field("participants", &self.participants.len()).finish_non_exhaustive()
+    }
+}
+
 /// Mirrors `session-state` in `wit/module.wit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -327,6 +349,14 @@ impl ModuleHandle {
     pub async fn get_attachment(&self, account: &str, conversation: &str, message: &str, attachment: &str) -> Result<Attachment, HostError> {
         let ids = [account, conversation, message, attachment].map(str::to_string);
         self.request(|reply| Request::GetAttachment { ids, reply }).await
+    }
+
+    /// What a write in `conversation` would be about (`message`: the one replied to, edited or
+    /// reacted to), for its approval.
+    pub async fn describe_target(&self, account: &str, conversation: &str, message: Option<&str>) -> Result<Target, HostError> {
+        let ids = [account, conversation].map(str::to_string);
+        let message = message.map(str::to_string);
+        self.request(|reply| Request::DescribeTarget { ids, message, reply }).await
     }
 }
 
