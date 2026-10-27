@@ -1,17 +1,19 @@
 //! The `om` command line.
 //!
-//! Besides `om daemon` and `om mcp-command`, every command is a tool from the daemon's registry:
-//! `om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]`. The CLI asks the running
-//! daemon which tools exist, so the CLI and MCP always offer the same tools.
+//! Besides `om daemon`, `om mcp-command` and `om mcp-stdio`, every command is a tool from the
+//! daemon's registry: `om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]`. The CLI
+//! asks the running daemon which tools exist, so the CLI and MCP always offer the same tools.
 
 use std::io::Write as _;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use reqwest::StatusCode;
 use serde_json::{Map, Value};
 
+use crate::bridge::{self, Locate};
 use crate::daemon::{self, LAST_START_ERROR_FILE};
 use crate::instance::InstanceLock;
 use crate::store::{DEFAULT_PORT, Store};
@@ -31,6 +33,9 @@ enum Action {
     Daemon,
     /// Print the command that connects Claude Code to open_mess. It contains the local API token.
     McpCommand,
+    /// Serve MCP on stdin and stdout for a Claude Code session with channels, forwarding to the
+    /// daemon: trigger notifications reach the session this way.
+    McpStdio,
     /// A tool: om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]
     #[command(external_subcommand)]
     Tool(Vec<String>),
@@ -91,6 +96,7 @@ pub fn run() -> ExitCode {
     let result = match cli.command {
         Action::Daemon => daemon::run().map_err(|err| failed(err.to_string())),
         Action::McpCommand => mcp_command(),
+        Action::McpStdio => mcp_stdio(),
         Action::Tool(args) => run_tool(&args),
     };
     match result {
@@ -109,6 +115,21 @@ fn mcp_command() -> Result<(), Failure> {
         std::io::stdout(),
         "claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\""
     ))
+}
+
+/// `om mcp-stdio` (bridge.rs): runs until Claude Code closes the session.
+fn mcp_stdio() -> Result<(), Failure> {
+    let locate: Locate = Arc::new(|| {
+        // As for a tool call: after a failed start, whatever holds the port may be another program.
+        if last_start_error().is_some() && !daemon_holds_the_lock() {
+            return Err(not_running().message);
+        }
+        let (port, token) = (port().map_err(|failure| failure.message)?, token().map_err(|failure| failure.message)?);
+        Ok((format!("http://127.0.0.1:{port}/mcp"), token))
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?;
+    let stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    runtime.block_on(bridge::serve(stdio, locate)).map_err(failed)
 }
 
 /// Output goes through writeln!, never println!, which panics when stdout is closed. A reader that

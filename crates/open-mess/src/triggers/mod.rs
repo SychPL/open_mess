@@ -1,11 +1,13 @@
 //! Triggers (spec 8.7): rules that wake an agent when someone writes to the user. The engine
 //! (engine.rs) matches the event bus against the rules (rules.rs), batches and rate-limits, and
-//! hands each batch to its rule's action ([`Actions`]): a program started for it (spawn.rs).
+//! hands each batch to its rule's action ([`Actions`]): a notification into an open Claude Code
+//! session (channel.rs), or a program started for it (spawn.rs).
 //!
 //! What an agent gets of a batch ([`payload`]) keeps metadata (account, conversation, kind, ids,
 //! times, counts) apart from other people's content (sender names, text), which sits only under
 //! `untrusted`, with the shared tools' notice (spec 8.5).
 
+pub mod channel;
 pub mod engine;
 pub mod rules;
 pub mod spawn;
@@ -19,6 +21,7 @@ use serde_json::{Value, json};
 use crate::accounts::Accounts;
 use crate::pending;
 use crate::tools::{self, shared};
+use channel::Sessions;
 use engine::{Batch, Delivery, DeliveryResult};
 use rules::{Action, Rule};
 use spawn::Runs;
@@ -29,6 +32,7 @@ pub const MAX_PAYLOAD: usize = 1024 * 1024;
 /// The daemon's actions, behind the engine.
 pub struct Actions {
     pub accounts: Arc<Accounts>,
+    pub sessions: Sessions,
     pub runs: Arc<Runs>,
 }
 
@@ -37,7 +41,8 @@ impl Delivery for Actions {
         fill_in_content(&self.accounts, &mut batch).await;
         match &rule.action {
             Action::Spawn(program) => spawn::deliver(&self.runs, &rule.id, program, &batch),
-            // ponytail: no channel notifications yet, so there is never a session to notify.
+            Action::Channel { .. } if channel::deliver(&self.sessions, &rule.id, &batch).await => DeliveryResult::Delivered,
+            // No session: the rule's program instead, if it has one (spec 8.7).
             Action::Channel { fallback_spawn: Some(program) } => spawn::deliver(&self.runs, &rule.id, program, &batch),
             Action::Channel { fallback_spawn: None } => DeliveryResult::NoSession,
         }

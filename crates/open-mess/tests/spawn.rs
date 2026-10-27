@@ -189,7 +189,8 @@ async fn actions_fill_in_content() {
     d.accounts.add("test-echo", info("a")).unwrap();
     let out = d.dir.path().join("out.json");
     let rule = Rule::new("r1", "test-echo:a", Condition::Direct, Action::Spawn(recorder(&out, &[])));
-    let actions = Actions { accounts: Arc::clone(&d.accounts), runs: Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT) };
+    let runs = Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT);
+    let actions = Actions { accounts: Arc::clone(&d.accounts), sessions: Default::default(), runs };
     assert_eq!(actions.deliver(rule, batch(vec![message("m1", None)])).await, DeliveryResult::Delivered);
     wait_for("the run", || out.exists()).await;
     let stdin: Value = serde_json::from_str(read(&out)["stdin"].as_str().unwrap()).unwrap();

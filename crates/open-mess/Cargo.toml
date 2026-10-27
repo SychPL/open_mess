@@ -37,7 +37,13 @@ keyring-core = "1.0.1"
 open-mess-host = { path = "../open-mess-host" }
 # Talks only to http://127.0.0.1: no TLS, no system proxy.
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
-rmcp = { version = "3.7.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+# The MCP server on /mcp, and `om mcp-stdio`, a client of it.
+rmcp = { version = "3.7.0", default-features = false, features = [
+    "client",
+    "server",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+] }
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 # Cargo unifies reqwest features across the workspace, and the module host builds it with
 # rustls-no-provider; every reqwest client then needs a process-wide crypto provider.
@@ -47,7 +53,7 @@ serde_json = "1.0.154"
 # Module files and manifests are approved by their SHA-256.
 sha2 = "0.10.9"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 # The `Show all` dialog of an approval.
@@ -61,7 +67,6 @@ winreg = "0.56.0"
 [dev-dependencies]
 # Short call limits, so the tests of slow and crashing modules finish quickly.
 open-mess-host = { path = "../open-mess-host", features = ["test-support"] }
-rmcp = { version = "3.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["sync", "test-util"] }
 

@@ -73,7 +73,8 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, String, 
         // Inside the runtime: the engine spawns its tasks there.
         let _entered = runtime.enter();
         // Files of runs a daemon that stopped left behind are deleted here (spec 8.7, R6).
-        let actions = Actions { accounts: Arc::clone(&accounts), runs: Runs::new(dir.join("runs"), spawn::RUN_TIMEOUT) };
+        let runs = Runs::new(dir.join("runs"), spawn::RUN_TIMEOUT);
+        let actions = Actions { accounts: Arc::clone(&accounts), sessions: registry.channel_sessions().clone(), runs };
         let counters = registry.trigger_counters().clone();
         triggers::engine::spawn(&bus, Arc::clone(&accounts), Arc::new(actions), counters, || chrono::Local::now().time());
     }

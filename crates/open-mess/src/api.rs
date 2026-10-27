@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::Json;
 use axum::Router;
@@ -20,7 +20,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerConfig, Tool,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -29,6 +29,7 @@ use tokio::net::TcpListener;
 
 use crate::Error;
 use crate::tools::{Registry, ToolError, ToolInfo};
+use crate::triggers::channel;
 
 /// Binds `127.0.0.1:<port>`. A taken port is [`Error::PortInUse`]; there is no fallback port.
 pub async fn bind(port: u16) -> Result<TcpListener, Error> {
@@ -51,7 +52,7 @@ pub async fn serve(
     let mcp = StreamableHttpService::new(
         {
             let registry = Arc::clone(&registry);
-            move || Ok(McpServer { registry: Arc::clone(&registry) })
+            move || Ok(McpServer { registry: Arc::clone(&registry), channel: Arc::default() })
         },
         Arc::new(LocalSessionManager::default()),
         mcp_config,
@@ -119,19 +120,44 @@ fn error_response(status: StatusCode, message: String) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
-/// The MCP face of the registry: `tools/list` and `tools/call` delegate to it unchanged.
+/// The MCP face of the registry: `tools/list` and `tools/call` delegate to it unchanged. One per
+/// MCP session.
 #[derive(Clone)]
 struct McpServer {
     registry: Arc<Registry>,
+    /// The session's id among the channel sessions, when its client declared the capability
+    /// (triggers/channel.rs).
+    channel: Arc<OnceLock<u64>>,
+}
+
+impl McpServer {
+    /// Notes a request: trigger notifications go to the most recently active session.
+    fn touch(&self) {
+        if let Some(id) = self.channel.get() {
+            self.registry.channel_sessions().touch(*id);
+        }
+    }
 }
 
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_experimental_with(channel::capability()).enable_tools().build())
             .with_server_info(Implementation::new("open_mess", env!("CARGO_PKG_VERSION")))
+            .with_instructions(channel::INSTRUCTIONS)
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        let declared = context
+            .peer
+            .peer_info()
+            .is_some_and(|info| info.capabilities.experimental.as_ref().is_some_and(|experimental| experimental.contains_key(channel::CAPABILITY)));
+        if declared {
+            let _ = self.channel.set(self.registry.channel_sessions().register(context.peer));
+        }
     }
 
     async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
+        self.touch();
         let tools = self
             .registry
             .list()
@@ -148,6 +174,7 @@ impl ServerHandler for McpServer {
     }
 
     async fn call_tool(&self, request: CallToolRequestParams, _context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+        self.touch();
         let args = Value::Object(request.arguments.unwrap_or_default());
         match self.registry.call(&request.name, args).await {
             Ok(result) => Ok(CallToolResult::structured(result).into()),

@@ -38,6 +38,12 @@ claude mcp add --transport http --scope user open_mess http://127.0.0.1:7341/mcp
 The token is generated at the daemon's first start and kept in Windows Credential Manager. It is
 shown only by `om mcp-command`; keep it to yourself, since anything holding it can use the tools.
 
+Trigger notifications reach a Claude Code session through Claude Code's channels, which take them
+only from MCP servers it starts over stdio. For such a session, add open_mess as `om mcp-stdio`,
+which forwards everything to the daemon, and start Claude Code with that server's channel enabled
+(during Claude Code's research preview of channels: `--dangerously-load-development-channels
+server:<name>`).
+
 ## Why
 
 Agent integrations for messengers today are bolted onto other apps: you copy tokens out of a
