@@ -204,6 +204,7 @@ async function renderIntegrations() {
       for (const [label, command] of [["Claude Code", commands.claude], ["Codex", commands.codex]]) {
         shown.append(el("h2", label), el("pre", command, "content-text"), button("Kopiuj", () => navigator.clipboard.writeText(command)));
       }
+      shown.append(el("p", "setx zapisuje token dla nowych okien terminala: uruchom Codex w nowym oknie.", "muted"));
     }),
   );
   root.append(shown);

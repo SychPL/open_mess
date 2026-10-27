@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use open_mess_host::limits::CALL_TIMEOUT;
-use open_mess_host::{HostError, ModuleError, Target};
+use open_mess_host::{HostError, ModuleError, ModuleHandle, Target};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -206,7 +206,7 @@ impl Pending {
         match write {
             Write::Never => Err(ToolError::NotAllowed("writing to this conversation is not allowed".into())),
             Write::Autonomous => {
-                let action = self.insert(&account, conversation, kind, &args, "", State::Approved)?;
+                let action = self.insert(&account, conversation, kind, &args, "", State::Approved, None)?;
                 let (state, detail) = self.execute(&action).await.map_err(failed)?;
                 Ok(Outcome { action, state, detail })
             }
@@ -214,8 +214,9 @@ impl Pending {
                 if self.count_waiting(&account.id)? >= MAX_WAITING {
                     return Err(too_many());
                 }
-                let target = describe(&self.accounts, &account, conversation, kind.message(&args)).await?;
-                let action = self.insert(&account, conversation, kind, &args, &fingerprint(&target), State::Waiting)?;
+                let handle = module(&self.accounts, &account)?;
+                let target = within(&account.module, handle.describe_target(&account.module_account, conversation, kind.message(&args))).await?;
+                let action = self.insert(&account, conversation, kind, &args, &fingerprint(&target), State::Waiting, Some(&handle))?;
                 self.previews().push(preview(&action, kind, &account, &args, target));
                 self.changed.send_replace(());
                 Ok(Outcome { action, state: State::Waiting, detail: None })
@@ -233,12 +234,30 @@ impl Pending {
         Ok(count)
     }
 
-    /// Stores a new action; a waiting one only while the account has fewer than [`MAX_WAITING`].
-    fn insert(&self, account: &Account, conversation: &str, kind: Kind, args: &Value, fingerprint: &str, state: State) -> Result<String, ToolError> {
+    /// Stores a new action; a waiting one only while the account has fewer than [`MAX_WAITING`],
+    /// and only while `described_by`, the module that described it for its approval, is still the
+    /// account's module.
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &self,
+        account: &Account,
+        conversation: &str,
+        kind: Kind,
+        args: &Value,
+        fingerprint: &str,
+        state: State,
+        described_by: Option<&ModuleHandle>,
+    ) -> Result<String, ToolError> {
         let action = new_id()?;
-        let inserted = self
-            .accounts
-            .store()
+        // Checked under the store lock, which a module swap holds while it expires the waiting
+        // actions (Accounts::rescan_modules): no action described by the old module is stored
+        // after that.
+        let store = self.accounts.store();
+        let replaced = |handle: &ModuleHandle| !self.accounts.modules().handle(&account.module).is_some_and(|current| current.same(handle));
+        if described_by.is_some_and(replaced) {
+            return Err(ToolError::Module(format!("module {} was replaced while the action was prepared - try again", account.module)));
+        }
+        let inserted = store
             .conn()
             .execute(
                 "INSERT INTO pending (id, account, conversation, kind, args, fingerprint, state, created_ms)
@@ -251,7 +270,7 @@ impl Pending {
             return Err(too_many());
         }
         // Best effort: the action is stored, and the next one tries again.
-        let _ = self.accounts.store().conn().execute(
+        let _ = store.conn().execute(
             "DELETE FROM pending WHERE rowid IN (SELECT rowid FROM pending WHERE account = ?1 AND state NOT IN ('waiting', 'approved')
              ORDER BY state = 'uncertain' DESC, created_ms DESC, rowid DESC LIMIT -1 OFFSET ?2)",
             rusqlite::params![account.id, MAX_KEPT],
