@@ -113,6 +113,20 @@ async fn code_budget_expires_as_timed_out() {
 }
 
 #[tokio::test]
+async fn cancel_is_kept_when_the_code_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (echo, signing_in, mut prompts) = sign_in_with(dir.path(), "qr-refresh", Duration::from_secs(30)).await;
+    // The user cancels the first code before the module shows the second one.
+    let (_, first) = prompts.recv().await.unwrap();
+    first.send(SignInReply::Cancelled).unwrap();
+    let (_second, _reply) = prompts.recv().await.unwrap();
+    // The module's polls still learn of the cancel.
+    let result = signing_in.await.unwrap();
+    assert!(matches!(&result, Err(HostError::Module(ModuleError::Platform(why))) if why == "sign-in cancelled"), "{result:?}");
+    assert_eq!(echo.state(), ModuleState::Running);
+}
+
+#[tokio::test]
 async fn cancel_stops_a_module_that_keeps_showing_codes() {
     let dir = tempfile::tempdir().unwrap();
     let (_echo, signing_in, mut prompts) = sign_in_with(dir.path(), "qr-loop", Duration::from_secs(30)).await;

@@ -178,8 +178,9 @@ impl SignIns {
         self.state().question.as_ref().map(|question| (question.id, question.host.clone()))
     }
 
-    /// The user's answer to prompt or question `id`. A prompt goes off the screen, and a cancel
-    /// cancels the rest of the sign-in too; a question is answered yes by anything but a cancel.
+    /// The user's answer to prompt or question `id`. A prompt goes off the screen, and a cancel or
+    /// refusal cancels the rest of the sign-in too; a question is answered yes by anything but a
+    /// cancel.
     pub fn answer(&self, id: u64, reply: SignInReply) -> Result<(), String> {
         let shown = {
             let mut state = self.state();
@@ -192,7 +193,8 @@ impl SignIns {
             if state.shown.as_ref().is_none_or(|shown| shown.id != id) {
                 return Err(GONE.into());
             }
-            state.cancelled |= reply == SignInReply::Cancelled;
+            // A cancel, or a refusal (a sign-in page host the user did not allow), ends the sign-in.
+            state.cancelled |= matches!(reply, SignInReply::Cancelled | SignInReply::Refused(_));
             match state.take_shown() {
                 Some(shown) => shown,
                 None => return Err(GONE.into()),

@@ -259,6 +259,12 @@ async fn unknown_sign_in_host_asks_and_remembers() {
     assert!(!asking.await.unwrap());
     assert!(matches!(answer.await, Ok(SignInReply::Refused(_))));
     assert_eq!(approved("test-echo"), ["login.contoso-adfs.example"]);
+    // The refusal ends the sign-in: a module that opens the page again is cancelled at once.
+    let (reply, retried) = oneshot::channel();
+    let (url, redirect_prefix) = ("https://login.example.com/start".into(), "https://login.example.com/done".into());
+    state.sign_ins.offer(SignInRequest::OpenPage { module: "test-echo".into(), url, redirect_prefix }, reply);
+    assert_eq!(retried.await, Ok(SignInReply::Cancelled));
+    assert!(state.sign_ins.shown().is_none());
 }
 
 #[tokio::test]

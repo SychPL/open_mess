@@ -141,6 +141,9 @@ mod window {
                         );
                         tauri::async_runtime::spawn(async move {
                             if unknown_host(&sign_ins, &accounts, page, &module, &host).await {
+                                // ponytail: the page is loaded anew with GET, so a form POST to the
+                                // new host is not repeated (the user sends it again); federated
+                                // sign-in hands over with GET redirects.
                                 approved.lock().unwrap_or_else(PoisonError::into_inner).push(host);
                                 if let Some(window) = handle.get_webview_window(&label(page)) {
                                     let _ = window.navigate(url);

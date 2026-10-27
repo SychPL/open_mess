@@ -23,7 +23,8 @@
 //! `sign-in-with` `{"how": "windows"}` it signs in account "windows" with a WAM token for the
 //! manifest's identity (the Teams client id; for the manual check only) instead, and after
 //! `{"how": "device-code"}` it shows a device code and polls `http.fetch` until the host refuses
-//! with "sign-in ...", which it returns as a platform error; `{"how": "qr-loop"}` shows QR codes
+//! with "sign-in ...", which it returns as a platform error (`{"how": "qr-refresh"}` the same after a
+//! QR code replaced once); `{"how": "qr-loop"}` shows QR codes
 //! forever without polling (a misbehaving module); and after `{"how": "microsoft"}` its
 //! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
@@ -187,6 +188,24 @@ mod guest {
         }
     }
 
+    /// Polls, as a device-code sign-in would, until the host says the code is abandoned.
+    fn poll_until_abandoned() -> types::ModuleError {
+        loop {
+            let poll = http::Request {
+                method: "POST".to_string(),
+                url: "https://login.example.com/token".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            if let Err(http::HttpError::Blocked(why)) = http::fetch(&poll)
+                && why.starts_with("sign-in")
+            {
+                return types::ModuleError::Platform(why);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// A JSON value the module stored under `key`, else null.
     fn stored(key: &str) -> Value {
         storage::get(key).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
@@ -212,32 +231,26 @@ mod guest {
         }
 
         fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
-            if storage::get("sign-in-with").as_deref() == Some(b"device-code") {
-                // Polls, as a device-code sign-in would, until the host says the code is abandoned.
+            let how = storage::get("sign-in-with").unwrap_or_default();
+            if how == b"device-code" {
                 sign_in::show_device_code("WXYZ-5678", "https://login.example.com/device");
-                loop {
-                    let poll = http::Request {
-                        method: "POST".to_string(),
-                        url: "https://login.example.com/token".to_string(),
-                        headers: Vec::new(),
-                        body: Vec::new(),
-                    };
-                    if let Err(http::HttpError::Blocked(why)) = http::fetch(&poll)
-                        && why.starts_with("sign-in")
-                    {
-                        return Err(types::ModuleError::Platform(why));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
+                return Err(poll_until_abandoned());
             }
-            if storage::get("sign-in-with").as_deref() == Some(b"qr-loop") {
+            if how == b"qr-refresh" {
+                // A code that is replaced once before the module polls.
+                sign_in::show_qr("otpauth://open-mess-test/1");
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                sign_in::show_qr("otpauth://open-mess-test/2");
+                return Err(poll_until_abandoned());
+            }
+            if how == b"qr-loop" {
                 // Misbehaves: shows a new QR code every 100 ms and never stops.
                 loop {
                     sign_in::show_qr("otpauth://open-mess-test");
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
-            if storage::get("sign-in-with").as_deref() == Some(b"windows") {
+            if how == b"windows" {
                 // The manual check of WAM: only the token's length is logged.
                 let token =
                     sign_in::wam_token(&[CHAT_SCOPE.to_string()], false, None).map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
@@ -246,8 +259,8 @@ mod guest {
             }
             sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
             // The manual check of the sign-in window opens Microsoft's real sign-in page.
-            let (start, redirect) = match storage::get("sign-in-with").as_deref() {
-                Some(b"microsoft") => ("https://login.microsoftonline.com/", "https://login.microsoftonline.com/common/oauth2/nativeclient"),
+            let (start, redirect) = match how.as_slice() {
+                b"microsoft" => ("https://login.microsoftonline.com/", "https://login.microsoftonline.com/common/oauth2/nativeclient"),
                 _ => ("https://login.example.com/start", "https://login.example.com/done"),
             };
             let url = sign_in::open_page(start, redirect).map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;

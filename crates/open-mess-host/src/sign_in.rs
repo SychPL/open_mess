@@ -138,6 +138,8 @@ pub(crate) struct CodeShown {
     answer: Option<oneshot::Receiver<SignInReply>>,
     /// When the budget runs out.
     until: Instant,
+    /// Why the code wait ended (cancelled, timed out), for every later fetch of the call.
+    ended: Option<&'static str>,
 }
 
 /// After a code's budget, a module that still polls (fetch is refused by then) has this long
@@ -308,11 +310,11 @@ impl HostState {
         // The budget is the code wait's, not each code's: a module that shows code after code gets
         // no more time, and none at all once the user cancelled.
         let now = Instant::now();
-        let abandoned = self.code_abandoned().is_some();
+        let ended = self.code_abandoned();
         self.code_done();
         let Ok(prompts) = self.prompts() else { return };
         let until = match &self.code_shown {
-            _ if abandoned => now,
+            _ if ended.is_some() => now,
             Some(shown) => shown.until,
             None => now + prompts.budget,
         };
@@ -320,7 +322,7 @@ impl HostState {
         if answer.is_some() {
             self.deadline.pause_until(until + CODE_GRACE);
         }
-        self.code_shown = Some(CodeShown { answer, until });
+        self.code_shown = Some(CodeShown { answer, until, ended });
     }
 
     /// The module moved on from a code on screen: the clock runs again.
@@ -332,16 +334,21 @@ impl HostState {
         }
     }
 
-    /// Why the module should stop polling for the code on screen: the user cancelled it (or the
-    /// sign-in ended), or its budget ran out. The clock runs again from then on.
+    /// Why the module should stop polling for its codes: the user cancelled (or the sign-in
+    /// ended), or the budget ran out. The clock runs again from then on, and the answer stays for
+    /// the rest of the call.
     pub(crate) fn code_abandoned(&mut self) -> Option<&'static str> {
         let shown = self.code_shown.as_mut()?;
+        if shown.ended.is_some() {
+            return shown.ended;
+        }
         let answer = shown.answer.as_mut()?;
         let why = match answer.try_recv() {
             Err(oneshot::error::TryRecvError::Empty) if Instant::now() < shown.until => return None,
             Err(oneshot::error::TryRecvError::Empty) => "sign-in timed out",
             _ => "sign-in cancelled",
         };
+        shown.ended = Some(why);
         self.code_done();
         Some(why)
     }
