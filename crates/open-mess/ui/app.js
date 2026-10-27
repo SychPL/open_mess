@@ -855,8 +855,9 @@ for (const node of document.querySelectorAll("#menu button")) {
 // Asked for by the notice that several actions wait, on an open window.
 window.addEventListener("show-waiting", () => show("waiting"));
 
-// Actions waiting for approval come first; otherwise the accounts.
+// Actions waiting for approval come first; otherwise the accounts. Not over a section the user
+// picked meanwhile.
 call("waiting")
-  .then((waiting) => show(waiting.length > 0 ? "waiting" : "accounts"))
-  .catch(() => show("accounts"));
+  .then((waiting) => current === null && show(waiting.length > 0 ? "waiting" : "accounts"))
+  .catch(() => current === null && show("accounts"));
 renderSignIn().catch(showError);
