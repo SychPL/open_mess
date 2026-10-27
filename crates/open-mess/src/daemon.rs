@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{Engine, ModuleContext, Net};
+use open_mess_host::{Engine, ModuleContext, Net, SignInPrompts};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -21,6 +21,7 @@ use crate::store::Store;
 use crate::tools::Registry;
 use crate::triggers::spawn::{self, Runs};
 use crate::triggers::{self, Actions};
+use crate::ui::sign_in::SignIns;
 use crate::ui::{Opener, UiState};
 use crate::{Error, api, approval, paths, secrets, ui};
 
@@ -96,8 +97,14 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, Registry
     // One engine for the process; the modules keep it for loading files again.
     let engine = Engine::new()?;
     let (events, host_events) = mpsc::channel(EVENT_QUEUE);
+    let (prompts, sign_in_prompts) = mpsc::channel(SIGN_IN_QUEUE);
     let data_dir = dir.to_path_buf();
-    let ctx = move |_: &str| ModuleContext { data_dir: data_dir.clone(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
+    let ctx = move |_: &str| ModuleContext {
+        data_dir: data_dir.clone(),
+        events: events.clone(),
+        net: Net::new(AddressPolicy::Strict),
+        sign_in: SignInPrompts::new(prompts.clone()),
+    };
     let modules = runtime.block_on(Modules::scan(&store, &engine, &dir.join("modules"), ctx))?;
     // After the local API token: from here on keyring-core's default store is the platform one.
     let credentials = open_mess_host::credential_store().map_err(|why| Error::Secrets(keyring_core::Error::PlatformFailure(why.into())))?;
@@ -115,6 +122,8 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, Registry
         triggers::engine::spawn(&bus, Arc::clone(&accounts), Arc::new(actions), counters, || chrono::Local::now().time());
     }
     runtime.spawn(bus.forward(host_events, Arc::clone(&accounts)));
+    let sign_ins = SignIns::default();
+    runtime.spawn(sign_ins.clone().forward(sign_in_prompts));
     // Sessions come back in the background; the tools answer meanwhile.
     runtime.spawn({
         let accounts = Arc::clone(&accounts);
@@ -126,11 +135,14 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, Registry
     pending.recover()?;
     runtime.spawn(Arc::clone(&pending).sweep());
     approval::start(&runtime, Arc::clone(&pending));
-    Ok((runtime, listener, registry, UiState { accounts, pending, started, port, token }))
+    let (counters, sessions) = (registry.trigger_counters().clone(), registry.channel_sessions().clone());
+    Ok((runtime, listener, registry, UiState { accounts, pending, started, port, token, sign_ins, counters, sessions }))
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.
 const EVENT_QUEUE: usize = 256;
+/// Sign-in prompts waiting for the window's side; only one module signs in at a time.
+const SIGN_IN_QUEUE: usize = 8;
 
 async fn ctrl_c() {
     // Without a Ctrl+C handler the daemon runs until it is killed, rather than stopping at once.

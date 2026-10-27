@@ -7,12 +7,15 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use open_mess_host::Manifest;
-use serde::Serialize;
+use open_mess_host::{Manifest, SignInReply, SignInRequest};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::UiState;
+use crate::accounts::Account;
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
+use crate::triggers::RuleCounters;
+use crate::triggers::rules::{self, Rule};
 use crate::{approval, cli, permissions};
 
 /// Why an approval is refused when the file on disk is not the one the window showed.
@@ -74,22 +77,18 @@ pub struct AccountDto {
 
 pub fn accounts(state: &UiState) -> Result<Vec<AccountDto>, String> {
     let modules = state.accounts.modules().list();
-    let platform = |module: &str| {
-        modules.iter().find(|info| info.name == module && info.state != ModuleState::PendingReplacement).map(|info| info.platform.clone())
-    };
-    Ok(state
-        .accounts
-        .list()
-        .map_err(text)?
-        .into_iter()
-        .map(|account| AccountDto {
-            platform: platform(&account.module),
-            state: state.accounts.effective_state(&account),
-            id: account.id,
-            module: account.module,
-            display_name: account.display_name,
-        })
-        .collect())
+    Ok(state.accounts.list().map_err(text)?.into_iter().map(|account| account_dto(state, &modules, account)).collect())
+}
+
+fn account_dto(state: &UiState, modules: &[ModuleInfo], account: Account) -> AccountDto {
+    let platform = modules.iter().find(|info| info.name == account.module && info.state != ModuleState::PendingReplacement);
+    AccountDto {
+        platform: platform.map(|info| info.platform.clone()),
+        state: state.accounts.effective_state(&account),
+        id: account.id,
+        module: account.module,
+        display_name: account.display_name,
+    }
 }
 
 /// Removes an account with its secrets, data and waiting actions (spec 8.8); their toasts close.
@@ -448,3 +447,225 @@ pub fn mcp_command(state: &UiState) -> McpCommandsDto {
         ),
     }
 }
+
+/// A module's sign-in prompt, as the window shows it.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignInPromptDto {
+    /// What [`sign_in_answer`] names.
+    pub id: u64,
+    /// `device-code`, `qr`, `page`, `wam-pick` or `ask-host` (the sign-in page went on to the host
+    /// in `url`: may it?).
+    pub kind: &'static str,
+    pub module: String,
+    pub code: Option<String>,
+    /// Where the device code is entered; the host of a sign-in page or of the question.
+    pub url: Option<String>,
+    /// The QR code, as an SVG image.
+    pub qr_svg: Option<String>,
+    /// The Windows accounts to pick from.
+    pub accounts: Vec<WamAccountDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WamAccountDto {
+    /// What the answer names.
+    pub id: String,
+    pub user_name: String,
+    /// The organization's id, to tell apart one user name in several organizations.
+    pub tenant: String,
+}
+
+/// The window's answer to a sign-in prompt: `{"done": value}` or `"cancelled"`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerDto {
+    Done(Option<String>),
+    Cancelled,
+}
+
+/// Signs in an account of `module` (`Dodaj konto`), or `account` again (`Zaloguj ponownie`), from
+/// the window only (spec 8.8); the module's prompts reach the window meanwhile. Returns the account.
+pub async fn sign_in_start(state: &UiState, module: &str, account: Option<&str>) -> Result<AccountDto, String> {
+    let _active = state.sign_ins.begin(module)?;
+    let account = state.accounts.sign_in(module, account).await.map_err(text)?;
+    Ok(account_dto(state, &state.accounts.modules().list(), account))
+}
+
+/// The sign-in prompt waiting for the user, if any.
+pub fn sign_in_request(state: &UiState) -> Option<SignInPromptDto> {
+    let (id, request) = state.sign_ins.shown()?;
+    let module = request.module().to_owned();
+    // The sign-in page went on to a host that is not approved: the window asks first.
+    if let Some((id, host)) = state.sign_ins.question() {
+        return Some(SignInPromptDto { id, kind: "ask-host", module, code: None, url: Some(host), qr_svg: None, accounts: Vec::new() });
+    }
+    let dto = |kind| SignInPromptDto { id, kind, module, code: None, url: None, qr_svg: None, accounts: Vec::new() };
+    Some(match request {
+        SignInRequest::DeviceCode { code, url, .. } => SignInPromptDto { code: Some(code), url: Some(url), ..dto("device-code") },
+        SignInRequest::Qr { data, .. } => SignInPromptDto { qr_svg: qr_svg(&data), ..dto("qr") },
+        SignInRequest::OpenPage { url, .. } => SignInPromptDto { url: Some(host_of(&url)), ..dto("page") },
+        SignInRequest::WamPick { accounts, .. } => SignInPromptDto {
+            accounts: accounts
+                .into_iter()
+                .map(|account| WamAccountDto { id: account.id, user_name: account.user_name, tenant: account.tenant })
+                .collect(),
+            ..dto("wam-pick")
+        },
+        // Answered by the daemon, never shown.
+        SignInRequest::WamWindow { .. } => return None,
+    })
+}
+
+/// The QR code of `data` as an SVG image; None when it does not fit in one.
+fn qr_svg(data: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    Some(code.render::<qrcode::render::svg::Color<'_>>().min_dimensions(240, 240).build())
+}
+
+/// The host of a URL, for the window to name; the URL itself when it has none.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_owned()
+}
+
+/// The user's answer to sign-in prompt `id`. A sign-in page is answered only by the page itself
+/// (its redirect); the window can only cancel it.
+pub fn sign_in_answer(state: &UiState, id: u64, answer: AnswerDto) -> Result<(), String> {
+    let reply = match answer {
+        AnswerDto::Cancelled => SignInReply::Cancelled,
+        AnswerDto::Done(_) if matches!(state.sign_ins.shown(), Some((shown, SignInRequest::OpenPage { .. })) if shown == id) => {
+            return Err("stronę logowania można tylko anulować".into());
+        }
+        AnswerDto::Done(value) => SignInReply::Done(value),
+    };
+    state.sign_ins.answer(id, reply)
+}
+
+/// Opens the verification page of device-code prompt `id` in the default browser. Only that
+/// page: the window opens nothing else.
+pub fn sign_in_open_link(state: &UiState, id: u64) -> Result<(), String> {
+    let url = match state.sign_ins.shown() {
+        Some((shown, SignInRequest::DeviceCode { url, .. })) if shown == id => url,
+        _ => return Err(super::sign_in::GONE.into()),
+    };
+    if !url.starts_with("https://") || url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') {
+        return Err("moduł podał nieprawidłowy adres strony logowania".into());
+    }
+    open_in_browser(&url)
+}
+
+#[cfg(windows)]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    // Explorer hands an https URL to the default browser; no shell parses it.
+    std::process::Command::new("explorer.exe").arg(url).spawn().map(drop).map_err(text)
+}
+
+#[cfg(not(windows))]
+fn open_in_browser(_url: &str) -> Result<(), String> {
+    Err(crate::Error::NoWindow.to_string())
+}
+
+/// A trigger rule as the window edits it (spec 8.7): the rule's own fields, flattened.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleDto {
+    /// 1-64 characters, made by the window for a new rule.
+    pub id: String,
+    pub account: String,
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub rule: Rule,
+}
+
+/// A rule with what happened to its batches since the daemon started.
+#[derive(Clone, Debug, Serialize)]
+pub struct RuleViewDto {
+    #[serde(flatten)]
+    pub rule: RuleDto,
+    pub counters: RuleCounters,
+}
+
+/// What the window shows when a rule wakes agents that may write on their own (spec 8.7).
+pub const AUTONOMOUS_RULE: &str = "Agenci obudzeni przez tę regułę mogą wysyłać, poprawiać i reagować bez Twojej zgody, bo konto albo rozmowa, której dotyczy, ma pisanie \"samodzielnie\". Ustaw \"z potwierdzeniem\" w sekcji Uprawnienia agentów, jeśli mają pytać.";
+
+/// Every trigger rule, oldest first, with its counters.
+pub fn rules(state: &UiState) -> Result<Vec<RuleViewDto>, String> {
+    let rules = rules::list(&state.accounts.store()).map_err(text)?;
+    Ok(rules
+        .into_iter()
+        .map(|rule| RuleViewDto {
+            counters: state.counters.rule(&rule.id),
+            rule: RuleDto { id: rule.id.clone(), account: rule.account.clone(), enabled: rule.enabled, rule },
+        })
+        .collect())
+}
+
+/// Saves a rule, new or changed, for an account open_mess has. Returns the warning about agents
+/// that may write on their own; the rule is saved anyway.
+pub fn put_rule(state: &UiState, dto: RuleDto) -> Result<Option<String>, String> {
+    known_account(state, &dto.account)?;
+    let rule = Rule { id: dto.id, account: dto.account, enabled: dto.enabled, ..dto.rule };
+    let warning = rules::put(&state.accounts.store(), &rule).map_err(text)?;
+    Ok(warning.map(|_| AUTONOMOUS_RULE.to_owned()))
+}
+
+pub fn delete_rule(state: &UiState, id: &str) -> Result<(), String> {
+    match rules::delete(&state.accounts.store(), id).map_err(text)? {
+        true => Ok(()),
+        false => Err(format!("nie ma reguły {id}")),
+    }
+}
+
+/// The program a spawn action starts, chosen in a file dialog: its full path, or None.
+pub async fn pick_program() -> Result<Option<String>, String> {
+    pick_file().await
+}
+
+#[cfg(windows)]
+async fn pick_file() -> Result<Option<String>, String> {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Program, który uruchomi reguła")
+            .add_filter("Programy", &["exe", "cmd", "bat"])
+            .add_filter("Wszystkie pliki", &["*"])
+            .pick_file()
+    });
+    Ok(picked.await.map_err(text)?.map(|path| path.display().to_string()))
+}
+
+#[cfg(not(windows))]
+async fn pick_file() -> Result<Option<String>, String> {
+    Err(crate::Error::NoWindow.to_string())
+}
+
+/// How to start a Claude Code session that takes trigger notifications (spec 8.7).
+#[derive(Clone, Debug, Serialize)]
+pub struct ChannelSetupDto {
+    /// Where the MCP configuration below is saved.
+    pub file: String,
+    /// The MCP configuration with `om mcp-stdio`.
+    pub json: String,
+    /// The command that starts Claude Code with it.
+    pub command: String,
+    /// MCP sessions that take notifications now.
+    pub sessions: usize,
+}
+
+/// The channel setup, with its MCP configuration saved in the data folder.
+pub fn channel_setup(state: &UiState) -> Result<ChannelSetupDto, String> {
+    let om = std::env::current_exe().map_err(text)?;
+    // The bridge finds the daemon (its port, as stored) through the data folder: this daemon's.
+    let data_dir = state.accounts.data_dir();
+    let config = serde_json::json!({"mcpServers": {"open_mess_channel": {
+        "command": om, "args": ["mcp-stdio"], "env": {"OPEN_MESS_DATA_DIR": data_dir},
+    }}});
+    let json = serde_json::to_string_pretty(&config).map_err(text)?;
+    let file = data_dir.join(CHANNEL_CONFIG);
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(json.as_str()) {
+        std::fs::write(&file, &json).map_err(text)?;
+    }
+    let command = format!("claude --mcp-config \"{}\" --dangerously-load-development-channels server:open_mess_channel", file.display());
+    Ok(ChannelSetupDto { file: file.display().to_string(), json, command, sessions: state.sessions.len() })
+}
+
+/// The channel setup's MCP configuration, in the data folder.
+pub const CHANNEL_CONFIG: &str = "channel-mcp.json";

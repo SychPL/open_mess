@@ -6,15 +6,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use keyring_core::api::CredentialStore;
 use open_mess::accounts::Accounts;
 use open_mess::modules::{self, Modules};
 use open_mess::store::Store;
 use open_mess::tools::Registry;
+use open_mess::ui::sign_in::SignIns;
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{AccountInfo, Engine, HostEvent, ModuleContext, Net, limits};
+use open_mess_host::{AccountInfo, Engine, HostEvent, ModuleContext, Net, SignInPrompts, limits};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -65,10 +66,20 @@ pub fn store(data_dir: &Path) -> Store {
     Store::open(&data_dir.join("state.sqlite3")).unwrap()
 }
 
-/// Scans the data folder's modules, sending host events to `events`.
+/// Scans the data folder's modules, sending host events to `events`; sign-in prompts go nowhere.
 pub async fn scan_with(store: &Store, engine: &Engine, data_dir: &Path, events: mpsc::Sender<HostEvent>) -> Modules {
+    scan_prompting(store, engine, data_dir, events, SignInPrompts::new(mpsc::channel(1).0)).await
+}
+
+/// [`scan_with`], with the modules' sign-in prompts sent to `sign_in`.
+pub async fn scan_prompting(store: &Store, engine: &Engine, data_dir: &Path, events: mpsc::Sender<HostEvent>, sign_in: SignInPrompts) -> Modules {
     let dir = data_dir.to_path_buf();
-    let ctx = move |_: &str| ModuleContext { data_dir: dir.clone(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
+    let ctx = move |_: &str| ModuleContext {
+        data_dir: dir.clone(),
+        events: events.clone(),
+        net: Net::new(AddressPolicy::Strict),
+        sign_in: sign_in.clone(),
+    };
     Modules::scan(store, engine, &data_dir.join("modules"), ctx).await.unwrap()
 }
 
@@ -100,7 +111,12 @@ pub struct Daemon {
     pub registry: Registry,
     pub events: mpsc::Receiver<HostEvent>,
     pub credentials: Arc<CredentialStore>,
+    /// The modules' sign-in prompts, as the window's side gets them.
+    pub sign_ins: SignIns,
 }
+
+/// How long the test daemon's sign-in prompts wait for an answer.
+pub const SIGN_IN_BUDGET: Duration = Duration::from_secs(5);
 
 /// A daemon's accounts and tools over module files (file name, built module), all approved.
 pub async fn daemon(files: &[(&str, &str)]) -> Daemon {
@@ -110,11 +126,16 @@ pub async fn daemon(files: &[(&str, &str)]) -> Daemon {
     }
     let engine = Engine::with_limits(limits::for_tests()).unwrap();
     let (sender, events) = mpsc::channel(64);
-    let modules = running(dir.path(), &engine, sender).await;
+    let (prompts, requests) = mpsc::channel(8);
+    let sign_ins = SignIns::default();
+    tokio::spawn(sign_ins.clone().forward(requests));
+    let store = store(dir.path());
+    approve_all(&store, &scan(&store, &engine, dir.path()).await);
+    let modules = scan_prompting(&store, &engine, dir.path(), sender, SignInPrompts::with_budget(prompts, SIGN_IN_BUDGET)).await;
     let credentials: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
     let accounts = accounts(dir.path(), modules, Arc::clone(&credentials));
     let registry = Registry::new(Instant::now(), Arc::clone(&accounts));
-    Daemon { dir, accounts, registry, events, credentials }
+    Daemon { dir, accounts, registry, events, credentials, sign_ins }
 }
 
 pub const ECHO: (&str, &str) = ("echo.wasm", "open_mess_test_echo");

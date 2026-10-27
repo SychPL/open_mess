@@ -75,30 +75,67 @@ function stateDot(state) {
   return node;
 }
 
+/** The module signing in from this window, while it does. */
+let signingIn = null;
+
+/**
+ * Signs in an account of `module`, or `account` again (the module's prompts appear in the sign-in
+ * dialog meanwhile).
+ */
+async function signIn(module, account) {
+  signingIn = module;
+  renderAccounts().catch(showError);
+  try {
+    await call("sign_in_start", { module, account: account || null });
+  } finally {
+    signingIn = null;
+    await renderAccounts();
+  }
+}
+
 async function renderAccounts() {
   const accounts = await call("accounts");
+  const modules = (await call("modules")).filter((module) => module.status === "active");
   const root = content("accounts");
   root.replaceChildren();
-  const add = el("button", "Dodaj konto", "action primary");
-  add.disabled = true;
-  add.title = "Logowanie kont pojawi się w następnej wersji";
-  root.append(add);
+  const top = el("div", null, "row");
+  if (signingIn) {
+    top.append(el("span", "Trwa logowanie w module " + signingIn + "...", "muted"));
+  } else if (modules.length === 0) {
+    top.append(el("span", "Żeby dodać konto, zatwierdź i włącz moduł w sekcji Moduły.", "muted"));
+  } else {
+    const pick = el("select");
+    for (const module of modules) {
+      const option = el("option", module.name + (module.platform ? " (" + module.platform + ")" : ""));
+      option.value = module.name;
+      pick.append(option);
+    }
+    top.append(button("Dodaj konto", () => signIn(pick.value), "primary"));
+    if (modules.length > 1) top.append(pick);
+  }
+  root.append(top);
   if (accounts.length === 0) root.append(el("p", "Nie ma jeszcze żadnego konta.", "muted"));
   for (const account of accounts) {
     const card = el("div", null, "card row");
     const who = el("div", null, "grow");
     who.append(el("strong", account.display_name), el("div", (account.platform || account.module) + " - " + account.id, "muted"));
     card.append(who, stateDot(account.state));
-    card.append(
-      button("Usuń", async () => {
-        const sure = confirm(
-          "Usunąć konto " + account.display_name + "?\n\nZnikną jego sekrety, uprawnienia, akcje czekające na zatwierdzenie i pobrane załączniki.",
-        );
-        if (!sure) return;
-        await call("remove_account", { id: account.id });
-        await renderAccounts();
-      }, "danger"),
-    );
+    if (!signingIn && account.state !== "removing" && modules.some((module) => module.name === account.module)) {
+      card.append(button("Zaloguj ponownie", () => signIn(account.module, account.id)));
+    }
+    // Not while a sign-in runs: it might be signing in this very account.
+    if (!signingIn) {
+      card.append(
+        button("Usuń", async () => {
+          const sure = confirm(
+            "Usunąć konto " + account.display_name + "?\n\nZnikną jego sekrety, uprawnienia, akcje czekające na zatwierdzenie i pobrane załączniki.",
+          );
+          if (!sure) return;
+          await call("remove_account", { id: account.id });
+          await renderAccounts();
+        }, "danger"),
+      );
+    }
     root.append(card);
   }
 }
@@ -433,8 +470,340 @@ async function refreshWaiting() {
   root.querySelector(".empty").hidden = waiting.length > 0;
 }
 
+/** The module's sign-in prompt in a dialog over the window; it disappears once nothing waits. */
+async function refreshSignIn() {
+  const prompt = await call("sign_in_request");
+  const overlay = document.getElementById("sign-in");
+  const dialog = overlay.querySelector(".dialog");
+  dialog.replaceChildren();
+  overlay.hidden = !prompt;
+  if (!prompt) return;
+  dialog.append(el("h1", "Logowanie - " + prompt.module));
+  if (prompt.kind === "device-code") {
+    dialog.append(el("p", "Otwórz stronę logowania w przeglądarce i wpisz ten kod:"), el("div", prompt.code, "code"), el("p", prompt.url, "muted"));
+    dialog.append(button("Otwórz stronę w przeglądarce", () => call("sign_in_open_link", { request_id: prompt.id })));
+  } else if (prompt.kind === "qr") {
+    dialog.append(el("p", "Zeskanuj ten kod telefonem:"));
+    if (prompt.qr_svg) {
+      const image = el("img");
+      image.alt = "kod QR";
+      // An image, so nothing in it runs.
+      image.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(prompt.qr_svg);
+      dialog.append(image);
+    } else {
+      dialog.append(el("p", "Kod jest za długi, żeby go pokazać.", "error"));
+    }
+  } else if (prompt.kind === "page") {
+    dialog.append(el("p", "Zaloguj się w osobnym oknie strony logowania (" + prompt.url + "). Hasło wpisujesz tylko tam."));
+  } else if (prompt.kind === "ask-host") {
+    dialog.append(el("p", "Strona logowania przechodzi na " + prompt.url + ". Zezwolić?"));
+    dialog.append(
+      el("p", "Zgoda doda ten host do zatwierdzonych hostów logowania modułu (np. firmowy serwer logowania). Odmowa przerwie logowanie.", "muted"),
+    );
+    const row = el("div", null, "row");
+    row.append(
+      button("Zezwól", () => call("sign_in_answer", { request_id: prompt.id, reply: { done: "allow" } }), "primary"),
+      button("Nie zezwalaj", () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"),
+    );
+    dialog.append(row);
+    return;
+  } else if (prompt.kind === "wam-pick") {
+    const answer = (done) => () => call("sign_in_answer", { request_id: prompt.id, reply: { done } });
+    dialog.append(el("p", "Wybierz konto Windows, którym moduł ma się zalogować:"));
+    if (prompt.accounts.length === 0) dialog.append(el("p", "Windows nie zna jeszcze żadnego konta służbowego dla tego modułu.", "muted"));
+    // The same name in several organizations (as a guest, say) shows the organization's id.
+    const total = new Map();
+    for (const account of prompt.accounts) total.set(account.user_name, (total.get(account.user_name) || 0) + 1);
+    for (const account of prompt.accounts) {
+      const label = account.user_name + (total.get(account.user_name) > 1 ? " (organizacja " + (account.tenant || "?") + ")" : "");
+      dialog.append(button(label, answer(account.id), "choice"));
+    }
+    dialog.append(button("Inne konto Windows...", answer(null), "choice"));
+  }
+  const row = el("div", null, "row");
+  row.append(button("Anuluj", () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"));
+  dialog.append(row);
+}
+
+/** One refresh at a time, in order, so an older answer never undoes a newer one. */
+let signInRefresh = Promise.resolve();
+
+function renderSignIn() {
+  signInRefresh = signInRefresh.then(refreshSignIn, refreshSignIn);
+  return signInRefresh;
+}
+
+// Sent by the daemon whenever the sign-in prompt changes.
+window.addEventListener("sign-in-request", () => renderSignIn().catch(showError));
+
+const CONDITIONS = [
+  ["direct", "wiadomość prywatna (DM)"],
+  ["mention", "wzmianka o mnie"],
+  ["conversation", "nowa wiadomość w wybranej rozmowie"],
+  ["from", "wiadomość od wybranych osób"],
+];
+
+const DROPS = [
+  ["dropped_rate", "ponad limit na godzinę"],
+  ["dropped_quiet_hours", "w ciszy nocnej"],
+  ["dropped_queue", "wypchnięte z kolejki"],
+  ["dropped_no_session", "bez sesji i programu"],
+];
+
+function conditionText(condition) {
+  const [, label] = CONDITIONS.find(([type]) => type === condition.type) || [condition.type, condition.type];
+  if (condition.type === "conversation") return label + ": " + condition.id;
+  if (condition.type === "from") return label + ": " + condition.senders.join(", ");
+  return label;
+}
+
+function spawnText(spawn) {
+  return [spawn.program, ...spawn.args].join(" ") + (spawn.working_dir ? " (w " + spawn.working_dir + ")" : "");
+}
+
+function actionText(action) {
+  if (action.type === "spawn") return "uruchom program: " + spawnText(action);
+  const fallback = action.fallback_spawn ? "; bez sesji uruchom: " + spawnText(action.fallback_spawn) : "";
+  return "wpis do otwartej sesji Claude Code (kanał)" + fallback;
+}
+
+/** A labelled form field. */
+function field(label, input) {
+  const node = el("label", null, "row");
+  node.append(el("span", label), input);
+  return node;
+}
+
+function input(type, value) {
+  const node = el("input");
+  node.type = type;
+  if (value !== undefined && value !== null) node.value = String(value);
+  return node;
+}
+
+function select(options, value) {
+  const node = el("select");
+  for (const [key, label] of options) {
+    const option = el("option", label);
+    option.value = key;
+    node.append(option);
+  }
+  if (value !== undefined) node.value = value;
+  return node;
+}
+
+/** The program, arguments and folder of a spawn action; `read()` gives the spawn or null. */
+function spawnFields(spawn) {
+  const program = input("text", spawn ? spawn.program : "");
+  program.readOnly = true;
+  program.placeholder = "wybierz program";
+  const pick = button("Wybierz program...", async () => {
+    const picked = await call("pick_program");
+    if (picked) program.value = picked;
+  });
+  const args = el("textarea");
+  args.rows = 3;
+  args.value = spawn ? spawn.args.join("\n") : "";
+  const dir = input("text", spawn ? spawn.working_dir : "");
+  dir.placeholder = "pełna ścieżka, opcjonalnie";
+  const node = el("div");
+  const programRow = el("div", null, "row");
+  const clear = button("Bez programu", () => {
+    program.value = "";
+  });
+  programRow.append(el("span", "Program:"), program, pick, clear);
+  node.append(programRow, field("Argumenty (stałe, po jednym w wierszu):", args), field("Folder roboczy:", dir));
+  node.append(el("p", "Treść wiadomości nigdy nie trafia do argumentów: program dostaje ją na wejściu jako dane niezaufane.", "muted"));
+  const read = () => {
+    if (!program.value) return null;
+    return { program: program.value, args: args.value.split("\n").filter((line) => line !== ""), working_dir: dir.value.trim() || null };
+  };
+  return { node, read };
+}
+
+/** The form that adds a rule (`existing` null) or changes one. */
+function ruleForm(accounts, existing, done) {
+  const rule = existing || {
+    // A new rule's id (1-64 characters); randomUUID needs a secure context, which the page is.
+    id: crypto.randomUUID ? crypto.randomUUID() : "r" + Date.now() + Math.random().toString(16).slice(2),
+    account: accounts[0].id,
+    enabled: true,
+    condition: { type: "direct" },
+    action: { type: "channel", fallback_spawn: null },
+    quiet_hours: null,
+    max_per_hour: 6,
+    quiet_ms: 60000,
+    max_delay_ms: 300000,
+  };
+  const card = el("div", null, "card");
+  card.append(el("h2", existing ? "Zmień regułę" : "Nowa reguła"));
+  const account = select(accounts.map((item) => [item.id, item.display_name + " (" + item.id + ")"]), rule.account);
+  const condition = select(CONDITIONS, rule.condition.type);
+  const conditionValue = input("text", rule.condition.id || (rule.condition.senders || []).join(", "));
+  const conditionRow = field("", conditionValue);
+  const showCondition = () => {
+    conditionRow.hidden = condition.value !== "conversation" && condition.value !== "from";
+    conditionRow.firstChild.textContent =
+      condition.value === "conversation" ? "Identyfikator rozmowy:" : "Identyfikatory osób (po przecinku):";
+  };
+  condition.addEventListener("change", showCondition);
+  showCondition();
+
+  const action = select([["channel", "wpis do otwartej sesji Claude Code (kanał)"], ["spawn", "uruchom program"]], rule.action.type);
+  const spawn = spawnFields(rule.action.type === "spawn" ? rule.action : rule.action.fallback_spawn);
+  const fallbackNote = el("p", "Gdy nie ma otwartej sesji z kanałami, reguła uruchomi program poniżej (zostaw pusty, żeby nic nie robić).", "muted");
+  const showAction = () => {
+    fallbackNote.hidden = action.value !== "channel";
+  };
+  action.addEventListener("change", showAction);
+  showAction();
+
+  const quiet = input("checkbox");
+  quiet.checked = !!rule.quiet_hours;
+  const quietFrom = input("time", rule.quiet_hours ? rule.quiet_hours[0].slice(0, 5) : "22:00");
+  const quietTo = input("time", rule.quiet_hours ? rule.quiet_hours[1].slice(0, 5) : "07:00");
+  const quietRow = el("div", null, "row");
+  quietRow.append(quiet, el("span", "Cisza nocna od"), quietFrom, el("span", "do"), quietTo);
+  const perHour = input("number", rule.max_per_hour);
+  const quietSeconds = input("number", rule.quiet_ms / 1000);
+  const delaySeconds = input("number", rule.max_delay_ms / 1000);
+  const enabled = input("checkbox");
+  enabled.checked = rule.enabled;
+
+  card.append(
+    field("Konto:", account),
+    field("Gdy przyjdzie:", condition),
+    conditionRow,
+    field("Akcja:", action),
+    fallbackNote,
+    spawn.node,
+    quietRow,
+    field("Najwyżej pobudek na godzinę:", perHour),
+    field("Wyślij po tylu sekundach ciszy w rozmowie:", quietSeconds),
+    field("...ale najpóźniej po tylu sekundach:", delaySeconds),
+    field("Włączona:", enabled),
+  );
+  const row = el("div", null, "row");
+  row.append(
+    button("Zapisz", async () => {
+      if (quiet.checked && (!quietFrom.value || !quietTo.value)) throw "podaj obie godziny ciszy nocnej";
+      const values = conditionValue.value.split(",").map((value) => value.trim()).filter((value) => value !== "");
+      const conditionDto =
+        condition.value === "conversation"
+          ? { type: "conversation", id: conditionValue.value.trim() }
+          : condition.value === "from"
+            ? { type: "from", senders: values }
+            : { type: condition.value };
+      const program = spawn.read();
+      const actionDto = action.value === "spawn" ? Object.assign({ type: "spawn" }, program || { program: "", args: [], working_dir: null }) : { type: "channel", fallback_spawn: program };
+      const warning = await call("put_rule", {
+        rule: {
+          id: rule.id,
+          account: account.value,
+          enabled: enabled.checked,
+          condition: conditionDto,
+          action: actionDto,
+          quiet_hours: quiet.checked ? [quietFrom.value + ":00", quietTo.value + ":00"] : null,
+          max_per_hour: Number(perHour.value),
+          quiet_ms: Math.round(Number(quietSeconds.value) * 1000),
+          max_delay_ms: Math.round(Number(delaySeconds.value) * 1000),
+        },
+      });
+      if (warning) alert(warning);
+      await done();
+    }, "primary"),
+    button("Anuluj", done),
+  );
+  card.append(row);
+  return card;
+}
+
+async function renderTriggers() {
+  const [rules, accounts] = await Promise.all([call("rules"), call("accounts")]);
+  const root = content("triggers");
+  root.replaceChildren();
+  root.append(
+    el(
+      "p",
+      "Reguła budzi agenta, gdy ktoś napisze do Ciebie: wpisem do otwartej sesji Claude Code albo uruchomieniem programu. Twoje własne wiadomości nigdy jej nie uruchamiają, a rozmowy, których agent nie może czytać, są pomijane. Treść od innych osób agent dostaje jako dane niezaufane.",
+      "muted",
+    ),
+  );
+  const editor = el("div");
+  const close = async () => renderTriggers();
+  if (accounts.length === 0) {
+    root.append(el("p", "Reguły należą do kont: najpierw dodaj konto.", "muted"));
+  } else {
+    root.append(button("Dodaj regułę", () => editor.replaceChildren(ruleForm(accounts, null, close)), "primary"));
+  }
+  root.append(editor);
+  if (rules.length === 0) root.append(el("p", "Nie ma jeszcze żadnej reguły.", "muted"));
+  for (const rule of rules) {
+    const card = el("div", null, "card");
+    const head = el("div", null, "row");
+    const title = el("div", null, "grow");
+    const owner = accounts.find((account) => account.id === rule.account);
+    title.append(
+      el("strong", conditionText(rule.condition)),
+      el("div", (owner ? owner.display_name + " - " : "") + rule.account + (rule.enabled ? "" : " (wyłączona)"), "muted"),
+    );
+    head.append(
+      title,
+      button("Zmień", () => editor.replaceChildren(ruleForm(accounts, rule, close))),
+      button("Usuń", async () => {
+        if (!confirm("Usunąć regułę?")) return;
+        await call("delete_rule", { id: rule.id });
+        await renderTriggers();
+      }, "danger"),
+    );
+    card.append(head);
+    const quiet = rule.quiet_hours ? rule.quiet_hours[0].slice(0, 5) + "-" + rule.quiet_hours[1].slice(0, 5) : "brak";
+    const counters = rule.counters;
+    const dropped = DROPS.filter(([key]) => counters[key] > 0).map(([key, label]) => label + ": " + counters[key]);
+    card.append(
+      details([
+        ["Akcja", actionText(rule.action)],
+        ["Cisza nocna", quiet],
+        ["Limity", rule.max_per_hour + " na godzinę; po " + rule.quiet_ms / 1000 + " s ciszy, najpóźniej po " + rule.max_delay_ms / 1000 + " s"],
+        ["Od startu demona", "dostarczone: " + counters.delivered + (dropped.length ? "; pominięte - " + dropped.join(", ") : "")],
+      ]),
+    );
+    if (counters.failed_to_start > 0) {
+      card.append(
+        el("p", "Program nie uruchomił się " + counters.failed_to_start + " raz(y) - sprawdź, czy nadal jest pod tą ścieżką, i wybierz go ponownie.", "error"),
+      );
+    }
+    root.append(card);
+  }
+
+  root.append(el("h2", "Sesja Claude Code z kanałami"));
+  root.append(
+    el(
+      "p",
+      "Wpis do sesji działa w sesjach Claude Code uruchomionych z kanałem open_mess. Polecenie om mcp-stdio należy tylko do takich sesji: nie dodawaj go do zwykłej konfiguracji MCP (tam open_mess działa przez adres z sekcji Integracje).",
+      "muted",
+    ),
+  );
+  const setup = el("div");
+  setup.append(
+    button("Pokaż konfigurację kanału", async () => {
+      const channel = await call("channel_setup");
+      setup.replaceChildren(
+        el("p", "Konfiguracja MCP (zapisana w " + channel.file + "):", "muted"),
+        el("pre", channel.json, "content-text"),
+        el("p", "Uruchom Claude Code tak:", "muted"),
+        el("pre", channel.command, "content-text"),
+        button("Kopiuj polecenie", () => navigator.clipboard.writeText(channel.command)),
+        el("p", "Otwarte sesje z kanałem: " + channel.sessions + ".", "muted"),
+      );
+    }),
+  );
+  root.append(setup);
+}
+
 const RENDER = {
   accounts: renderAccounts,
+  triggers: renderTriggers,
   permissions: renderPermissions,
   waiting: renderWaiting,
   modules: renderModules,
@@ -474,3 +843,4 @@ for (const node of document.querySelectorAll("#menu button")) {
 }
 
 show("accounts");
+renderSignIn().catch(showError);

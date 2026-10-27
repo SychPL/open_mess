@@ -15,6 +15,7 @@ use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::{HostError, ModuleError};
 use crate::limits::{self, Limits};
 use crate::runtime::{AccountInfo, Attachment, HostState, ModuleEnv, Target};
+use crate::sign_in::Caller;
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
@@ -46,6 +47,19 @@ pub(crate) enum Request {
         message: Option<String>,
         reply: Reply<Target>,
     },
+}
+
+impl Request {
+    /// Whose call this is, for the sign-in imports.
+    fn caller(&self) -> Caller {
+        match self {
+            Request::SignIn(_) => Caller::SignIn,
+            Request::Restore(account, _) | Request::SignOut(account, _) | Request::Call { account, .. } => Caller::Account(account.clone()),
+            Request::GetAttachment { ids: [account, ..], .. } | Request::DescribeTarget { ids: [account, ..], .. } => {
+                Caller::Account(account.clone())
+            }
+        }
+    }
 }
 
 /// What a module instance's sockets and timers deliver to its `events` export, through the actor
@@ -88,6 +102,21 @@ pub(crate) struct Deadline(Arc<Mutex<DeadlineState>>);
 struct DeadlineState {
     at: Option<Instant>,
     paused_since: Option<Instant>,
+    /// The latest the call may run however long it is paused: set while a sign-in code waits on
+    /// screen.
+    limit: Option<Instant>,
+}
+
+impl DeadlineState {
+    /// Starts the clock again; the paused time is added back.
+    fn resume(&mut self) {
+        self.limit = None;
+        if let Some(since) = self.paused_since.take()
+            && let Some(at) = &mut self.at
+        {
+            *at += since.elapsed();
+        }
+    }
 }
 
 /// While paused, the actor looks at the deadline this often.
@@ -99,44 +128,67 @@ impl Deadline {
     }
 
     fn set(&self, at: Option<Instant>) {
-        *self.state() = DeadlineState { at, paused_since: None };
+        *self.state() = DeadlineState { at, paused_since: None, limit: None };
     }
 
     /// When the actor should look at the deadline again; None outside a call.
     fn wake_at(&self) -> Option<Instant> {
         let state = self.state();
-        if state.paused_since.is_some() { state.at.map(|_| Instant::now() + PAUSED_POLL) } else { state.at }
+        if state.paused_since.is_none() {
+            return state.at;
+        }
+        let poll = Instant::now() + PAUSED_POLL;
+        state.at.map(|_| state.limit.map_or(poll, |limit| limit.min(poll)))
     }
 
-    /// Time left in the call in progress; `None` outside a call.
+    /// Time left in the call in progress; `None` outside a call. While the clock is paused (a
+    /// sign-in code on screen, which the module polls for) it is what was left when it stopped,
+    /// and no more than the time to the pause's limit.
     pub(crate) fn remaining(&self) -> Option<Duration> {
-        self.state().at.map(|at| at.saturating_duration_since(Instant::now()))
+        let (state, now) = (self.state(), Instant::now());
+        let at = state.at?;
+        let left = at.saturating_duration_since(state.paused_since.unwrap_or(now));
+        Some(state.limit.map_or(left, |limit| left.min(limit.saturating_duration_since(now))))
     }
 
     pub(crate) fn expired(&self) -> bool {
-        let state = self.state();
-        state.paused_since.is_none() && state.at.is_some_and(|at| Instant::now() >= at)
+        let (state, now) = (self.state(), Instant::now());
+        state.limit.is_some_and(|limit| now >= limit) || (state.paused_since.is_none() && state.at.is_some_and(|at| now >= at))
     }
 
     /// Stops the clock until the returned guard is dropped; the paused time is added back.
     pub(crate) fn pause(&self) -> Paused<'_> {
         let mut state = self.state();
-        if state.paused_since.is_none() {
+        let started = state.paused_since.is_none();
+        if started {
             state.paused_since = Some(Instant::now());
         }
-        Paused(self)
+        Paused { deadline: self, started }
+    }
+
+    /// Stops the clock until [`Deadline::resume`] (or the call's end), but lets the call run no
+    /// later than `limit`: a sign-in code on screen, which the module polls for (spec 8.3, R4).
+    pub(crate) fn pause_until(&self, limit: Instant) {
+        let mut state = self.state();
+        state.paused_since.get_or_insert_with(Instant::now);
+        state.limit = Some(limit);
+    }
+
+    pub(crate) fn resume(&self) {
+        self.state().resume();
     }
 }
 
-pub(crate) struct Paused<'a>(&'a Deadline);
+pub(crate) struct Paused<'a> {
+    deadline: &'a Deadline,
+    /// Whether this guard paused the clock; a pause it found in place is not its to end.
+    started: bool,
+}
 
 impl Drop for Paused<'_> {
     fn drop(&mut self) {
-        let mut state = self.0.state();
-        if let Some(since) = state.paused_since.take()
-            && let Some(at) = &mut state.at
-        {
-            *at += since.elapsed();
+        if self.started {
+            self.deadline.state().resume();
         }
     }
 }
@@ -176,6 +228,8 @@ pub(crate) struct Actor {
     events: Option<mpsc::Receiver<GuestEvent>>,
     crashes: u32,
     state: watch::Sender<ModuleState>,
+    /// Whose call the next `run` makes.
+    caller: Caller,
 }
 
 impl Actor {
@@ -186,7 +240,8 @@ impl Actor {
         env: Arc<ModuleEnv>,
     ) -> (Actor, watch::Receiver<ModuleState>) {
         let (state, watch) = watch::channel(ModuleState::Running);
-        let actor = Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, events: None, crashes: 0, state };
+        let actor =
+            Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, events: None, crashes: 0, state, caller: Caller::Event };
         (actor, watch)
     }
 
@@ -247,6 +302,10 @@ impl Actor {
                 (store, module)
             }
         };
+        let data = store.data_mut();
+        data.caller = std::mem::take(&mut self.caller);
+        data.pick = None;
+        data.code_shown = None;
         let value = within(&self.deadline, export(&module, &mut store)).await?;
         self.instance = Some((store, module));
         Ok(value)
@@ -286,6 +345,7 @@ impl Actor {
     }
 
     async fn deliver(&mut self, event: GuestEvent) {
+        self.caller = Caller::Event;
         // A crash is recorded by `run`; there is nobody else to tell.
         let _delivered = match event {
             GuestEvent::WsMessage { conn, text } => {
@@ -315,9 +375,17 @@ impl Actor {
     }
 
     async fn answer(&mut self, request: Request) {
+        self.caller = request.caller();
         match request {
             Request::SignIn(reply) => {
-                let result = self.run(|m, s| Box::pin(m.open_mess_module_module().call_sign_in(s))).await;
+                let result = self
+                    .run(|m, s| {
+                        Box::pin(async move {
+                            let result = m.open_mess_module_module().call_sign_in(&mut *s).await?;
+                            Ok(s.data_mut().signed_in(result))
+                        })
+                    })
+                    .await;
                 reply.send(module_result(result).map(Into::into)).ok();
             }
             Request::Restore(account, reply) => {
@@ -389,6 +457,45 @@ mod tests {
             assert!(!deadline.expired());
         }
         // The 100 ms paused were added back: 50 ms are still left.
+        assert!(!deadline.expired());
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(deadline.expired());
+    }
+
+    #[test]
+    fn remaining_time_stands_still_while_paused() {
+        let deadline = Deadline::default();
+        deadline.set(Some(Instant::now() + Duration::from_millis(500)));
+        deadline.pause_until(Instant::now() + Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(600));
+        // Past the call's own end in wall time, but its clock stopped with about 500 ms left.
+        let left = deadline.remaining().unwrap();
+        assert!(left > Duration::from_millis(400) && left <= Duration::from_millis(500), "{left:?}");
+        // Never past the pause's limit.
+        deadline.set(Some(Instant::now() + Duration::from_secs(30)));
+        deadline.pause_until(Instant::now() + Duration::from_millis(200));
+        assert!(deadline.remaining().unwrap() <= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn code_on_screen_pauses_up_to_its_limit() {
+        let deadline = Deadline::default();
+        deadline.set(Some(Instant::now() + Duration::from_millis(50)));
+        deadline.pause_until(Instant::now() + Duration::from_millis(150));
+        {
+            // A wait inside it does not end it.
+            let _paused = deadline.pause();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!deadline.expired());
+        std::thread::sleep(Duration::from_millis(80));
+        // Past the limit, paused or not.
+        assert!(deadline.expired());
+        // Resumed before the limit, the call's own time goes on.
+        deadline.set(Some(Instant::now() + Duration::from_millis(50)));
+        deadline.pause_until(Instant::now() + Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(100));
+        deadline.resume();
         assert!(!deadline.expired());
         std::thread::sleep(Duration::from_millis(80));
         assert!(deadline.expired());

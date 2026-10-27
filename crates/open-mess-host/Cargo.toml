@@ -36,6 +36,18 @@ url = "2.5.8"
 wasmtime = { version = "50.0.0", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime"] }
 wasmtime-wasi = { version = "50.0.0", default-features = false, features = ["p2"] }
 
+[target.'cfg(windows)'.dependencies]
+# Windows account sign-in (WAM, the `wam-token` import); the version the daemon's toasts build.
+windows = { version = "0.62.2", features = [
+    "Foundation_Collections",
+    "Security_Authentication_Web_Core",
+    "Security_Credentials",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+] }
+# WAM's async operations, waited for with `join`.
+windows-future = "0.3.2"
+
 [dev-dependencies]
 axum = "0.8.9"
 open-mess-host = { path = ".", features = ["test-support"] }

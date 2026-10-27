@@ -13,8 +13,10 @@ use crate::error::HostError;
 use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
 use crate::net::Net;
+use crate::sign_in::{Caller, CodeShown, SignInPrompts};
 use crate::storage::Storage;
 use crate::timers::Timers;
+use crate::wam::WamAccount;
 use crate::ws::Sockets;
 
 /// Mirrors `manifest` in `wit/module.wit`.
@@ -138,6 +140,8 @@ pub struct ModuleContext {
     pub events: mpsc::Sender<HostEvent>,
     /// The network modules reach the outside world through.
     pub net: Net,
+    /// Where the module's sign-in prompts go.
+    pub sign_in: SignInPrompts,
 }
 
 /// What a module's imports work with; shared by all its instances.
@@ -153,6 +157,9 @@ pub(crate) struct ModuleEnv {
     /// Test support: the longest delay a timer gets, in milliseconds.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) timer_cap: Option<u32>,
+    pub(crate) sign_in: SignInPrompts,
+    /// The manifest's Windows account identity, the only one `wam-token` asks for.
+    pub(crate) wam: Option<WamIdentity>,
 }
 
 /// The state a module instance runs with: a WASI context with nothing inherited, plus the host
@@ -170,6 +177,12 @@ pub(crate) struct HostState {
     pub(crate) max_body: usize,
     /// Where this instance's sockets and timers send what they deliver.
     pub(crate) guest_events: mpsc::Sender<GuestEvent>,
+    /// Whose call runs now, set by the actor before each call.
+    pub(crate) caller: Caller,
+    /// The Windows account picked during the `sign-in` call that runs.
+    pub(crate) pick: Option<WamAccount>,
+    /// A device or QR code on screen, which the `sign-in` call that runs polls for.
+    pub(crate) code_shown: Option<CodeShown>,
 }
 
 impl HostState {
@@ -193,6 +206,9 @@ impl HostState {
             storage: None,
             max_body: limits::MAX_BODY,
             guest_events,
+            caller: Caller::default(),
+            pick: None,
+            code_shown: None,
         }
     }
 }
@@ -299,7 +315,7 @@ impl Engine {
             .map_err(|e| HostError::Load(format!("not a platform module: {e}")))?;
         // The manifest runs before the module has a name or hosts: its imports reach nothing, and
         // its host events go nowhere.
-        let ModuleContext { data_dir, events, net } = ctx;
+        let ModuleContext { data_dir, events, net, sign_in } = ctx;
         let (nowhere, _) = mpsc::channel(1);
         let loading = ModuleEnv {
             name: String::new(),
@@ -311,6 +327,8 @@ impl Engine {
             fake_wam: None,
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: None,
+            sign_in: sign_in.clone(),
+            wam: None,
         };
         let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
@@ -332,6 +350,8 @@ impl Engine {
             fake_wam: self.fake_wam.clone(),
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: self.timer_cap,
+            sign_in,
+            wam: manifest.wam.clone(),
         }));
         let (requests, queue) = mpsc::channel(QUEUE);
         tokio::spawn(actor.serve(queue));

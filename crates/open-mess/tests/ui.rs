@@ -1,4 +1,5 @@
-//! The configuration window's commands, without a webview: accounts, modules and their approval.
+//! The configuration window's commands, without a webview: accounts, modules and their approval,
+//! and the trigger rules.
 
 // Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -8,14 +9,21 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::NaiveTime;
 use common::{Daemon, ECHO, daemon, echo, echo_rebuilt, echo_with_another_host, info, install, scan, store};
 use open_mess::approval;
+use open_mess::events::{Bus, Event};
 use open_mess::pending::{Kind, Pending, Preview, State};
 use open_mess::tools::ToolError;
+use open_mess::triggers::Counters;
+use open_mess::triggers::channel::Sessions;
+use open_mess::triggers::engine::{self, Batch, Delivery, DeliveryResult};
+use open_mess::triggers::rules::{Action, Condition, Rule, Spawn};
 use open_mess::ui::UiState;
-use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto};
+use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto, RuleDto};
+use open_mess::ui::sign_in::SignIns;
 use open_mess_host::Engine;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn state(d: &Daemon) -> UiState {
@@ -25,6 +33,9 @@ fn state(d: &Daemon) -> UiState {
         started: Instant::now(),
         port: 7341,
         token: "t0ken".into(),
+        sign_ins: d.sign_ins.clone(),
+        counters: d.registry.trigger_counters().clone(),
+        sessions: d.registry.channel_sessions().clone(),
     }
 }
 
@@ -46,7 +57,17 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
     let modules = scan(&store(dir.path()), &engine, dir.path()).await;
     let accounts = common::accounts(dir.path(), modules, keyring_core::mock::Store::new().unwrap());
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
-    (dir, UiState { accounts, pending, started: Instant::now(), port: 7341, token: "t0ken".into() })
+    let state = UiState {
+        accounts,
+        pending,
+        started: Instant::now(),
+        port: 7341,
+        token: "t0ken".into(),
+        sign_ins: SignIns::default(),
+        counters: Counters::default(),
+        sessions: Sessions::default(),
+    };
+    (dir, state)
 }
 
 #[tokio::test]
@@ -363,4 +384,109 @@ async fn replacing_a_disabled_module_shows_what_changed() {
     assert_eq!(replacement.detail, "czeka na zatwierdzenie: zmieniony manifest");
     assert_eq!(replacement.changes, ["nowy host: extra.example.com"]);
     assert!(replacement.takes_over);
+}
+
+fn rule(id: &str, condition: Condition, action: Action) -> RuleDto {
+    RuleDto { id: id.into(), account: "test-echo:a".into(), enabled: true, rule: Rule::new(id, "test-echo:a", condition, action) }
+}
+
+fn channel() -> Action {
+    Action::Channel { fallback_spawn: None }
+}
+
+/// A daemon with test-echo's account "a" (the module is not loaded: rules need only the account).
+async fn with_account() -> (Daemon, UiState) {
+    let d = daemon(&[]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let state = state(&d);
+    (d, state)
+}
+
+#[tokio::test]
+async fn put_rule_returns_autonomous_warning() {
+    let (_d, state) = with_account().await;
+    let direct = rule("r1", Condition::Direct, channel());
+    assert_eq!(commands::put_rule(&state, direct.clone()).unwrap(), None);
+    commands::set_permissions(&state, "test-echo:a", None, true, "autonomous").unwrap();
+    assert_eq!(commands::put_rule(&state, direct).unwrap().as_deref(), Some(commands::AUTONOMOUS_RULE));
+    // Saved either way, and the window gets it back as it sends it.
+    let listed = commands::rules(&state).unwrap();
+    assert_eq!(listed.len(), 1);
+    let sent = serde_json::to_value(&listed[0].rule).unwrap();
+    assert_eq!(
+        (sent["id"].as_str(), sent["condition"]["type"].as_str(), sent["action"]["type"].as_str()),
+        (Some("r1"), Some("direct"), Some("channel"))
+    );
+    assert_eq!(serde_json::to_value(serde_json::from_value::<RuleDto>(sent.clone()).unwrap()).unwrap(), sent);
+
+    commands::delete_rule(&state, "r1").unwrap();
+    assert!(commands::rules(&state).unwrap().is_empty());
+    assert!(commands::delete_rule(&state, "r1").is_err());
+    // Only for an account open_mess has.
+    let other = RuleDto { account: "test-echo:nobody".into(), ..rule("r2", Condition::Mention, channel()) };
+    assert!(commands::put_rule(&state, other).is_err());
+}
+
+#[tokio::test]
+async fn relative_program_is_rejected_from_the_window() {
+    let (_d, state) = with_account().await;
+    let spawn =
+        |program: &str| Action::Spawn(Spawn { program: program.into(), args: vec!["-p".into(), "check open_mess".into()], working_dir: None });
+    assert!(commands::put_rule(&state, rule("r", Condition::Mention, spawn("claude"))).is_err());
+    // As the window sends it.
+    let sent = json!({
+        "id": "r", "account": "test-echo:a", "enabled": true,
+        "condition": {"type": "mention"},
+        "action": {"type": "spawn", "program": "claude", "args": [], "working_dir": null},
+        "quiet_hours": ["22:00:00", "07:00:00"], "max_per_hour": 6, "quiet_ms": 60000, "max_delay_ms": 300000,
+    });
+    assert!(commands::put_rule(&state, serde_json::from_value(sent).unwrap()).is_err());
+    assert!(commands::rules(&state).unwrap().is_empty());
+    // The full path of a program that exists is fine.
+    let program = std::env::current_exe().unwrap();
+    commands::put_rule(&state, rule("r", Condition::Mention, spawn(program.to_str().unwrap()))).unwrap();
+}
+
+struct Delivered;
+
+impl Delivery for Delivered {
+    async fn deliver(&self, _rule: Rule, _batch: Batch) -> DeliveryResult {
+        DeliveryResult::Delivered
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn counters_are_listed() {
+    let (d, state) = with_account().await;
+    commands::put_rule(&state, rule("r1", Condition::Direct, channel())).unwrap();
+    let bus = Bus::default();
+    let noon = || NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+    let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(Delivered), state.counters.clone(), noon);
+    let message = |id: &str| Event::Message {
+        account: "test-echo:a".into(),
+        conversation: "c1".into(),
+        message: id.into(),
+        sender: "p1".into(),
+        own: false,
+        mentions_me: false,
+        direct: true,
+    };
+    bus.publish(message("m1"));
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let listed = commands::rules(&state).unwrap();
+    assert_eq!((listed[0].counters.delivered, listed[0].counters.failed_to_start), (1, 0));
+}
+
+#[tokio::test]
+async fn channel_setup_names_the_bridge() {
+    let (_d, state) = with_account().await;
+    let setup = commands::channel_setup(&state).unwrap();
+    let config: Value = serde_json::from_str(&setup.json).unwrap();
+    assert_eq!(config["mcpServers"]["open_mess_channel"]["args"], json!(["mcp-stdio"]));
+    // The bridge finds this daemon through its data folder, wherever the session starts.
+    let data_dir = state.accounts.data_dir().display().to_string();
+    assert_eq!(config["mcpServers"]["open_mess_channel"]["env"]["OPEN_MESS_DATA_DIR"], json!(data_dir));
+    assert_eq!(std::fs::read_to_string(&setup.file).unwrap(), setup.json);
+    assert_eq!(setup.command, format!(r#"claude --mcp-config "{}" --dangerously-load-development-channels server:open_mess_channel"#, setup.file));
+    assert_eq!(setup.sessions, 0);
 }

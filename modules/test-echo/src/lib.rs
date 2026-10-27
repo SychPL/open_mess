@@ -15,9 +15,20 @@
 //! tool `writes` returns them) and succeed, except a `text` of "uncertain" (the module error), "fail"
 //! (a platform error) or "slow" (recorded, then busy until the call limit). `describe-target`
 //! returns the target the tool `set-target` stored for `{"conversation"}` (`{"participants"}` as
-//! `[id, name]` pairs, `{"text"}` for any message), else participant "p1" (Pat) and "message <id>". The `restore` export succeeds only for account "known"; the `sign-in` export is not
-//! supported; `sign-out` reports the account offline; `get-attachment` downloads an `http://`
-//! attachment id and returns fixed bytes named after any other.
+//! `[id, name]` pairs, `{"text"}` for any message), else participant "p1" (Pat) and "message <id>".
+//! The `restore` export succeeds only for account "known"; the `sign-in` export shows a device code,
+//! then opens the page `https://login.example.com/start` with the redirect prefix
+//! `https://login.example.com/done` and signs in the account named by the redirect's `account=`
+//! parameter (a sign-in error ends it as a platform error naming the case); after the tool
+//! `sign-in-with` `{"how": "windows"}` it signs in account "windows" with a WAM token for the
+//! manifest's identity (the Teams client id; for the manual check only) instead, and after
+//! `{"how": "device-code"}` it shows a device code and polls `http.fetch` until the host refuses
+//! with "sign-in ...", which it returns as a platform error (`{"how": "qr-refresh"}` the same after a
+//! QR code replaced once); `{"how": "qr-loop"}` shows QR codes
+//! forever without polling (a misbehaving module); and after `{"how": "microsoft"}` its
+//! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
+//! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
+//! named after any other.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -40,6 +51,10 @@ mod guest {
     /// The manifest's hosts, padded so the core's tests can add one by patching the built file
     /// (a rebuild with another manifest under the same name).
     const HOSTS: &str = "localhost                               ";
+    /// The Windows account identity: the Teams desktop client id and the chat service's scope
+    /// (docs/protocols/teams.md, "Live results" item 1), for the manual check of WAM.
+    const TEAMS_CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
+    const CHAT_SCOPE: &str = "https://ic3.teams.office.com/.default";
 
     fn http_error(e: &http::HttpError) -> &'static str {
         match e {
@@ -84,16 +99,17 @@ mod guest {
             "sign-in" => {
                 let describe = |result: Result<String, sign_in::SignInError>| match result {
                     Ok(_) => "ok".to_string(),
-                    Err(sign_in::SignInError::Cancelled) => "cancelled".to_string(),
-                    Err(sign_in::SignInError::TimedOut) => "timed-out".to_string(),
-                    Err(sign_in::SignInError::Refused(why)) => format!("refused: {why}"),
-                    Err(sign_in::SignInError::Blocked(why)) => format!("blocked: {why}"),
+                    Err(e) => sign_in_error(&e),
                 };
                 sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
                 json!({
                     "open-page": describe(sign_in::open_page("https://login.example.com/", "https://login.example.com/done")),
                     "wam-token": describe(sign_in::wam_token(&["scope".to_string()], true, None)),
                 })
+            }
+            "sign-in-with" => {
+                storage::set("sign-in-with", text("how").as_bytes()).map_err(|_| types::ModuleError::Platform("storage".to_string()))?;
+                json!({})
             }
             "trap" => std::process::abort(),
             // Opens a socket, stays busy while the server's frames pile up, then sends 40 frames.
@@ -163,6 +179,33 @@ mod guest {
         Ok(result.to_string())
     }
 
+    fn sign_in_error(e: &sign_in::SignInError) -> String {
+        match e {
+            sign_in::SignInError::Cancelled => "cancelled".to_string(),
+            sign_in::SignInError::TimedOut => "timed-out".to_string(),
+            sign_in::SignInError::Refused(why) => format!("refused: {why}"),
+            sign_in::SignInError::Blocked(why) => format!("blocked: {why}"),
+        }
+    }
+
+    /// Polls, as a device-code sign-in would, until the host says the code is abandoned.
+    fn poll_until_abandoned() -> types::ModuleError {
+        loop {
+            let poll = http::Request {
+                method: "POST".to_string(),
+                url: "https://login.example.com/token".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            if let Err(http::HttpError::Blocked(why)) = http::fetch(&poll)
+                && why.starts_with("sign-in")
+            {
+                return types::ModuleError::Platform(why);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// A JSON value the module stored under `key`, else null.
     fn stored(key: &str) -> Value {
         storage::get(key).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
@@ -181,14 +224,48 @@ mod guest {
                 platform: "test".to_string(),
                 // black_box: the padded string stays in the file as written.
                 hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),
-                sign_in_hosts: Vec::new(),
-                wam: None,
+                sign_in_hosts: vec!["login.example.com".to_string(), "login.microsoftonline.com".to_string()],
+                wam: Some(types::WamIdentity { client_id: TEAMS_CLIENT.to_string(), scopes: vec![CHAT_SCOPE.to_string()] }),
                 extra_tools: Vec::new(),
             }
         }
 
         fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
-            Err(types::ModuleError::NotSupported("sign-in".to_string()))
+            let how = storage::get("sign-in-with").unwrap_or_default();
+            if how == b"device-code" {
+                sign_in::show_device_code("WXYZ-5678", "https://login.example.com/device");
+                return Err(poll_until_abandoned());
+            }
+            if how == b"qr-refresh" {
+                // A code that is replaced once before the module polls.
+                sign_in::show_qr("otpauth://open-mess-test/1");
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                sign_in::show_qr("otpauth://open-mess-test/2");
+                return Err(poll_until_abandoned());
+            }
+            if how == b"qr-loop" {
+                // Misbehaves: shows a new QR code every 100 ms and never stops.
+                loop {
+                    sign_in::show_qr("otpauth://open-mess-test");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            if how == b"windows" {
+                // The manual check of WAM: only the token's length is logged.
+                let token =
+                    sign_in::wam_token(&[CHAT_SCOPE.to_string()], false, None).map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
+                host::log(2, &format!("Windows token: {} bytes", token.len()));
+                return Ok(types::AccountInfo { id: "windows".to_string(), display_name: format!("Windows token of {} bytes", token.len()) });
+            }
+            sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
+            // The manual check of the sign-in window opens Microsoft's real sign-in page.
+            let (start, redirect) = match how.as_slice() {
+                b"microsoft" => ("https://login.microsoftonline.com/", "https://login.microsoftonline.com/common/oauth2/nativeclient"),
+                _ => ("https://login.example.com/start", "https://login.example.com/done"),
+            };
+            let url = sign_in::open_page(start, redirect).map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
+            let id = url.split_once("account=").map(|(_, id)| id.split('&').next().unwrap_or(id)).unwrap_or_default();
+            Ok(types::AccountInfo { id: id.to_string(), display_name: format!("Echo {id}") })
         }
 
         // Only account "known" has a session, so tests can tell restore from sign-out.

@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use fake::{AUTHZ_PATH, CHAT, CHAT_PATH, Fake, ME, ME_NAME, ME_OID, OTHER, Reply, Wam, WamCall, conversation, message, page};
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{AccountInfo, Engine, HostError, HostEvent, ModuleContext, ModuleError, ModuleHandle, Net, NewMessage, SessionState, limits};
+use open_mess_host::{
+    AccountInfo, Engine, HostError, HostEvent, ModuleContext, ModuleError, ModuleHandle, Net, NewMessage, SessionState, SignInPrompts, limits,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -87,7 +89,10 @@ async fn load(fake: &Fake, wam: &Wam, data_dir: &Path, timer_cap: Option<u32>) -
     }
     let net = Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests()).serving_hosts_from(fake.addr);
     let (events, receiver) = mpsc::channel(64);
-    let module = engine.load(&common::wasm("open_mess_teams"), ModuleContext { data_dir: data_dir.to_path_buf(), events, net }).await.unwrap();
+    // Signs in through the fake WAM: no prompt reaches a window.
+    let sign_in = SignInPrompts::new(mpsc::channel(1).0);
+    let module =
+        engine.load(&common::wasm("open_mess_teams"), ModuleContext { data_dir: data_dir.to_path_buf(), events, net, sign_in }).await.unwrap();
     (module, receiver)
 }
 

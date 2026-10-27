@@ -15,6 +15,15 @@
     "allow-set-permissions",
     "allow-clear-permission-override",
     "allow-waiting",
-    "allow-decide"
+    "allow-decide",
+    "allow-sign-in-start",
+    "allow-sign-in-request",
+    "allow-sign-in-answer",
+    "allow-sign-in-open-link",
+    "allow-rules",
+    "allow-put-rule",
+    "allow-delete-rule",
+    "allow-pick-program",
+    "allow-channel-setup"
   ]
 }

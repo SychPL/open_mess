@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::runtime::Runtime;
 
-use super::{Opener, UiState};
+use open_mess_host::{SignInReply, SignInRequest};
+
+use super::{Opener, UiState, sign_in_page};
 use crate::Error;
 
 /// The window's label; the capability file grants its commands to this label only.
@@ -22,6 +24,7 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     // The webview's profile stays in the data folder (spec 8.4), not in a folder of its own.
     let profile = state.accounts.data_dir().join("webview");
     let pending = std::sync::Arc::clone(&state.pending);
+    let sign_ins = state.sign_ins.clone();
     let app = tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -37,11 +40,21 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::set_permissions,
             ipc::clear_permission_override,
             ipc::waiting,
-            ipc::decide
+            ipc::decide,
+            ipc::sign_in_start,
+            ipc::sign_in_request,
+            ipc::sign_in_answer,
+            ipc::sign_in_open_link,
+            ipc::rules,
+            ipc::put_rule,
+            ipc::delete_rule,
+            ipc::pick_program,
+            ipc::channel_setup
         ])
         .build(tauri::generate_context!())
         .map_err(failed)?;
     tray(&app, profile.clone()).map_err(failed)?;
+    let page_profile = profile.clone();
 
     let handle = app.handle().clone();
     runtime.spawn(async move {
@@ -53,14 +66,40 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             });
         }
     });
-    // The page's "pending-changed" event, sent by evaluating a line in the page, so the window
-    // needs no event permissions.
+    // The page's "pending-changed" and "sign-in-request" events, sent by evaluating a line in the
+    // page, so the window needs no event permissions.
     let (handle, mut changed) = (app.handle().clone(), pending.subscribe());
     runtime.spawn(async move {
         while changed.changed().await.is_ok() {
-            if let Some(window) = handle.get_webview_window(LABEL) {
-                // ponytail: a page that misses one refreshes on the next change or when shown.
-                let _ = window.eval("window.dispatchEvent(new Event('pending-changed'))");
+            dispatch(&handle, "pending-changed");
+        }
+    });
+    let (handle, mut prompts, watched) = (app.handle().clone(), sign_ins.subscribe(), sign_ins.clone());
+    runtime.spawn(async move {
+        // The prompt whose sign-in page has a window.
+        let mut page_open = None;
+        while prompts.changed().await.is_ok() {
+            dispatch(&handle, "sign-in-request");
+            let page = match watched.shown() {
+                Some((id, SignInRequest::OpenPage { module, url, redirect_prefix })) => Some((id, module, url, redirect_prefix)),
+                _ => None,
+            };
+            if page.as_ref().map(|(id, ..)| *id) == page_open {
+                continue;
+            }
+            // The prompt changed: its page's window goes, the new one's opens.
+            if let Some(old) = page_open.take() {
+                let app = handle.clone();
+                let _ = handle.run_on_main_thread(move || sign_in_page::close(&app, old));
+            }
+            if let Some((id, module, url, prefix)) = page {
+                page_open = Some(id);
+                let (app, profile, sign_ins) = (handle.clone(), page_profile.clone(), watched.clone());
+                let _ = handle.run_on_main_thread(move || {
+                    if let Err(why) = sign_in_page::open(&app, &profile, id, &module, &url, &prefix) {
+                        let _ = sign_ins.answer(id, SignInReply::Refused(why));
+                    }
+                });
             }
         }
     });
@@ -70,13 +109,28 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
         handle.exit(0);
     });
 
-    app.run_return(|_, event| {
+    app.run_return(move |_, event| match event {
         // The last window closing asks to exit; only `Zakończ` and `quit` end the loop.
-        if let RunEvent::ExitRequested { code: None, api, .. } = event {
-            api.prevent_exit();
+        RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+        // Nobody can answer what the closed window showed.
+        RunEvent::WindowEvent { label, event: WindowEvent::Destroyed, .. } if label == LABEL => sign_ins.window_closed(),
+        // The user closed a sign-in page: that sign-in is cancelled, if it still waits.
+        RunEvent::WindowEvent { label, event: WindowEvent::Destroyed, .. } => {
+            if let Some(page) = sign_in_page::page_of(&label) {
+                sign_ins.page_closed(page);
+            }
         }
+        _ => {}
     });
     Ok(())
+}
+
+/// Sends an event to the page, if the window is open.
+fn dispatch<R: tauri::Runtime>(app: &AppHandle<R>, event: &str) {
+    if let Some(window) = app.get_webview_window(LABEL) {
+        // ponytail: a page that misses one refreshes on the next change or when shown.
+        let _ = window.eval(format!("window.dispatchEvent(new Event('{event}'))"));
+    }
 }
 
 fn failed(err: tauri::Error) -> Error {
@@ -92,7 +146,10 @@ mod ipc {
     use tauri::State;
 
     use crate::ui::UiState;
-    use crate::ui::commands::{self, AccountDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, StatusDto};
+    use crate::ui::commands::{
+        self, AccountDto, AnswerDto, ChannelSetupDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, RuleDto, RuleViewDto, SignInPromptDto,
+        StatusDto,
+    };
 
     #[tauri::command(rename_all = "snake_case")]
     pub async fn status(state: State<'_, UiState>) -> Result<StatusDto, String> {
@@ -164,6 +221,51 @@ mod ipc {
     pub async fn decide(state: State<'_, UiState>, action: String, approve: bool) -> Result<String, String> {
         commands::decide(&state, &action, approve).await
     }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn sign_in_start(state: State<'_, UiState>, module: String, account: Option<String>) -> Result<AccountDto, String> {
+        commands::sign_in_start(&state, &module, account.as_deref()).await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn sign_in_request(state: State<'_, UiState>) -> Result<Option<SignInPromptDto>, String> {
+        Ok(commands::sign_in_request(&state))
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn sign_in_answer(state: State<'_, UiState>, request_id: u64, reply: AnswerDto) -> Result<(), String> {
+        commands::sign_in_answer(&state, request_id, reply)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn sign_in_open_link(state: State<'_, UiState>, request_id: u64) -> Result<(), String> {
+        commands::sign_in_open_link(&state, request_id)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn rules(state: State<'_, UiState>) -> Result<Vec<RuleViewDto>, String> {
+        commands::rules(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn put_rule(state: State<'_, UiState>, rule: RuleDto) -> Result<Option<String>, String> {
+        commands::put_rule(&state, rule)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn delete_rule(state: State<'_, UiState>, id: String) -> Result<(), String> {
+        commands::delete_rule(&state, &id)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn pick_program() -> Result<Option<String>, String> {
+        commands::pick_program().await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn channel_setup(state: State<'_, UiState>) -> Result<ChannelSetupDto, String> {
+        commands::channel_setup(&state)
+    }
 }
 
 fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
@@ -204,15 +306,19 @@ fn open_window<R: tauri::Runtime>(app: &AppHandle<R>, profile: &Path) -> Result<
         let _ = window.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("open_mess - ustawienia")
         .inner_size(960.0, 680.0)
         .min_inner_size(640.0, 420.0)
         .data_directory(profile.to_path_buf())
         .on_navigation(own_page)
         .build()
-        .map(drop)
-        .map_err(|err| format!("the window did not open: {err}"))
+        .map_err(|err| format!("the window did not open: {err}"))?;
+    // The WAM dialog of a sign-in opens over this window.
+    if let (Some(state), Ok(hwnd)) = (app.try_state::<UiState>(), window.hwnd()) {
+        state.sign_ins.window_opened(hwnd.0 as isize);
+    }
+    Ok(())
 }
 
 /// The embedded pages only: the window never goes to a remote address.

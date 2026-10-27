@@ -23,6 +23,8 @@ const MAX_DISPLAY_NAME: usize = 256;
 /// The state of an account being removed: no tool reaches it, no module report changes it, and a
 /// removal cut short (the daemon stopped) can be run again.
 pub const REMOVING: &str = "removing";
+/// Why signing in an account again with another one is refused.
+pub const OTHER_ACCOUNT: &str = "to jest inne konto - zaloguj się kontem, które ponownie logujesz, albo najpierw usuń stare konto i dodaj nowe";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
@@ -100,12 +102,87 @@ impl Accounts {
             display_name,
             state: state_name(SessionState::Online).into(),
         };
-        self.store().conn().execute(
+        // An account being removed stays so: its removal is not undone by a sign-in that ends
+        // meanwhile.
+        let changed = self.store().conn().execute(
             "INSERT INTO accounts (id, module, module_account, display_name, state) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, state = excluded.state",
-            [&account.id, &account.module, &account.module_account, &account.display_name, &account.state],
+             ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, state = excluded.state WHERE accounts.state <> ?6",
+            [&account.id, &account.module, &account.module_account, &account.display_name, &account.state, REMOVING],
         )?;
+        if changed == 0 {
+            return Err(Error::Account(format!("konto {} jest usuwane", account.id)));
+        }
         Ok(account)
+    }
+
+    /// Signs in an account through its module's own sign-in and adds it (`Dodaj konto`), or signs
+    /// in `again` an account the module has (`Zaloguj ponownie`): then the module must sign in
+    /// that same account, else nothing changes. A failed sign-in adds nothing. The configuration
+    /// window calls it; no tool starts a sign-in (spec 8.8).
+    pub async fn sign_in(&self, module: &str, again: Option<&str>) -> Result<Account, Error> {
+        let handle = self.modules.handle(module).ok_or_else(|| Error::Account(format!("moduł {module} nie działa")))?;
+        let expected = match again {
+            Some(id) => match self.get(id)? {
+                Some(account) if account.module == module && account.state != REMOVING => Some(account),
+                _ => return Err(Error::Account(format!("nie ma konta {id} w module {module}"))),
+            },
+            None => None,
+        };
+        let info = handle.sign_in().await.map_err(|err| Error::Account(format!("logowanie nie powiodło się: {err}")))?;
+        // The sign-in took a while: the module may have been turned off or replaced meanwhile, and
+        // the account signed in again may have been removed.
+        // An account signed in again is only updated, never inserted: one removed meanwhile does
+        // not come back.
+        let refusal = if !self.modules.handle(module).is_some_and(|current| current.same(&handle)) {
+            format!("moduł {module} wyłączono albo podmieniono w trakcie logowania")
+        } else if let Some(expected) = &expected {
+            if info.id == expected.module_account {
+                if self.renew(&expected.id, &info.display_name)? {
+                    let renewed = self.get(&expected.id)?.filter(|account| account.state != REMOVING);
+                    return renewed.ok_or_else(|| Error::Account(format!("konto {} usunięto w trakcie logowania", expected.id)));
+                }
+                format!("konto {} usunięto w trakcie logowania", expected.id)
+            } else {
+                OTHER_ACCOUNT.to_owned()
+            }
+        } else {
+            return self.add(module, info);
+        };
+        match self.get(&format!("{module}:{}", info.id))? {
+            // Another account open_mess has: the module now holds its session, so it is online
+            // (unless it is being removed).
+            Some(other) if refusal == OTHER_ACCOUNT => {
+                self.renew(&other.id, &info.display_name)?;
+                return Err(Error::Account(format!("{OTHER_ACCOUNT} (zalogowano ponownie konto {})", other.id)));
+            }
+            Some(_) => {}
+            // One open_mess does not have: its session and the secrets the module kept go.
+            None => {
+                let _ = handle.sign_out(&info.id).await;
+                let (credentials, data_dir, module, account) = (Arc::clone(&self.credentials), self.data_dir.clone(), module.to_owned(), info.id);
+                let deleted =
+                    tokio::task::spawn_blocking(move || open_mess_host::delete_account_secrets(&*credentials, &data_dir, &module, &account))
+                        .await
+                        .unwrap_or_else(|err| Err(err.to_string()));
+                // Said, so the user knows something of that account stayed in Credential Manager
+                // (under open_mess/module/<module>).
+                if let Err(why) = deleted {
+                    return Err(Error::Account(format!("{refusal} (sekretów tamtego konta nie udało się usunąć: {why})")));
+                }
+            }
+        }
+        Err(Error::Account(refusal))
+    }
+
+    /// Marks an account signed in again, with the name its module gave now; false when it is gone
+    /// or being removed.
+    fn renew(&self, id: &str, display_name: &str) -> Result<bool, Error> {
+        let display_name: String = display_name.chars().filter(|c| !c.is_control()).take(MAX_DISPLAY_NAME).collect();
+        let changed = self.store().conn().execute(
+            "UPDATE accounts SET display_name = ?2, state = ?3 WHERE id = ?1 AND state <> ?4",
+            [id, &display_name, state_name(SessionState::Online), REMOVING],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Records what a module reported about one of its accounts. Unknown accounts and accounts
@@ -236,4 +313,36 @@ impl Accounts {
 
 fn account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account { id: row.get(0)?, module: row.get(1)?, module_account: row.get(2)?, display_name: row.get(3)?, state: row.get(4)? })
+}
+
+#[cfg(test)]
+mod tests {
+    use open_mess_host::ip_policy::AddressPolicy;
+    use open_mess_host::{Engine, ModuleContext, Net, SignInPrompts};
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_account_being_removed_is_not_signed_in_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.sqlite3")).unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let ctx = move |_: &str| ModuleContext {
+            data_dir: data_dir.clone(),
+            events: mpsc::channel(1).0,
+            net: Net::new(AddressPolicy::Strict),
+            sign_in: SignInPrompts::new(mpsc::channel(1).0),
+        };
+        let modules = Modules::scan(&store, &Engine::new().unwrap(), &dir.path().join("modules"), ctx).await.unwrap();
+        let accounts = Accounts::new(store, modules, dir.path().to_path_buf(), keyring_core::mock::Store::new().unwrap());
+        let info = || AccountInfo { id: "a".into(), display_name: "Ann".into() };
+        accounts.add("m", info()).unwrap();
+        // A removal cut short (the daemon stopped) leaves the row marked.
+        accounts.store().conn().execute("UPDATE accounts SET state = ?1", [REMOVING]).unwrap();
+        // Neither "Dodaj konto" nor "Zaloguj ponownie" brings it back.
+        assert!(accounts.add("m", info()).is_err());
+        assert!(!accounts.renew("m:a", "Ann").unwrap());
+        assert_eq!(accounts.get("m:a").unwrap().unwrap().state, REMOVING);
+    }
 }

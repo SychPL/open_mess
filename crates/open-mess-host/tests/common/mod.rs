@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{Engine, HostEvent, ModuleContext, ModuleHandle, Net, limits};
+use open_mess_host::{Engine, HostEvent, ModuleContext, ModuleHandle, Net, SignInPrompts, limits};
 use tokio::sync::mpsc;
 
 /// A module built by `cargo xtask ci` (the wasm build runs before the tests), found from this test
@@ -26,7 +26,9 @@ pub fn wasm(name: &str) -> PathBuf {
 pub fn context_with_events() -> (ModuleContext, mpsc::Receiver<HostEvent>) {
     let (events, receiver) = mpsc::channel(8);
     let net = Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests());
-    (ModuleContext { data_dir: std::env::temp_dir(), events, net }, receiver)
+    // Sign-in prompts go nowhere: the imports answer that no window takes them.
+    let sign_in = SignInPrompts::new(mpsc::channel(1).0);
+    (ModuleContext { data_dir: std::env::temp_dir(), events, net, sign_in }, receiver)
 }
 
 pub fn context() -> ModuleContext {

@@ -9,7 +9,6 @@ use crate::error::ModuleError;
 use crate::limits;
 use crate::net;
 use crate::runtime::{AccountInfo, Attachment, HostEvent, HostState, Manifest, NewMessage, Participant, SessionState, Target, ToolDecl, WamIdentity};
-use crate::sign_in::{UNAVAILABLE, wait_for_user};
 use crate::storage::{Storage, StorageError};
 
 wasmtime::component::bindgen!({
@@ -21,12 +20,12 @@ wasmtime::component::bindgen!({
     exports: { default: async },
 });
 
-use open_mess::module::{host, http, secrets, sign_in, storage, types, websocket};
+use open_mess::module::{host, http, secrets, storage, types, websocket};
 
 impl HostState {
     /// The module's storage, opened on first use. Not while the manifest is read at load: the
     /// module has no name yet.
-    fn storage(&mut self) -> Result<&mut Storage, StorageError> {
+    pub(crate) fn storage(&mut self) -> Result<&mut Storage, StorageError> {
         if self.env.name.is_empty() {
             return Err(StorageError::Failed("storage is not available while the module loads".to_string()));
         }
@@ -36,7 +35,7 @@ impl HostState {
         self.storage.as_mut().ok_or_else(|| StorageError::Failed("storage did not open".to_string()))
     }
 
-    fn secret_store(&self) -> Result<Arc<CredentialStore>, String> {
+    pub(crate) fn secret_store(&self) -> Result<Arc<CredentialStore>, String> {
         if self.env.name.is_empty() {
             return Err("secrets are not available while the module loads".to_string());
         }
@@ -48,6 +47,10 @@ impl types::Host for HostState {}
 
 impl http::Host for HostState {
     async fn fetch(&mut self, req: http::Request) -> Result<http::Response, http::HttpError> {
+        // A module polling for a sign-in code stops once the user cancelled it or its time is up.
+        if let Some(why) = self.code_abandoned() {
+            return Err(http::HttpError::Blocked(why.to_string()));
+        }
         let req = net::Request { method: req.method, url: req.url, headers: req.headers, body: req.body };
         let fetch = self.env.net.fetch_up_to(&self.env.hosts, req, self.max_body);
         // A body that keeps trickling in never trips the read timeout: the fetch ends before the
@@ -117,29 +120,6 @@ impl secrets::Host for HostState {
         if let Ok(store) = self.secret_store() {
             crate::secrets::delete(&*store, self.storage().ok(), &env.name, &account, &key);
         }
-    }
-}
-
-/// Refused until the configuration window exists; codes and URLs are never logged.
-impl sign_in::Host for HostState {
-    async fn show_device_code(&mut self, _code: String, _verification_url: String) {
-        tracing::debug!(module = %self.env.name, "device code not shown: {UNAVAILABLE}");
-    }
-
-    async fn show_qr(&mut self, _data: String) {
-        tracing::debug!(module = %self.env.name, "QR code not shown: {UNAVAILABLE}");
-    }
-
-    async fn open_page(&mut self, _url: String, _redirect_prefix: String) -> Result<String, sign_in::SignInError> {
-        wait_for_user(&self.deadline, async { Err(sign_in::SignInError::Refused(UNAVAILABLE.to_string())) }).await
-    }
-
-    async fn wam_token(&mut self, _scopes: Vec<String>, _interactive: bool, _claims: Option<String>) -> Result<String, sign_in::SignInError> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(wam) = &self.env.fake_wam {
-            return wam(&_scopes, _interactive, _claims.as_deref()).map_err(sign_in::SignInError::Refused);
-        }
-        wait_for_user(&self.deadline, async { Err(sign_in::SignInError::Refused(UNAVAILABLE.to_string())) }).await
     }
 }
 
