@@ -19,11 +19,14 @@ use crate::instance::InstanceLock;
 use crate::modules::Modules;
 use crate::pending::Pending;
 use crate::store::Store;
-use crate::tools::Registry;
+use crate::tools::{GateMode, Registry};
 use crate::triggers::spawn::{self, Runs};
 use crate::triggers::{self, Actions};
 use crate::ui::sign_in::SignIns;
 use crate::ui::{Opener, UiState};
+use crate::update::probation::{self, Start};
+use crate::update::quiesce::{Activity, Launcher};
+use crate::update::state::Paths;
 use crate::{Error, api, approval, paths, secrets, ui};
 
 /// Why the last `om daemon` failed to start, one line, in the data folder. The CLI shows it when
@@ -36,19 +39,46 @@ pub const LAST_START_ERROR_FILE: &str = "last-start-error.txt";
 pub fn run() -> Result<(), Error> {
     let started = Instant::now();
     let dir = paths::data_dir()?;
+    // First of all: an update's helper may be changing the files, or waiting for this daemon to be
+    // gone (spec 2026-10-27-self-update, 7.6).
+    let mut probation = None;
+    if let Some((paths, launcher)) = update()? {
+        match probation::on_start(&paths) {
+            Start::Normal => {}
+            Start::Probation => probation = Some((paths, launcher)),
+            Start::Exit => return Ok(()),
+            Start::LaunchHelperAndExit => return probation::launch_helper(&paths, &*launcher).map_err(|err| Error::Io(std::io::Error::other(err))),
+        }
+    }
     // A second daemon fails here and leaves the running one's error file alone.
     let _lock = acquire_lock(&dir)?;
     let error_file = dir.join(LAST_START_ERROR_FILE);
     let window = Opener::default();
-    let (runtime, listener, registry, ui) = start(&dir, started, &window).inspect_err(|err| {
+    let (runtime, listener, registry, ui) = start(&dir, started, &window, probation.is_some()).inspect_err(|err| {
         let _ = std::fs::write(&error_file, format!("{}\n", err.to_string().replace(['\r', '\n'], " ")));
     })?;
     let _ = std::fs::remove_file(&error_file);
     let exit = Arc::clone(&ui.exit);
+    let registry = Arc::new(registry);
+    if let Some((paths, launcher)) = probation {
+        let activity = Activity {
+            gate: ui.gate.clone(),
+            triggers: Arc::clone(&ui.activity),
+            pending: Arc::clone(&ui.pending),
+            runs: Arc::clone(&ui.runs),
+            modules: ui.accounts.modules().handles(),
+            host_events: ui.host_events.clone(),
+        };
+        let (registry, exit) = (Arc::clone(&registry), Arc::clone(&exit));
+        runtime.spawn(async move {
+            let status = || registry.status().unwrap_or_default();
+            probation::watch(&paths, &activity, &*launcher, status, tokio::time::Instant::from_std(started), &exit).await;
+        });
+    }
     // Never println!: it panics when the launcher has closed stdout.
     let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
     let (stop, stopped) = oneshot::channel::<()>();
-    let serve = api::serve(listener, ui.token.clone(), Arc::new(registry), window.clone(), async {
+    let serve = api::serve(listener, ui.token.clone(), registry, window.clone(), async {
         let _ = stopped.await;
     });
     // The API ending on its own ends the daemon too, tray and all.
@@ -80,6 +110,22 @@ async fn until_stopped(ended: Arc<Notify>, exit: Arc<Notify>) {
     }
 }
 
+/// An update's folders and what starts its helper.
+type Update = (Paths, Arc<dyn Launcher>);
+
+/// None where updates do not install.
+#[cfg(windows)]
+fn update() -> Result<Option<Update>, Error> {
+    let paths = Paths::current()?;
+    let system = crate::update::system::WindowsSystem { data: paths.data.clone() };
+    Ok(Some((paths, Arc::new(system))))
+}
+
+#[cfg(not(windows))]
+fn update() -> Result<Option<Update>, Error> {
+    Ok(None)
+}
+
 /// The instance lock, retried for half a second: a CLI checking whether a daemon runs holds it for
 /// an instant (cli.rs), and must not be taken for a running daemon.
 fn acquire_lock(dir: &Path) -> Result<InstanceLock, Error> {
@@ -92,7 +138,9 @@ fn acquire_lock(dir: &Path) -> Result<InstanceLock, Error> {
     InstanceLock::acquire(dir)
 }
 
-fn start(dir: &Path, started: Instant, window: &Opener) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
+/// Everything the daemon runs. `probation`: a new version is being checked, and the daemon starts
+/// with writes, window saves and trigger deliveries held (spec 2026-10-27-self-update, 7.2).
+fn start(dir: &Path, started: Instant, window: &Opener, probation: bool) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
     let store = Store::open(&dir.join("state.sqlite3"))?;
     let port = store.port()?;
     let token = secrets::local_api_token()?;
@@ -118,6 +166,12 @@ fn start(dir: &Path, started: Instant, window: &Opener) -> Result<(Runtime, TcpL
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
     let registry = Registry::with_pending(started, Arc::clone(&accounts), Arc::clone(&pending));
     let activity = Arc::new(triggers::Activity::default());
+    if probation {
+        // Before the trigger engine, the approvals and the API run; the probation lets them go.
+        registry.gate().set(GateMode::WritesBlocked);
+        activity.hold.send_replace(true);
+        pending.probation().set(true);
+    }
     let runs = {
         // Inside the runtime: the engine spawns its tasks there.
         let _entered = runtime.enter();
@@ -147,6 +201,7 @@ fn start(dir: &Path, started: Instant, window: &Opener) -> Result<(Runtime, TcpL
     let (gate, ui_ready) = (registry.gate().clone(), Arc::clone(registry.ui_ready()));
     let ui = UiState {
         accounts,
+        probation: pending.probation().clone(),
         pending,
         started,
         port,

@@ -37,7 +37,7 @@ const GIVE_UP: Duration = Duration::from_secs(30 * 60);
 /// How long the helper gets to take `update.lock`.
 const HELPER_START: Duration = Duration::from_secs(30);
 /// The helper program, next to `om.exe`; the scheduled task runs it.
-const HELPER: &str = "om.update.exe";
+pub(crate) const HELPER: &str = "om.update.exe";
 
 /// What the phases wait for and stop.
 pub struct Activity {

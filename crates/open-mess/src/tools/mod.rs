@@ -252,7 +252,9 @@ impl Registry {
         }
     }
 
-    fn status(&self) -> Result<Value, ToolError> {
+    /// What the `status` tool answers; the daemon's own check during an update's probation reads it
+    /// too (spec 2026-10-27-self-update, 7.2).
+    pub fn status(&self) -> Result<Value, ToolError> {
         let (modules, accounts) = match &self.accounts {
             None => (Vec::new(), Vec::new()),
             Some(accounts) => {

@@ -3,6 +3,7 @@
 pub mod apply;
 pub mod consent;
 pub mod fetch;
+pub mod probation;
 pub mod quiesce;
 pub mod release;
 pub mod state;

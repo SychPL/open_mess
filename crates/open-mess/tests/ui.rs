@@ -43,6 +43,7 @@ fn state(d: &Daemon) -> UiState {
         host_events: tokio::sync::mpsc::channel(1).0,
         ui_ready: Arc::default(),
         exit: Arc::default(),
+        probation: d.registry.pending().unwrap().probation().clone(),
     }
 }
 
@@ -66,6 +67,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
     let state = UiState {
         accounts,
+        probation: pending.probation().clone(),
         pending,
         started: Instant::now(),
         port: 7341,

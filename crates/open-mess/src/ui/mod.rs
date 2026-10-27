@@ -25,6 +25,7 @@ use crate::tools::Gate;
 use crate::triggers::channel::Sessions;
 use crate::triggers::spawn::Runs;
 use crate::triggers::{Activity, Counters};
+use crate::update::probation::Flag;
 use sign_in::SignIns;
 
 /// What the window's commands work on.
@@ -52,6 +53,9 @@ pub struct UiState {
     pub ui_ready: Arc<AtomicBool>,
     /// Ends the daemon as Ctrl+C does: an update whose helper started (spec 7.1).
     pub exit: Arc<Notify>,
+    /// On while an update's new version is checked: the window's saves are refused (spec 7.2). The
+    /// pending actions' own flag.
+    pub probation: Flag,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.

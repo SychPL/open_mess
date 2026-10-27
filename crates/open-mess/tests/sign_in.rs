@@ -36,6 +36,7 @@ fn state(d: &Daemon) -> Arc<UiState> {
         host_events: tokio::sync::mpsc::channel(1).0,
         ui_ready: Arc::default(),
         exit: Arc::default(),
+        probation: d.registry.pending().unwrap().probation().clone(),
     })
 }
 

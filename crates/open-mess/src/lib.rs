@@ -44,6 +44,10 @@ pub enum Error {
     Account(String),
     #[error("unknown action {0:?}")]
     UnknownAction(String),
+    /// A new version is being checked (spec 2026-10-27-self-update, 7.2): nothing a rollback would
+    /// undo is done meanwhile.
+    #[error("aktualizacja w toku, spróbuj za chwilę")]
+    UpdateInProgress,
     #[error("the configuration window exists only on Windows")]
     NoWindow,
     #[error("configuration window: {0}")]

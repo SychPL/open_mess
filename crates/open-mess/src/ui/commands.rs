@@ -21,8 +21,17 @@ use crate::{approval, cli, permissions};
 /// Why an approval is refused when the file on disk is not the one the window showed.
 pub const MODULE_CHANGED: &str = "plik modułu się zmienił - odśwież";
 
+/// Why a save from the window is refused while an update's new version is checked (spec
+/// 2026-10-27-self-update, 7.2): a rollback would undo it without a word.
+pub const UPDATE_IN_PROGRESS: &str = "aktualizacja w toku";
+
 fn text(err: impl std::fmt::Display) -> String {
     err.to_string()
+}
+
+/// Refuses a change while an update's new version is checked.
+fn changes_allowed(state: &UiState) -> Result<(), String> {
+    if state.probation.get() { Err(UPDATE_IN_PROGRESS.into()) } else { Ok(()) }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -93,6 +102,7 @@ fn account_dto(state: &UiState, modules: &[ModuleInfo], account: Account) -> Acc
 
 /// Removes an account with its secrets, data and waiting actions (spec 8.8); their toasts close.
 pub async fn remove_account(state: &UiState, id: &str) -> Result<(), String> {
+    changes_allowed(state)?;
     state.accounts.remove(id).await.map_err(text)?;
     // The removal deleted the actions; this forgets their previews and tells the toasts.
     state.pending.expire_due().map_err(text)
@@ -268,19 +278,23 @@ fn list_changes(changes: &mut Vec<String>, what: &str, new: &Value, old: &Value)
 
 /// Approves the module file the window showed, by the hashes it showed, and loads it (a module
 /// stopped after repeated crashes starts again). Refused with [`MODULE_CHANGED`] when the file is
-/// no longer that one.
+/// no longer that one. Once it is the module, the file it replaced is deleted, so that the module
+/// has one file (spec 2026-10-27-self-update, 7.4).
 pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, manifest_sha256: &str) -> Result<(), String> {
-    let shown = state
-        .accounts
-        .modules()
-        .list()
-        .into_iter()
-        .find(|info| info.name == name && info.file_sha256 == file_sha256 && info.manifest_sha256 == manifest_sha256);
-    let Some((file, Some(manifest))) = shown.map(|info| (info.file, info.manifest)) else {
+    changes_allowed(state)?;
+    let list = state.accounts.modules().list();
+    let shown = list.iter().find(|info| info.name == name && info.file_sha256 == file_sha256 && info.manifest_sha256 == manifest_sha256);
+    let Some((file, Some(manifest))) = shown.map(|info| (info.file.clone(), info.manifest.clone())) else {
         return Err(MODULE_CHANGED.into());
     };
+    // The module's file now, when it is another one.
+    let replaced = list
+        .iter()
+        .find(|info| info.name == name && info.state != ModuleState::PendingReplacement && info.file != file)
+        .map(|info| info.file.clone());
     let accounts = Arc::clone(&state.accounts);
-    let on_disk = tokio::task::spawn_blocking(move || accounts.modules().file_sha256(&file)).await.map_err(text)?;
+    let shown_file = file.clone();
+    let on_disk = tokio::task::spawn_blocking(move || accounts.modules().file_sha256(&shown_file)).await.map_err(text)?;
     if on_disk.as_deref() != Some(file_sha256) {
         return Err(MODULE_CHANGED.into());
     }
@@ -289,11 +303,22 @@ pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, mani
         modules::approve(store.conn(), name, file_sha256, manifest_sha256).map_err(text)?;
         modules::remember_approved(store.conn(), &manifest).map_err(text)?;
     }
-    rescan(state, Some(name)).await
+    rescan(state, Some(name)).await?;
+    let is_module =
+        state.accounts.modules().list().iter().any(|info| info.name == name && info.file == file && info.state != ModuleState::PendingReplacement);
+    if let Some(replaced) = replaced.filter(|_| is_module)
+        && std::fs::remove_file(state.accounts.data_dir().join("modules").join(replaced)).is_ok()
+    {
+        // ponytail: reads the folder once more so the window stops listing the deleted file; a
+        // Modules method that drops one entry would save loading every module again.
+        rescan(state, None).await?;
+    }
+    Ok(())
 }
 
 /// Turns a module on or off, at once; turning it on also restarts it after repeated crashes.
 pub async fn set_module_enabled(state: &UiState, name: &str, enabled: bool) -> Result<(), String> {
+    changes_allowed(state)?;
     if !state.accounts.modules().list().iter().any(|info| info.name == name && info.manifest.is_some()) {
         return Err(format!("nie ma modułu {name}"));
     }
@@ -303,6 +328,7 @@ pub async fn set_module_enabled(state: &UiState, name: &str, enabled: bool) -> R
 
 /// Reads the modules folder again (spec 8.3).
 pub async fn rescan_modules(state: &UiState) -> Result<(), String> {
+    changes_allowed(state)?;
     rescan(state, None).await
 }
 
@@ -357,6 +383,7 @@ pub fn permissions(state: &UiState, account: &str) -> Result<PermissionsDto, Str
 
 /// Sets the permissions of an account (`conversation` None) or of one of its conversations.
 pub fn set_permissions(state: &UiState, account: &str, conversation: Option<String>, read: bool, write: &str) -> Result<(), String> {
+    changes_allowed(state)?;
     known_account(state, account)?;
     let write = permissions::Write::parse(write).map_err(text)?;
     let conversation = conversation.map(|id| id.trim().to_owned());
@@ -370,6 +397,7 @@ pub fn set_permissions(state: &UiState, account: &str, conversation: Option<Stri
 
 /// Removes a conversation's own permissions; the account's apply to it again.
 pub fn clear_permission_override(state: &UiState, account: &str, conversation: &str) -> Result<(), String> {
+    changes_allowed(state)?;
     permissions::clear_override(&state.accounts.store(), account, conversation).map_err(text)
 }
 
@@ -422,6 +450,7 @@ pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
 /// the action's state: `done`, `rejected`, `expired`, `voided`, `uncertain` or `failed`. Nothing
 /// is approved that the window could not show in full.
 pub async fn decide(state: &UiState, action: &str, approve: bool) -> Result<String, String> {
+    changes_allowed(state)?;
     if approve && state.pending.waiting().iter().any(|preview| preview.action == action && preview.target_cut) {
         return Err(TARGET_CUT.into());
     }
@@ -488,6 +517,7 @@ pub enum AnswerDto {
 /// Signs in an account of `module` (`Dodaj konto`), or `account` again (`Zaloguj ponownie`), from
 /// the window only (spec 8.8); the module's prompts reach the window meanwhile. Returns the account.
 pub async fn sign_in_start(state: &UiState, module: &str, account: Option<&str>) -> Result<AccountDto, String> {
+    changes_allowed(state)?;
     let _active = state.sign_ins.begin(module)?;
     let account = state.accounts.sign_in(module, account).await.map_err(text)?;
     Ok(account_dto(state, &state.accounts.modules().list(), account))
@@ -604,6 +634,7 @@ pub fn rules(state: &UiState) -> Result<Vec<RuleViewDto>, String> {
 /// Saves a rule, new or changed, for an account open_mess has. Returns the warning about agents
 /// that may write on their own; the rule is saved anyway.
 pub fn put_rule(state: &UiState, dto: RuleDto) -> Result<Option<String>, String> {
+    changes_allowed(state)?;
     known_account(state, &dto.account)?;
     let rule = Rule { id: dto.id, account: dto.account, enabled: dto.enabled, ..dto.rule };
     let warning = rules::put(&state.accounts.store(), &rule).map_err(text)?;
@@ -611,6 +642,7 @@ pub fn put_rule(state: &UiState, dto: RuleDto) -> Result<Option<String>, String>
 }
 
 pub fn delete_rule(state: &UiState, id: &str) -> Result<(), String> {
+    changes_allowed(state)?;
     match rules::delete(&state.accounts.store(), id).map_err(text)? {
         true => Ok(()),
         false => Err(format!("nie ma reguły {id}")),
