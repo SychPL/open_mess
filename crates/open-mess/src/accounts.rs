@@ -131,21 +131,27 @@ impl Accounts {
         let info = handle.sign_in().await.map_err(|err| Error::Account(format!("logowanie nie powiodło się: {err}")))?;
         // The sign-in took a while: the module may have been turned off or replaced meanwhile, and
         // the account signed in again may have been removed.
+        // An account signed in again is only updated, never inserted: one removed meanwhile does
+        // not come back.
         let refusal = if !self.modules.handle(module).is_some_and(|current| current.same(&handle)) {
-            Some(format!("moduł {module} wyłączono albo podmieniono w trakcie logowania"))
+            format!("moduł {module} wyłączono albo podmieniono w trakcie logowania")
         } else if let Some(expected) = &expected {
-            match self.get(&expected.id)? {
-                Some(account) if account.state != REMOVING => (info.id != expected.module_account).then(|| OTHER_ACCOUNT.to_owned()),
-                _ => Some(format!("konto {} usunięto w trakcie logowania", expected.id)),
+            if info.id == expected.module_account {
+                if self.renew(&expected.id, &info.display_name)? {
+                    return self.get(&expected.id)?.ok_or_else(|| Error::Account(format!("konto {} usunięto w trakcie logowania", expected.id)));
+                }
+                format!("konto {} usunięto w trakcie logowania", expected.id)
+            } else {
+                OTHER_ACCOUNT.to_owned()
             }
         } else {
-            None
+            return self.add(module, info);
         };
-        let Some(refusal) = refusal else { return self.add(module, info) };
         match self.get(&format!("{module}:{}", info.id))? {
-            // Another account open_mess has: the module now holds its session, so it is online.
-            Some(other) if other.state != REMOVING && refusal == OTHER_ACCOUNT => {
-                self.add(module, info)?;
+            // Another account open_mess has: the module now holds its session, so it is online
+            // (unless it is being removed).
+            Some(other) if refusal == OTHER_ACCOUNT => {
+                self.set_state(module, &info.id, SessionState::Online)?;
                 return Err(Error::Account(format!("{OTHER_ACCOUNT} (zalogowano ponownie konto {})", other.id)));
             }
             Some(_) => {}
@@ -165,6 +171,17 @@ impl Accounts {
             }
         }
         Err(Error::Account(refusal))
+    }
+
+    /// Marks an account signed in again, with the name its module gave now; false when it is gone
+    /// or being removed.
+    fn renew(&self, id: &str, display_name: &str) -> Result<bool, Error> {
+        let display_name: String = display_name.chars().filter(|c| !c.is_control()).take(MAX_DISPLAY_NAME).collect();
+        let changed = self.store().conn().execute(
+            "UPDATE accounts SET display_name = ?2, state = ?3 WHERE id = ?1 AND state <> ?4",
+            [id, &display_name, state_name(SessionState::Online), REMOVING],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Records what a module reported about one of its accounts. Unknown accounts and accounts

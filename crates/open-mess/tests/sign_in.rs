@@ -386,6 +386,21 @@ async fn what_changed_during_a_sign_in_is_respected() {
     removing.await.unwrap().unwrap();
     assert!(listed(&state).is_empty());
 
+    // "Dodaj konto" ends as an account that is being removed: it stays removed.
+    sign_in_as(&state, None, "a").await.unwrap();
+    let (signing_in, page) = page_open(&state, None).await;
+    let removing = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move { commands::remove_account(&state, "test-echo:a").await })
+    };
+    while d.accounts.get("test-echo:a").unwrap().is_some_and(|account| account.state != open_mess::accounts::REMOVING) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    finish(&state, page, "a");
+    assert!(signing_in.await.unwrap().unwrap_err().contains("jest usuwane"));
+    removing.await.unwrap().unwrap();
+    assert!(listed(&state).is_empty());
+
     // Signed in again as another account open_mess has: refused, but that one is online now.
     sign_in_as(&state, None, "a").await.unwrap();
     sign_in_as(&state, None, "b").await.unwrap();
