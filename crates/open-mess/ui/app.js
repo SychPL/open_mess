@@ -75,14 +75,42 @@ function stateDot(state) {
   return node;
 }
 
+/** The module signing in from this window, while it does. */
+let signingIn = null;
+
+/** Signs in an account of `module` (the module's prompts appear in the sign-in dialog meanwhile). */
+async function signIn(module) {
+  signingIn = module;
+  renderAccounts().catch(showError);
+  try {
+    await call("sign_in_start", { module });
+  } finally {
+    signingIn = null;
+    await renderAccounts();
+  }
+}
+
 async function renderAccounts() {
   const accounts = await call("accounts");
+  const modules = (await call("modules")).filter((module) => module.status === "active");
   const root = content("accounts");
   root.replaceChildren();
-  const add = el("button", "Dodaj konto", "action primary");
-  add.disabled = true;
-  add.title = "Logowanie kont pojawi się w następnej wersji";
-  root.append(add);
+  const top = el("div", null, "row");
+  if (signingIn) {
+    top.append(el("span", "Trwa logowanie w module " + signingIn + "...", "muted"));
+  } else if (modules.length === 0) {
+    top.append(el("span", "Żeby dodać konto, zatwierdź i włącz moduł w sekcji Moduły.", "muted"));
+  } else {
+    const pick = el("select");
+    for (const module of modules) {
+      const option = el("option", module.name + (module.platform ? " (" + module.platform + ")" : ""));
+      option.value = module.name;
+      pick.append(option);
+    }
+    top.append(button("Dodaj konto", () => signIn(pick.value), "primary"));
+    if (modules.length > 1) top.append(pick);
+  }
+  root.append(top);
   if (accounts.length === 0) root.append(el("p", "Nie ma jeszcze żadnego konta.", "muted"));
   for (const account of accounts) {
     const card = el("div", null, "card row");
@@ -433,6 +461,48 @@ async function refreshWaiting() {
   root.querySelector(".empty").hidden = waiting.length > 0;
 }
 
+/** The module's sign-in prompt in a dialog over the window; it disappears once nothing waits. */
+async function refreshSignIn() {
+  const prompt = await call("sign_in_request");
+  const overlay = document.getElementById("sign-in");
+  const dialog = overlay.querySelector(".dialog");
+  dialog.replaceChildren();
+  overlay.hidden = !prompt;
+  if (!prompt) return;
+  dialog.append(el("h1", "Logowanie - " + prompt.module));
+  if (prompt.kind === "device-code") {
+    dialog.append(el("p", "Otwórz stronę logowania w przeglądarce i wpisz ten kod:"), el("div", prompt.code, "code"), el("p", prompt.url, "muted"));
+    dialog.append(button("Otwórz stronę w przeglądarce", () => call("sign_in_open_link", { request_id: prompt.id })));
+  } else if (prompt.kind === "qr") {
+    dialog.append(el("p", "Zeskanuj ten kod telefonem:"));
+    if (prompt.qr_svg) {
+      const image = el("img");
+      image.alt = "kod QR";
+      // An image, so nothing in it runs.
+      image.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(prompt.qr_svg);
+      dialog.append(image);
+    } else {
+      dialog.append(el("p", "Kod jest za długi, żeby go pokazać.", "error"));
+    }
+  } else if (prompt.kind === "page") {
+    dialog.append(el("p", "Zaloguj się w osobnym oknie strony logowania (" + prompt.url + "). Hasło wpisujesz tylko tam."));
+  }
+  const row = el("div", null, "row");
+  row.append(button("Anuluj", () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"));
+  dialog.append(row);
+}
+
+/** One refresh at a time, in order, so an older answer never undoes a newer one. */
+let signInRefresh = Promise.resolve();
+
+function renderSignIn() {
+  signInRefresh = signInRefresh.then(refreshSignIn, refreshSignIn);
+  return signInRefresh;
+}
+
+// Sent by the daemon whenever the sign-in prompt changes.
+window.addEventListener("sign-in-request", () => renderSignIn().catch(showError));
+
 const RENDER = {
   accounts: renderAccounts,
   permissions: renderPermissions,
@@ -474,3 +544,4 @@ for (const node of document.querySelectorAll("#menu button")) {
 }
 
 show("accounts");
+renderSignIn().catch(showError);

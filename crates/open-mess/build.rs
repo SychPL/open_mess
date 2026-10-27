@@ -17,6 +17,10 @@ const COMMANDS: &[&str] = &[
     "clear_permission_override",
     "waiting",
     "decide",
+    "sign_in_start",
+    "sign_in_request",
+    "sign_in_answer",
+    "sign_in_open_link",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

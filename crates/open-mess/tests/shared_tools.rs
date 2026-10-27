@@ -120,6 +120,7 @@ async fn attachment_is_written_by_the_core() {
         data_dir: dir.path().to_path_buf(),
         events: tokio::sync::mpsc::channel(8).0,
         net: open_mess_host::Net::new(AddressPolicy::Strict),
+        sign_in: open_mess_host::SignInPrompts::new(tokio::sync::mpsc::channel(1).0),
     };
     let echo = Engine::new().unwrap().load(&common::wasm("open_mess_test_echo"), ctx).await.unwrap();
     let attachments = shared::attachments_dir(dir.path(), "test-echo:a");

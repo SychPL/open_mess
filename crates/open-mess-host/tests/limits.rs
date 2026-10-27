@@ -15,7 +15,9 @@ async fn lifecycle_exports_reach_the_module() {
     let result = echo.restore("other").await;
     assert!(matches!(&result, Err(HostError::Module(ModuleError::AuthRequired(account))) if account == "other"), "{result:?}");
     echo.sign_out("other").await.unwrap();
-    assert!(matches!(echo.sign_in().await, Err(HostError::Module(ModuleError::NotSupported(_)))));
+    // No window takes its sign-in page.
+    let result = echo.sign_in().await;
+    assert!(matches!(&result, Err(HostError::Module(ModuleError::Platform(why))) if why == "refused: sign-in UI not available"), "{result:?}");
 }
 
 #[tokio::test]

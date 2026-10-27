@@ -15,9 +15,13 @@
 //! tool `writes` returns them) and succeed, except a `text` of "uncertain" (the module error), "fail"
 //! (a platform error) or "slow" (recorded, then busy until the call limit). `describe-target`
 //! returns the target the tool `set-target` stored for `{"conversation"}` (`{"participants"}` as
-//! `[id, name]` pairs, `{"text"}` for any message), else participant "p1" (Pat) and "message <id>". The `restore` export succeeds only for account "known"; the `sign-in` export is not
-//! supported; `sign-out` reports the account offline; `get-attachment` downloads an `http://`
-//! attachment id and returns fixed bytes named after any other.
+//! `[id, name]` pairs, `{"text"}` for any message), else participant "p1" (Pat) and "message <id>".
+//! The `restore` export succeeds only for account "known"; the `sign-in` export shows a device code,
+//! then opens the page `https://login.example.com/start` with the redirect prefix
+//! `https://login.example.com/done` and signs in the account named by the redirect's `account=`
+//! parameter (a sign-in error ends it as a platform error naming the case); `sign-out` reports the
+//! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
+//! named after any other.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -84,10 +88,7 @@ mod guest {
             "sign-in" => {
                 let describe = |result: Result<String, sign_in::SignInError>| match result {
                     Ok(_) => "ok".to_string(),
-                    Err(sign_in::SignInError::Cancelled) => "cancelled".to_string(),
-                    Err(sign_in::SignInError::TimedOut) => "timed-out".to_string(),
-                    Err(sign_in::SignInError::Refused(why)) => format!("refused: {why}"),
-                    Err(sign_in::SignInError::Blocked(why)) => format!("blocked: {why}"),
+                    Err(e) => sign_in_error(&e),
                 };
                 sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
                 json!({
@@ -163,6 +164,15 @@ mod guest {
         Ok(result.to_string())
     }
 
+    fn sign_in_error(e: &sign_in::SignInError) -> String {
+        match e {
+            sign_in::SignInError::Cancelled => "cancelled".to_string(),
+            sign_in::SignInError::TimedOut => "timed-out".to_string(),
+            sign_in::SignInError::Refused(why) => format!("refused: {why}"),
+            sign_in::SignInError::Blocked(why) => format!("blocked: {why}"),
+        }
+    }
+
     /// A JSON value the module stored under `key`, else null.
     fn stored(key: &str) -> Value {
         storage::get(key).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
@@ -181,14 +191,18 @@ mod guest {
                 platform: "test".to_string(),
                 // black_box: the padded string stays in the file as written.
                 hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),
-                sign_in_hosts: Vec::new(),
+                sign_in_hosts: vec!["login.example.com".to_string()],
                 wam: None,
                 extra_tools: Vec::new(),
             }
         }
 
         fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
-            Err(types::ModuleError::NotSupported("sign-in".to_string()))
+            sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
+            let url = sign_in::open_page("https://login.example.com/start", "https://login.example.com/done")
+                .map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
+            let id = url.split_once("account=").map(|(_, id)| id.split('&').next().unwrap_or(id)).unwrap_or_default();
+            Ok(types::AccountInfo { id: id.to_string(), display_name: format!("Echo {id}") })
         }
 
         // Only account "known" has a session, so tests can tell restore from sign-out.

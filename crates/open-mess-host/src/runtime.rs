@@ -13,6 +13,7 @@ use crate::error::HostError;
 use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
 use crate::net::Net;
+use crate::sign_in::SignInPrompts;
 use crate::storage::Storage;
 use crate::timers::Timers;
 use crate::ws::Sockets;
@@ -138,6 +139,8 @@ pub struct ModuleContext {
     pub events: mpsc::Sender<HostEvent>,
     /// The network modules reach the outside world through.
     pub net: Net,
+    /// Where the module's sign-in prompts go.
+    pub sign_in: SignInPrompts,
 }
 
 /// What a module's imports work with; shared by all its instances.
@@ -153,6 +156,7 @@ pub(crate) struct ModuleEnv {
     /// Test support: the longest delay a timer gets, in milliseconds.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) timer_cap: Option<u32>,
+    pub(crate) sign_in: SignInPrompts,
 }
 
 /// The state a module instance runs with: a WASI context with nothing inherited, plus the host
@@ -299,7 +303,7 @@ impl Engine {
             .map_err(|e| HostError::Load(format!("not a platform module: {e}")))?;
         // The manifest runs before the module has a name or hosts: its imports reach nothing, and
         // its host events go nowhere.
-        let ModuleContext { data_dir, events, net } = ctx;
+        let ModuleContext { data_dir, events, net, sign_in } = ctx;
         let (nowhere, _) = mpsc::channel(1);
         let loading = ModuleEnv {
             name: String::new(),
@@ -311,6 +315,7 @@ impl Engine {
             fake_wam: None,
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: None,
+            sign_in: sign_in.clone(),
         };
         let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
@@ -332,6 +337,7 @@ impl Engine {
             fake_wam: self.fake_wam.clone(),
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: self.timer_cap,
+            sign_in,
         }));
         let (requests, queue) = mpsc::channel(QUEUE);
         tokio::spawn(actor.serve(queue));

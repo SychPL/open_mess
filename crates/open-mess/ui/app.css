@@ -139,5 +139,28 @@ pre, .content-text {
 
 code { font-family: Consolas, "Cascadia Mono", monospace; overflow-wrap: anywhere; }
 
+#sign-in {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+#sign-in .dialog {
+  width: min(480px, 90vw);
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 20px 24px;
+  border-radius: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.code { font: 600 28px/1.2 Consolas, "Cascadia Mono", monospace; letter-spacing: 2px; user-select: all; }
+
+.choice { width: 100%; text-align: left; margin-bottom: 6px; }
+
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }

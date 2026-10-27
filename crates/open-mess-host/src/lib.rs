@@ -25,3 +25,4 @@ pub use runtime::{
 pub use secrets::{delete_account_secrets, platform_store as credential_store};
 #[cfg(any(test, feature = "test-support"))]
 pub use sign_in::FakeWam;
+pub use sign_in::{Prompt, SIGN_IN_BUDGET, SignInPrompts, SignInReply, SignInRequest};

@@ -9,7 +9,6 @@ use crate::error::ModuleError;
 use crate::limits;
 use crate::net;
 use crate::runtime::{AccountInfo, Attachment, HostEvent, HostState, Manifest, NewMessage, Participant, SessionState, Target, ToolDecl, WamIdentity};
-use crate::sign_in::{UNAVAILABLE, wait_for_user};
 use crate::storage::{Storage, StorageError};
 
 wasmtime::component::bindgen!({
@@ -21,7 +20,7 @@ wasmtime::component::bindgen!({
     exports: { default: async },
 });
 
-use open_mess::module::{host, http, secrets, sign_in, storage, types, websocket};
+use open_mess::module::{host, http, secrets, storage, types, websocket};
 
 impl HostState {
     /// The module's storage, opened on first use. Not while the manifest is read at load: the
@@ -117,29 +116,6 @@ impl secrets::Host for HostState {
         if let Ok(store) = self.secret_store() {
             crate::secrets::delete(&*store, self.storage().ok(), &env.name, &account, &key);
         }
-    }
-}
-
-/// Refused until the configuration window exists; codes and URLs are never logged.
-impl sign_in::Host for HostState {
-    async fn show_device_code(&mut self, _code: String, _verification_url: String) {
-        tracing::debug!(module = %self.env.name, "device code not shown: {UNAVAILABLE}");
-    }
-
-    async fn show_qr(&mut self, _data: String) {
-        tracing::debug!(module = %self.env.name, "QR code not shown: {UNAVAILABLE}");
-    }
-
-    async fn open_page(&mut self, _url: String, _redirect_prefix: String) -> Result<String, sign_in::SignInError> {
-        wait_for_user(&self.deadline, async { Err(sign_in::SignInError::Refused(UNAVAILABLE.to_string())) }).await
-    }
-
-    async fn wam_token(&mut self, _scopes: Vec<String>, _interactive: bool, _claims: Option<String>) -> Result<String, sign_in::SignInError> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(wam) = &self.env.fake_wam {
-            return wam(&_scopes, _interactive, _claims.as_deref()).map_err(sign_in::SignInError::Refused);
-        }
-        wait_for_user(&self.deadline, async { Err(sign_in::SignInError::Refused(UNAVAILABLE.to_string())) }).await
     }
 }
 

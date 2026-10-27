@@ -1,5 +1,4 @@
-//! Module storage with its quota, and the sign-in imports (refused until the configuration window
-//! exists).
+//! Module storage with its quota.
 
 // clippy.toml allows unwrap in #[test] functions only; the helpers here are test code too.
 #![allow(clippy::unwrap_used)]
@@ -50,12 +49,4 @@ async fn quota_is_enforced() {
     let fits = limits::STORAGE_QUOTA - 1;
     assert_eq!(store(&module, fits).await, format!(r#"{{"len":{fits}}}"#));
     assert_eq!(store(&module, fits + 1).await, format!(r#"{{"error":"quota-exceeded","len":{fits}}}"#));
-}
-
-#[tokio::test]
-async fn sign_in_is_refused_for_now() {
-    let dir = tempfile::tempdir().unwrap();
-    let module = echo(dir.path()).await;
-    let refused = "refused: sign-in UI not available";
-    assert_eq!(module.call("a", "sign-in", "{}").await.unwrap(), format!(r#"{{"open-page":"{refused}","wam-token":"{refused}"}}"#));
 }

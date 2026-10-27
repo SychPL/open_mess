@@ -7,11 +7,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use open_mess_host::Manifest;
-use serde::Serialize;
+use open_mess_host::{Manifest, SignInReply, SignInRequest};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::UiState;
+use crate::accounts::Account;
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
 use crate::{approval, cli, permissions};
 
@@ -74,22 +75,18 @@ pub struct AccountDto {
 
 pub fn accounts(state: &UiState) -> Result<Vec<AccountDto>, String> {
     let modules = state.accounts.modules().list();
-    let platform = |module: &str| {
-        modules.iter().find(|info| info.name == module && info.state != ModuleState::PendingReplacement).map(|info| info.platform.clone())
-    };
-    Ok(state
-        .accounts
-        .list()
-        .map_err(text)?
-        .into_iter()
-        .map(|account| AccountDto {
-            platform: platform(&account.module),
-            state: state.accounts.effective_state(&account),
-            id: account.id,
-            module: account.module,
-            display_name: account.display_name,
-        })
-        .collect())
+    Ok(state.accounts.list().map_err(text)?.into_iter().map(|account| account_dto(state, &modules, account)).collect())
+}
+
+fn account_dto(state: &UiState, modules: &[ModuleInfo], account: Account) -> AccountDto {
+    let platform = modules.iter().find(|info| info.name == account.module && info.state != ModuleState::PendingReplacement);
+    AccountDto {
+        platform: platform.map(|info| info.platform.clone()),
+        state: state.accounts.effective_state(&account),
+        id: account.id,
+        module: account.module,
+        display_name: account.display_name,
+    }
 }
 
 /// Removes an account with its secrets, data and waiting actions (spec 8.8); their toasts close.
@@ -447,4 +444,98 @@ pub fn mcp_command(state: &UiState) -> McpCommandsDto {
             state.token, state.port
         ),
     }
+}
+
+/// A module's sign-in prompt, as the window shows it.
+#[derive(Clone, Debug, Serialize)]
+pub struct SignInPromptDto {
+    /// What [`sign_in_answer`] names.
+    pub id: u64,
+    /// `device-code`, `qr` or `page`.
+    pub kind: &'static str,
+    pub module: String,
+    pub code: Option<String>,
+    /// Where the device code is entered; the host of a sign-in page.
+    pub url: Option<String>,
+    /// The QR code, as an SVG image.
+    pub qr_svg: Option<String>,
+}
+
+/// The window's answer to a sign-in prompt: `{"done": value}` or `"cancelled"`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerDto {
+    Done(Option<String>),
+    Cancelled,
+}
+
+/// Signs in an account of `module`, from the window only (spec 8.8); the module's prompts reach
+/// the window meanwhile. Returns the account added.
+pub async fn sign_in_start(state: &UiState, module: &str) -> Result<AccountDto, String> {
+    let handle = state.accounts.modules().handle(module).ok_or_else(|| format!("moduł {module} nie działa"))?;
+    let _active = state.sign_ins.begin(module)?;
+    let info = handle.sign_in().await.map_err(|err| format!("logowanie nie powiodło się: {err}"))?;
+    let account = state.accounts.add(module, info).map_err(text)?;
+    Ok(account_dto(state, &state.accounts.modules().list(), account))
+}
+
+/// The sign-in prompt waiting for the user, if any.
+pub fn sign_in_request(state: &UiState) -> Option<SignInPromptDto> {
+    let (id, request) = state.sign_ins.shown()?;
+    let module = request.module().to_owned();
+    let dto = |kind| SignInPromptDto { id, kind, module, code: None, url: None, qr_svg: None };
+    Some(match request {
+        SignInRequest::DeviceCode { code, url, .. } => SignInPromptDto { code: Some(code), url: Some(url), ..dto("device-code") },
+        SignInRequest::Qr { data, .. } => SignInPromptDto { qr_svg: qr_svg(&data), ..dto("qr") },
+        SignInRequest::OpenPage { url, .. } => SignInPromptDto { url: Some(host_of(&url)), ..dto("page") },
+    })
+}
+
+/// The QR code of `data` as an SVG image; None when it does not fit in one.
+fn qr_svg(data: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    Some(code.render::<qrcode::render::svg::Color<'_>>().min_dimensions(240, 240).build())
+}
+
+/// The host of a URL, for the window to name; the URL itself when it has none.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_owned()
+}
+
+/// The user's answer to sign-in prompt `id`. A sign-in page is answered only by the page itself
+/// (its redirect); the window can only cancel it.
+pub fn sign_in_answer(state: &UiState, id: u64, answer: AnswerDto) -> Result<(), String> {
+    let reply = match answer {
+        AnswerDto::Cancelled => SignInReply::Cancelled,
+        AnswerDto::Done(_) if matches!(state.sign_ins.shown(), Some((shown, SignInRequest::OpenPage { .. })) if shown == id) => {
+            return Err("stronę logowania można tylko anulować".into());
+        }
+        AnswerDto::Done(value) => SignInReply::Done(value),
+    };
+    state.sign_ins.answer(id, reply)
+}
+
+/// Opens the verification page of device-code prompt `id` in the default browser. Only that
+/// page: the window opens nothing else.
+pub fn sign_in_open_link(state: &UiState, id: u64) -> Result<(), String> {
+    let url = match state.sign_ins.shown() {
+        Some((shown, SignInRequest::DeviceCode { url, .. })) if shown == id => url,
+        _ => return Err(super::sign_in::GONE.into()),
+    };
+    if !url.starts_with("https://") || url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') {
+        return Err("moduł podał nieprawidłowy adres strony logowania".into());
+    }
+    open_in_browser(&url)
+}
+
+#[cfg(windows)]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    // Explorer hands an https URL to the default browser; no shell parses it.
+    std::process::Command::new("explorer.exe").arg(url).spawn().map(drop).map_err(text)
+}
+
+#[cfg(not(windows))]
+fn open_in_browser(_url: &str) -> Result<(), String> {
+    Err(crate::Error::NoWindow.to_string())
 }

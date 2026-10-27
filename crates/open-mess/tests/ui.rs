@@ -14,6 +14,7 @@ use open_mess::pending::{Kind, Pending, Preview, State};
 use open_mess::tools::ToolError;
 use open_mess::ui::UiState;
 use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto};
+use open_mess::ui::sign_in::SignIns;
 use open_mess_host::Engine;
 use serde_json::json;
 use tempfile::TempDir;
@@ -25,6 +26,7 @@ fn state(d: &Daemon) -> UiState {
         started: Instant::now(),
         port: 7341,
         token: "t0ken".into(),
+        sign_ins: d.sign_ins.clone(),
     }
 }
 
@@ -46,7 +48,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
     let modules = scan(&store(dir.path()), &engine, dir.path()).await;
     let accounts = common::accounts(dir.path(), modules, keyring_core::mock::Store::new().unwrap());
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
-    (dir, UiState { accounts, pending, started: Instant::now(), port: 7341, token: "t0ken".into() })
+    (dir, UiState { accounts, pending, started: Instant::now(), port: 7341, token: "t0ken".into(), sign_ins: SignIns::default() })
 }
 
 #[tokio::test]

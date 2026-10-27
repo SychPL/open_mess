@@ -15,6 +15,10 @@
     "allow-set-permissions",
     "allow-clear-permission-override",
     "allow-waiting",
-    "allow-decide"
+    "allow-decide",
+    "allow-sign-in-start",
+    "allow-sign-in-request",
+    "allow-sign-in-answer",
+    "allow-sign-in-open-link"
   ]
 }

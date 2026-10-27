@@ -4,6 +4,7 @@
 //! for the daemon to be stopped.
 
 pub mod commands;
+pub mod sign_in;
 #[cfg(windows)]
 mod window;
 
@@ -17,6 +18,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::Error;
 use crate::accounts::Accounts;
 use crate::pending::Pending;
+use sign_in::SignIns;
 
 /// What the window's commands work on.
 pub struct UiState {
@@ -27,6 +29,8 @@ pub struct UiState {
     /// The local API's port and token, for the command that connects an agent.
     pub port: u16,
     pub token: String,
+    /// The sign-in in progress and its prompts.
+    pub sign_ins: SignIns,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.
