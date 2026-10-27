@@ -172,10 +172,17 @@ fn asset_url<'a>(candidate: &'a Candidate, name: &str) -> Result<&'a Url, Update
 }
 
 /// Downloads the manifest, verifies it and then every file it lists into `<root>\<version>`.
-/// On any error that folder is removed.
+/// On any error that folder is removed. A folder that holds an installation's backup is refused,
+/// never removed: after a failed rollback it may be the only copy of the user's data.
 pub async fn download(client: &reqwest::Client, candidate: &Candidate, public_key: &str, root: &Path) -> Result<Downloaded, UpdateError> {
     let dir = root.join(candidate.version.to_string());
     if dir.exists() {
+        if holds_backup(&dir)? {
+            return Err(UpdateError::Rejected(format!(
+                "{} holds the backup of an earlier installation; remove it once open_mess works again",
+                dir.display()
+            )));
+        }
         std::fs::remove_dir_all(&dir)?; // leftovers of an earlier attempt are never reused
     }
     let result = download_into(client, candidate, public_key, &dir).await;
@@ -183,6 +190,19 @@ pub async fn download(client: &reqwest::Client, candidate: &Candidate, public_ke
         std::fs::remove_dir_all(&dir).ok();
     }
     result
+}
+
+/// Whether an update folder holds a whole backup, current (`backup`) or set aside (`backup-*`), as
+/// update/apply.rs names them. A `backup.partial` was never whole and does not count.
+fn holds_backup(dir: &Path) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name == "backup" || name.starts_with("backup-") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn download_into(client: &reqwest::Client, candidate: &Candidate, public_key: &str, dir: &Path) -> Result<Downloaded, UpdateError> {

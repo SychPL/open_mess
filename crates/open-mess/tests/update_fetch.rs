@@ -228,6 +228,28 @@ async fn partial_download_is_removed() {
 }
 
 #[tokio::test]
+async fn folder_with_a_backup_is_never_replaced() {
+    let keys = keys();
+    let (source, _) = Fake::release(&keys).serve().await;
+    let client = client(&source).expect("client");
+    let candidate = latest(&client, &source, current()).await.expect("latest").expect("candidate");
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("9.9.9");
+    for backup in ["backup", "backup-1700000000000"] {
+        std::fs::create_dir_all(dir.join(backup)).expect("backup");
+        std::fs::write(dir.join(backup).join("state.sqlite3"), b"the user's data").expect("backup file");
+        let result = download(&client, &candidate, &keys.0, root.path()).await;
+        let Err(UpdateError::Rejected(why)) = result else { panic!("downloaded over {backup}: {result:?}") };
+        assert!(why.contains(&dir.display().to_string()) && why.contains("remove it"), "{why}");
+        assert_eq!(std::fs::read(dir.join(backup).join("state.sqlite3")).expect("kept"), b"the user's data");
+        std::fs::rename(dir.join(backup), root.path().join(backup)).expect("move away");
+    }
+    // A partial backup was never whole: the folder is an ordinary leftover.
+    std::fs::create_dir_all(dir.join("backup.partial")).expect("partial");
+    download(&client, &candidate, &keys.0, root.path()).await.expect("download");
+}
+
+#[tokio::test]
 async fn asset_not_in_manifest_is_not_downloaded() {
     let keys = keys();
     let mut fake = Fake::release(&keys);

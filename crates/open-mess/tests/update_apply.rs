@@ -41,12 +41,20 @@ struct Machine {
     meanwhile: Box<dyn Fn()>,
     /// A stop panics: the helper dies in the middle of a rollback.
     crash_on_stop: bool,
+    /// A stop leaves the daemon running: something keeps holding its lock.
+    stop_fails: bool,
     log: RefCell<Vec<&'static str>>,
 }
 
 impl Machine {
     fn new(running: bool, health: Health) -> Machine {
-        Machine { running: Cell::new(running), health, meanwhile: Box::new(|| {}), crash_on_stop: false, log: RefCell::default() }
+        Machine { running: Cell::new(running), health, meanwhile: Box::new(|| {}), crash_on_stop: false, stop_fails: false, log: RefCell::default() }
+    }
+
+    /// A machine on which the helper dies while the new daemon's health is asked: after the
+    /// installation, at stage `installed`.
+    fn crashing() -> Machine {
+        Machine { meanwhile: Box::new(|| panic!("power loss")), ..Machine::new(false, Health::Healthy) }
     }
 
     fn log(&self) -> Vec<&'static str> {
@@ -63,7 +71,7 @@ impl System for Machine {
     fn stop_daemon(&self) -> Result<(), UpdateError> {
         self.log.borrow_mut().push("stop");
         assert!(!self.crash_on_stop, "the helper died");
-        self.running.set(false);
+        self.running.set(self.running.get() && self.stop_fails);
         Ok(())
     }
 
@@ -73,9 +81,9 @@ impl System for Machine {
         Ok(())
     }
 
-    fn health(&self, active_modules: &[String]) -> Health {
+    fn health(&self, version: &str, active_modules: &[String]) -> Health {
         self.log.borrow_mut().push("health");
-        assert_eq!(active_modules, ["test-echo"]);
+        assert_eq!((version, active_modules), (RELEASE, &["test-echo".to_string()][..]));
         (self.meanwhile)();
         self.health.clone()
     }
@@ -86,6 +94,7 @@ struct Setup {
     _root: TempDir,
     paths: Paths,
     public_key: String,
+    secret_key: minisign::SecretKey,
     update_dir: PathBuf,
     manifest_sha256: String,
 }
@@ -137,7 +146,7 @@ impl Setup {
             replaced: Vec::new(),
         };
         state::write(&paths.pending_file(), &pending).unwrap();
-        Setup { _root: root, paths, public_key: keys.pk.to_box().unwrap().to_string(), update_dir, manifest_sha256 }
+        Setup { _root: root, paths, public_key: keys.pk.to_box().unwrap().to_string(), secret_key: keys.sk, update_dir, manifest_sha256 }
     }
 
     fn run(&self, machine: &Machine) -> Outcome {
@@ -191,6 +200,11 @@ impl Setup {
 
     fn backup(&self) -> PathBuf {
         self.update_dir.join("backup")
+    }
+
+    /// The backup of a successful installation, kept for recovery by hand.
+    fn kept_backup(&self) -> PathBuf {
+        self.update_dir.join(format!("backup-{NOW}"))
     }
 
     /// Nothing changed but the stage file and the consent.
@@ -304,9 +318,24 @@ fn install_swaps_exe_and_approves_version_only_module() {
     assert_eq!(modules.len(), 1);
     assert_eq!((modules[0].state.clone(), modules[0].version.as_str()), (ModuleState::Active, "9.9.9"));
     assert_eq!(modules::approved_manifest(&s.store(), "test-echo").unwrap().unwrap()["version"], "9.9.9");
-    // The backup stays until the next update (spec 7.5).
-    assert_eq!(std::fs::read(s.backup().join("bin").join("om.exe")).unwrap(), OLD_OM);
-    assert_eq!(std::fs::read(s.backup().join("data").join("modules").join("echo.wasm")).unwrap(), common::echo());
+    // The backup stays until the next update (spec 7.5), under a name no rollback looks for.
+    assert!(!s.backup().exists());
+    assert_eq!(std::fs::read(s.kept_backup().join("bin").join("om.exe")).unwrap(), OLD_OM);
+    assert_eq!(std::fs::read(s.kept_backup().join("data").join("modules").join("echo.wasm")).unwrap(), common::echo());
+}
+
+#[test]
+fn earlier_backup_is_moved_aside() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    // Left by an earlier attempt whose rollback failed: maybe the only copy of the user's data.
+    std::fs::create_dir_all(s.backup()).unwrap();
+    std::fs::write(s.backup().join("state.sqlite3"), b"an earlier attempt's").unwrap();
+    assert_eq!(s.run(&Machine::new(false, Health::Healthy)), Outcome::Installed);
+    let earlier = s.update_dir.join(format!("backup-{NOW}-earlier"));
+    assert_eq!(std::fs::read(earlier.join("state.sqlite3")).unwrap(), b"an earlier attempt's");
+    // Never mixed into this installation's backup.
+    assert!(!s.kept_backup().join("state.sqlite3").exists());
+    assert_eq!(std::fs::read(s.kept_backup().join("bin").join("om.exe")).unwrap(), OLD_OM);
 }
 
 #[test]
@@ -369,9 +398,7 @@ fn failed_health_rolls_back_everything() {
 #[test]
 fn crash_after_backup_rolls_back_on_next_run() {
     let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
-    let mut machine = Machine::new(false, Health::Healthy);
-    machine.meanwhile = Box::new(|| panic!("power loss"));
-    s.crash(&machine);
+    s.crash(&Machine::crashing());
     // Whatever the helper had done after the backup, the stage says what is left to undo.
     s.set_stage(Stage::BackedUp);
 
@@ -404,11 +431,87 @@ fn interrupted_rollback_finishes_on_next_run() {
 }
 
 #[test]
+fn rollback_waits_for_the_daemon_to_let_go() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    s.crash(&Machine::crashing());
+    // The new daemon holds its lock, and its files, through two stops.
+    let machine = Machine { stop_fails: true, ..Machine::new(true, Health::Healthy) };
+    let Outcome::RollbackFailed(why) = s.run(&machine) else { panic!("rolled back under a running daemon") };
+    assert!(why.contains("tried again"), "{why}");
+    assert_eq!(machine.log(), ["stop", "wait", "stop", "wait"], "nothing restored, nothing started");
+    assert_eq!(s.pending().stage, Stage::RollingBack);
+    assert_eq!(s.om(), NEW_OM);
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo_with_version("9.9.9"));
+
+    let machine = Machine::new(true, Health::Healthy);
+    assert_eq!(s.run(&machine), Outcome::RolledBack("the update was interrupted".into()));
+    assert_eq!(s.om(), OLD_OM);
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
+}
+
+#[test]
+fn failed_rollback_keeps_and_names_the_backup() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    s.crash(&Machine::crashing());
+    std::fs::remove_file(s.backup().join("bin").join("om.exe")).unwrap();
+    let machine = Machine::new(false, Health::Healthy);
+    let Outcome::RollbackFailed(why) = s.run(&machine) else { panic!("rolled back without om.exe in the backup") };
+    assert!(why.contains(&format!("kopia zapasowa: {}", s.backup().display())), "{why}");
+    assert_eq!(machine.log(), ["stop", "wait", "start"], "started all the same");
+    assert!(!s.paths.pending_file().exists(), "not tried again at every logon");
+    assert!(s.backup().join("data").join("state.sqlite3").exists(), "the backup is kept");
+    assert!(s.last_result().unwrap().starts_with("wycofanie nieudane: "));
+    // The rest is restored all the same.
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
+    assert!(!s.rolled_back());
+}
+
+#[test]
+fn unreadable_stage_file_with_a_backup_rolls_back() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    s.crash(&Machine::crashing());
+    std::fs::write(s.paths.pending_file(), "{\"version\": ").unwrap();
+    let machine = Machine::new(false, Health::Healthy);
+    assert_eq!(s.run(&machine), Outcome::RolledBack("update-pending.json is unreadable".into()));
+    assert_eq!(machine.log(), ["stop", "wait", "start"]);
+    assert_eq!(s.om(), OLD_OM);
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
+    assert_eq!(s.modules()[0].version, RELEASE);
+    assert!(!s.paths.pending_file().exists());
+    assert!(!s.backup().exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn busy_om_exe_is_moved_aside() {
+    use std::process::{Command, Stdio};
+
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    s.crash(&Machine::crashing());
+    // A bridge runs the installed om.exe: Windows lets it be renamed, not replaced.
+    let om = s.paths.bin().join("om.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_open-mess-record-run"), &om).unwrap();
+    let started = s.paths.data.join("bridge-started");
+    let mut bridge = Command::new(&om).arg(&started).args(["--sleep", "60000"]).stdin(Stdio::null()).spawn().unwrap();
+    let wait = std::time::Instant::now();
+    while !started.exists() && wait.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let outcome = s.run(&Machine::new(false, Health::Healthy));
+    bridge.kill().unwrap();
+    bridge.wait().unwrap();
+    assert!(matches!(outcome, Outcome::RolledBack(_)), "{outcome:?}");
+    assert_eq!(s.om(), OLD_OM);
+    assert_eq!(
+        std::fs::read(s.paths.bin().join(format!("om.failed-{NOW}.exe"))).unwrap(),
+        std::fs::read(env!("CARGO_BIN_EXE_open-mess-record-run")).unwrap()
+    );
+}
+
+#[test]
 fn missing_om_exe_after_crash_is_restored() {
     let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
-    let mut machine = Machine::new(false, Health::Healthy);
-    machine.meanwhile = Box::new(|| panic!("power loss"));
-    s.crash(&machine);
+    s.crash(&Machine::crashing());
     // Power lost between the two renames: om.exe moved aside, om.new.exe not in its place yet.
     std::fs::rename(s.paths.bin().join("om.exe"), s.paths.bin().join("om.new.exe")).unwrap();
     s.set_stage(Stage::BackedUp);
@@ -465,18 +568,67 @@ fn tampered_file_after_download_is_caught_by_reverify() {
 }
 
 #[test]
+fn tampered_signature_or_manifest_is_caught_by_reverify() {
+    // Signed by someone else.
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    let other = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let manifest = std::fs::read(s.update_dir.join("manifest.json")).unwrap();
+    let forged = minisign::sign(None, &other.sk, Cursor::new(&manifest), None, None).unwrap().to_string();
+    std::fs::write(s.update_dir.join("manifest.json.minisig"), forged).unwrap();
+    let machine = Machine::new(false, Health::Healthy);
+    let Outcome::Aborted(why) = s.run(&machine) else { panic!("installed a forged signature") };
+    assert!(why.starts_with("release rejected: signature"), "{why}");
+    assert_eq!(machine.log(), ["wait", "wait", "start"]);
+    s.assert_untouched();
+
+    // Signed by the release key, but not the release the user accepted.
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    let other_release =
+        format!(r#"{{"version":"{RELEASE}","files":[{{"name":"om.exe","kind":"exe","size":{},"sha256":"{}"}}]}}"#, NEW_OM.len(), sha(NEW_OM));
+    let signature = minisign::sign(None, &s.secret_key, Cursor::new(other_release.as_bytes()), None, None).unwrap().to_string();
+    std::fs::write(s.update_dir.join("manifest.json"), &other_release).unwrap();
+    std::fs::write(s.update_dir.join("manifest.json.minisig"), signature).unwrap();
+    let machine = Machine::new(false, Health::Healthy);
+    assert_eq!(s.run(&machine), Outcome::Aborted("release rejected: the update folder holds another release than the one accepted".into()));
+    s.assert_untouched();
+}
+
+#[test]
+fn daemon_that_does_not_stop_changes_nothing_and_is_started() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    let machine = Machine { stop_fails: true, ..Machine::new(true, Health::Healthy) };
+    assert_eq!(s.run(&machine), Outcome::Aborted("the daemon did not stop".into()));
+    // Never left stopped: a start is harmless to a daemon that runs.
+    assert_eq!(machine.log(), ["wait", "stop", "wait", "start"]);
+    assert!(!s.paths.pending_file().exists());
+    assert!(s.consent_valid(), "nothing was tried, the consent is not spent");
+    s.assert_untouched();
+}
+
+#[test]
 fn stage_file_naming_other_files_is_unreadable() {
     let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
     let victim = s.paths.data.join("state.sqlite3");
-    let tampered = PendingFile { stage: Stage::RollingBack, added: vec![victim.clone()], ..pending_of(&s) };
-    state::write(&s.paths.pending_file(), &tampered).unwrap();
-    let machine = Machine::new(false, Health::Healthy);
-    // No backup of this version: deleted, and the daemon started.
-    assert_eq!(s.run(&machine), Outcome::Aborted("update-pending.json is unreadable".into()));
-    assert_eq!(machine.log(), ["wait", "start"]);
-    assert!(victim.exists());
-    assert!(!s.paths.pending_file().exists());
-    s.assert_untouched();
+    // A file outside the folders an installation adds to, or a backup outside the update folders.
+    let elsewhere = s.paths.data.join("elsewhere");
+    std::fs::create_dir_all(elsewhere.join("backup").join("bin")).unwrap();
+    std::fs::write(elsewhere.join("backup").join("bin").join("om.exe"), b"planted").unwrap();
+    for tampered in [
+        PendingFile { stage: Stage::RollingBack, added: vec![victim.clone()], ..pending_of(&s) },
+        PendingFile { stage: Stage::RollingBack, replaced: vec![s.paths.data.join("modules").join("..").join("state.sqlite3")], ..pending_of(&s) },
+        PendingFile { stage: Stage::RollingBack, update_dir: elsewhere.clone(), ..pending_of(&s) },
+        PendingFile { stage: Stage::RollingBack, version: "../9.9.9".into(), ..pending_of(&s) },
+    ] {
+        state::write(&s.paths.pending_file(), &tampered).unwrap();
+        let machine = Machine::new(false, Health::Healthy);
+        // No backup of this version: deleted, and the daemon started.
+        assert_eq!(s.run(&machine), Outcome::Aborted("update-pending.json is unreadable".into()), "{tampered:?}");
+        assert_eq!(machine.log(), ["wait", "start"]);
+        assert!(victim.exists());
+        assert!(elsewhere.join("backup").exists());
+        assert!(!s.paths.pending_file().exists());
+        s.assert_untouched();
+    }
 }
 
 #[test]
@@ -485,6 +637,7 @@ fn judge_waits_for_accounts_but_fails_on_a_crash() {
     let status = |ui_ready: bool, accounts_restored: bool, modules: serde_json::Value| json!({"version": "9.9.9", "modules": modules, "ui_ready": ui_ready, "accounts_restored": accounts_restored});
     let echo = |state: &str, crashes: serde_json::Value| json!([{"name": "test-echo", "state": state, "crashes_since_load": crashes}]);
     let back = || echo("active", json!(0));
+    let judge = |status: &serde_json::Value, active: &[String]| judge(status, "9.9.9", active);
 
     assert_eq!(judge(&json!({}), &active), Judgement::Pending { accounts_only: false });
     assert_eq!(judge(&status(false, true, back()), &active), Judgement::Pending { accounts_only: false });
@@ -492,6 +645,10 @@ fn judge_waits_for_accounts_but_fails_on_a_crash() {
     assert_eq!(judge(&status(true, true, echo("awaiting approval (new module)", json!(null))), &active), Judgement::Pending { accounts_only: false });
     assert_eq!(judge(&status(true, false, back()), &active), Judgement::Pending { accounts_only: true });
     assert_eq!(judge(&status(true, true, back()), &active), Judgement::Healthy);
+    // Another version answering is not the new daemon, however well it is.
+    let mut old = status(true, true, back());
+    old["version"] = json!("9.9.8");
+    assert_eq!(judge(&old, &active), Judgement::Pending { accounts_only: false });
 
     // A crash fails at once, even while the accounts are restored.
     assert!(matches!(judge(&status(true, false, echo("active", json!(1))), &active), Judgement::Failed(_)));

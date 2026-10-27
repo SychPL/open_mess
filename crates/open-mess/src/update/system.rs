@@ -32,9 +32,11 @@ const READY_WITHIN: Duration = Duration::from_secs(60);
 /// run between the accounts (spec 7.2).
 const ACCOUNTS_WITHIN: Duration = Duration::from_secs(10 * 60);
 /// Ends what `schtasks /End` leaves: every `om.exe` of this user whose command line says `daemon`,
-/// from any folder, with the filter of `scripts/install.ps1` (`Stop-Daemon`). Fixed text: nothing
-/// from outside goes into it, and no double quote that the command line would have to escape.
-const STOP_DAEMONS: &str = r"Get-CimInstance Win32_Process -Filter 'Name=''om.exe''' | Where-Object { $_.CommandLine -match '\bdaemon\b' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+/// from any folder, with the filter of `scripts/install.ps1` (`Stop-Daemon`): `daemon` must be the
+/// first argument after the program, so a bridge whose path has the word survives. Fixed text:
+/// nothing from outside goes into it, and no double quote (`"` in the pattern) that the command
+/// line would have to escape.
+const STOP_DAEMONS: &str = r"Get-CimInstance Win32_Process -Filter 'Name=''om.exe''' | Where-Object { $_.CommandLine -match '^\s*(\x22[^\x22]*\x22|\S+)\s+daemon(\s|$)' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
 
 /// Task Scheduler and the daemon for real.
 pub struct WindowsSystem {
@@ -86,9 +88,9 @@ impl System for WindowsSystem {
         schtasks(&[OsStr::new("/Run"), OsStr::new("/TN"), OsStr::new(DAEMON_TASK)])
     }
 
-    fn health(&self, active_modules: &[String]) -> Health {
+    fn health(&self, version: &str, active_modules: &[String]) -> Health {
         match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => runtime.block_on(self.watch(active_modules)),
+            Ok(runtime) => runtime.block_on(self.watch(version, active_modules)),
             Err(err) => Health::Failed(format!("cannot ask the new daemon: {err}")),
         }
     }
@@ -96,11 +98,11 @@ impl System for WindowsSystem {
 
 impl WindowsSystem {
     /// Asks the new daemon for its `status` every second until [`judge`] decides or a limit passes.
-    async fn watch(&self, active_modules: &[String]) -> Health {
+    async fn watch(&self, version: &str, active_modules: &[String]) -> Health {
         let started = Instant::now();
         loop {
             let (limit, why) = match self.status().await {
-                Ok(status) => match judge(&status, active_modules) {
+                Ok(status) => match judge(&status, version, active_modules) {
                     Judgement::Healthy => return Health::Healthy,
                     Judgement::Failed(why) => return Health::Failed(why),
                     Judgement::Pending { accounts_only: true } => (ACCOUNTS_WITHIN, "the accounts were not restored within 10 minutes".to_owned()),

@@ -8,7 +8,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::UpdateError;
 use super::consent;
-use super::release::{Kind, Manifest, Version, manifest_sha256, verify};
+use super::release::{FileEntry, Kind, Manifest, Version, manifest_sha256, verify};
 use super::state::{self, Paths, PendingFile, Read, Stage};
 use crate::modules::{self, ModuleState};
 
@@ -45,9 +45,9 @@ pub trait System {
     fn wait_daemon_lock_free(&self, wait: Duration) -> bool;
     fn stop_daemon(&self) -> Result<(), UpdateError>;
     fn start_daemon(&self) -> Result<(), UpdateError>;
-    /// Waits until the new daemon is up with every module of `active_modules` back (spec 7.2), or
-    /// gives up.
-    fn health(&self, active_modules: &[String]) -> Health;
+    /// Waits until the daemon of `version` is up with every module of `active_modules` back (spec
+    /// 7.2), or gives up.
+    fn health(&self, version: &str, active_modules: &[String]) -> Health;
 }
 
 /// How the new daemon came up.
@@ -94,11 +94,15 @@ pub enum Judgement {
     Failed(String),
 }
 
-/// Judges a `status` answer: the window and tray are ready and every module of `active_modules` is
-/// active without a crash since it was loaded; then the account restore has finished. A crash, or a
-/// module stopped or turned off, fails at once. The daemon's own check during the probation uses it
-/// too.
-pub fn judge(status: &Value, active_modules: &[String]) -> Judgement {
+/// Judges a `status` answer: it comes from the daemon of `version`, the window and tray are ready
+/// and every module of `active_modules` is active without a crash since it was loaded; then the
+/// account restore has finished. A crash, or a module stopped or turned off, fails at once. The
+/// daemon's own check during the probation uses it too.
+pub fn judge(status: &Value, version: &str, active_modules: &[String]) -> Judgement {
+    // Another version answering is not the new daemon yet (an old one not quite gone, say).
+    if status.get("version").and_then(Value::as_str) != Some(version) {
+        return Judgement::Pending { accounts_only: false };
+    }
     let listed = status.get("modules").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let [active, waiting, crashed, disabled] =
         [ModuleState::Active, ModuleState::PendingReplacement, ModuleState::Crashed, ModuleState::Disabled].map(|state| state.to_string());
@@ -148,13 +152,19 @@ pub fn run(paths: &Paths, system: &dyn System, public_key: &str, now: fn() -> i6
     outcome
 }
 
-/// `update-pending.json`, as unreadable when it names a file outside the two folders an
-/// installation adds files to: a rollback deletes every file in `added`.
+/// `update-pending.json`, as unreadable unless its update folder is `updates\<version>` and every
+/// file it lists lies in one of the two folders an installation adds files to: a rollback restores
+/// from that folder's backup, deletes it, and deletes every file in `added`.
 fn read(paths: &Paths) -> Read {
     let (modules, bin) = (paths.data.join("modules"), paths.bin());
     let inside = |path: &PathBuf| path.file_name().is_some() && (path.parent() == Some(&*modules) || path.parent() == Some(&*bin));
+    let valid = |pending: &PendingFile| {
+        Version::parse(&pending.version).is_ok()
+            && pending.update_dir == paths.updates().join(&pending.version)
+            && pending.added.iter().chain(&pending.replaced).all(inside)
+    };
     match state::read(&paths.pending_file()) {
-        Read::Found(pending) if !pending.added.iter().chain(&pending.replaced).all(inside) => Read::Unreadable,
+        Read::Found(pending) if !valid(&pending) => Read::Unreadable,
         read => read,
     }
 }
@@ -192,7 +202,11 @@ fn install(paths: &Paths, system: &dyn System, mut pending: PendingFile, public_
         // Whether it worked shows in the lock.
         let _ = system.stop_daemon();
         if !system.wait_daemon_lock_free(STOP_WAIT) {
-            return abort(paths, system, "the daemon did not stop".into());
+            // Nothing changed. Whatever holds the lock may be a daemon on its way out after the
+            // stop: started all the same, never left stopped. A daemon that runs ignores it (the
+            // task's IgnoreNew, or the lock), and the task's 5-minute trigger tries again.
+            let _ = remove_stage_file(paths);
+            return Outcome::Aborted(start(system, "the daemon did not stop".into()));
         }
     }
     // The daemon is stopped: from here every way out starts it again.
@@ -211,10 +225,15 @@ fn install(paths: &Paths, system: &dyn System, mut pending: PendingFile, public_
     if let Err(err) = put_in_place(paths, system, &mut pending, &manifest, now()) {
         return roll_back(paths, system, pending, err.to_string(), now);
     }
-    match system.health(&pending.active_modules) {
+    match system.health(&pending.version, &pending.active_modules) {
         Health::Healthy => {
-            // One left behind ends the daemon's probation all the same (spec 7.2).
-            let _ = fs::remove_file(paths.pending_file());
+            // Only once the stage file is gone, since a rollback still needs the backup: kept for
+            // recovery by hand (spec 7.5), but under another name, so that an unreadable stage
+            // file of a later attempt never restores this one. A stage file left behind ends the
+            // daemon's probation all the same (spec 7.2).
+            if remove_stage_file(paths).is_ok() {
+                let _ = fs::rename(pending.update_dir.join(BACKUP), pending.update_dir.join(format!("{BACKUP}-{}", now())));
+            }
             Outcome::Installed
         }
         Health::Failed(why) => roll_back(paths, system, pending, why, now),
@@ -223,7 +242,7 @@ fn install(paths: &Paths, system: &dyn System, mut pending: PendingFile, public_
 
 /// Swaps `om.exe`, places the modules and starts the new daemon (spec 7.2).
 fn put_in_place(paths: &Paths, system: &dyn System, pending: &mut PendingFile, manifest: &Manifest, ms: i64) -> Result<(), UpdateError> {
-    swap_exe(paths, pending, ms)?;
+    swap_exe(paths, pending, manifest, ms)?;
     place_modules(paths, pending, manifest)?;
     pending.stage = Stage::Installed;
     state::write(&paths.pending_file(), pending)?;
@@ -232,8 +251,23 @@ fn put_in_place(paths: &Paths, system: &dyn System, pending: &mut PendingFile, m
 
 /// Ends a run that changed nothing: the stage file goes, and the daemon starts unless it runs.
 fn abort(paths: &Paths, system: &dyn System, why: String) -> Outcome {
-    let _ = fs::remove_file(paths.pending_file());
+    let _ = remove_stage_file(paths);
     Outcome::Aborted(if system.wait_daemon_lock_free(Duration::ZERO) { start(system, why) } else { why })
+}
+
+/// Deletes `update-pending.json`, 5 tries 100 ms apart: an antivirus may hold it for a moment, and
+/// a stage file left behind makes the next run roll back.
+fn remove_stage_file(paths: &Paths) -> io::Result<()> {
+    let mut tries = 5;
+    loop {
+        match remove_if_present(&paths.pending_file()) {
+            Err(_) if tries > 1 => {
+                tries -= 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            removed => return removed,
+        }
+    }
 }
 
 /// Starts the daemon; a failure is added to `why`, there is nothing else to do about it.
@@ -246,13 +280,19 @@ fn start(system: &dyn System, why: String) -> String {
 
 /// Puts back everything the backup holds (spec 7.3). The stage is `rolling-back` first, so that a
 /// run cut short starts over. Then the stage file goes and the daemon starts, whatever came of it.
+/// A daemon that does not let go of its lock after two stops would keep its files open: nothing is
+/// restored then, and the stage file stays for the next run.
 fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: String, now: fn() -> i64) -> Outcome {
     pending.stage = Stage::RollingBack;
     // Not written, the stage on disk means a rollback all the same.
     let _ = state::write(&paths.pending_file(), &pending);
-    let _ = system.stop_daemon();
-    // A file the daemon still holds fails to restore, and the result says so.
-    let _ = system.wait_daemon_lock_free(STOP_WAIT);
+    let stopped = (0..2).any(|_| {
+        let _ = system.stop_daemon();
+        system.wait_daemon_lock_free(STOP_WAIT)
+    });
+    if !stopped {
+        return Outcome::RollbackFailed(format!("{why}; the daemon did not stop, the rollback is tried again at the next run"));
+    }
     let backup = pending.update_dir.join(BACKUP);
     match restore(paths, &pending, &backup, now()) {
         Ok(()) => {
@@ -260,14 +300,15 @@ fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: 
                 // Best effort: without it the release is only offered again.
                 let _ = open_db(paths).and_then(|conn| consent::record_rolled_back(&conn, &pending.version, &pending.manifest_sha256));
             }
-            let _ = fs::remove_file(paths.pending_file());
             // After the stage file, never before: a later unreadable stage file must not find this
             // backup and restore it again.
-            let _ = fs::remove_dir_all(&backup);
+            if remove_stage_file(paths).is_ok() {
+                let _ = fs::remove_dir_all(&backup);
+            }
             Outcome::RolledBack(start(system, why))
         }
         Err(failed) => {
-            let _ = fs::remove_file(paths.pending_file());
+            let _ = remove_stage_file(paths);
             Outcome::RollbackFailed(start(system, format!("{why}; {failed}; kopia zapasowa: {}", backup.display())))
         }
     }
@@ -326,7 +367,7 @@ fn back_up(paths: &Paths, update_dir: &Path, ms: i64) -> Result<(), UpdateError>
     if backup.exists() {
         // An earlier attempt's, perhaps the only copy after a failed rollback: kept aside, never
         // mixed into this one.
-        fs::rename(&backup, update_dir.join(format!("{BACKUP}-{ms}")))?;
+        fs::rename(&backup, update_dir.join(format!("{BACKUP}-{ms}-earlier")))?;
     }
     let partial = update_dir.join("backup.partial");
     if partial.exists() {
@@ -404,14 +445,31 @@ fn reverify(pending: &PendingFile, public_key: &str) -> Result<Manifest, UpdateE
         return Err(UpdateError::Rejected("the update folder holds another release than the one accepted".into()));
     }
     for file in &manifest.files {
-        let mut hasher = Sha256::new();
-        let size = io::copy(&mut File::open(pending.update_dir.join(&file.name))?.take(file.size.saturating_add(1)), &mut hasher)?;
-        let sum: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
-        if size != file.size || sum != file.sha256 {
-            return Err(UpdateError::Rejected(format!("{} does not match the release manifest", file.name)));
-        }
+        check_sum(&pending.update_dir.join(&file.name), file)?;
     }
     Ok(manifest)
+}
+
+/// Whether the file at `path` is `entry` of the release manifest, size and SHA-256.
+fn check_sum(path: &Path, entry: &FileEntry) -> Result<(), UpdateError> {
+    let mut hasher = Sha256::new();
+    let size = io::copy(&mut File::open(path)?.take(entry.size.saturating_add(1)), &mut hasher)?;
+    let sum: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    if size != entry.size || sum != entry.sha256 {
+        return Err(UpdateError::Rejected(format!("{} does not match the release manifest", entry.name)));
+    }
+    Ok(())
+}
+
+/// Copies the release's `entry` from the update folder to `to`, a new file (an existing one is
+/// never overwritten), and checks the copy against the manifest: the bytes put in place are the
+/// signed ones, whatever happened to the update folder since it was checked.
+fn copy_checked(update_dir: &Path, entry: &FileEntry, to: &Path) -> Result<(), UpdateError> {
+    let mut out = OpenOptions::new().write(true).create_new(true).open(to)?;
+    io::copy(&mut File::open(update_dir.join(&entry.name))?.take(entry.size.saturating_add(1)), &mut out)?;
+    out.sync_all()?;
+    drop(out);
+    check_sum(to, entry)
 }
 
 fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
@@ -440,11 +498,14 @@ fn add(paths: &Paths, pending: &mut PendingFile, path: PathBuf) -> Result<(), Up
 
 /// Puts the release's `om.exe` in place. A bridge (`om mcp-stdio`) may still run the current one,
 /// which Windows lets rename but not replace: it moves aside under a name of its own.
-fn swap_exe(paths: &Paths, pending: &mut PendingFile, ms: i64) -> Result<(), UpdateError> {
+fn swap_exe(paths: &Paths, pending: &mut PendingFile, manifest: &Manifest, ms: i64) -> Result<(), UpdateError> {
+    let entry = manifest.files.iter().find(|file| file.kind == Kind::Exe).ok_or_else(|| UpdateError::Rejected("release has no om.exe".into()))?;
     let bin = paths.bin();
     let new = bin.join("om.new.exe");
     add(paths, pending, new.clone())?;
-    fs::copy(pending.update_dir.join("om.exe"), &new)?;
+    // A leftover is ours: the name is in `added` now.
+    remove_if_present(&new)?;
+    copy_checked(&pending.update_dir, entry, &new)?;
     fs::rename(bin.join("om.exe"), bin.join(format!("om.old-{ms}.exe")))?;
     fs::rename(&new, bin.join("om.exe"))?;
     Ok(())
@@ -456,8 +517,8 @@ fn swap_exe(paths: &Paths, pending: &mut PendingFile, ms: i64) -> Result<(), Upd
 /// as `<name>-<version>.wasm`, or as `<name>.wasm` without a predecessor, and waits for the user's
 /// approval. A new file never takes a name already there: `<name>-<version>-<n>.wasm` then.
 fn place_modules(paths: &Paths, pending: &mut PendingFile, manifest: &Manifest) -> Result<(), UpdateError> {
-    let names: Vec<&str> = manifest.files.iter().filter(|file| file.kind == Kind::Module).map(|file| file.name.as_str()).collect();
-    if names.is_empty() {
+    let entries: Vec<&FileEntry> = manifest.files.iter().filter(|file| file.kind == Kind::Module).collect();
+    if entries.is_empty() {
         return Ok(());
     }
     let dir = paths.data.join("modules");
@@ -476,25 +537,39 @@ fn place_modules(paths: &Paths, pending: &mut PendingFile, manifest: &Manifest) 
                 approved.push((path, found));
             }
         }
-        for name in names {
-            let source = pending.update_dir.join(name);
-            let new = modules::inspect(&engine, &source).await.map_err(|err| UpdateError::Rejected(err.to_string()))?;
+        for entry in entries {
+            let new = modules::inspect(&engine, &pending.update_dir.join(&entry.name)).await.map_err(|err| UpdateError::Rejected(err.to_string()))?;
+            // The manifest read is the signed file's, and the copies below are checked against the
+            // same sum: what is approved is what was signed.
+            if new.file_sha256 != entry.sha256 {
+                return Err(UpdateError::Rejected(format!("{} does not match the release manifest", entry.name)));
+            }
             let predecessor = approved.iter().find(|(_, old)| old.manifest.name == new.manifest.name);
             if let Some((path, _)) = predecessor.filter(|(_, old)| modules::version_only_change(&old.manifest, &new.manifest)) {
                 // Copied next to it and renamed over it: atomic within the folder.
                 pending.replaced.push(path.clone());
                 let temp = with_suffix(path, ".new");
                 add(paths, pending, temp.clone())?;
-                fs::copy(&source, &temp)?;
+                // A leftover is ours: the name is in `added` now.
+                remove_if_present(&temp)?;
+                copy_checked(&pending.update_dir, entry, &temp)?;
                 fs::rename(&temp, path)?;
                 modules::approve(&conn, &new.manifest.name, &new.file_sha256, &new.manifest_sha256).map_err(other)?;
                 modules::remember_approved(&conn, &new.manifest).map_err(other)?;
             } else {
-                let stem = name.strip_suffix(".wasm").unwrap_or(name);
-                let first = if predecessor.is_some() { format!("{stem}-{}.wasm", pending.version) } else { name.to_owned() };
+                let stem = entry.name.strip_suffix(".wasm").unwrap_or(&entry.name);
+                let first = if predecessor.is_some() { format!("{stem}-{}.wasm", pending.version) } else { entry.name.clone() };
                 let target = free_name(&dir, first, stem, &pending.version)?;
                 add(paths, pending, target.clone())?;
-                fs::copy(&source, &target)?;
+                // A new file: a name taken meanwhile fails here instead of being overwritten, and
+                // the file there is someone else's, not one for the rollback to delete.
+                if let Err(err) = copy_checked(&pending.update_dir, entry, &target) {
+                    if matches!(&err, UpdateError::Io(failed) if failed.kind() == io::ErrorKind::AlreadyExists) {
+                        pending.added.retain(|added| *added != target);
+                        state::write(&paths.pending_file(), pending)?;
+                    }
+                    return Err(err);
+                }
             }
         }
         Ok(())
@@ -512,4 +587,30 @@ fn free_name(dir: &Path, first: String, stem: &str, version: &str) -> Result<Pat
 
 fn other(err: impl fmt::Display) -> UpdateError {
     UpdateError::Io(io::Error::other(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(bytes: &[u8]) -> FileEntry {
+        FileEntry { name: "teams.wasm".into(), kind: Kind::Module, size: bytes.len() as u64, sha256: manifest_sha256(bytes) }
+    }
+
+    #[test]
+    fn copies_are_checked_and_never_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("teams.wasm"), b"signed").unwrap();
+        let to = dir.path().join("copy.wasm");
+        copy_checked(dir.path(), &entry(b"signed"), &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"signed");
+        // Never over a file already there.
+        std::fs::write(&to, b"someone else's").unwrap();
+        assert!(copy_checked(dir.path(), &entry(b"signed"), &to).is_err());
+        assert_eq!(std::fs::read(&to).unwrap(), b"someone else's");
+        // Swapped after the check: the copy is refused.
+        std::fs::write(dir.path().join("teams.wasm"), b"SIGNED").unwrap();
+        let swapped = copy_checked(dir.path(), &entry(b"signed"), &dir.path().join("other.wasm"));
+        assert!(matches!(swapped, Err(UpdateError::Rejected(_))), "{swapped:?}");
+    }
 }

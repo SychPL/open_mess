@@ -44,8 +44,9 @@ function Stop-Daemon {
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     }
+    # `daemon` must be the first argument after the program: a bridge whose path has the word survives.
     Get-CimInstance Win32_Process -Filter "Name='om.exe'" |
-        Where-Object { $_.CommandLine -match '\bdaemon\b' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } |
+        Where-Object { $_.CommandLine -match '^\s*("[^"]*"|\S+)\s+daemon(\s|$)' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
 }
