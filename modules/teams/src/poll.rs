@@ -43,25 +43,32 @@ pub struct Arrival {
 pub struct PollState {
     /// Messages that arrived at or before this time are never reported.
     floor_ms: i64,
-    /// Conversation and the id of its last message seen, least recent first.
-    seen: Vec<(String, String)>,
+    /// Conversation, and the id and time of its last message seen, least recent first.
+    seen: Vec<(String, String, i64)>,
+    /// When a conversation that could not be read began to hold the floor.
+    held_since_ms: Option<i64>,
 }
 
 impl PollState {
     /// An account whose messages count from `now_ms` on: when it signs in or is restored.
     pub fn new(now_ms: i64) -> PollState {
-        PollState { floor_ms: now_ms, seen: Vec::new() }
+        PollState { floor_ms: now_ms, seen: Vec::new(), held_since_ms: None }
     }
 
     /// The stored state; `None` when there is none or it does not read.
     pub fn decode(bytes: &[u8]) -> Option<PollState> {
         let v: Value = serde_json::from_slice(bytes).ok()?;
-        let seen = v.get("seen")?.as_array()?.iter().map(|pair| Some((pair.get(0)?.as_str()?.to_string(), pair.get(1)?.as_str()?.to_string())));
-        Some(PollState { floor_ms: v.get("floor")?.as_i64()?, seen: seen.collect::<Option<_>>()? })
+        let entry = |e: &Value| Some((e.get(0)?.as_str()?.to_string(), e.get(1)?.as_str()?.to_string(), e.get(2)?.as_i64()?));
+        let seen = v.get("seen")?.as_array()?.iter().map(entry).collect::<Option<_>>()?;
+        let held_since_ms = match v.get("held") {
+            None | Some(Value::Null) => None,
+            Some(ms) => Some(ms.as_i64()?),
+        };
+        Some(PollState { floor_ms: v.get("floor")?.as_i64()?, seen, held_since_ms })
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        json!({"floor": self.floor_ms, "seen": self.seen}).to_string().into_bytes()
+        json!({"floor": self.floor_ms, "seen": self.seen, "held": self.held_since_ms}).to_string().into_bytes()
     }
 
     /// The list's `startTime`: conversations updated since then.
@@ -69,13 +76,14 @@ impl PollState {
         self.floor_ms
     }
 
-    fn seen(&self, conversation: &str) -> Option<&str> {
-        self.seen.iter().find(|(c, _)| c == conversation).map(|(_, id)| id.as_str())
+    fn seen(&self, conversation: &str) -> Option<(&str, i64)> {
+        self.seen.iter().find(|(c, ..)| c == conversation).map(|(_, id, ms)| (id.as_str(), *ms))
     }
 
-    /// Whether `m` of `conversation` is new: after the floor and not the message seen last there.
+    /// Whether `m` of `conversation` is new: after the floor, and neither the message seen last
+    /// there nor older than it (a list that lags behind the history shows an older one).
     pub fn fresh(&self, conversation: &str, m: &Message) -> bool {
-        m.sent_ms > self.floor_ms && self.seen(conversation) != Some(m.id.as_str())
+        m.sent_ms > self.floor_ms && self.seen(conversation).is_none_or(|(id, ms)| m.id != id && m.sent_ms >= ms)
     }
 
     /// Whether the conversation's last message is new.
@@ -94,7 +102,7 @@ impl PollState {
             Some(new) if !new.is_empty() => new.iter().collect(),
             _ => vec![last],
         };
-        let newest = messages.first().map_or_else(|| last.id.clone(), |m| m.id.clone());
+        let newest = messages.first().map_or_else(|| (last.id.clone(), last.sent_ms), |m| (m.id.clone(), m.sent_ms));
         let direct = c.kind == ConversationKind::Direct;
         let mut arrivals: Vec<Arrival> = messages
             .into_iter()
@@ -109,8 +117,8 @@ impl PollState {
             })
             .collect();
         arrivals.reverse();
-        self.seen.retain(|(conversation, _)| *conversation != c.id);
-        self.seen.push((c.id.clone(), newest));
+        self.seen.retain(|(conversation, ..)| *conversation != c.id);
+        self.seen.push((c.id.clone(), newest.0, newest.1));
         if self.seen.len() > MAX_SEEN {
             self.seen.remove(0);
         }
@@ -118,14 +126,17 @@ impl PollState {
     }
 
     /// Whether a conversation that could not be read at `now_ms` may hold the floor for the next
-    /// poll.
+    /// poll: for an hour from when holding began, however old the floor (after a sleep, say).
     pub fn can_hold(&self, now_ms: i64) -> bool {
-        now_ms.saturating_sub(self.floor_ms) < MAX_HOLD_MS
+        self.held_since_ms.is_none_or(|since| now_ms.saturating_sub(since) < MAX_HOLD_MS)
     }
 
     /// After a poll that started at `started_ms`; `held` when a conversation holds the floor.
     pub fn finish(&mut self, started_ms: i64, held: bool) {
-        if !held {
+        if held {
+            self.held_since_ms.get_or_insert(started_ms);
+        } else {
+            self.held_since_ms = None;
             self.floor_ms = self.floor_ms.max(started_ms.saturating_sub(OVERLAP_MS));
         }
     }
@@ -218,10 +229,30 @@ mod tests {
     #[test]
     fn a_held_floor_stays_for_an_hour_at_most() {
         let mut state = PollState::new(NOW);
-        state.finish(NOW + 600_000, true);
+        // After a long sleep the floor is old, but holding has only begun.
+        let woke = NOW + 3 * MAX_HOLD_MS;
+        assert!(state.can_hold(woke));
+        state.finish(woke, true);
         assert_eq!(state.start_ms(), NOW);
-        assert!(state.can_hold(NOW + MAX_HOLD_MS - 1));
-        assert!(!state.can_hold(NOW + MAX_HOLD_MS));
+        state.finish(woke + 60_000, true);
+        assert!(state.can_hold(woke + MAX_HOLD_MS - 1));
+        assert!(!state.can_hold(woke + MAX_HOLD_MS));
+        // A poll that holds nothing ends the hold.
+        state.finish(woke + MAX_HOLD_MS, false);
+        assert!(state.can_hold(woke + 10 * MAX_HOLD_MS));
+        assert_eq!(state.start_ms(), woke + MAX_HOLD_MS - OVERLAP_MS);
+    }
+
+    #[test]
+    fn a_list_behind_the_history_reports_nothing_twice() {
+        // The list shows 2; the history already has 3, and both are reported.
+        let mut state = PollState::new(NOW);
+        let (two, three) = (message("19:a@thread.v2", "2", OTHER, NOW + 2, None), message("19:a@thread.v2", "3", OTHER, NOW + 3, None));
+        let fresh = new(&state, "19:a@thread.v2", vec![three.clone(), two.clone()]);
+        assert_eq!(state.arrivals(&conversation("19:a@thread.v2", two.clone()), Some(&fresh), ME).len(), 2);
+        // A minute later the list still shows 2: it is not new, so nothing is read or reported.
+        assert!(!state.changed(&conversation("19:a@thread.v2", two)));
+        assert!(!state.changed(&conversation("19:a@thread.v2", three)));
     }
 
     #[test]
@@ -251,7 +282,7 @@ mod tests {
         assert_eq!(state.seen.len(), MAX_SEEN);
         assert_eq!(state.seen[0].0, "19:1@thread.v2");
         assert_eq!(PollState::decode(&state.encode()), Some(state));
-        for bad in [&b"not json"[..], br#"{"floor": 1}"#, br#"{"floor": 1, "seen": [[1, 2]]}"#] {
+        for bad in [&b"not json"[..], br#"{"floor": 1}"#, br#"{"floor": 1, "seen": [[1, 2]]}"#, br#"{"floor": 1, "seen": [["a", "b"]]}"#] {
             assert_eq!(PollState::decode(bad), None);
         }
     }
