@@ -5,7 +5,7 @@
 //! or `{"error"}` (the `http-error` case name); `ws` opens a WebSocket to `{"url"}`, sends "ping"
 //! and returns `{"conn"}` or `{"error"}`; `store` sets key "k" to `{"size"}` bytes and returns the
 //! length read back (`{"len"}`, plus `{"error"}` when the set failed); `timer` sets timer 7 to
-//! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` from "p1" in
+//! fire after 100 ms; `timer-at` the same for timer `{"id"}` (timer 8 is busy for 400 ms and then logs "timer 8 done"); `message` reports account "a" online and a message `{"text"}` from "p1" in
 //! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
 //! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
@@ -94,6 +94,10 @@ mod guest {
             }
             "timer" => {
                 host::set_timer(7, 100);
+                json!({})
+            }
+            "timer-at" => {
+                host::set_timer(args.get("id").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()).unwrap_or_default(), 100);
                 json!({})
             }
             "sign-in" => {
@@ -323,6 +327,13 @@ mod guest {
 
         fn on_timer(id: u32) {
             host::log(2, &format!("timer {id}"));
+            if id == 8 {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_millis(400) {
+                    std::hint::spin_loop();
+                }
+                host::log(2, "timer 8 done");
+            }
         }
     }
 }
