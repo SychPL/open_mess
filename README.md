@@ -39,10 +39,19 @@ The token is generated at the daemon's first start and kept in Windows Credentia
 shown only by `om mcp-command`; keep it to yourself, since anything holding it can use the tools.
 
 Trigger notifications reach a Claude Code session through Claude Code's channels, which take them
-only from MCP servers it starts over stdio. For such a session, add open_mess as `om mcp-stdio`,
-which forwards everything to the daemon, and start Claude Code with that server's channel enabled
-(during Claude Code's research preview of channels: `--dangerously-load-development-channels
-server:<name>`).
+only from MCP servers it starts over stdio: `om mcp-stdio` is such a server and forwards everything
+to the daemon. Add it only to the sessions you start with channels, not to every project: Claude
+Code never tells a server whether channels are on, so open_mess counts every `om mcp-stdio` as a
+session to notify, and a notification sent to a session without channels is lost. For example, with
+`open-mess-channel.json` holding
+`{"mcpServers": {"open_mess_channel": {"command": "om", "args": ["mcp-stdio"]}}}`:
+
+```bash
+claude --mcp-config open-mess-channel.json --dangerously-load-development-channels server:open_mess_channel
+```
+
+(`--dangerously-load-development-channels` is how Claude Code loads channels outside its approved
+list during its research preview of channels.)
 
 ## Why
 

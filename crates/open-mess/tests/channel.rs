@@ -275,3 +275,42 @@ async fn bridge_reports_a_missing_daemon_and_reconnects() {
     let result = session.call_tool(CallToolRequestParams::new("status")).await.unwrap();
     assert_ne!(result.is_error, Some(true));
 }
+
+#[tokio::test]
+async fn bridge_leaves_with_its_session() {
+    let (port, registry, _stop) = daemon().await;
+    let (session, _got) = bridged(locate(port)).await;
+    wait_for("the bridge to connect", || registry.channel_sessions().len() == 1).await;
+    // Claude Code ends the session: the bridge closes its daemon session at once.
+    session.cancel().await.unwrap();
+    wait_for("the daemon session to close", || registry.channel_sessions().is_empty()).await;
+}
+
+#[tokio::test]
+async fn killed_bridge_is_skipped() {
+    // `om mcp-stdio` as Claude Code runs it, then killed (with its terminal, say): it never closes
+    // its daemon session, which would take notifications and drop them until it expires.
+    let (port, registry, _stop) = daemon().await;
+    let data = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_om"))
+        .arg("mcp-stdio")
+        .env("OPEN_MESS_PORT", port.to_string())
+        .env("OPEN_MESS_TOKEN", TOKEN)
+        .env("OPEN_MESS_DATA_DIR", data.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pipes = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    let (got, _killed_got) = mpsc::unbounded_channel();
+    let killed = Session { declares: false, got }.serve(pipes).await.unwrap();
+    wait_for("the first bridge", || registry.channel_sessions().len() == 1).await;
+    let (_alive, mut alive_got) = bridged(locate(port)).await;
+    wait_for("the second bridge", || registry.channel_sessions().len() == 2).await;
+    // The first one is the most recently active, then it dies.
+    killed.call_tool(CallToolRequestParams::new("status")).await.unwrap();
+    child.kill().await.unwrap();
+    assert!(channel::deliver(registry.channel_sessions(), "r1", &batch(None)).await);
+    assert_eq!(received(&mut alive_got).await.len(), 1);
+}

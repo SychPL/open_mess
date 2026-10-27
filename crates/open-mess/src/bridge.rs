@@ -29,6 +29,8 @@ const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// How often an idle bridge checks that the daemon is still the one it connected to.
 const PING_EVERY: Duration = Duration::from_secs(15);
 const FIRST_RETRY: Duration = Duration::from_millis(500);
+/// How long a bridge whose session ended waits to close the daemon's session.
+const QUIT_WAIT: Duration = Duration::from_secs(2);
 const MAX_RETRY: Duration = Duration::from_secs(30);
 
 /// The daemon's MCP URL and bearer token, looked up again before every connection: a daemon that
@@ -44,9 +46,14 @@ where
     let lost = Arc::new(Notify::new());
     let bridge = Bridge { daemon, lost: Arc::clone(&lost) };
     let session = bridge.serve(transport).await.map_err(|err| err.to_string())?;
-    let connection = tokio::spawn(keep_connected(locate, session.peer().clone(), publish, lost));
+    let quit = Arc::new(Notify::new());
+    let connection = tokio::spawn(keep_connected(locate, session.peer().clone(), publish, lost, Arc::clone(&quit)));
     let _ = session.waiting().await;
-    connection.abort();
+    // Closing the daemon's session, rather than leaving it to expire, takes this session out of
+    // the ones notifications go to at once.
+    quit.notify_one();
+    // A daemon that does not answer in time has its session expire by itself.
+    let _ = tokio::time::timeout(QUIT_WAIT, connection).await;
     Ok(())
 }
 
@@ -137,30 +144,48 @@ async fn tools_changed(session: &Peer<RoleServer>) {
 }
 
 /// Connects to the daemon and connects again whenever the connection is lost, each failed attempt
-/// waiting twice as long as the last, up to [`MAX_RETRY`].
-async fn keep_connected(locate: Locate, session: Peer<RoleServer>, publish: watch::Sender<Option<Peer<RoleClient>>>, lost: Arc<Notify>) {
+/// waiting twice as long as the last, up to [`MAX_RETRY`]; closes the daemon's session and returns
+/// when told to `quit`.
+async fn keep_connected(
+    locate: Locate,
+    session: Peer<RoleServer>,
+    publish: watch::Sender<Option<Peer<RoleClient>>>,
+    lost: Arc<Notify>,
+    quit: Arc<Notify>,
+) {
     let mut retry = FIRST_RETRY;
     loop {
-        if let Ok(connection) = connect(&locate, session.clone()).await {
+        let connected = tokio::select! {
+            connected = connect(&locate, session.clone()) => connected,
+            () = quit.notified() => return,
+        };
+        if let Ok(connection) = connected {
             retry = FIRST_RETRY;
             let daemon = connection.peer().clone();
             publish.send_replace(Some(daemon.clone()));
             // The daemon may have other tools than the one before it.
             tools_changed(&session).await;
-            loop {
+            let quitting = loop {
                 tokio::select! {
-                    () = lost.notified() => break,
+                    () = quit.notified() => break true,
+                    () = lost.notified() => break false,
                     () = tokio::time::sleep(PING_EVERY) => {
                         if daemon.send_request(ClientRequest::PingRequest(PingRequest::default())).await.is_err() {
-                            break;
+                            break false;
                         }
                     }
                 }
-            }
+            };
             publish.send_replace(None);
             let _ = connection.cancel().await;
+            if quitting {
+                return;
+            }
         }
-        tokio::time::sleep(retry).await;
+        tokio::select! {
+            () = tokio::time::sleep(retry) => {}
+            () = quit.notified() => return,
+        }
         retry = (retry * 2).min(MAX_RETRY);
     }
 }

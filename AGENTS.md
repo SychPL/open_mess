@@ -71,7 +71,9 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
 - **Modules reach the outside world only through host imports** (HTTP, WebSocket, storage,
   secrets, sign-in prompts). A module's network access is limited to the hosts in its manifest.
 - **One process.** No permanent helper processes and no browser engine running in the
-  background. The configuration window's WebView exists only while the window is open.
+  background. The configuration window's WebView exists only while the window is open. The only
+  exception is `om mcp-stdio` (spec 8.7): a bridge Claude Code starts for a session with channels,
+  which only forwards messages to the daemon and ends with the session.
 - **Protocol facts are verified, not remembered.** Endpoints, client ids and flows come from REA
   analysis of the current official client and are written down in `docs/protocols/<platform>.md`
   (redacted) before code depends on them.

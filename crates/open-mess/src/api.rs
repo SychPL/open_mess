@@ -152,7 +152,8 @@ impl ServerHandler for McpServer {
             .peer_info()
             .is_some_and(|info| info.capabilities.experimental.as_ref().is_some_and(|experimental| experimental.contains_key(channel::CAPABILITY)));
         if declared {
-            let _ = self.channel.set(self.registry.channel_sessions().register(context.peer));
+            // Once, however often a client says it is initialized.
+            self.channel.get_or_init(|| self.registry.channel_sessions().register(context.peer));
         }
     }
 
