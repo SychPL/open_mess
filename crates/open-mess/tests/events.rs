@@ -28,7 +28,7 @@ async fn echo_on_a_bus() -> (TempDir, Arc<Accounts>, ModuleHandle, broadcast::Re
     accounts.add("test-echo", AccountInfo { id: "a".into(), display_name: "A".into() }).unwrap();
     let bus = Bus::default();
     let subscriber = bus.subscribe();
-    tokio::spawn(bus.forward(events, Arc::clone(&accounts)));
+    tokio::spawn(bus.forward(events, Arc::clone(&accounts), Arc::default()));
     (dir, accounts, echo, subscriber)
 }
 

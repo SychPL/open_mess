@@ -11,9 +11,13 @@
 //! unknown or being removed, and conversations the agent may not read (spec 8.4, 8.6, 8.7). The
 //! account and the permission are checked again when a batch goes out, so taking the read
 //! permission away mutes it at once (R7).
+//!
+//! What the engine is doing is counted in [`Activity`], for an update waiting for it to finish; its
+//! hold keeps the batches collecting without handing any over.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,8 +26,8 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
-use super::Counters;
 use super::rules::{self, Condition, Rule};
+use super::{Activity, Counters};
 use crate::accounts::{Accounts, REMOVING};
 use crate::events::{Bus, Event};
 use crate::permissions;
@@ -106,13 +110,20 @@ pub enum DeliveryResult {
 
 /// Starts the engine on the bus; it runs until the bus closes. `local_time` gives the local time
 /// of day, for quiet hours.
-pub fn spawn<D: Delivery>(bus: &Bus, accounts: Arc<Accounts>, delivery: Arc<D>, counters: Counters, local_time: fn() -> NaiveTime) -> JoinHandle<()> {
+pub fn spawn<D: Delivery>(
+    bus: &Bus,
+    accounts: Arc<Accounts>,
+    delivery: Arc<D>,
+    counters: Counters,
+    activity: Arc<Activity>,
+    local_time: fn() -> NaiveTime,
+) -> JoinHandle<()> {
     let events = bus.subscribe();
     // Batches collected when the daemon stopped never went out: a module that reports their
     // messages again wakes the rules for them.
     // ponytail: a failed delete leaves them muted until they are forgotten (SEEN_FOR).
     let _ = accounts.store().conn().execute("DELETE FROM trigger_seen WHERE batch IS NOT NULL", []);
-    let engine = Engine { accounts, delivery, counters, local_time, open: HashMap::new(), sent: Arc::default(), remembered: 0, batches: 0 };
+    let engine = Engine { accounts, delivery, counters, activity, local_time, open: HashMap::new(), sent: Arc::default(), remembered: 0, batches: 0 };
     tokio::spawn(engine.run(events))
 }
 
@@ -123,6 +134,7 @@ struct Engine<D> {
     accounts: Arc<Accounts>,
     delivery: Arc<D>,
     counters: Counters,
+    activity: Arc<Activity>,
     local_time: fn() -> NaiveTime,
     /// Batches being collected, by rule id and conversation.
     open: HashMap<(String, String), Open>,
@@ -162,22 +174,35 @@ impl Open {
 
 impl<D: Delivery> Engine<D> {
     async fn run(mut self, mut events: broadcast::Receiver<Event>) {
+        let mut hold = self.activity.hold.subscribe();
         loop {
-            let due = self.open.values().map(Open::due).min();
-            tokio::select! {
+            // Held, due batches wait for the release rather than for a deadline already past.
+            let due = if *hold.borrow_and_update() { None } else { self.open.values().map(Open::due).min() };
+            let consumed = tokio::select! {
                 event = events.recv() => match event {
                     Ok(Event::Message { account, conversation, message, sender, own, mentions_me, direct }) => {
                         if !own {
                             self.add(&account, &conversation, BatchedMessage { id: message, sender, at_ms: now_ms(), untrusted: None }, mentions_me, direct);
                         }
+                        1
                     }
-                    Ok(Event::Session { .. }) => {}
+                    Ok(Event::Session { .. }) => 1,
                     // The bus kept the newest events; the engine goes on with them.
-                    Err(RecvError::Lagged(missed)) => self.counters.add_lagged(missed),
+                    Err(RecvError::Lagged(missed)) => {
+                        self.counters.add_lagged(missed);
+                        missed
+                    }
                     Err(RecvError::Closed) => return,
                 },
-                () = sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => self.flush_due(),
-            }
+                () = sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
+                    self.flush_due();
+                    0
+                }
+                Ok(()) = hold.changed() => 0,
+            };
+            // Consumed once it is in its batch: whoever sees the event consumed sees the batch.
+            self.activity.open_batches.store(self.open.len(), Ordering::SeqCst);
+            self.activity.consumed.fetch_add(consumed, Ordering::SeqCst);
         }
     }
 
@@ -288,6 +313,9 @@ impl<D: Delivery> Engine<D> {
     }
 
     fn flush_due(&mut self) {
+        if *self.activity.hold.borrow() {
+            return;
+        }
         let now = Instant::now();
         let due: Vec<(String, String)> = self.open.iter().filter(|(_, open)| open.due() <= now).map(|(key, _)| key.clone()).collect();
         for key in due {
@@ -328,7 +356,9 @@ impl<D: Delivery> Engine<D> {
         }
         // In its own task: an action may wait for a module, and the bus must keep moving.
         let (delivery, counters, sent) = (Arc::clone(&self.delivery), self.counters.clone(), Arc::clone(&self.sent));
+        let delivering = Delivering::new(&self.activity);
         tokio::spawn(async move {
+            let _delivering = delivering;
             let id = rule.id.clone();
             match delivery.deliver(rule, batch).await {
                 DeliveryResult::Delivered => counters.count(&id, |counters| &mut counters.delivered),
@@ -352,6 +382,24 @@ impl<D: Delivery> Engine<D> {
 
     fn known(&self, account: &str) -> bool {
         known(&self.accounts, account)
+    }
+}
+
+/// A batch handed to its action, counted from the engine letting it go until the action returns.
+struct Delivering(Arc<Activity>);
+
+impl Delivering {
+    fn new(activity: &Arc<Activity>) -> Delivering {
+        activity.delivering.fetch_add(1, Ordering::SeqCst);
+        Delivering(Arc::clone(activity))
+    }
+}
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        // Before the count drops: whoever sees no delivery sees when the last one ended.
+        self.0.last_delivery_ms.store(now_ms(), Ordering::SeqCst);
+        self.0.delivering.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -417,6 +465,6 @@ fn in_quiet_hours(hours: Option<(NaiveTime, NaiveTime)>, now: NaiveTime) -> bool
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
 }

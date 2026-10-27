@@ -226,6 +226,12 @@ impl Pending {
         }
     }
 
+    /// The actions in `state`, over all accounts.
+    pub fn count(&self, state: State) -> Result<usize, Error> {
+        let count: i64 = self.accounts.store().conn().query_row("SELECT COUNT(*) FROM pending WHERE state = ?1", [state.name()], |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or_default())
+    }
+
     fn count_waiting(&self, account: &str) -> Result<i64, ToolError> {
         let count: i64 = self
             .accounts

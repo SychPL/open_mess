@@ -252,3 +252,21 @@ async fn never_is_refused() {
     // An unknown or removed account is not written to.
     assert!(matches!(pending.create(Kind::Send, "test-echo:b", "c1", send("hi")).await, Err(ToolError::InvalidArgs(_))));
 }
+
+#[tokio::test]
+async fn count_by_state() {
+    let (d, pending) = setup(Write::Confirm).await;
+    let first = pending.create(Kind::Send, "test-echo:a", "c1", send("one")).await.unwrap();
+    pending.create(Kind::Send, "test-echo:a", "c1", send("two")).await.unwrap();
+    let rejected = pending.create(Kind::Send, "test-echo:a", "c1", send("three")).await.unwrap();
+    pending.decide(&rejected.action, false).await.unwrap();
+    // Over all accounts.
+    d.accounts.add("test-echo", info("b")).unwrap();
+    permissions::set(&common::store(d.dir.path()), "test-echo:b", None, true, Write::Confirm).unwrap();
+    pending.create(Kind::Send, "test-echo:b", "c1", send("four")).await.unwrap();
+    // One running.
+    db(&d).execute("UPDATE pending SET state = 'approved' WHERE id = ?1", [&first.action]).unwrap();
+    let counts: Vec<usize> =
+        [State::Waiting, State::Approved, State::Rejected, State::Done].into_iter().map(|state| pending.count(state).unwrap()).collect();
+    assert_eq!(counts, [2, 1, 1, 0]);
+}

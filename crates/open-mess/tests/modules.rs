@@ -127,8 +127,10 @@ async fn status_lists_modules() {
     let echo = modules.iter().find(|module| module["name"] == "test-echo").unwrap();
     assert_eq!(
         *echo,
-        json!({"name": "test-echo", "file": "echo.wasm", "version": env!("CARGO_PKG_VERSION"), "platform": "test", "state": "active", "hosts": ["localhost"]})
+        json!({"name": "test-echo", "file": "echo.wasm", "version": env!("CARGO_PKG_VERSION"), "platform": "test", "state": "active", "hosts": ["localhost"], "crashes_since_load": 0})
     );
     let broken = modules.iter().find(|module| module["file"] == "broken.wasm").unwrap();
     assert!(broken["state"].as_str().unwrap().starts_with("not a valid module"), "{broken}");
+    // Nothing runs to have crashed.
+    assert!(broken["crashes_since_load"].is_null(), "{broken}");
 }

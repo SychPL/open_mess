@@ -19,6 +19,7 @@ use open_mess::triggers::Counters;
 use open_mess::triggers::channel::Sessions;
 use open_mess::triggers::engine::{self, Batch, Delivery, DeliveryResult};
 use open_mess::triggers::rules::{Action, Condition, Rule, Spawn};
+use open_mess::triggers::spawn::{RUN_TIMEOUT, Runs};
 use open_mess::ui::UiState;
 use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto, RuleDto};
 use open_mess::ui::sign_in::SignIns;
@@ -36,6 +37,11 @@ fn state(d: &Daemon) -> UiState {
         sign_ins: d.sign_ins.clone(),
         counters: d.registry.trigger_counters().clone(),
         sessions: d.registry.channel_sessions().clone(),
+        gate: d.registry.gate().clone(),
+        activity: Arc::default(),
+        runs: Runs::new(d.dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
+        host_events: tokio::sync::mpsc::channel(1).0,
+        ui_ready: Arc::default(),
     }
 }
 
@@ -66,6 +72,11 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         sign_ins: SignIns::default(),
         counters: Counters::default(),
         sessions: Sessions::default(),
+        gate: Default::default(),
+        activity: Arc::default(),
+        runs: Runs::new(dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
+        host_events: tokio::sync::mpsc::channel(1).0,
+        ui_ready: Arc::default(),
     };
     (dir, state)
 }
@@ -466,7 +477,7 @@ async fn counters_are_listed() {
     commands::put_rule(&state, rule("r1", Condition::Direct, channel())).unwrap();
     let bus = Bus::default();
     let noon = || NaiveTime::from_hms_opt(12, 0, 0).unwrap();
-    let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(Delivered), state.counters.clone(), noon);
+    let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(Delivered), state.counters.clone(), Arc::default(), noon);
     let message = |id: &str| Event::Message {
         account: "test-echo:a".into(),
         conversation: "c1".into(),

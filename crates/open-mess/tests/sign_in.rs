@@ -30,6 +30,11 @@ fn state(d: &Daemon) -> Arc<UiState> {
         sign_ins: d.sign_ins.clone(),
         counters: d.registry.trigger_counters().clone(),
         sessions: d.registry.channel_sessions().clone(),
+        gate: d.registry.gate().clone(),
+        activity: Arc::default(),
+        runs: open_mess::triggers::spawn::Runs::new(d.dir.path().join("runs"), open_mess::triggers::spawn::RUN_TIMEOUT, Default::default()),
+        host_events: tokio::sync::mpsc::channel(1).0,
+        ui_ready: Arc::default(),
     })
 }
 

@@ -4,6 +4,7 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use open_mess_host::ip_policy::AddressPolicy;
@@ -97,6 +98,7 @@ fn start(dir: &Path, started: Instant, window: &Opener) -> Result<(Runtime, TcpL
     // One engine for the process; the modules keep it for loading files again.
     let engine = Engine::new()?;
     let (events, host_events) = mpsc::channel(EVENT_QUEUE);
+    let event_queue = events.clone();
     let (prompts, sign_in_prompts) = mpsc::channel(SIGN_IN_QUEUE);
     let data_dir = dir.to_path_buf();
     let ctx = move |_: &str| ModuleContext {
@@ -112,31 +114,37 @@ fn start(dir: &Path, started: Instant, window: &Opener) -> Result<(Runtime, TcpL
     let bus = Bus::default();
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
     let registry = Registry::with_pending(started, Arc::clone(&accounts), Arc::clone(&pending));
-    {
+    let activity = Arc::new(triggers::Activity::default());
+    let runs = {
         // Inside the runtime: the engine spawns its tasks there.
         let _entered = runtime.enter();
         // Files of runs a daemon that stopped left behind are deleted here (spec 8.7, R6).
         let counters = registry.trigger_counters().clone();
         let runs = Runs::new(dir.join("runs"), spawn::RUN_TIMEOUT, counters.clone());
-        let actions = Actions { accounts: Arc::clone(&accounts), sessions: registry.channel_sessions().clone(), runs };
-        triggers::engine::spawn(&bus, Arc::clone(&accounts), Arc::new(actions), counters, || chrono::Local::now().time());
-    }
-    runtime.spawn(bus.forward(host_events, Arc::clone(&accounts)));
+        let actions = Actions { accounts: Arc::clone(&accounts), sessions: registry.channel_sessions().clone(), runs: Arc::clone(&runs) };
+        triggers::engine::spawn(&bus, Arc::clone(&accounts), Arc::new(actions), counters, Arc::clone(&activity), || chrono::Local::now().time());
+        runs
+    };
+    runtime.spawn(bus.forward(host_events, Arc::clone(&accounts), Arc::clone(&activity)));
     let sign_ins = SignIns::default();
     runtime.spawn(sign_ins.clone().forward(sign_in_prompts));
     // Sessions come back in the background; the tools answer meanwhile.
     runtime.spawn({
-        let accounts = Arc::clone(&accounts);
+        let (accounts, restored) = (Arc::clone(&accounts), Arc::clone(registry.accounts_restored()));
         async move {
             // ponytail: a failed restore leaves the stored states; reported once a log sink exists.
             let _ = accounts.restore().await;
+            restored.store(true, Ordering::SeqCst);
         }
     });
     pending.recover()?;
     runtime.spawn(Arc::clone(&pending).sweep());
     approval::start(&runtime, Arc::clone(&pending), window.clone());
     let (counters, sessions) = (registry.trigger_counters().clone(), registry.channel_sessions().clone());
-    Ok((runtime, listener, registry, UiState { accounts, pending, started, port, token, sign_ins, counters, sessions }))
+    let (gate, ui_ready) = (registry.gate().clone(), Arc::clone(registry.ui_ready()));
+    let ui =
+        UiState { accounts, pending, started, port, token, sign_ins, counters, sessions, gate, activity, runs, host_events: event_queue, ui_ready };
+    Ok((runtime, listener, registry, ui))
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.

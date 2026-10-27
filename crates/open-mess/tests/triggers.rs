@@ -14,9 +14,11 @@ use chrono::NaiveTime;
 use common::{Daemon, info};
 use open_mess::events::{self, Bus, Event};
 use open_mess::permissions::{self, Write};
-use open_mess::triggers::Counters;
 use open_mess::triggers::engine::{self, Batch, Delivery, DeliveryResult};
 use open_mess::triggers::rules::{self, Action, Condition, Rule};
+use open_mess::triggers::{Activity, Counters};
+use open_mess_host::{HostEvent, NewMessage};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
@@ -35,11 +37,17 @@ struct Recorder {
     calls: Mutex<Vec<(String, Batch, Instant)>>,
     /// Answer that no session took the batch.
     no_session: AtomicBool,
+    /// Return only once `release` is notified.
+    slow: AtomicBool,
+    release: Notify,
 }
 
 impl Delivery for Recorder {
     async fn deliver(&self, rule: Rule, batch: Batch) -> DeliveryResult {
         self.calls.lock().unwrap().push((rule.id, batch, Instant::now()));
+        if self.slow.load(Ordering::SeqCst) {
+            self.release.notified().await;
+        }
         if self.no_session.load(Ordering::SeqCst) { DeliveryResult::NoSession } else { DeliveryResult::Delivered }
     }
 }
@@ -49,6 +57,7 @@ struct Setup {
     bus: Bus,
     recorder: Arc<Recorder>,
     counters: Counters,
+    activity: Arc<Activity>,
     started: Instant,
     engine: JoinHandle<()>,
 }
@@ -72,9 +81,9 @@ async fn setup(rules: &[Rule]) -> Setup {
         rules::put(&store, rule).unwrap();
     }
     let bus = Bus::default();
-    let (recorder, counters) = (Arc::new(Recorder::default()), Counters::default());
-    let engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::clone(&recorder), counters.clone(), local_time);
-    Setup { d, bus, recorder, counters, started: Instant::now(), engine }
+    let (recorder, counters, activity) = (Arc::new(Recorder::default()), Counters::default(), Arc::new(Activity::default()));
+    let engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::clone(&recorder), counters.clone(), Arc::clone(&activity), local_time);
+    Setup { d, bus, recorder, counters, activity, started: Instant::now(), engine }
 }
 
 fn rule(id: &str, condition: Condition) -> Rule {
@@ -308,6 +317,8 @@ async fn lagged_bus_is_counted() {
     }
     sleep(Duration::from_secs(61)).await;
     assert_eq!(t.counters.lagged(), 100);
+    // The missed events count as consumed: none of them is still on its way.
+    assert_eq!(t.activity.consumed.load(Ordering::SeqCst), u64::try_from(flood).unwrap());
     // What was kept is one batch, its message list capped.
     let calls = t.calls();
     assert_eq!(calls.len(), 1);
@@ -407,7 +418,7 @@ async fn a_batch_lost_with_the_daemon_fires_when_reported_again() {
     // starts.
     t.engine.abort();
     let bus = Bus::default();
-    let _engine = engine::spawn(&bus, Arc::clone(&t.d.accounts), Arc::clone(&t.recorder), t.counters.clone(), local_time);
+    let _engine = engine::spawn(&bus, Arc::clone(&t.d.accounts), Arc::clone(&t.recorder), t.counters.clone(), Arc::default(), local_time);
     bus.publish(message("c1", "m1", Kind::Direct));
     sleep(Duration::from_secs(61)).await;
     assert_eq!(t.calls().iter().map(|(_, batch, _)| ids(batch)).collect::<Vec<_>>(), [vec!["m1"]]);
@@ -429,7 +440,7 @@ async fn a_message_reported_again_fires_once() {
     // another conversation is another message.
     t.engine.abort();
     let bus = Bus::default();
-    let _engine = engine::spawn(&bus, Arc::clone(&t.d.accounts), Arc::clone(&t.recorder), t.counters.clone(), local_time);
+    let _engine = engine::spawn(&bus, Arc::clone(&t.d.accounts), Arc::clone(&t.recorder), t.counters.clone(), Arc::default(), local_time);
     bus.publish(message("c1", "m1", Kind::Direct));
     bus.publish(message("c2", "m1", Kind::Direct));
     sleep(Duration::from_secs(61)).await;
@@ -472,4 +483,58 @@ async fn deliveries_that_woke_nobody_leave_the_hourly_cap() {
     sleep(Duration::from_secs(10)).await;
     let counters = t.counters.rule("r");
     assert_eq!((counters.dropped_no_session, counters.delivered, counters.dropped_rate), (4, 2, 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_engine_keeps_due_batches_and_flushes_on_release() {
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    let activity = |counter: &std::sync::atomic::AtomicUsize| counter.load(Ordering::SeqCst);
+    t.activity.hold.send_replace(true);
+    t.bus.publish(message("c1", "m1", Kind::Direct));
+    // Long past its quiet period and its longest delay, the batch is still collected, and takes
+    // more messages.
+    sleep(Duration::from_secs(600)).await;
+    t.bus.publish(message("c1", "m2", Kind::Direct));
+    sleep(Duration::from_secs(1)).await;
+    assert!(t.calls().is_empty());
+    assert_eq!(activity(&t.activity.open_batches), 1);
+    // Released, it goes out at once, and counts as delivering until its action returns.
+    t.recorder.slow.store(true, Ordering::SeqCst);
+    t.activity.hold.send_replace(false);
+    sleep(Duration::from_millis(1)).await;
+    let calls = t.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!((ids(&calls[0].1), calls[0].2 - t.started), (vec!["m1", "m2"], Duration::from_secs(601)));
+    assert_eq!((activity(&t.activity.open_batches), activity(&t.activity.delivering)), (0, 1));
+    assert_eq!(t.activity.last_delivery_ms.load(Ordering::SeqCst), 0);
+    t.recorder.release.notify_one();
+    sleep(Duration::from_millis(1)).await;
+    assert_eq!(activity(&t.activity.delivering), 0);
+    assert!(t.activity.last_delivery_ms.load(Ordering::SeqCst) > 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn consumed_matches_received_after_drain() {
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    // The modules' queue, as the daemon forwards it to the bus.
+    let (modules, queue) = mpsc::channel(8);
+    tokio::spawn(t.bus.clone().forward(queue, Arc::clone(&t.d.accounts), Arc::clone(&t.activity)));
+    for n in 0..100 {
+        let message = NewMessage {
+            module: "test-echo".into(),
+            account: "a".into(),
+            conversation: "c1".into(),
+            message: format!("m{n}"),
+            sender: "p1".into(),
+            own: false,
+            mentions_me: false,
+            direct: true,
+        };
+        modules.send(HostEvent::MessageArrived(message)).await.unwrap();
+    }
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!((t.activity.received.load(Ordering::SeqCst), t.activity.consumed.load(Ordering::SeqCst)), (100, 100));
+    assert_eq!(t.activity.open_batches.load(Ordering::SeqCst), 1);
+    sleep(Duration::from_secs(60)).await;
+    assert_eq!(t.calls().iter().map(|(_, batch, _)| batch.count).collect::<Vec<_>>(), [100]);
 }

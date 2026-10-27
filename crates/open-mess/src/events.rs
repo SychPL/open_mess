@@ -3,11 +3,13 @@
 //! Session changes also update the accounts table.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use open_mess_host::{HostEvent, SessionState};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::accounts::Accounts;
+use crate::triggers::Activity;
 
 /// Events kept for subscribers; one that falls further behind loses the oldest and gets their
 /// count (`RecvError::Lagged`).
@@ -68,9 +70,11 @@ impl Bus {
         let _ = self.0.send(event);
     }
 
-    /// Publishes every host event until all senders (the modules' contexts) are gone.
-    pub async fn forward(self, mut events: mpsc::Receiver<HostEvent>, accounts: Arc<Accounts>) {
+    /// Publishes every host event until all senders (the modules' contexts) are gone, counting
+    /// each in `activity` as received.
+    pub async fn forward(self, mut events: mpsc::Receiver<HostEvent>, accounts: Arc<Accounts>, activity: Arc<Activity>) {
         while let Some(event) = events.recv().await {
+            activity.received.fetch_add(1, Ordering::SeqCst);
             let event = match event {
                 HostEvent::Session { module, account, state } => {
                     // A failed write keeps the old state; the event still goes out.

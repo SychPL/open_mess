@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -25,6 +26,7 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     let profile = state.accounts.data_dir().join("webview");
     let pending = std::sync::Arc::clone(&state.pending);
     let sign_ins = state.sign_ins.clone();
+    let ui_ready = std::sync::Arc::clone(&state.ui_ready);
     let app = tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -110,6 +112,8 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     });
 
     app.run_return(move |_, event| match event {
+        // Tauri has finished its setup; the tray was made before the loop started.
+        RunEvent::Ready => ui_ready.store(true, Ordering::SeqCst),
         // The last window closing asks to exit; only `Zakończ` and `quit` end the loop.
         RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
         // Nobody can answer what the closed window showed.
