@@ -64,7 +64,13 @@ pub async fn serve(
         .route("/api/call/{tool}", post(call_tool))
         .with_state(registry)
         // Not a tool: opening the window is harmless, and the window is where the user decides.
-        .route("/api/ui/open", post(move || open_window(window.clone())))
+        .route(
+            "/api/ui/open",
+            post(move || {
+                let window = window.clone();
+                async move { open_window(&window).await }
+            }),
+        )
         .route_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(Arc::new(token), require_token));
     axum::serve(listener, app)
@@ -120,10 +126,12 @@ async fn call_tool(State(registry): State<Arc<Registry>>, Path(tool): Path<Strin
     }
 }
 
-async fn open_window(window: Opener) -> Response {
-    match window.open() {
+/// Answers once the window is open, or with why it did not open.
+async fn open_window(window: &Opener) -> Response {
+    match window.open().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => error_response(StatusCode::NOT_IMPLEMENTED, err.to_string()),
+        Err(err @ Error::NoWindow) => error_response(StatusCode::NOT_IMPLEMENTED, err.to_string()),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 

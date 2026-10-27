@@ -43,11 +43,23 @@ async fn start_with_window() -> (u16, oneshot::Sender<()>, Opener) {
 async fn cli_config_opens_the_window() {
     let (port, _stop, opener) = start_with_window().await;
     let dir = data_dir();
-    let output = om(dir.path(), port, TOKEN, &["config"]);
+    let answer = |answer: Result<(), String>| {
+        let opener = opener.clone();
+        tokio::spawn(async move {
+            let _ = opener.next().await.unwrap().send(answer);
+        })
+    };
     if cfg!(windows) {
+        answer(Ok(()));
+        let output = om(dir.path(), port, TOKEN, &["config"]);
         assert!(output.status.success(), "{}", stderr(&output));
-        assert!(tokio::time::timeout(Duration::from_secs(1), opener.requested()).await.is_ok());
+        // A window that fails to open is reported, not taken for success.
+        answer(Err("the window did not open: no WebView2".into()));
+        let output = om(dir.path(), port, TOKEN, &["config"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains("no WebView2"), "{}", stderr(&output));
     } else {
+        let output = om(dir.path(), port, TOKEN, &["config"]);
         assert_eq!(output.status.code(), Some(1));
         assert!(stderr(&output).contains("only on Windows"), "{}", stderr(&output));
     }

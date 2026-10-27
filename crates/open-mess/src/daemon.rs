@@ -10,7 +10,7 @@ use open_mess_host::ip_policy::AddressPolicy;
 use open_mess_host::{Engine, ModuleContext, Net};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::accounts::Accounts;
 use crate::events::Bus;
@@ -42,16 +42,35 @@ pub fn run() -> Result<(), Error> {
     let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
     let window = Opener::default();
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = runtime.spawn(api::serve(listener, ui.token.clone(), Arc::new(registry), window.clone(), async {
+    let serve = api::serve(listener, ui.token.clone(), Arc::new(registry), window.clone(), async {
         let _ = stopped.await;
-    }));
-    if let Err(err) = ui::run(&runtime, ui, window, ctrl_c()) {
-        // Without the tray and the window the daemon still serves its agents.
+    });
+    // The API ending on its own ends the daemon too, tray and all.
+    let ended = Arc::new(Notify::new());
+    let server = runtime.spawn({
+        let ended = Arc::clone(&ended);
+        async move {
+            let served = serve.await;
+            ended.notify_one();
+            served
+        }
+    });
+    if let Err(err) = ui::run(&runtime, ui, window.clone(), until_stopped(Arc::clone(&ended))) {
+        // Without the tray and the window the daemon still serves its agents; `om config` says so.
         let _ = writeln!(std::io::stderr(), "{err}");
-        runtime.block_on(ctrl_c());
+        runtime.block_on(window.close());
+        runtime.block_on(until_stopped(ended));
     }
     let _ = stop.send(());
     runtime.block_on(server).map_err(|err| Error::Io(std::io::Error::other(err)))?
+}
+
+/// Ctrl+C, or the API ended.
+async fn until_stopped(ended: Arc<Notify>) {
+    tokio::select! {
+        () = ctrl_c() => {}
+        () = ended.notified() => {}
+    }
 }
 
 /// The instance lock, retried for half a second: a CLI checking whether a daemon runs holds it for
