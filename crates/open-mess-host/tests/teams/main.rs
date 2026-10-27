@@ -867,6 +867,35 @@ async fn many_messages_between_polls_all_arrive() {
 }
 
 #[tokio::test]
+async fn a_conversation_that_fails_waits_without_the_others() {
+    // One conversation's messages fail: the other's arrive at once, and the failing one's once it
+    // can be read, nothing lost in between.
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail = failing.clone();
+    let (group, channel) = (messages_path(GROUP), messages_path(CHANNEL));
+    let in_group = message("1900000000041", GROUP, OTHER, "<p>a</p>", at);
+    let mention = mentioning(message("1900000000042", CHANNEL, OTHER, "<p>hey One</p>", at), ME);
+    let in_channel = message("1900000000043", CHANNEL, OTHER, "<p>b</p>", at + 1);
+    let list = vec![conversation(GROUP, None, Some(in_group.clone())), conversation(CHANNEL, None, Some(in_channel.clone()))];
+    teams.fake.on(move |s| match s.path.as_str() {
+        CHAT_PATH => Some(Reply::json(page("conversations", list.clone(), None))),
+        p if p == group => Some(Reply::json(page("messages", vec![in_group.clone()], None))),
+        p if p == channel && fail.load(Ordering::SeqCst) => Some(Reply::status(400)),
+        p if p == channel => Some(Reply::json(page("messages", vec![in_channel.clone(), mention.clone()], None))),
+        _ => None,
+    });
+    assert_eq!(teams.next_message().await.unwrap().message, "1900000000041");
+    assert_eq!(teams.next_message().await, None);
+    failing.store(false, Ordering::SeqCst);
+    let first = teams.next_message().await.unwrap();
+    assert_eq!((first.message.as_str(), first.mentions_me), ("1900000000042", true));
+    assert_eq!(teams.next_message().await.unwrap().message, "1900000000043");
+    assert_eq!(teams.next_message().await, None);
+}
+
+#[tokio::test]
 async fn a_failed_poll_is_tried_again() {
     // The second page of the list fails: nothing is reported, and nothing is skipped either.
     let mut teams = Teams::polling().await;

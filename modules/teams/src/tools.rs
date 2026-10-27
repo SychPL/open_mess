@@ -464,7 +464,7 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
 
 /// The new messages of a conversation, newest first, page by page until the first one not new;
 /// `None` when they may not be read (403, 404), and then the list's last message stands for them.
-/// Any other failure ends the poll, which the next one repeats.
+/// Any other failure leaves the conversation for the next poll.
 fn new_messages(session: &mut Session, conversation: &str, state: &PollState) -> Result<Option<Vec<Message>>, ModuleError> {
     let slow = || ModuleError::Platform("Teams answers too slowly; polling again later".to_string());
     let mut link: Option<String> = None;
@@ -512,14 +512,18 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
             }
             true
         })?;
-        // All or nothing: a poll cut short stores and reports nothing, and the next one starts
-        // from the same floor.
-        let mut arrivals = Vec::new();
+        // A conversation whose messages cannot be read now is left for the next poll, which starts
+        // from the same floor; the others are reported. A list that cannot be read ends the poll.
+        let (mut arrivals, mut held) = (Vec::new(), false);
         for c in changed {
-            let new = new_messages(session, &c.id, &state)?;
-            arrivals.extend(state.arrivals(&c, new.as_deref(), &me));
+            match new_messages(session, &c.id, &state) {
+                Ok(new) => arrivals.extend(state.arrivals(&c, new.as_deref(), &me)),
+                Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
+                Err(_) if state.can_hold(started) => held = true,
+                Err(_) => arrivals.extend(state.arrivals(&c, None, &me)),
+            }
         }
-        state.finish(started);
+        state.finish(started, held);
         // Stored before they are reported, so a crash in between loses them rather than
         // reporting them twice.
         if storage::set(&key, &state.encode()).is_err() {

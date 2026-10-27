@@ -1,9 +1,10 @@
 //! New-message events by polling (docs/protocols/teams.md 3.2): each poll lists the conversations
-//! updated since the previous one; a conversation whose last message is new has its newest page of
-//! messages read, and each new message reports one `message-arrived`, so a mention followed by
-//! another message is not lost. Read-only: nothing here touches read state. What was reported is
-//! kept in module storage, so a restarted instance does not report it again. Trouter (live
-//! events) needs live checks first (F2b).
+//! updated since the previous one; a conversation whose last message is new has its messages read
+//! back to the last one seen, and each new message reports one `message-arrived`, so a mention
+//! followed by another message is not lost. A conversation whose messages cannot be read this time
+//! holds the floor, so the next poll tries it again without the others waiting. Read-only:
+//! nothing here touches read state. What was reported is kept in module storage, so a restarted
+//! instance does not report it again. Trouter (live events) needs live checks first (F2b).
 
 use serde_json::{Value, json};
 
@@ -17,6 +18,10 @@ pub const INTERVAL_MS: u32 = 60_000;
 const OVERLAP_MS: i64 = 5 * 60_000;
 /// Conversations whose last reported message is remembered; the least recent go first.
 const MAX_SEEN: usize = 1000;
+/// How long a conversation that cannot be read may hold the floor; past that its last message
+/// stands for what could not be read, so one broken conversation cannot make every poll list
+/// ever more conversations.
+const MAX_HOLD_MS: i64 = 60 * 60_000;
 
 /// Where an account's state is stored.
 pub fn key(account: &str) -> String {
@@ -84,7 +89,11 @@ impl PollState {
     /// than the list's last one, if it came while the poll ran.
     pub fn arrivals(&mut self, c: &Conversation, new_newest_first: Option<&[Message]>, me: &str) -> Vec<Arrival> {
         let Some(last) = &c.last_message else { return Vec::new() };
-        let messages: Vec<&Message> = new_newest_first.map_or_else(|| vec![last], |new| new.iter().collect());
+        // An empty answer did not show the new last message: the list's word stands.
+        let messages: Vec<&Message> = match new_newest_first {
+            Some(new) if !new.is_empty() => new.iter().collect(),
+            _ => vec![last],
+        };
         let newest = messages.first().map_or_else(|| last.id.clone(), |m| m.id.clone());
         let direct = c.kind == ConversationKind::Direct;
         let mut arrivals: Vec<Arrival> = messages
@@ -108,9 +117,17 @@ impl PollState {
         arrivals
     }
 
-    /// After a complete poll that started at `started_ms`.
-    pub fn finish(&mut self, started_ms: i64) {
-        self.floor_ms = self.floor_ms.max(started_ms.saturating_sub(OVERLAP_MS));
+    /// Whether a conversation that could not be read at `now_ms` may hold the floor for the next
+    /// poll.
+    pub fn can_hold(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.floor_ms) < MAX_HOLD_MS
+    }
+
+    /// After a poll that started at `started_ms`; `held` when a conversation holds the floor.
+    pub fn finish(&mut self, started_ms: i64, held: bool) {
+        if !held {
+            self.floor_ms = self.floor_ms.max(started_ms.saturating_sub(OVERLAP_MS));
+        }
     }
 }
 
@@ -186,13 +203,25 @@ mod tests {
 
     #[test]
     fn unreadable_messages_leave_the_last_one() {
-        let mut state = PollState::new(NOW);
         let direct = "19:00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002@unq.gbl.spaces";
         let c = conversation(direct, message(direct, "5", OTHER, NOW + 5, Some(ME)));
-        let arrivals = state.arrivals(&c, None, ME);
-        assert_eq!(arrivals.len(), 1);
-        let a = &arrivals[0];
-        assert!(a.direct && a.mentions_me && !a.own && a.sender == OTHER && a.message == "5");
+        // Not readable, or read but empty.
+        for new in [None, Some(&[][..])] {
+            let mut state = PollState::new(NOW);
+            let arrivals = state.arrivals(&c, new, ME);
+            assert_eq!(arrivals.len(), 1);
+            let a = &arrivals[0];
+            assert!(a.direct && a.mentions_me && !a.own && a.sender == OTHER && a.message == "5");
+        }
+    }
+
+    #[test]
+    fn a_held_floor_stays_for_an_hour_at_most() {
+        let mut state = PollState::new(NOW);
+        state.finish(NOW + 600_000, true);
+        assert_eq!(state.start_ms(), NOW);
+        assert!(state.can_hold(NOW + MAX_HOLD_MS - 1));
+        assert!(!state.can_hold(NOW + MAX_HOLD_MS));
     }
 
     #[test]
@@ -205,10 +234,10 @@ mod tests {
     #[test]
     fn the_floor_keeps_an_overlap() {
         let mut state = PollState::new(NOW);
-        state.finish(NOW + 600_000);
+        state.finish(NOW + 600_000, false);
         assert_eq!(state.start_ms(), NOW + 600_000 - OVERLAP_MS);
         // Never back.
-        state.finish(NOW);
+        state.finish(NOW, false);
         assert_eq!(state.start_ms(), NOW + 600_000 - OVERLAP_MS);
     }
 
