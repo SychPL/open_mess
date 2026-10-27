@@ -74,7 +74,8 @@ fn not_running() -> Failure {
 
 /// Whether a daemon holds this data folder's instance lock. Only a lock held by someone else
 /// counts: failing to open or lock the file proves nothing. When the lock is free this takes it
-/// for an instant; a starting daemon retries for that (daemon.rs).
+/// for an instant; a starting daemon retries for that (daemon.rs). Only this Windows user can hold
+/// a lock in their own data folder.
 fn daemon_holds_the_lock() -> bool {
     paths::data_dir().is_ok_and(|dir| matches!(InstanceLock::acquire(&dir), Err(Error::AlreadyRunning)))
 }
@@ -125,12 +126,9 @@ pub fn mcp_add_command(port: u16, token: &str) -> String {
 
 /// `om mcp-stdio` (bridge.rs): runs until Claude Code closes the session.
 fn mcp_stdio() -> Result<(), Failure> {
+    // Asked before every connection: a daemon that stopped may have left its port to another program.
     let locate: Locate = Arc::new(|| {
-        // As for a tool call: after a failed start, whatever holds the port may be another program.
-        if last_start_error().is_some() && !daemon_holds_the_lock() {
-            return Err(not_running().message);
-        }
-        let (port, token) = (port().map_err(|failure| failure.message)?, token().map_err(|failure| failure.message)?);
+        let (port, token) = daemon().map_err(|failure| failure.message)?;
         Ok((format!("http://127.0.0.1:{port}/mcp"), token))
     });
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?;
@@ -249,13 +247,12 @@ fn open_config() -> Result<(), Failure> {
     })
 }
 
-/// The running daemon's port and token.
+/// The running daemon's port and token. Without a daemon holding the lock, whatever holds the port
+/// is another program (another Windows user's, say) and never gets the token.
 fn daemon() -> Result<(u16, String), Failure> {
-    // After a failed start, whatever holds the port may be another program: don't send it the token
-    // unless a daemon holds the lock (a good start may have failed to delete the file).
     // ponytail: a daemon still starting holds the lock for the milliseconds before its bind fails;
     // closing that window needs the daemon to prove itself before the token is sent.
-    if last_start_error().is_some() && !daemon_holds_the_lock() {
+    if !daemon_holds_the_lock() {
         return Err(not_running());
     }
     Ok((port()?, token()?))
