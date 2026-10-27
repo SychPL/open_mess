@@ -68,4 +68,6 @@ Record every result (redacted: no tokens, tenant or user ids, names or message t
 
 - [ ] The daemon runs every day; owner notes any oddity in the official client (logouts, empty
       chats, read state, phone notifications).
+- [ ] Every day `om status` shows the Teams account online (spec 4.2: open_mess itself stays
+      signed in); a day it is not counts as a failure of the week.
 - [ ] After 7 days with none: spec 4 success criteria 2 and 3 are met.

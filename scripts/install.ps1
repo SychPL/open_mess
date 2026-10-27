@@ -5,7 +5,8 @@
 #
 # What it does: stops a running daemon, copies om.exe to %LOCALAPPDATA%\open_mess\bin, copies the
 # platform modules (not the test guests) into %APPDATA%\open_mess\modules, registers the scheduled
-# task "open_mess" that starts the daemon hidden at every logon of this user, and starts it.
+# task "open_mess" that starts the daemon hidden at every logon of this user and every 5 minutes
+# (a running daemon makes that a no-op, a stopped one comes back), and starts it.
 # A changed module file waits for approval again in the configuration window (spec 8.3).
 #
 # Run it from a normal terminal, not from a tool inside Claude Desktop: that is an MSIX package and
@@ -31,26 +32,37 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
 }
 # ponytail: a hard stop; pending actions are recovered at the next start (spec 8.6). Add `om stop`
 # for a graceful one if anything ever needs it.
+# Stopping the task ends the agents its triggers started too; a daemon run by hand leaves its own.
 Get-CimInstance Win32_Process -Filter "Name='om.exe'" |
-    Where-Object { $_.CommandLine -match '\bdaemon\b' } |
+    Where-Object { $_.CommandLine -match '\bdaemon\b' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 500
 
 # 2. The binary. A running copy cannot be overwritten on Windows, so move it aside first.
 New-Item -ItemType Directory -Force $bin | Out-Null
 $target = Join-Path $bin 'om.exe'
+$old = Join-Path $bin 'om.old.exe'
 if (Test-Path $target) {
-    $old = Join-Path $bin 'om.old.exe'
     Remove-Item $old -Force -ErrorAction SilentlyContinue
     Move-Item $target $old -Force
 }
-Copy-Item $exe $target
+try {
+    Copy-Item $exe $target
+} catch {
+    # A full disk, say: put the previous binary back so the task still has one to start.
+    if (Test-Path $old) { Move-Item $old $target -Force }
+    throw
+}
 Write-Host "om.exe -> $target"
 
 # 3. Platform modules: open_mess_<name>.wasm -> <name>.wasm; test guests are never installed.
 New-Item -ItemType Directory -Force $modules | Out-Null
-Get-ChildItem $wasmDir -Filter 'open_mess_*.wasm' -ErrorAction SilentlyContinue |
-    Where-Object { $_.BaseName -notmatch '^open_mess_test_' } |
+$built = @(Get-ChildItem $wasmDir -Filter 'open_mess_*.wasm' -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -notmatch '^open_mess_test_' })
+if ($built.Count -eq 0) {
+    throw "No platform modules in $wasmDir - run: cargo build --release --target wasm32-wasip2 -p open-mess-teams"
+}
+$built |
     ForEach-Object {
         $name = $_.BaseName -replace '^open_mess_', ''
         $dest = Join-Path $modules "$name.wasm"
@@ -63,15 +75,19 @@ Get-ChildItem $wasmDir -Filter 'open_mess_*.wasm' -ErrorAction SilentlyContinue 
         }
     }
 
-# 4. Start at logon, hidden (conhost --headless keeps the console window away), restart on failure.
+# 4. Start at logon, hidden (conhost --headless keeps the console window away), and every 5 minutes:
+# conhost exits 0 whatever the daemon did, so the restart-on-failure settings alone never fire.
 $action = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument "--headless `"$target`" daemon" -WorkingDirectory $bin
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$trigger = @(
+    New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
     -Description 'open_mess daemon (scripts/install.ps1)' -Force | Out-Null
-Write-Host "scheduled task '$taskName' starts the daemon at logon"
+Write-Host "scheduled task '$taskName' starts the daemon at logon and every 5 minutes if it stopped"
 
 if (-not $NoStart) {
     Start-ScheduledTask -TaskName $taskName
