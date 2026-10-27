@@ -85,6 +85,7 @@ async fn status_over_api() {
     assert!(body["uptime_seconds"].is_u64());
     assert_eq!(body["modules"], json!([]));
     assert_eq!(body["accounts"], json!([]));
+    assert_eq!(body["triggers"], json!({"lagged": 0, "rules": {}}));
 }
 
 #[tokio::test]

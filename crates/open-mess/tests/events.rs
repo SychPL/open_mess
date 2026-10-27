@@ -45,13 +45,14 @@ async fn message_events_reach_subscribers() {
     let event = next(&mut subscriber).await;
     // A `{:?}` of the event, as a log line would print it, has no conversation or message id.
     let debug = format!("{event:?}");
-    assert!(debug.contains("test-echo:a") && !debug.contains("m-42") && !debug.contains("conversation"), "{debug}");
+    assert!(debug.contains("test-echo:a") && !debug.contains("m-42") && !debug.contains("conversation") && !debug.contains("p1"), "{debug}");
     assert_eq!(
         event,
         Event::Message {
             account: "test-echo:a".into(),
             conversation: "c".into(),
             message: "m-42".into(),
+            sender: "p1".into(),
             own: false,
             mentions_me: true,
             direct: false

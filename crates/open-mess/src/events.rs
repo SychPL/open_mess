@@ -20,6 +20,8 @@ pub enum Event {
         account: String,
         conversation: String,
         message: String,
+        /// The sender's platform id.
+        sender: String,
         own: bool,
         mentions_me: bool,
         direct: bool,
@@ -30,7 +32,7 @@ pub enum Event {
     },
 }
 
-// Hand-written so that a `{:?}` in a log line never prints conversation or message ids.
+// Hand-written so that a `{:?}` in a log line never prints conversation, message or sender ids.
 impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -60,6 +62,12 @@ impl Bus {
         self.0.subscribe()
     }
 
+    /// Publishes one event; with no subscriber it is dropped. The modules' events come through
+    /// [`Bus::forward`].
+    pub fn publish(&self, event: Event) {
+        let _ = self.0.send(event);
+    }
+
     /// Publishes every host event until all senders (the modules' contexts) are gone.
     pub async fn forward(self, mut events: mpsc::Receiver<HostEvent>, accounts: Arc<Accounts>) {
         while let Some(event) = events.recv().await {
@@ -73,13 +81,13 @@ impl Bus {
                     account: format!("{}:{}", msg.module, msg.account),
                     conversation: msg.conversation,
                     message: msg.message,
+                    sender: msg.sender,
                     own: msg.own,
                     mentions_me: msg.mentions_me,
                     direct: msg.direct,
                 },
             };
-            // With no subscriber the event is simply dropped.
-            let _ = self.0.send(event);
+            self.publish(event);
         }
     }
 }

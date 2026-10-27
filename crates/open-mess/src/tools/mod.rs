@@ -24,6 +24,7 @@ use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::ModuleState;
 use crate::pending::{Kind, Pending, State};
 use crate::permissions;
+use crate::triggers::Counters;
 
 /// A tool as both front ends describe it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,18 +63,25 @@ pub struct Registry {
     accounts: Option<Arc<Accounts>>,
     /// The accounts' writes; None with the accounts.
     pending: Option<Arc<Pending>>,
+    /// What the trigger engine delivered and dropped, for `status`.
+    triggers: Counters,
 }
 
 impl Registry {
     /// The tools with no modules and no accounts; `started` is when the daemon started, for
     /// `status`.
     pub fn with_builtin(started: Instant) -> Registry {
-        Registry { started, accounts: None, pending: None }
+        Registry { started, accounts: None, pending: None, triggers: Counters::default() }
     }
 
     pub fn new(started: Instant, accounts: Arc<Accounts>) -> Registry {
         let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
-        Registry { started, accounts: Some(accounts), pending: Some(pending) }
+        Registry { started, accounts: Some(accounts), pending: Some(pending), triggers: Counters::default() }
+    }
+
+    /// The trigger engine's counters, for the engine to count into.
+    pub fn trigger_counters(&self) -> &Counters {
+        &self.triggers
     }
 
     /// The pending actions, for the approval UI and the configuration window.
@@ -156,6 +164,7 @@ impl Registry {
             "uptime_seconds": self.started.elapsed().as_secs(),
             "modules": modules,
             "accounts": accounts,
+            "triggers": self.triggers.to_json(),
         }))
     }
 }

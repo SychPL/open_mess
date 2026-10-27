@@ -179,7 +179,7 @@ async fn message_arrived_becomes_host_event() {
     assert_eq!(events.recv().await, Some(session));
     let Some(HostEvent::MessageArrived(message)) = events.recv().await else { panic!("no message event") };
     assert_eq!((message.module.as_str(), message.account.as_str(), message.conversation.as_str()), ("test-echo", "a", "c"));
-    assert_eq!(message.message, "hi");
+    assert_eq!((message.message.as_str(), message.sender.as_str()), ("hi", "p1"));
     assert!(message.mentions_me && !message.own && !message.direct);
     // An event larger than the cap is dropped: only the session event comes through.
     let huge = "x".repeat(limits::MAX_EVENT_TEXT + 1);

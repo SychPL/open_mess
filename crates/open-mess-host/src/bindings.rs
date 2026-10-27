@@ -167,7 +167,7 @@ impl host::Host for HostState {
     }
 
     async fn message_arrived(&mut self, msg: host::NewMessage) {
-        if [&msg.account, &msg.conversation, &msg.message].iter().any(|text| text.len() > limits::MAX_EVENT_TEXT) {
+        if [&msg.account, &msg.conversation, &msg.message, &msg.sender].iter().any(|text| text.len() > limits::MAX_EVENT_TEXT) {
             tracing::warn!(module = %self.env.name, "message event dropped: a field is over {} bytes", limits::MAX_EVENT_TEXT);
             return;
         }
@@ -176,6 +176,7 @@ impl host::Host for HostState {
             account: msg.account,
             conversation: msg.conversation,
             message: msg.message,
+            sender: msg.sender,
             own: msg.own,
             mentions_me: msg.mentions_me,
             direct: msg.direct,
