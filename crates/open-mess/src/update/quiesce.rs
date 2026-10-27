@@ -3,10 +3,11 @@
 //! actions, the batches, the programs they started, the approved writes, and the agents' tool calls
 //! until 60 s of quiet. Phase B refuses every new tool call and waits for the running ones and for
 //! the actions waiting for the user. Then the daemon hands over to the helper and exits once the
-//! helper holds `update.lock`. A cancel, or a helper that does not start, resumes everything.
+//! helper holds `update.lock`. A cancel, or a helper that does not start, resumes everything, unless
+//! the stage file cannot be withdrawn: then the daemon exits and the recovery takes over.
 
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -144,7 +145,12 @@ pub trait Launcher: Send + Sync {
 /// Hands over to the helper: copies the release's verified `om.exe` to `bin\om.update.exe`, writes
 /// `update-pending.json` at stage `started`, launches the helper and notifies `exit` once the helper
 /// holds `update.lock`. A helper that does not take it within 30 s did not start: holding the lock,
-/// so that a late one finds nothing to do, the daemon deletes the file and goes back to work.
+/// so that a late one finds nothing to do, the daemon deletes the file.
+///
+/// On `Err` the caller goes back to work with [`resume`], except after
+/// [`UpdateError::StageFileLeft`]: the file could not be deleted (or the lock taken), and a helper
+/// started by the task's own trigger within 5 minutes would stop a daemon back at work. `exit` is
+/// notified then, and the daemon ends instead; the recovery deals with the file (spec 7.6).
 pub async fn launch(
     paths: &Paths,
     downloaded: &Downloaded,
@@ -177,12 +183,34 @@ pub async fn launch(
         }
     }
     // Even a failed launch may have registered the task, which runs again within 5 minutes.
-    let Some(_lock) = state::try_lock(&paths.lock_file(), Duration::ZERO)? else {
-        exit.notify_one(); // it started just now
-        return Ok(());
+    let removed = match state::try_lock(&paths.lock_file(), Duration::ZERO) {
+        Ok(None) => {
+            exit.notify_one(); // it started just now
+            return Ok(());
+        }
+        Ok(Some(_lock)) => remove_stage_file(paths).await,
+        Err(err) => Err(err),
     };
-    std::fs::remove_file(paths.pending_file())?;
+    if let Err(err) = removed {
+        exit.notify_one();
+        return Err(UpdateError::StageFileLeft(err));
+    }
     launched.and(Err(UpdateError::HelperNotStarted))
+}
+
+/// Deletes `update-pending.json`, 5 tries 100 ms apart: an antivirus may hold it for a moment.
+async fn remove_stage_file(paths: &Paths) -> io::Result<()> {
+    let mut tries = 5;
+    loop {
+        match std::fs::remove_file(paths.pending_file()) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if tries > 1 => {
+                tries -= 1;
+                sleep(Duration::from_millis(100)).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Copies the release's `om.exe` beside the helper's place, checks it against the release manifest

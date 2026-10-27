@@ -83,25 +83,41 @@ pub struct PendingFile {
 #[derive(Debug)]
 pub enum Read {
     Missing,
-    /// There, but not a stage file: a write never leaves half a file, so something else broke it.
+    /// Read, but not a stage file: a write never leaves half a file, so something else broke it.
     Unreadable,
+    /// Not read, even after a few tries (an antivirus holding it, say): leave everything alone and
+    /// look again later.
+    Error(io::Error),
     Found(PendingFile),
 }
 
 /// A stage file is a few lists of paths; anything bigger is not one.
 const MAX_FILE: u64 = 1024 * 1024;
 
+/// Tries 5 times, 100 ms apart, before an error counts.
 pub fn read(path: &Path) -> Read {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Read::Missing,
-        Err(_) => return Read::Unreadable,
+    let mut tries = 5;
+    let bytes = loop {
+        match read_capped(path) {
+            Ok(bytes) => break bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Read::Missing,
+            Err(_) if tries > 1 => {
+                tries -= 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => return Read::Error(err),
+        }
     };
-    let mut bytes = Vec::new();
-    if file.take(MAX_FILE + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_FILE {
+    if bytes.len() as u64 > MAX_FILE {
         return Read::Unreadable;
     }
     serde_json::from_slice(&bytes).map_or(Read::Unreadable, Read::Found)
+}
+
+fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Writes the whole file next to `path` and moves it over `path`: a reader, or the next step after
@@ -146,4 +162,27 @@ pub fn helper_alive(paths: &Paths) -> bool {
 /// only not shown.
 pub fn record_result(paths: &Paths, text: &str) {
     let _ = std::fs::write(paths.last_result(), format!("{}\n", text.replace(['\r', '\n'], " ")));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_does_not_parse_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-pending.json");
+        assert!(matches!(read(&path), Read::Missing));
+        std::fs::write(&path, "{\"version\": ").unwrap();
+        assert!(matches!(read(&path), Read::Unreadable));
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(read(&path), Read::Unreadable));
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_an_error_not_unreadable() {
+        // A folder in its place fails to open on every try, like a file an antivirus keeps locked.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(read(dir.path()), Read::Error(_)));
+    }
 }

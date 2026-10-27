@@ -24,4 +24,8 @@ pub enum UpdateError {
     /// The helper did not take `update.lock` in time; the daemon went back to work.
     #[error("pomocnik nie wystartował")]
     HelperNotStarted,
+    /// The helper may or may not run, and `update-pending.json` could not be deleted: the daemon
+    /// exits, and the recovery at its next start takes over (spec 7.6).
+    #[error("update-pending.json could not be withdrawn ({0}); the daemon exits and the recovery takes over")]
+    StageFileLeft(std::io::Error),
 }

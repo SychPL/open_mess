@@ -404,6 +404,48 @@ async fn helper_not_started_resumes_after_30_s() {
     t.d.registry.call("status", json!({})).await.unwrap();
 }
 
+/// A launch that cannot withdraw its stage file must not let the daemon resume: within 5 minutes
+/// the task's own trigger would run a helper that finds it and stops a daemon back at work. The
+/// daemon ends instead, and the recovery deals with the file.
+async fn daemon_ends(r: &Release, launcher: &dyn Launcher) {
+    let t = setup().await;
+    // Phase B closed the gate.
+    t.activity.gate.set(GateMode::Closed);
+    let exit = Notify::new();
+    let result = quiesce::launch(&r.paths, &r.downloaded, Vec::new(), launcher, &exit).await;
+    assert!(matches!(&result, Err(UpdateError::StageFileLeft(_))), "{result:?}");
+    assert!(notified(&exit).await);
+    assert!(matches!(state::read(&r.paths.pending_file()), Read::Found(_)));
+    assert!(is_update_in_progress(&t.d.registry.call("status", json!({})).await));
+}
+
+#[tokio::test(start_paused = true)]
+async fn lock_that_cannot_be_taken_ends_the_daemon() {
+    let r = release();
+    // Not a file: whether a helper holds it cannot be told.
+    std::fs::create_dir(r.paths.lock_file()).unwrap();
+    daemon_ends(&r, &Helper::starting_after(None)).await;
+}
+
+#[cfg(windows)]
+#[tokio::test(start_paused = true)]
+async fn stage_file_that_cannot_be_deleted_ends_the_daemon() {
+    /// The helper never starts, and an antivirus holds the stage file without letting it be deleted.
+    struct Scanned(Mutex<Option<File>>);
+
+    impl Launcher for Scanned {
+        fn launch_helper(&self, _: &Path, data: &Path) -> Result<(), UpdateError> {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_SHARE_READ: u32 = 1;
+            let file = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(data.join("update-pending.json"))?;
+            *self.0.lock().unwrap() = Some(file);
+            Ok(())
+        }
+    }
+
+    daemon_ends(&release(), &Scanned(Mutex::default())).await;
+}
+
 #[tokio::test]
 async fn changed_om_exe_is_not_launched() {
     let r = release();
@@ -454,7 +496,4 @@ fn pending_file_write_is_atomic() {
     done.store(true, Ordering::SeqCst);
     assert!(reader.join().unwrap() > 0);
     assert!(matches!(state::read(&path), Read::Found(found) if found == file(299 % 30 * 50)));
-    assert!(matches!(state::read(&dir.path().join("missing.json")), Read::Missing));
-    std::fs::write(&path, "{\"version\": ").unwrap();
-    assert!(matches!(state::read(&path), Read::Unreadable));
 }
