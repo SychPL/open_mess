@@ -37,13 +37,13 @@ pub fn run() -> Result<(), Error> {
     // A second daemon fails here and leaves the running one's error file alone.
     let _lock = acquire_lock(&dir)?;
     let error_file = dir.join(LAST_START_ERROR_FILE);
-    let (runtime, listener, registry, ui) = start(&dir, started).inspect_err(|err| {
+    let window = Opener::default();
+    let (runtime, listener, registry, ui) = start(&dir, started, &window).inspect_err(|err| {
         let _ = std::fs::write(&error_file, format!("{}\n", err.to_string().replace(['\r', '\n'], " ")));
     })?;
     let _ = std::fs::remove_file(&error_file);
     // Never println!: it panics when the launcher has closed stdout.
     let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
-    let window = Opener::default();
     let (stop, stopped) = oneshot::channel::<()>();
     let serve = api::serve(listener, ui.token.clone(), Arc::new(registry), window.clone(), async {
         let _ = stopped.await;
@@ -88,7 +88,7 @@ fn acquire_lock(dir: &Path) -> Result<InstanceLock, Error> {
     InstanceLock::acquire(dir)
 }
 
-fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
+fn start(dir: &Path, started: Instant, window: &Opener) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
     let store = Store::open(&dir.join("state.sqlite3"))?;
     let port = store.port()?;
     let token = secrets::local_api_token()?;
@@ -134,7 +134,7 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, Registry
     });
     pending.recover()?;
     runtime.spawn(Arc::clone(&pending).sweep());
-    approval::start(&runtime, Arc::clone(&pending));
+    approval::start(&runtime, Arc::clone(&pending), window.clone());
     let (counters, sessions) = (registry.trigger_counters().clone(), registry.channel_sessions().clone());
     Ok((runtime, listener, registry, UiState { accounts, pending, started, port, token, sign_ins, counters, sessions }))
 }

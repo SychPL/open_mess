@@ -191,10 +191,10 @@ async fn status_and_mcp_command() {
         commands.claude,
         "claude mcp add --transport http --scope user open_mess http://127.0.0.1:7341/mcp --header \"Authorization: Bearer t0ken\""
     );
-    assert_eq!(
-        commands.codex,
-        "setx OPEN_MESS_TOKEN \"t0ken\"\ncodex mcp add open_mess --url http://127.0.0.1:7341/mcp --bearer-token-env-var OPEN_MESS_TOKEN"
-    );
+    // For Codex's config.toml: the token stays in Codex's own configuration, never in an environment
+    // variable, which Codex hands on to the commands it runs, nor in a shell's history.
+    assert_eq!(commands.codex, "[mcp_servers.open_mess]\nurl = \"http://127.0.0.1:7341/mcp\"\nhttp_headers = { Authorization = \"Bearer t0ken\" }");
+    assert!(!commands.codex.contains("setx") && !commands.codex.contains("OPEN_MESS_TOKEN"));
 }
 
 #[tokio::test]
@@ -282,7 +282,7 @@ async fn removing_account_clears_its_waiting_actions() {
     d.accounts.add("test-echo", info("a")).unwrap();
     d.accounts.add("test-echo", info("b")).unwrap();
     let state = state(&d);
-    let (shown, withdrawn) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(0)));
+    let (shown, several, withdrawn) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(0)), Arc::new(Mutex::new(0)));
     tokio::spawn(approval::run(
         Arc::clone(&state.pending),
         {
@@ -290,23 +290,28 @@ async fn removing_account_clears_its_waiting_actions() {
             move |preview: &Preview| shown.lock().unwrap().push(preview.action.clone())
         },
         {
+            let several = Arc::clone(&several);
+            move |_| *several.lock().unwrap() += 1
+        },
+        {
             let withdrawn = Arc::clone(&withdrawn);
             move || *withdrawn.lock().unwrap() += 1
         },
     ));
     let send = |account: &str| d.registry.call("send", json!({"account": account, "conversation": "c1", "text": "hi"}));
-    let a1 = send("test-echo:a").await.unwrap()["action"].as_str().unwrap().to_owned();
+    send("test-echo:a").await.unwrap();
     send("test-echo:a").await.unwrap();
     let b1 = send("test-echo:b").await.unwrap()["action"].as_str().unwrap().to_owned();
-    wait_for(|| shown.lock().unwrap().len() == 1).await;
-    assert_eq!(*shown.lock().unwrap(), std::slice::from_ref(&a1));
+    // Three wait: one notice says so.
+    wait_for(|| *several.lock().unwrap() == 1).await;
+    let withdrawn_before = *withdrawn.lock().unwrap();
 
     commands::remove_account(&state, "test-echo:a").await.unwrap();
-    // Gone from the list, its toast taken off the screen, and the next account's shown.
+    // Gone from the list, the notice taken off the screen, and the one left shown on its own.
     assert_eq!(commands::waiting(&state).iter().map(|preview| preview.action.clone()).collect::<Vec<_>>(), std::slice::from_ref(&b1));
-    wait_for(|| shown.lock().unwrap().len() == 2).await;
-    assert_eq!(*shown.lock().unwrap(), [a1, b1]);
-    assert_eq!(*withdrawn.lock().unwrap(), 1);
+    wait_for(|| shown.lock().unwrap().last() == Some(&b1)).await;
+    assert_eq!(*withdrawn.lock().unwrap(), withdrawn_before + 1);
+    assert_eq!(*several.lock().unwrap(), 1);
 }
 
 async fn wait_for(done: impl Fn() -> bool) {

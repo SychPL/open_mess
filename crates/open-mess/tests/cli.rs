@@ -9,6 +9,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use open_mess::instance::InstanceLock;
 use open_mess::tools::Registry;
 use open_mess::ui::Opener;
 use rmcp::ServiceExt;
@@ -42,7 +43,7 @@ async fn start_with_window() -> (u16, oneshot::Sender<()>, Opener) {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_config_opens_the_window() {
     let (port, _stop, opener) = start_with_window().await;
-    let dir = data_dir();
+    let dir = running();
     let answer = |answer: Result<(), String>| {
         let opener = opener.clone();
         tokio::spawn(async move {
@@ -92,10 +93,28 @@ fn data_dir() -> TempDir {
     tempfile::tempdir().unwrap()
 }
 
+/// A data folder whose instance lock is held, as by the daemon whose API a test serves.
+struct Running {
+    dir: TempDir,
+    _lock: InstanceLock,
+}
+
+impl Running {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn running() -> Running {
+    let dir = data_dir();
+    let lock = InstanceLock::acquire(dir.path()).unwrap();
+    Running { dir, _lock: lock }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_status_json() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     let output = om(dir.path(), port, TOKEN, &["status", "--json"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let body: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -105,7 +124,7 @@ async fn cli_status_json() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_status_for_people() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     let output = om(dir.path(), port, TOKEN, &["status"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -116,7 +135,7 @@ async fn cli_status_for_people() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_unknown_tool() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     let output = om(dir.path(), port, TOKEN, &["nope"]);
     assert_eq!(output.status.code(), Some(3));
     assert!(stderr(&output).contains("nope"));
@@ -125,7 +144,7 @@ async fn cli_unknown_tool() {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_tools_exist_over_mcp_and_cli() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     // The CLI names the tools the daemon offers when asked for one it doesn't.
     let unknown = stderr(&om(dir.path(), port, TOKEN, &["nope"]));
     let cli: BTreeSet<String> = unknown.split("available: ").nth(1).unwrap().trim().split(", ").map(str::to_owned).collect();
@@ -148,7 +167,7 @@ async fn write_tools_exist_over_mcp_and_cli() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_bad_args() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     // status takes no parameters: the API refuses them.
     let output = om(dir.path(), port, TOKEN, &["status", "--verbose", "true"]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
@@ -165,7 +184,7 @@ async fn cli_bad_args() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_types_flags_by_the_schema() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     // A string parameter keeps a value that looks like a number, as Teams message ids do.
     let output = om(dir.path(), port, TOKEN, &["pending", "--account", "1800000000300"]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
@@ -221,18 +240,33 @@ fn cli_takes_only_a_held_lock_as_a_running_daemon() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_ignores_a_stale_start_error_while_the_daemon_runs() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     // A good start could not delete the file (say, a virus scanner held it open).
     std::fs::write(dir.path().join("last-start-error.txt"), "port 7341 is already in use\n").unwrap();
-    let _daemon = open_mess::instance::InstanceLock::acquire(dir.path()).unwrap();
     let output = om(dir.path(), port, TOKEN, &["status"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+#[test]
+fn cli_never_sends_the_token_without_a_daemon_holding_the_lock() {
+    // The daemon stopped cleanly (no start error) and another program, another Windows user's say,
+    // took its port.
+    let dir = data_dir();
+    let other_program = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = other_program.local_addr().unwrap().port();
+    for args in [&["status"][..], &["config"]] {
+        let output = om(dir.path(), port, TOKEN, args);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert!(stderr(&output).contains("open_mess daemon is not running"), "{}", stderr(&output));
+    }
+    other_program.set_nonblocking(true).unwrap();
+    assert!(other_program.accept().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_ignores_proxy_settings() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     // A proxy would get the token; this one doesn't even exist.
     let proxy = format!("http://127.0.0.1:{}", free_port());
     let mut command = om_command(dir.path(), port, TOKEN, &["status"]);
@@ -246,7 +280,7 @@ async fn cli_ignores_proxy_settings() {
 
 #[test]
 fn cli_gives_up_on_a_port_that_never_answers() {
-    let dir = data_dir();
+    let dir = running();
     // Takes connections (into the backlog) and never answers.
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let started = Instant::now();
@@ -259,7 +293,7 @@ fn cli_gives_up_on_a_port_that_never_answers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_bad_token() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     let output = om(dir.path(), port, "wrong", &["status"]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = stderr(&output);
@@ -290,7 +324,7 @@ fn cli_closed_stdout_is_fine() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_reports_a_failed_write() {
     let (port, _stop) = start().await;
-    let dir = data_dir();
+    let dir = running();
     // A stdout that refuses writes: a full device on Unix, a read-only file on Windows.
     #[cfg(unix)]
     let refusing = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use common::info;
 use open_mess::bridge::{self, Locate, UNAVAILABLE};
 use open_mess::events::{Bus, Event};
+use open_mess::instance::InstanceLock;
 use open_mess::tools::Registry;
 use open_mess::tools::shared::UNTRUSTED_NOTICE;
 use open_mess::triggers::channel::{self, Sessions};
@@ -291,22 +292,45 @@ async fn bridge_leaves_with_its_session() {
     wait_for("the daemon session to close", || registry.channel_sessions().is_empty()).await;
 }
 
+/// `om mcp-stdio` as Claude Code runs it, for a daemon on `port` with `data_dir`.
+fn mcp_stdio(port: u16, data_dir: &std::path::Path) -> tokio::process::Child {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_om"))
+        .arg("mcp-stdio")
+        .env("OPEN_MESS_PORT", port.to_string())
+        .env("OPEN_MESS_TOKEN", TOKEN)
+        .env("OPEN_MESS_DATA_DIR", data_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn bridge_never_sends_the_token_without_a_daemon_holding_the_lock() {
+    // The daemon stopped cleanly and another program, another Windows user's say, took its port.
+    let other_program = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    other_program.set_nonblocking(true).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut child = mcp_stdio(other_program.local_addr().unwrap().port(), data.path());
+    let pipes = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    let (got, _got) = mpsc::unbounded_channel();
+    let session = Session { declares: false, got }.serve(pipes).await.unwrap();
+    let result = session.call_tool(CallToolRequestParams::new("status")).await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(format!("{:?}", result.content).contains(UNAVAILABLE));
+    assert!(other_program.accept().is_err());
+}
+
 #[tokio::test]
 async fn killed_bridge_is_skipped() {
     // `om mcp-stdio` as Claude Code runs it, then killed (with its terminal, say): it never closes
     // its daemon session, which would take notifications and drop them until it expires.
     let (port, registry, _stop) = daemon().await;
     let data = tempfile::tempdir().unwrap();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_om"))
-        .arg("mcp-stdio")
-        .env("OPEN_MESS_PORT", port.to_string())
-        .env("OPEN_MESS_TOKEN", TOKEN)
-        .env("OPEN_MESS_DATA_DIR", data.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+    // Held as the daemon holds it: the bridge sends the token only to a daemon that does.
+    let _lock = InstanceLock::acquire(data.path()).unwrap();
+    let mut child = mcp_stdio(port, data.path());
     let pipes = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
     let (got, _killed_got) = mpsc::unbounded_channel();
     let killed = Session { declares: false, got }.serve(pipes).await.unwrap();

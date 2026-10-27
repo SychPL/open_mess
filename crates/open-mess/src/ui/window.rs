@@ -59,10 +59,10 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     let handle = app.handle().clone();
     runtime.spawn(async move {
         while let Some(request) = opener.next().await {
-            let (app, profile) = (handle.clone(), profile.clone());
+            let (app, profile, waiting) = (handle.clone(), profile.clone(), opener.take_waiting());
             // A request the event loop drops tells its caller that the window is not available.
             let _ = handle.run_on_main_thread(move || {
-                let _ = request.send(open_window(&app, &profile));
+                let _ = request.send(open_window(&app, &profile, waiting));
             });
         }
     });
@@ -280,13 +280,13 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
         // ponytail: a window the tray fails to open is reported once a log sink exists; `om config`
         // reports it now.
         .on_menu_event(move |app, event| match event.id().as_ref() {
-            "open" => drop(open_window(app, &profile)),
+            "open" => drop(open_window(app, &profile, false)),
             "quit" => app.exit(0),
             _ => {}
         })
         .on_tray_icon_event(move |tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                drop(open_window(tray.app_handle(), &on_click));
+                drop(open_window(tray.app_handle(), &on_click, false));
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -298,12 +298,17 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
 
 /// Opens the window, or brings the open one to the front. On the main thread, so two requests
 /// never make two windows.
-fn open_window<R: tauri::Runtime>(app: &AppHandle<R>, profile: &Path) -> Result<(), String> {
+/// Opens the window, or raises the open one; `waiting`: on the list of actions waiting for
+/// approval. (A new window starts on that list anyway while any wait.)
+fn open_window<R: tauri::Runtime>(app: &AppHandle<R>, profile: &Path, waiting: bool) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(LABEL) {
         // A window that cannot be raised is still open.
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        if waiting {
+            dispatch(app, "show-waiting");
+        }
         return Ok(());
     }
     let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
@@ -338,8 +343,9 @@ mod tests {
     fn second_open_focuses() {
         let app = tauri::test::mock_app();
         let profile = tempfile::tempdir().unwrap();
-        open_window(app.handle(), profile.path()).unwrap();
-        open_window(app.handle(), profile.path()).unwrap();
+        open_window(app.handle(), profile.path(), false).unwrap();
+        // Raised on the list of waiting actions, as the notice that several wait asks.
+        open_window(app.handle(), profile.path(), true).unwrap();
         assert_eq!(app.webview_windows().len(), 1);
         assert!(app.get_webview_window(LABEL).is_some());
     }

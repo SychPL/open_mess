@@ -432,8 +432,10 @@ pub async fn decide(state: &UiState, action: &str, approve: bool) -> Result<Stri
 pub struct McpCommandsDto {
     /// `claude mcp add ...`, as `om mcp-command` prints it.
     pub claude: String,
-    /// `codex mcp add ...`, which reads the token from `OPEN_MESS_TOKEN`, and the `setx` that sets
-    /// it for the user.
+    /// The `[mcp_servers.open_mess]` table for Codex's `config.toml`, the token in a fixed header,
+    /// kept in Codex's own configuration as Claude Code keeps it in its own. `codex mcp add` takes a
+    /// token only from an environment variable, which Codex hands on to the commands it runs (and
+    /// setx to every program); a line typed into a shell also lands in its history and logs.
     pub codex: String,
 }
 
@@ -442,8 +444,8 @@ pub fn mcp_command(state: &UiState) -> McpCommandsDto {
     McpCommandsDto {
         claude: cli::mcp_add_command(state.port, &state.token),
         codex: format!(
-            "setx OPEN_MESS_TOKEN \"{}\"\ncodex mcp add open_mess --url http://127.0.0.1:{}/mcp --bearer-token-env-var OPEN_MESS_TOKEN",
-            state.token, state.port
+            "[mcp_servers.open_mess]\nurl = \"http://127.0.0.1:{}/mcp\"\nhttp_headers = {{ Authorization = \"Bearer {}\" }}",
+            state.port, state.token
         ),
     }
 }
