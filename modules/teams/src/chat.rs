@@ -209,6 +209,13 @@ pub fn kind(id: &str) -> ConversationKind {
     }
 }
 
+/// The service's own feeds (`48:mentions`, `48:notifications`, `48:calllogs`) hold copies of what
+/// happens in real conversations ("Live results" 8): they are not conversations. `48:notes` is the
+/// self-chat.
+pub fn is_feed(id: &str) -> bool {
+    id.starts_with("48:") && id != "48:notes"
+}
+
 /// An empty horizon is `0;0;0` (docs 3.4); anything else must have all three fields.
 fn horizon(text: &str, path: &str) -> Result<Horizon, ProtoError> {
     if text.is_empty() {
@@ -496,6 +503,7 @@ mod tests {
         assert_eq!(kinds, [ConversationKind::Group, ConversationKind::Direct, ConversationKind::Channel, ConversationKind::Meeting]);
         assert_eq!(kind("19:dddddddddddddddddddddddddddddddd@thread.skype"), ConversationKind::Other);
         assert_eq!(kind("48:notes"), ConversationKind::Other);
+        assert!(is_feed("48:mentions") && is_feed("48:notifications") && !is_feed("48:notes") && !is_feed("19:a@thread.v2"));
     }
 
     #[test]

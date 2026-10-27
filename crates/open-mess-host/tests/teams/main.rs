@@ -294,6 +294,8 @@ async fn list_conversations_maps_kinds() {
         conversation(CHANNEL, Some("Synthetic channel"), None),
         conversation(MEETING, Some("Synthetic meeting"), None),
         conversation("48:notes", None, None),
+        // The service's own feed of copies is not a conversation; the self-chat is.
+        conversation("48:mentions", None, None),
     ]));
     let result = teams.call("list_conversations", json!({"limit": 50})).await.unwrap();
     let kinds: Vec<(String, String)> = ids(&result, "id").into_iter().zip(ids(&result, "kind")).collect();
@@ -481,11 +483,14 @@ async fn unread_pages_within_the_limit() {
 #[tokio::test]
 async fn mentions_from_recent_messages() {
     let teams = Teams::signed_in().await;
-    let (group, channel) = (messages_path(GROUP), messages_path(CHANNEL));
+    let (group, channel, feed) = (messages_path(GROUP), messages_path(CHANNEL), messages_path("48:mentions"));
     let conversations = vec![
+        // The feed of copies of mentions ("Live results" 8), newest of all.
+        conversation("48:mentions", None, Some(mentioning(numbered(104, "48:mentions", OTHER, "copy"), ME))),
         conversation(GROUP, None, Some(numbered(103, GROUP, OTHER, "x"))),
         conversation(CHANNEL, None, Some(numbered(102, CHANNEL, OTHER, "x"))),
     ];
+    let feed_path = feed.clone();
     teams.fake.on(move |s| {
         let messages = if s.path == CHAT_PATH {
             return Some(Reply::json(page("conversations", conversations.clone(), None)));
@@ -498,6 +503,8 @@ async fn mentions_from_recent_messages() {
             ]
         } else if s.path == channel {
             vec![mentioning(numbered(102, CHANNEL, OTHER, "someone else"), OTHER), mentioning(numbered(101, CHANNEL, ME, "myself"), ME)]
+        } else if s.path == feed_path {
+            vec![mentioning(numbered(104, "48:mentions", OTHER, "copy"), ME)]
         } else {
             return None;
         };
@@ -505,7 +512,9 @@ async fn mentions_from_recent_messages() {
     });
     let result = teams.call("mentions", json!({"since": "2027-01-15T08:00:00Z"})).await.unwrap();
     assert_eq!(ids(&result, "id"), ["103"]);
+    assert_eq!(ids(&result, "conversation"), [GROUP]);
     assert_eq!(result["items"][0]["untrusted"]["text"], "hey @One");
+    assert!(teams.fake.requests(&feed).is_empty());
     // Only conversations active since then were listed.
     assert!(teams.fake.requests(CHAT_PATH)[0].query.contains("startTime=1800000000000"));
 }

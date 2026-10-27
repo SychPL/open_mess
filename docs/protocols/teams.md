@@ -549,6 +549,17 @@ token, tenant id, user id or account name.
      `fromFamilyNameInToken`, `imdisplayname`, `amsreferences`; `_metadata` has `backwardLink`,
      `syncState`, `lastCompleteSegmentStartTime`, `lastCompleteSegmentEndTime`.
 
-All checks in items 1-4 and 7 were read-only: no endpoint registration, no property write, no Trouter
+8. **The service's own feeds** (read-only, 2026-10-27): the conversation list also returns
+   `48:mentions`, `48:notifications` and `48:calllogs` next to the self-chat `48:notes`. They hold
+   copies: a `48:mentions` message has the user's mention and `conversationid` `48:mentions`, and
+   names the real message in `properties.activity` (`sourceThreadId`, `sourceMessageId`,
+   `sourceUserId`, `sourceThreadTopic`, `messagePreview`, `activityType`...). Reading them as
+   conversations gave the item 6 bug (every `mentions` item from `48:mentions`); the module now
+   leaves them out of every conversation walk (`chat::is_feed`). Messages of real conversations
+   always carry their own `conversationid` (20 conversations, 50 messages each, checked). The
+   self-chat page itself: one page of 43 messages, 52 KB, about 300 ms, no `backwardLink`; the
+   item 6 timeout is still to be reproduced through the daemon.
+
+All checks in items 1-4, 7 and 8 were read-only: no endpoint registration, no property write, no Trouter
 connection. Values printed during the checks were limited to status codes, key names, counts and
 service URLs.

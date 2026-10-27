@@ -74,7 +74,7 @@ fn kind_name(kind: ConversationKind) -> &'static str {
 }
 
 /// Walks the conversations updated since `start_ms`, newest first, while `keep` returns true,
-/// within `MAX_PAGES` and the call's time. With `partial`, a later page that fails ends the walk
+/// within `MAX_PAGES` and the call's time, leaving out the service's feeds ([`chat::is_feed`]). With `partial`, a later page that fails ends the walk
 /// with what the earlier ones gave (a listing); without, it is an error (unread, mentions and the
 /// poll must not pass a failure off as "nothing there").
 fn conversations(session: &mut Session, start_ms: i64, partial: bool, mut keep: impl FnMut(Conversation) -> bool) -> Result<(), ModuleError> {
@@ -93,7 +93,7 @@ fn conversations(session: &mut Session, start_ms: i64, partial: bool, mut keep: 
         };
         let page = chat::decode_conversations(&body).map_err(api::proto)?;
         let empty = page.items.is_empty();
-        for conversation in page.items {
+        for conversation in page.items.into_iter().filter(|c| !chat::is_feed(&c.id)) {
             if !keep(conversation) {
                 return Ok(());
             }
