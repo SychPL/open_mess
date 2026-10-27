@@ -571,13 +571,13 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
             }
         }
         // Older pages earlier polls left, with the time that is left: a long backlog never holds
-        // back what is new. Their messages are reported first all the same, as they came first, so
-        // a batch that keeps the newest keeps the new ones.
-        let mut older_arrivals = Vec::new();
+        // back what is new. Their messages are reported after the new ones too, so that a call
+        // running out of time while it reports loses old messages, not new ones. (A trigger batch
+        // that also gets more than 100 old ones then lists the newest of those; it counts them all.)
         for mut b in behind {
             match fresh_messages(session, &b.conversation, Some(b.link.clone()), |m| b.fresh(m)) {
                 Ok(Some((older, next))) => {
-                    older_arrivals.extend(PollState::older_arrivals(&b, &older, &me));
+                    arrivals.extend(PollState::older_arrivals(&b, &older, &me));
                     let Some(next) = next else { continue };
                     b.link = next;
                 }
@@ -591,8 +591,6 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
                 host::log(1, "older messages of a conversation are given up: an hour passed, or too many conversations fell behind");
             }
         }
-        older_arrivals.append(&mut arrivals);
-        let arrivals = older_arrivals;
         state.finish(started, held);
         // Stored before they are reported, so a crash in between loses them rather than
         // reporting them twice.
