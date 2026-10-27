@@ -9,3 +9,12 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Signs the release manifest (minisign, Ed25519); the daemon verifies it with the key in keys/release.pub.
+minisign = "0.10.0"
+serde_json = "1.0.154"
+sha2 = "0.10.9"
+
+[dev-dependencies]
+tempfile = "3.27.0"
