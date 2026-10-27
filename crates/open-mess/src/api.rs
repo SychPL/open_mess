@@ -1,4 +1,5 @@
-//! The local HTTP API: MCP on `/mcp` and plain JSON for the CLI on `/api`.
+//! The local HTTP API: MCP on `/mcp`, plain JSON for the CLI on `/api`, and `POST /api/ui/open`,
+//! which opens the configuration window (`om config`).
 //!
 //! Listens on 127.0.0.1 only and answers nothing without the bearer token (spec 8.1), so a web page
 //! in the user's browser can't call a tool even though it can reach the port.
@@ -30,6 +31,7 @@ use tokio::net::TcpListener;
 use crate::Error;
 use crate::tools::{Registry, ToolError, ToolInfo};
 use crate::triggers::channel;
+use crate::ui::Opener;
 
 /// Binds `127.0.0.1:<port>`. A taken port is [`Error::PortInUse`]; there is no fallback port.
 pub async fn bind(port: u16) -> Result<TcpListener, Error> {
@@ -39,11 +41,12 @@ pub async fn bind(port: u16) -> Result<TcpListener, Error> {
     })
 }
 
-/// Serves `/api/tools`, `/api/call/{tool}` and `/mcp` until `shutdown` completes.
+/// Serves `/api/tools`, `/api/call/{tool}`, `/api/ui/open` and `/mcp` until `shutdown` completes.
 pub async fn serve(
     listener: TcpListener,
     token: String,
     registry: Arc<Registry>,
+    window: Opener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Error> {
     let mcp_config = StreamableHttpServerConfig::default();
@@ -61,6 +64,14 @@ pub async fn serve(
         .route("/api/tools", get(list_tools))
         .route("/api/call/{tool}", post(call_tool))
         .with_state(registry)
+        // Not a tool: opening the window is harmless, and the window is where the user decides.
+        .route(
+            "/api/ui/open",
+            post(move || {
+                let window = window.clone();
+                async move { open_window(&window).await }
+            }),
+        )
         .route_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(Arc::new(token), require_token));
     axum::serve(listener, app)
@@ -113,6 +124,15 @@ async fn call_tool(State(registry): State<Arc<Registry>>, Path(tool): Path<Strin
         // The daemon is fine; the module behind the tool is not.
         Err(err @ ToolError::Module(_)) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
         Err(err @ ToolError::Failed(_)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+/// Answers once the window is open, or with why it did not open.
+async fn open_window(window: &Opener) -> Response {
+    match window.open().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err @ Error::NoWindow) => error_response(StatusCode::NOT_IMPLEMENTED, err.to_string()),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 

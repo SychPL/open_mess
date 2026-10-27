@@ -4,16 +4,19 @@
 //! A module runs only when both its file and its manifest are the ones the user approved (SHA-256 of
 //! the file and of the canonical manifest JSON). Its manifest is read to find its name, which the
 //! host does with no network, storage or secrets. One file per manifest name is the module; another
-//! file with the same name waits as its replacement (spec 8.3, R6 and R7).
+//! file with the same name waits as its replacement (spec 8.3, R6 and R7). The folder is read at
+//! daemon start and again on request from the configuration window; a running module keeps running
+//! until the file that replaces it is approved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use open_mess_host::{Engine, Manifest, ModuleContext, ModuleHandle};
 use rusqlite::OptionalExtension;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::Error;
@@ -75,6 +78,8 @@ pub struct ModuleInfo {
     /// What [`approve`] takes to approve this file.
     pub file_sha256: String,
     pub manifest_sha256: String,
+    /// All of it, for the approval; None for an invalid file.
+    pub manifest: Option<Manifest>,
 }
 
 struct Entry {
@@ -90,12 +95,20 @@ impl Entry {
             _ => self.info.state.clone(),
         }
     }
+
+    /// The module's file, not a file waiting to replace it.
+    fn is_current(&self, name: &str) -> bool {
+        self.info.name == name && self.info.state != ModuleState::PendingReplacement
+    }
 }
 
-/// The module files found at start, and the running modules.
-#[derive(Default)]
+/// The module files and the running modules, and how to read the folder again.
 pub struct Modules {
-    entries: Vec<Entry>,
+    entries: RwLock<Vec<Entry>>,
+    engine: Engine,
+    dir: PathBuf,
+    /// The context for loading a file, by file name.
+    ctx: Box<dyn Fn(&str) -> ModuleContext + Send + Sync>,
 }
 
 /// A file that loaded as a module.
@@ -107,110 +120,201 @@ struct Candidate {
     handle: ModuleHandle,
 }
 
+/// What one reading of the folder found: the modules by manifest name, and the files that are not
+/// modules.
+pub(crate) struct Found {
+    invalid: Vec<Entry>,
+    by_name: BTreeMap<String, Vec<Candidate>>,
+}
+
 impl Modules {
     /// Reads every `.wasm` file in `dir` (created if missing) and keeps the approved modules
     /// running. `ctx` gives the context for loading a file, by file name.
-    pub async fn scan(store: &Store, engine: &Engine, dir: &Path, ctx: impl Fn(&str) -> ModuleContext) -> Result<Modules, Error> {
-        std::fs::create_dir_all(dir)?;
-        let mut paths: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("wasm")) && path.is_file())
-            .collect();
-        paths.sort();
-
-        let mut entries = Vec::new();
-        let mut by_name: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-        for path in paths {
-            let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-            // The bytes that are hashed are the bytes that are loaded: a file swapped in between
-            // never runs under the other file's approval.
-            let bytes = match read_capped(&path) {
-                Ok(bytes) => bytes,
-                Err(why) => {
-                    entries.push(invalid(file, String::new(), why));
-                    continue;
-                }
-            };
-            let file_sha256 = sha256_hex(&bytes);
-            match engine.load_bytes(bytes, ctx(&file)).await {
-                Ok(handle) => match handle.manifest() {
-                    Ok(manifest) => {
-                        let manifest_sha256 = manifest_sha256(&manifest);
-                        by_name.entry(manifest.name.clone()).or_default().push(Candidate { file, file_sha256, manifest, manifest_sha256, handle });
-                    }
-                    Err(err) => entries.push(invalid(file, file_sha256, err.to_string())),
-                },
-                Err(err) => entries.push(invalid(file, file_sha256, err.to_string())),
-            }
-        }
-
-        for (name, candidates) in by_name {
-            let row = Row::get(store, &name)?;
-            let approved = |c: &Candidate| {
-                row.as_ref().is_some_and(|row| {
-                    row.approved_file_sha256.as_deref() == Some(c.file_sha256.as_str())
-                        && row.approved_manifest_sha256.as_deref() == Some(c.manifest_sha256.as_str())
-                })
-            };
-            // The approved file is the module; else the file it was last time; else the first.
-            let current = candidates
-                .iter()
-                .position(approved)
-                .or_else(|| candidates.iter().position(|c| row.as_ref().is_some_and(|row| row.file == c.file)))
-                .unwrap_or(0);
-            for (index, candidate) in candidates.into_iter().enumerate() {
-                let state = if index != current {
-                    ModuleState::PendingReplacement
-                } else if approved(&candidate) {
-                    if row.as_ref().is_some_and(|row| row.enabled) { ModuleState::Active } else { ModuleState::Disabled }
-                } else {
-                    let reason = match row.as_ref().and_then(|row| row.approved_manifest_sha256.as_deref()) {
-                        None => ApprovalReason::New,
-                        Some(approved) if approved != candidate.manifest_sha256 => ApprovalReason::ManifestChanged,
-                        Some(_) => ApprovalReason::FileChanged,
-                    };
-                    ModuleState::AwaitingApproval { reason }
-                };
-                if index == current {
-                    record(store, &name, &candidate)?;
-                }
-                let Candidate { file, file_sha256, manifest, manifest_sha256, handle } = candidate;
-                // Dropping the only handle stops the module.
-                let handle = (state == ModuleState::Active).then_some(handle);
-                let info = ModuleInfo {
-                    name: manifest.name,
-                    file,
-                    version: manifest.version,
-                    platform: manifest.platform,
-                    hosts: manifest.hosts,
-                    state,
-                    file_sha256,
-                    manifest_sha256,
-                };
-                entries.push(Entry { info, handle });
-            }
-        }
-        Ok(Modules { entries })
+    pub async fn scan(
+        store: &Store,
+        engine: &Engine,
+        dir: &Path,
+        ctx: impl Fn(&str) -> ModuleContext + Send + Sync + 'static,
+    ) -> Result<Modules, Error> {
+        let found = load(engine, dir, &ctx).await?;
+        let entries = decide(store, found)?;
+        Ok(Modules { entries: RwLock::new(entries), engine: engine.clone(), dir: dir.to_path_buf(), ctx: Box::new(ctx) })
     }
 
-    /// The module's file, not counting files waiting to replace it.
-    fn current(&self, name: &str) -> Option<&Entry> {
-        self.entries.iter().find(|entry| entry.info.name == name && entry.info.state != ModuleState::PendingReplacement)
+    fn read(&self) -> RwLockReadGuard<'_, Vec<Entry>> {
+        self.entries.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Vec<Entry>> {
+        self.entries.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn state(&self, name: &str) -> Option<ModuleState> {
-        self.current(name).map(Entry::state)
+        self.read().iter().find(|entry| entry.is_current(name)).map(Entry::state)
     }
 
     /// The running module, only when it is active.
-    pub fn handle(&self, name: &str) -> Option<&ModuleHandle> {
-        self.current(name).filter(|entry| entry.state() == ModuleState::Active).and_then(|entry| entry.handle.as_ref())
+    pub fn handle(&self, name: &str) -> Option<ModuleHandle> {
+        self.read()
+            .iter()
+            .find(|entry| entry.is_current(name))
+            .filter(|entry| entry.state() == ModuleState::Active)
+            .and_then(|entry| entry.handle.clone())
     }
 
     pub fn list(&self) -> Vec<ModuleInfo> {
-        self.entries.iter().map(|entry| ModuleInfo { state: entry.state(), ..entry.info.clone() }).collect()
+        self.read().iter().map(|entry| ModuleInfo { state: entry.state(), ..entry.info.clone() }).collect()
     }
+
+    /// SHA-256 of a module file as it is on disk now; None when it can't be read. Blocking.
+    pub fn file_sha256(&self, file: &str) -> Option<String> {
+        read_capped(&self.dir.join(file)).ok().map(|bytes| sha256_hex(&bytes))
+    }
+
+    /// Reads the folder again, without changing what runs ([`Modules::adopt`] does).
+    pub(crate) async fn load(&self) -> Result<Found, Error> {
+        load(&self.engine, &self.dir, &*self.ctx).await
+    }
+
+    /// Takes what [`Modules::load`] found. A loaded module goes on as it is, sessions and all,
+    /// until the user turns it off or approves a file that replaces it: a new file waiting for
+    /// approval, a file that is gone or one that does not load (still being written, say) leave it
+    /// running (spec 8.3). A module stopped after repeated crashes starts again only when `restart`
+    /// names it. Returns the modules that stopped, started or were replaced.
+    pub(crate) fn adopt(&self, store: &Store, found: Found, restart: Option<&str>) -> Result<Vec<String>, Error> {
+        let mut fresh = decide(store, found)?;
+        let mut entries = self.write();
+        let mut changed = BTreeSet::new();
+        let mut kept = BTreeSet::new();
+        for old in entries.drain(..).filter(|old| old.handle.is_some()) {
+            let name = old.info.name.clone();
+            let enabled = Row::get(store, &name)?.is_some_and(|row| row.enabled);
+            let crashed = old.state() == ModuleState::Crashed;
+            let at = fresh.iter().position(|entry| entry.is_current(&name) && entry.info.manifest.is_some());
+            let keep = match at.and_then(|at| fresh.get(at)) {
+                _ if !enabled => false,
+                _ if crashed && restart == Some(name.as_str()) => false,
+                Some(current) if current.info.state == ModuleState::Active => {
+                    let same = current.info.file_sha256 == old.info.file_sha256 && current.info.manifest_sha256 == old.info.manifest_sha256;
+                    // Another approved file replaces it; a crashed one stays stopped.
+                    same || crashed
+                }
+                _ => true,
+            };
+            if !keep {
+                changed.insert(name);
+                continue;
+            }
+            kept.insert(name);
+            match at.and_then(|at| fresh.get_mut(at).map(|current| (at, current))) {
+                // The copy loaded now is dropped.
+                Some((_, current)) if current.info.state == ModuleState::Active => *current = old,
+                Some((at, current)) => {
+                    current.info.state = ModuleState::PendingReplacement;
+                    fresh.insert(at, old);
+                }
+                None => fresh.push(old),
+            }
+        }
+        for entry in fresh.iter().filter(|entry| entry.info.state == ModuleState::Active && !kept.contains(&entry.info.name)) {
+            changed.insert(entry.info.name.clone());
+        }
+        *entries = fresh;
+        Ok(changed.into_iter().collect())
+    }
+}
+
+/// Loads every `.wasm` file in `dir`, reading each module's manifest.
+async fn load(engine: &Engine, dir: &Path, ctx: &(dyn Fn(&str) -> ModuleContext + Send + Sync)) -> Result<Found, Error> {
+    std::fs::create_dir_all(dir)?;
+    let mut paths: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("wasm")) && path.is_file())
+        .collect();
+    paths.sort();
+
+    let mut invalid = Vec::new();
+    let mut by_name: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
+    for path in paths {
+        let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        // The bytes that are hashed are the bytes that are loaded: a file swapped in between
+        // never runs under the other file's approval.
+        let bytes = match read_capped(&path) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                invalid.push(invalid_entry(file, String::new(), why));
+                continue;
+            }
+        };
+        let file_sha256 = sha256_hex(&bytes);
+        match engine.load_bytes(bytes, ctx(&file)).await {
+            Ok(handle) => match handle.manifest() {
+                Ok(manifest) => {
+                    let manifest_sha256 = manifest_sha256(&manifest);
+                    by_name.entry(manifest.name.clone()).or_default().push(Candidate { file, file_sha256, manifest, manifest_sha256, handle });
+                }
+                Err(err) => invalid.push(invalid_entry(file, file_sha256, err.to_string())),
+            },
+            Err(err) => invalid.push(invalid_entry(file, file_sha256, err.to_string())),
+        }
+    }
+    Ok(Found { invalid, by_name })
+}
+
+/// Which file is each module and what state it is in, by the approvals in `store`.
+fn decide(store: &Store, found: Found) -> Result<Vec<Entry>, Error> {
+    let Found { mut invalid, by_name } = found;
+    let mut entries = Vec::new();
+    entries.append(&mut invalid);
+    for (name, candidates) in by_name {
+        let row = Row::get(store, &name)?;
+        let approved = |c: &Candidate| {
+            row.as_ref().is_some_and(|row| {
+                row.approved_file_sha256.as_deref() == Some(c.file_sha256.as_str())
+                    && row.approved_manifest_sha256.as_deref() == Some(c.manifest_sha256.as_str())
+            })
+        };
+        // The approved file is the module; else the file it was last time; else the first.
+        let current = candidates
+            .iter()
+            .position(approved)
+            .or_else(|| candidates.iter().position(|c| row.as_ref().is_some_and(|row| row.file == c.file)))
+            .unwrap_or(0);
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            let state = if index != current {
+                ModuleState::PendingReplacement
+            } else if approved(&candidate) {
+                if row.as_ref().is_some_and(|row| row.enabled) { ModuleState::Active } else { ModuleState::Disabled }
+            } else {
+                let reason = match row.as_ref().and_then(|row| row.approved_manifest_sha256.as_deref()) {
+                    None => ApprovalReason::New,
+                    Some(approved) if approved != candidate.manifest_sha256 => ApprovalReason::ManifestChanged,
+                    Some(_) => ApprovalReason::FileChanged,
+                };
+                ModuleState::AwaitingApproval { reason }
+            };
+            if index == current {
+                record(store, &name, &candidate)?;
+            }
+            let Candidate { file, file_sha256, manifest, manifest_sha256, handle } = candidate;
+            // Dropping the only handle stops the module.
+            let handle = (state == ModuleState::Active).then_some(handle);
+            let info = ModuleInfo {
+                name: manifest.name.clone(),
+                file,
+                version: manifest.version.clone(),
+                platform: manifest.platform.clone(),
+                hosts: manifest.hosts.clone(),
+                state,
+                file_sha256,
+                manifest_sha256,
+                manifest: Some(manifest),
+            };
+            entries.push(Entry { info, handle });
+        }
+    }
+    Ok(entries)
 }
 
 /// The largest module file read; the Teams module is a few MiB.
@@ -225,7 +329,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn invalid(file: String, file_sha256: String, why: String) -> Entry {
+fn invalid_entry(file: String, file_sha256: String, why: String) -> Entry {
     let info = ModuleInfo {
         name: file.clone(),
         file,
@@ -235,6 +339,7 @@ fn invalid(file: String, file_sha256: String, why: String) -> Entry {
         state: ModuleState::Invalid(why),
         file_sha256,
         manifest_sha256: String::new(),
+        manifest: None,
     };
     Entry { info, handle: None }
 }
@@ -269,8 +374,8 @@ fn record(store: &Store, name: &str, current: &Candidate) -> Result<(), Error> {
     Ok(())
 }
 
-/// Approves a module file and manifest; the next scan runs the file with these hashes. For the
-/// approval UI (milestones C and E) and tests: no MCP or CLI tool approves anything.
+/// Approves a module file and manifest; the next scan runs the file with these hashes. Only the
+/// configuration window and tests call it: no MCP or CLI tool approves anything.
 pub fn approve(store: &Store, name: &str, file_sha256: &str, manifest_sha256: &str) -> Result<(), Error> {
     store.conn().execute(
         "INSERT INTO modules (name, file, file_sha256, manifest_sha256, approved_file_sha256, approved_manifest_sha256)
@@ -282,8 +387,7 @@ pub fn approve(store: &Store, name: &str, file_sha256: &str, manifest_sha256: &s
     Ok(())
 }
 
-/// Turns a module on or off from the next scan. For the configuration window (milestone E) and
-/// tests.
+/// Turns a module on or off from the next scan. For the configuration window and tests.
 pub fn set_enabled(store: &Store, name: &str, enabled: bool) -> Result<(), Error> {
     store.conn().execute(
         "INSERT INTO modules (name, file, file_sha256, manifest_sha256, enabled) VALUES (?1, '', '', '', ?2)
@@ -299,12 +403,17 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 /// SHA-256 of the manifest as JSON with sorted keys (serde_json's map is ordered by key).
 fn manifest_sha256(manifest: &Manifest) -> String {
+    sha256_hex(canonical(manifest).to_string().as_bytes())
+}
+
+/// The manifest as JSON, as it is hashed and remembered.
+pub fn canonical(manifest: &Manifest) -> Value {
     let tools: Vec<_> = manifest
         .extra_tools
         .iter()
         .map(|tool| json!({"description": tool.description, "input_schema": tool.input_schema, "name": tool.name, "writes": tool.writes}))
         .collect();
-    let canonical = json!({
+    json!({
         "extra_tools": tools,
         "hosts": manifest.hosts,
         "name": manifest.name,
@@ -312,8 +421,22 @@ fn manifest_sha256(manifest: &Manifest) -> String {
         "sign_in_hosts": manifest.sign_in_hosts,
         "version": manifest.version,
         "wam": manifest.wam.as_ref().map(|wam| json!({"client_id": wam.client_id, "scopes": wam.scopes})),
-    });
-    sha256_hex(canonical.to_string().as_bytes())
+    })
+}
+
+fn approved_manifest_key(name: &str) -> String {
+    format!("approved_manifest:{name}")
+}
+
+/// Remembers the manifest the user approved for its module, so that the approval of a later file
+/// can show what changed even when no version of the module runs.
+pub fn remember_approved(store: &Store, manifest: &Manifest) -> Result<(), Error> {
+    store.set_config(&approved_manifest_key(&manifest.name), &canonical(manifest).to_string())
+}
+
+/// The manifest last approved in the window for module `name`, as [`canonical`] gives it.
+pub fn approved_manifest(store: &Store, name: &str) -> Result<Option<Value>, Error> {
+    Ok(store.get_config(&approved_manifest_key(name))?.and_then(|json| serde_json::from_str(&json).ok()))
 }
 
 #[cfg(test)]

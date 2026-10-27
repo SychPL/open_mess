@@ -1,8 +1,8 @@
 //! The `om` command line.
 //!
-//! Besides `om daemon`, `om mcp-command` and `om mcp-stdio`, every command is a tool from the
-//! daemon's registry: `om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]`. The CLI
-//! asks the running daemon which tools exist, so the CLI and MCP always offer the same tools.
+//! Besides `om daemon`, `om mcp-command`, `om mcp-stdio` and `om config`, every command is a tool
+//! from the daemon's registry: `om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]`.
+//! The CLI asks the running daemon which tools exist, so the CLI and MCP always offer the same tools.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -36,6 +36,8 @@ enum Action {
     /// Serve MCP on stdin and stdout for a Claude Code session with channels, forwarding to the
     /// daemon: trigger notifications reach the session this way.
     McpStdio,
+    /// Open the configuration window of the running daemon (Windows).
+    Config,
     /// A tool: om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]
     #[command(external_subcommand)]
     Tool(Vec<String>),
@@ -97,6 +99,7 @@ pub fn run() -> ExitCode {
         Action::Daemon => daemon::run().map_err(|err| failed(err.to_string())),
         Action::McpCommand => mcp_command(),
         Action::McpStdio => mcp_stdio(),
+        Action::Config => open_config(),
         Action::Tool(args) => run_tool(&args),
     };
     match result {
@@ -111,10 +114,13 @@ pub fn run() -> ExitCode {
 fn mcp_command() -> Result<(), Failure> {
     let port = port()?;
     let token = token()?;
-    written(writeln!(
-        std::io::stdout(),
-        "claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\""
-    ))
+    written(writeln!(std::io::stdout(), "{}", mcp_add_command(port, &token)))
+}
+
+/// The command that connects Claude Code to open_mess, as `om mcp-command` prints it and the
+/// configuration window shows it.
+pub fn mcp_add_command(port: u16, token: &str) -> String {
+    format!("claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\"")
 }
 
 /// `om mcp-stdio` (bridge.rs): runs until Claude Code closes the session.
@@ -230,6 +236,21 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
         return Err(bad_usage("missing tool name"));
     };
     let ToolArgs { args, json_output, from_flags } = parse_tool_args(rest)?;
+    let (port, token) = daemon()?;
+    let result = block_on(call(port, &token, tool, args, from_flags))?;
+    written(print_result(&result, json_output))
+}
+
+fn open_config() -> Result<(), Failure> {
+    let (port, token) = daemon()?;
+    block_on(async {
+        let response = client()?.post(format!("http://127.0.0.1:{port}/api/ui/open")).bearer_auth(&token).send().await.map_err(request_failed)?;
+        check(response).await.map(drop)
+    })
+}
+
+/// The running daemon's port and token.
+fn daemon() -> Result<(u16, String), Failure> {
     // After a failed start, whatever holds the port may be another program: don't send it the token
     // unless a daemon holds the lock (a good start may have failed to delete the file).
     // ponytail: a daemon still starting holds the lock for the milliseconds before its bind fails;
@@ -237,24 +258,28 @@ fn run_tool(words: &[String]) -> Result<(), Failure> {
     if last_start_error().is_some() && !daemon_holds_the_lock() {
         return Err(not_running());
     }
-    let port = port()?;
-    let token = token()?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?;
-    let result = runtime.block_on(call(port, &token, tool, args, from_flags))?;
-    written(print_result(&result, json_output))
+    Ok((port()?, token()?))
 }
 
-async fn call(port: u16, token: &str, tool: &str, args: Value, from_flags: bool) -> Result<Value, Failure> {
+fn block_on<T>(future: impl std::future::Future<Output = Result<T, Failure>>) -> Result<T, Failure> {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|err| failed(err.to_string()))?.block_on(future)
+}
+
+fn client() -> Result<reqwest::Client, Failure> {
     // reqwest is built without a TLS crypto provider (see Cargo.toml); install ring once.
     // Err only means one is already installed.
     rustls::crypto::ring::default_provider().install_default().ok();
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         // HTTP_PROXY and friends would hand the token to a proxy.
         .no_proxy()
         .connect_timeout(Duration::from_secs(5))
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .map_err(|err| failed(err.to_string()))?;
+        .map_err(|err| failed(err.to_string()))
+}
+
+async fn call(port: u16, token: &str, tool: &str, args: Value, from_flags: bool) -> Result<Value, Failure> {
+    let client = client()?;
     let base = format!("http://127.0.0.1:{port}/api");
 
     let response = client.get(format!("{base}/tools")).bearer_auth(token).send().await.map_err(request_failed)?;

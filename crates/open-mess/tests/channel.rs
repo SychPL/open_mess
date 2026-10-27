@@ -69,7 +69,7 @@ async fn serve(listener: tokio::net::TcpListener) -> (u16, Arc<Registry>, onesho
     let port = listener.local_addr().unwrap().port();
     let registry = Arc::new(Registry::with_builtin(std::time::Instant::now()));
     let (stop, stopped) = oneshot::channel::<()>();
-    tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), Arc::clone(&registry), async {
+    tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), Arc::clone(&registry), open_mess::ui::Opener::default(), async {
         let _ = stopped.await;
     }));
     (port, registry, stop)

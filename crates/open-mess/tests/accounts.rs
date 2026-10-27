@@ -189,7 +189,7 @@ async fn module_errors_over_the_api() {
     let listener = open_mess::api::bind(0).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(open_mess::api::serve(listener, "t0ken".into(), Arc::new(d.registry), async {
+    tokio::spawn(open_mess::api::serve(listener, "t0ken".into(), Arc::new(d.registry), open_mess::ui::Opener::default(), async {
         let _ = stopped.await;
     }));
 

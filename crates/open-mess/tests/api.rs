@@ -5,9 +5,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use open_mess::tools::Registry;
+use open_mess::ui::Opener;
 use reqwest::StatusCode;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientConfig};
@@ -20,16 +21,62 @@ const TOKEN: &str = "t0ken";
 
 /// Serves the API on an ephemeral loopback port until the returned sender is dropped.
 async fn start() -> (SocketAddr, oneshot::Sender<()>) {
+    let (addr, stop, _) = start_with_window().await;
+    (addr, stop)
+}
+
+/// [`start`], with the opener of the configuration window.
+async fn start_with_window() -> (SocketAddr, oneshot::Sender<()>, Opener) {
     // The test clients use reqwest, built without a crypto provider in this workspace.
     rustls::crypto::ring::default_provider().install_default().ok();
     let listener = open_mess::api::bind(0).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
     let registry = Arc::new(Registry::with_builtin(Instant::now()));
-    tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), registry, async {
+    let opener = Opener::default();
+    tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), registry, opener.clone(), async {
         let _ = stopped.await;
     }));
-    (addr, stop)
+    (addr, stop, opener)
+}
+
+/// Answers the next request to open the window with `answer`, as the tray's event loop would.
+fn window_answers(opener: &Opener, answer: Result<(), String>) {
+    let opener = opener.clone();
+    tokio::spawn(async move {
+        let _ = opener.next().await.unwrap().send(answer);
+    });
+}
+
+#[tokio::test]
+async fn ui_open_route_requires_token() {
+    let (addr, _stop, opener) = start_with_window().await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/ui/open");
+
+    assert_eq!(client.post(&url).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(client.post(&url).bearer_auth("nope").send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert!(tokio::time::timeout(Duration::from_millis(200), opener.next()).await.is_err(), "a request without the token reached the window");
+
+    if cfg!(windows) {
+        window_answers(&opener, Ok(()));
+        assert_eq!(client.post(&url).bearer_auth(TOKEN).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+        // A window that fails to open is an error for whoever asked.
+        window_answers(&opener, Err("the window did not open: no WebView2".into()));
+        let response = client.post(&url).bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("no WebView2"), "{body}");
+        // Without a tray (it failed to start) every request fails at once.
+        opener.close().await;
+        let response = client.post(&url).bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("not available"), "{body}");
+    } else {
+        // No window outside Windows: a clear error, not a request nobody serves.
+        assert_eq!(client.post(&url).bearer_auth(TOKEN).send().await.unwrap().status(), StatusCode::NOT_IMPLEMENTED);
+    }
 }
 
 #[tokio::test]

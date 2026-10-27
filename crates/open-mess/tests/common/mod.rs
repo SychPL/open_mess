@@ -67,7 +67,8 @@ pub fn store(data_dir: &Path) -> Store {
 
 /// Scans the data folder's modules, sending host events to `events`.
 pub async fn scan_with(store: &Store, engine: &Engine, data_dir: &Path, events: mpsc::Sender<HostEvent>) -> Modules {
-    let ctx = |_: &str| ModuleContext { data_dir: data_dir.to_path_buf(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
+    let dir = data_dir.to_path_buf();
+    let ctx = move |_: &str| ModuleContext { data_dir: dir.clone(), events: events.clone(), net: Net::new(AddressPolicy::Strict) };
     Modules::scan(store, engine, &data_dir.join("modules"), ctx).await.unwrap()
 }
 

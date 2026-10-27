@@ -58,11 +58,25 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std",
 [target.'cfg(windows)'.dependencies]
 # The `Show all` dialog of an approval.
 rfd = { version = "0.17.2", default-features = false }
+# The tray icon and the configuration window (spec 8.8). No default features: no comctl32 v6
+# imports (test binaries have no manifest for them), no dynamic ACL, no compression.
+# custom-protocol: the window's page is always the embedded `ui/` folder, never a dev server.
+tauri = { version = "2.11.6", default-features = false, features = ["wry", "tray-icon", "custom-protocol"] }
 # Approval toasts with buttons, activated in this process.
 tauri-winrt-notification = "0.8.1"
+# Takes a toast off the screen once its action is decided elsewhere; the version
+# tauri-winrt-notification already builds.
+windows = { version = "0.62.2", features = ["UI_Notifications"] }
 windows-native-keyring-store = "1.1.0"
 # Registers the toasts' AppUserModelID for the current user.
 winreg = "0.56.0"
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-build = "2.6.3"
+
+[target.'cfg(windows)'.dev-dependencies]
+# The mock runtime, for the window logic without a webview.
+tauri = { version = "2.11.6", default-features = false, features = ["test"] }
 
 [dev-dependencies]
 # Short call limits, so the tests of slow and crashing modules finish quickly.

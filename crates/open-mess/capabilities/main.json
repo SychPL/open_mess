@@ -1,0 +1,20 @@
+{
+  "identifier": "main",
+  "description": "The configuration window: open_mess's own commands and nothing else (no plugin or core APIs).",
+  "windows": ["main"],
+  "permissions": [
+    "allow-status",
+    "allow-accounts",
+    "allow-remove-account",
+    "allow-modules",
+    "allow-approve-module",
+    "allow-set-module-enabled",
+    "allow-rescan-modules",
+    "allow-mcp-command",
+    "allow-permissions",
+    "allow-set-permissions",
+    "allow-clear-permission-override",
+    "allow-waiting",
+    "allow-decide"
+  ]
+}

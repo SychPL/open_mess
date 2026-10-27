@@ -198,7 +198,8 @@ impl WasiView for HostState {
     }
 }
 
-/// The WebAssembly engine; one per process.
+/// The WebAssembly engine; one per process. Clones share it.
+#[derive(Clone)]
 pub struct Engine {
     engine: wasmtime::Engine,
     linker: Linker<HostState>,
@@ -320,6 +321,11 @@ impl ModuleHandle {
 
     pub fn state(&self) -> ModuleState {
         self.state.borrow().clone()
+    }
+
+    /// Whether both handles are the same loaded module (clones of one handle), not two loads.
+    pub fn same(&self, other: &ModuleHandle) -> bool {
+        self.requests.same_channel(&other.requests)
     }
 
     async fn request<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, HostError> {

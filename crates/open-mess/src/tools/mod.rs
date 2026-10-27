@@ -79,6 +79,12 @@ impl Registry {
 
     pub fn new(started: Instant, accounts: Arc<Accounts>) -> Registry {
         let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
+        Registry::with_pending(started, accounts, pending)
+    }
+
+    /// [`Registry::new`] with the accounts' pending actions made by the caller, who shares them
+    /// with the approval toasts and the configuration window.
+    pub fn with_pending(started: Instant, accounts: Arc<Accounts>, pending: Arc<Pending>) -> Registry {
         Registry { started, accounts: Some(accounts), pending: Some(pending), triggers: Counters::default(), sessions: Sessions::default() }
     }
 
@@ -250,7 +256,7 @@ fn list_accounts(accounts: &Accounts) -> Result<Value, ToolError> {
 /// The account's running module, or an error naming the module's state.
 pub(crate) fn module(accounts: &Accounts, account: &Account) -> Result<ModuleHandle, ToolError> {
     let modules = accounts.modules();
-    modules.handle(&account.module).cloned().ok_or_else(|| {
+    modules.handle(&account.module).ok_or_else(|| {
         ToolError::Module(match modules.state(&account.module) {
             Some(state) => format!("module {} is {state}", account.module),
             None => format!("module {} is not installed", account.module),

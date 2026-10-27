@@ -1,7 +1,26 @@
 # cargo deny check - run by the "Dependency advisories" CI job.
 
+[graph]
+# The platforms open_mess is built for (Windows) and tested on (Linux CI). Without this list the
+# check also covers crates no build ever uses, such as Tauri's GTK stack, which open_mess never
+# builds (Tauri is a Windows-only dependency).
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+
 [advisories]
 yanked = "warn"
+# Unmaintained (not vulnerable) crates that Tauri, the configuration window, brings in; no
+# maintained Tauri 2 release avoids them.
+ignore = [
+    # Through GTK, Tauri's Linux backend, which open_mess never builds (cargo deny joins the
+    # dependencies of every listed target, so Tauri's Linux side shows up).
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: only in Tauri's Linux (GTK) backend, never built" },
+    # URL patterns in tauri-utils.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range: through tauri-utils, unmaintained only" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common: through tauri-utils, unmaintained only" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property: through tauri-utils, unmaintained only" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: through tauri-utils, unmaintained only" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: through tauri-utils, unmaintained only" },
+]
 
 [licenses]
 # Permissive licences only; open_mess is MIT OR Apache-2.0. No GPL/LGPL/AGPL.
@@ -9,7 +28,17 @@ allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", 
 private = { ignore = true }
 # Mozilla's root certificates as data. reqwest's rustls-platform-verifier depends on it only when
 # built for wasm32, which the module host never is; on Windows and Linux it uses the system store.
-exceptions = [{ crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] }]
+exceptions = [
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+    # Tauri's HTML and CSS handling (it adds the content security policy to the window's page) and
+    # its data-folder lookup. MPL-2.0 is file-level copyleft, not GPL-style: these crates are used
+    # unmodified from crates.io, and nothing of open_mess falls under it.
+    { crate = "cssparser", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short", allow = ["MPL-2.0"] },
+    { crate = "selectors", allow = ["MPL-2.0"] },
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"
