@@ -297,9 +297,10 @@ impl SessionManager for McpSessions {
         id: &SessionId,
         last_event_id: String,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        // The rest of an answer, after a lost connection. (Resuming the session's own stream
-        // spares the session the same way: the safe side.)
-        let busy = Busy::new(self.touch(id));
+        // The rest of an answer, after a lost connection: rmcp's event ids are `<index>/<request>`
+        // there, a bare `<index>` on the session's own stream, which answers no request.
+        let session = self.touch(id);
+        let busy = Busy::new(session.filter(|_| last_event_id.contains('/')));
         Ok(Answering::new(self.inner.resume(id, last_event_id).await?, busy))
     }
 }
