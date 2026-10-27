@@ -32,6 +32,9 @@ pub const INSTRUCTIONS: &str = "open_mess connects the user's messengers. When a
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a notification may take to go out.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pings in a row a session may leave unanswered before it is no longer notified (nor pinged, so
+/// rmcp lets it expire).
+const MAX_MISSED_PINGS: u32 = 3;
 
 /// `experimental: {"claude/channel": {}}`.
 pub fn capability() -> ExperimentalCapabilities {
@@ -53,6 +56,8 @@ struct Session {
     id: u64,
     peer: Peer<RoleServer>,
     active: Instant,
+    /// Pings left unanswered since the session last answered one or made a request.
+    missed_pings: u32,
 }
 
 impl Sessions {
@@ -61,14 +66,14 @@ impl Sessions {
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         let mut list = self.lock();
         list.retain(|session| !session.peer.is_transport_closed());
-        list.push(Session { id, peer, active: Instant::now() });
+        list.push(Session { id, peer, active: Instant::now(), missed_pings: 0 });
         id
     }
 
     /// Notes a request of the session.
     pub fn touch(&self, id: u64) {
         if let Some(session) = self.lock().iter_mut().find(|session| session.id == id) {
-            session.active = Instant::now();
+            (session.active, session.missed_pings) = (Instant::now(), 0);
         }
     }
 
@@ -93,9 +98,12 @@ impl Sessions {
             tried.push(id);
             // A client killed without closing its session (a bridge that died with its terminal)
             // leaves a session that takes notifications and drops them, until it expires; one
-            // that answers is there. A slow one is only skipped this time.
+            // that answers is there. One that doesn't is skipped, and after a few misses dropped,
+            // so pings stop keeping a dead session from expiring.
             let ping = peer.send_request(ServerRequest::PingRequest(PingRequest::default()));
-            if !matches!(tokio::time::timeout(PING_TIMEOUT, ping).await, Ok(Ok(_))) {
+            let answered = matches!(tokio::time::timeout(PING_TIMEOUT, ping).await, Ok(Ok(_)));
+            self.pinged(id, answered);
+            if !answered {
                 continue;
             }
             let notification = ServerNotification::CustomNotification(CustomNotification::new(METHOD, Some(params.clone())));
@@ -107,6 +115,14 @@ impl Sessions {
                 Err(_) => return true,
             }
         }
+    }
+
+    fn pinged(&self, id: u64, answered: bool) {
+        let mut list = self.lock();
+        if let Some(session) = list.iter_mut().find(|session| session.id == id) {
+            session.missed_pings = if answered { 0 } else { session.missed_pings.saturating_add(1) };
+        }
+        list.retain(|session| session.missed_pings < MAX_MISSED_PINGS);
     }
 
     /// The most recently active session not in `tried`; closed sessions are dropped.

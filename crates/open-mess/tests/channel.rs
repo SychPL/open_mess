@@ -20,7 +20,10 @@ use open_mess::triggers::engine::{self, Batch, BatchedMessage, Delivery, Deliver
 use open_mess::triggers::rules::{self, Action, Condition, Rule, Spawn};
 use open_mess::triggers::spawn::{self, Runs};
 use open_mess::triggers::{Actions, Counters};
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, CustomNotification, Implementation, ProtocolVersion};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientConfig, ClientNotification, CustomNotification, Implementation, InitializedNotification,
+    ProtocolVersion,
+};
 use rmcp::service::{NotificationContext, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -313,4 +316,20 @@ async fn killed_bridge_is_skipped() {
     child.kill().await.unwrap();
     assert!(channel::deliver(registry.channel_sessions(), "r1", &batch(None)).await);
     assert_eq!(received(&mut alive_got).await.len(), 1);
+    // After a few unanswered pings the dead session is let go, so pings stop keeping it alive.
+    for _ in 0..2 {
+        assert!(channel::deliver(registry.channel_sessions(), "r1", &batch(None)).await);
+    }
+    assert_eq!(registry.channel_sessions().len(), 1);
+    assert_eq!(received(&mut alive_got).await.len(), 2);
+}
+
+#[tokio::test]
+async fn initialized_twice_registers_once() {
+    let (port, registry, _stop) = daemon().await;
+    let (session, _got) = connect(port, true).await;
+    wait_for("the channel session", || registry.channel_sessions().len() == 1).await;
+    session.send_notification(ClientNotification::InitializedNotification(InitializedNotification::default())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(registry.channel_sessions().len(), 1);
 }
