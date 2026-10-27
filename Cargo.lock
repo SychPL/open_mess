@@ -3173,6 +3173,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "futures-core",
  "getrandom 0.4.3",
  "keyring-core",
  "open-mess-host",

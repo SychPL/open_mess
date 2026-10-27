@@ -4,9 +4,10 @@
 //! Listens on 127.0.0.1 only and answers nothing without the bearer token (spec 8.1), so a web page
 //! in the user's browser can't call a tool even though it can reach the port.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv4Addr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use axum::Json;
 use axum::Router;
@@ -17,13 +18,15 @@ use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use futures_core::Stream;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ContentBlock, Implementation, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, ServerJsonRpcMessage, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext};
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::transport::streamable_http_server::session::ServerSseMessage;
+use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, LocalSessionManagerError};
+use rmcp::transport::streamable_http_server::{SessionId, SessionManager, StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -57,7 +60,7 @@ pub async fn serve(
             let registry = Arc::clone(&registry);
             move || Ok(McpServer { registry: Arc::clone(&registry), channel: Arc::default() })
         },
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(McpSessions::default()),
         mcp_config,
     );
     let app = Router::new()
@@ -140,6 +143,97 @@ fn error_response(status: StatusCode, message: String) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
+/// MCP sessions open at once. Each Claude Code or Codex session keeps one; a client that opens them
+/// in a loop must not grow the daemon without end (spec 15).
+pub const MAX_MCP_SESSIONS: usize = 64;
+
+/// rmcp's session manager, with at most [`MAX_MCP_SESSIONS`] sessions: a new one closes the session
+/// unused the longest. Its client opens another when it next asks for something.
+#[derive(Default)]
+pub struct McpSessions {
+    inner: LocalSessionManager,
+    /// Each session and when it was last used, in uses of any session.
+    used: Mutex<(u64, HashMap<SessionId, u64>)>,
+}
+
+impl McpSessions {
+    fn touch(&self, id: &SessionId) {
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        let (clock, sessions) = &mut *used;
+        *clock += 1;
+        if let Some(at) = sessions.get_mut(id) {
+            *at = *clock;
+        }
+    }
+}
+
+impl SessionManager for McpSessions {
+    type Error = LocalSessionManagerError;
+    type Transport = <LocalSessionManager as SessionManager>::Transport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        let idle = {
+            let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+            let sessions = &used.1;
+            (sessions.len() >= MAX_MCP_SESSIONS).then(|| sessions.iter().min_by_key(|(_, at)| **at).map(|(id, _)| id.clone())).flatten()
+        };
+        if let Some(idle) = idle {
+            // One that would not close is the inner manager's to end; the new one opens anyway.
+            let _ = self.close_session(&idle).await;
+        }
+        let (id, transport) = self.inner.create_session().await?;
+        {
+            let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+            let (clock, sessions) = &mut *used;
+            *clock += 1;
+            sessions.insert(id.clone(), *clock);
+        }
+        Ok((id, transport))
+    }
+
+    async fn initialize_session(&self, id: &SessionId, message: ClientJsonRpcMessage) -> Result<ServerJsonRpcMessage, Self::Error> {
+        self.touch(id);
+        self.inner.initialize_session(id, message).await
+    }
+
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        self.inner.has_session(id).await
+    }
+
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.used.lock().unwrap_or_else(PoisonError::into_inner).1.remove(id);
+        self.inner.close_session(id).await
+    }
+
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.touch(id);
+        self.inner.create_stream(id, message).await
+    }
+
+    async fn accept_message(&self, id: &SessionId, message: ClientJsonRpcMessage) -> Result<(), Self::Error> {
+        self.touch(id);
+        self.inner.accept_message(id, message).await
+    }
+
+    async fn create_standalone_stream(&self, id: &SessionId) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.touch(id);
+        self.inner.create_standalone_stream(id).await
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.touch(id);
+        self.inner.resume(id, last_event_id).await
+    }
+}
+
 /// The MCP face of the registry: `tools/list` and `tools/call` delegate to it unchanged. One per
 /// MCP session.
 #[derive(Clone)]
@@ -215,5 +309,28 @@ impl ServerHandler for McpServer {
                 Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]).into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mcp_sessions_are_capped_closing_the_one_unused_longest() {
+        let sessions = McpSessions::default();
+        let mut open = Vec::new();
+        for _ in 0..MAX_MCP_SESSIONS {
+            open.push(sessions.create_session().await.unwrap());
+        }
+        let ids: Vec<SessionId> = open.iter().map(|(id, _)| id.clone()).collect();
+        // The first is used again: the second has been unused the longest.
+        sessions.touch(&ids[0]);
+        let (newest, _transport) = sessions.create_session().await.unwrap();
+        assert!(!sessions.has_session(&ids[1]).await.unwrap());
+        for id in [&ids[0], &ids[2], &newest] {
+            assert!(sessions.has_session(id).await.unwrap());
+        }
+        assert_eq!(sessions.used.lock().unwrap().1.len(), MAX_MCP_SESSIONS);
     }
 }
