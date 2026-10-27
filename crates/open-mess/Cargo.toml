@@ -54,6 +54,8 @@ rusqlite = { version = "0.41.0", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Release manifests are signed with minisign (Ed25519); the public key is compiled in.
+minisign-verify = "0.3.0"
 # Module files and manifests are approved by their SHA-256.
 sha2 = "0.10.9"
 thiserror = "2.0.21"
@@ -85,6 +87,8 @@ tauri-build = "2.6.3"
 tauri = { version = "2.11.6", default-features = false, features = ["test"] }
 
 [dev-dependencies]
+# Tests generate a release key pair, sign a manifest and verify it.
+minisign = "0.10.0"
 # Short call limits, so the tests of slow and crashing modules finish quickly.
 open-mess-host = { path = "../open-mess-host", features = ["test-support"] }
 tempfile = "3.27.0"

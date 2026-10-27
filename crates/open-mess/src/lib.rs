@@ -17,6 +17,7 @@ pub mod store;
 pub mod tools;
 pub mod triggers;
 pub mod ui;
+pub mod update;
 
 /// Everything that can go wrong in the daemon and the CLI.
 #[derive(Debug, thiserror::Error)]
