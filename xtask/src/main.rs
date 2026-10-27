@@ -107,23 +107,47 @@ fn only_version_changed(diff: &str) -> bool {
     seen
 }
 
-/// Sets the `version` of `[workspace.package]`; `None` when the section or the line is missing.
+/// Sets the `version` of `[workspace.package]`, keeping every line ending as it was; `None` when the
+/// section or the line is missing.
 fn set_workspace_version(toml: &str, version: &str) -> Option<String> {
     let mut in_section = false;
     let mut done = false;
-    let lines: Vec<String> = toml
-        .lines()
+    let out: String = toml
+        .split_inclusive('\n')
         .map(|line| {
             if line.starts_with('[') {
                 in_section = line.trim() == "[workspace.package]";
             } else if in_section && !done && line.starts_with("version =") {
                 done = true;
-                return format!("version = \"{version}\"");
+                let end = &line[line.trim_end().len()..];
+                return format!("version = \"{version}\"{end}");
             }
             line.to_string()
         })
         .collect();
-    done.then(|| lines.join("\n") + "\n")
+    done.then_some(out)
+}
+
+/// What the owner must run to undo or finish a release that failed after `stage`.
+fn recovery(stage: Stage, tag: &str) -> String {
+    match stage {
+        Stage::Clean => String::new(),
+        Stage::Edited => "git checkout -- Cargo.toml Cargo.lock".to_string(),
+        Stage::Committed => format!("git tag -d {tag}\ngit reset --hard HEAD~1"),
+        Stage::Pushed => format!("gh release create {tag} --title {tag} --notes \"\" target/release-dist/*"),
+    }
+}
+
+/// How far `release` got; decides which recovery commands are printed on failure.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Stage {
+    Clean,
+    /// Cargo.toml / Cargo.lock modified, nothing committed.
+    Edited,
+    /// The Release commit and the tag exist locally.
+    Committed,
+    /// Commit and tag are on origin; the GitHub release is missing.
+    Pushed,
 }
 
 /// The published name of a module's wasm output: `open_mess_<name>.wasm` -> `<name>.wasm` with `_` as `-`.
@@ -206,6 +230,19 @@ fn release(version: &str) -> Result<(), String> {
         return Err(format!("{version:?} is not a version like 1.2.3"));
     }
     let tag = format!("v{version}");
+    let mut stage = Stage::Clean;
+    let result = release_steps(version, &tag, &mut stage);
+    if result.is_err() {
+        let commands = recovery(stage, &tag);
+        if !commands.is_empty() {
+            eprintln!("the release stopped half way; run:\n{commands}");
+        }
+    }
+    result
+}
+
+fn release_steps(version: &str, tag: &str, stage: &mut Stage) -> Result<(), String> {
+    let tag = tag.to_string();
     let root = repo_root();
     std::env::set_current_dir(&root).map_err(|e| e.to_string())?;
 
@@ -216,6 +253,8 @@ fn release(version: &str) -> Result<(), String> {
     }
     let public =
         minisign::PublicKey::from_file(root.join("keys").join("release.pub")).map_err(|e| format!("keys/release.pub is not a release key: {e}"))?;
+    // Unlock now (the password is asked here): a wrong password must not strand a commit and tag.
+    let secret = minisign::SecretKey::from_file(&key_path, None).map_err(|e| format!("cannot unlock the secret key: {e}"))?;
     if !capture("git", &["status", "--porcelain"])?.is_empty() {
         return Err("the working tree is not clean".into());
     }
@@ -247,12 +286,14 @@ fn release(version: &str) -> Result<(), String> {
     let toml = std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
     let updated = set_workspace_version(&toml, version).ok_or("no version in [workspace.package] of Cargo.toml")?;
     std::fs::write(&manifest_path, updated).map_err(|e| e.to_string())?;
+    *stage = Stage::Edited;
     step("cargo", &["update", "--workspace"])?;
     if !only_version_changed(&capture("git", &["diff", "--unified=0"])?) {
         return Err("the version bump changed more than the version and Cargo.lock; reset and look".into());
     }
     step("git", &["add", "Cargo.toml", "Cargo.lock"])?;
     step("git", &["commit", "-m", &format!("Release {version}")])?;
+    *stage = Stage::Committed;
     step("git", &["tag", &tag])?;
 
     // 3. Build om.exe and the platform modules.
@@ -271,7 +312,6 @@ fn release(version: &str) -> Result<(), String> {
 
     // 4-5. Manifest and its minisign signature (the password is asked here).
     let manifest = build_manifest(version, &files);
-    let secret = minisign::SecretKey::from_file(&key_path, None).map_err(|e| format!("cannot unlock the secret key: {e}"))?;
     let signature = minisign::sign(Some(&public), &secret, manifest.as_bytes(), None, None).map_err(|e| format!("signing failed: {e}"))?;
     let dist = root.join("target/release-dist");
     std::fs::create_dir_all(&dist).map_err(|e| e.to_string())?;
@@ -286,6 +326,7 @@ fn release(version: &str) -> Result<(), String> {
 
     // 6. Publish.
     step("git", &["push", "origin", "main", &tag])?;
+    *stage = Stage::Pushed;
     let paths: Vec<String> = assets.iter().map(|name| dist.join(name).to_string_lossy().into_owned()).collect();
     let mut args = vec!["release", "create", &tag, "--title", &tag, "--notes", ""];
     args.extend(paths.iter().map(String::as_str));
@@ -362,6 +403,22 @@ mod tests {
         // A name the daemon's whitelist would reject stops the release.
         assert!(module_release_name(&format!("open_mess_{}.wasm", "a".repeat(40))).is_err());
         assert!(module_release_name("open_mess_Teams.wasm").is_err());
+    }
+
+    #[test]
+    fn line_endings_survive_the_version_bump() {
+        let toml = "[workspace.package]\r\nversion = \"0.0.0\"\r\nedition = \"2024\"";
+        let expected = "[workspace.package]\r\nversion = \"1.0.0\"\r\nedition = \"2024\"";
+        assert_eq!(set_workspace_version(toml, "1.0.0").expect("set"), expected);
+    }
+
+    #[test]
+    fn failed_release_prints_the_way_back() {
+        assert_eq!(recovery(Stage::Clean, "v1.0.0"), "");
+        assert!(recovery(Stage::Edited, "v1.0.0").contains("git checkout -- Cargo.toml Cargo.lock"));
+        let committed = recovery(Stage::Committed, "v1.0.0");
+        assert!(committed.contains("git tag -d v1.0.0") && committed.contains("git reset --hard HEAD~1"));
+        assert!(recovery(Stage::Pushed, "v1.0.0").starts_with("gh release create v1.0.0"));
     }
 
     #[test]
