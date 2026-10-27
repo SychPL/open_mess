@@ -239,6 +239,23 @@ async fn decide_from_window_updates_state() {
 }
 
 #[tokio::test]
+async fn long_target_can_only_be_rejected() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let state = state(&d);
+    // The message replied to is longer than an approval shows.
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    echo.call("a", "set-target", &json!({"conversation": "c1", "text": "x".repeat(28_001)}).to_string()).await.unwrap();
+    let sent = d.registry.call("send", json!({"account": "test-echo:a", "conversation": "c1", "text": "ok", "reply_to": "m1"})).await.unwrap();
+    let action = sent["action"].as_str().unwrap();
+    assert!(commands::waiting(&state)[0].target_cut);
+
+    assert_eq!(commands::decide(&state, action, true).await, Err(commands::TARGET_CUT.to_string()));
+    assert_eq!(state.pending.state(action).unwrap(), State::Waiting);
+    assert_eq!(commands::decide(&state, action, false).await.unwrap(), "rejected");
+}
+
+#[tokio::test]
 async fn removing_account_clears_its_waiting_actions() {
     let d = daemon(&[ECHO]).await;
     d.accounts.add("test-echo", info("a")).unwrap();

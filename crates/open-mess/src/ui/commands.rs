@@ -390,7 +390,12 @@ pub struct PreviewDto {
     pub reaction: Option<String>,
     /// The message replied to, edited or reacted to, as it is now.
     pub target_text: Option<String>,
+    /// That message is longer than shown: the action can only be rejected.
+    pub target_cut: bool,
 }
+
+/// Why an action whose target message could not be shown in full is not approved.
+pub const TARGET_CUT: &str = "wiadomości, której dotyczy akcja, nie da się pokazać w całości - można ją tylko odrzucić";
 
 /// The actions waiting for approval, oldest first, in full: the window is where long content can
 /// be approved.
@@ -409,13 +414,18 @@ pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
             text: clean(&preview.text),
             reaction: clean(&preview.reaction),
             target_text: clean(&preview.target_text),
+            target_cut: preview.target_cut,
         })
         .collect()
 }
 
 /// The user's decision on one waiting action; an approved one runs before this returns. Returns
-/// the action's state: `done`, `rejected`, `expired`, `voided`, `uncertain` or `failed`.
+/// the action's state: `done`, `rejected`, `expired`, `voided`, `uncertain` or `failed`. Nothing
+/// is approved that the window could not show in full.
 pub async fn decide(state: &UiState, action: &str, approve: bool) -> Result<String, String> {
+    if approve && state.pending.waiting().iter().any(|preview| preview.action == action && preview.target_cut) {
+        return Err(TARGET_CUT.into());
+    }
     Ok(state.pending.decide(action, approve).await.map_err(text)?.name().into())
 }
 

@@ -340,8 +340,10 @@ async function renderPermissions() {
       id,
       button("Dodaj rozmowę", async () => {
         if (!id.value.trim()) return;
-        // A new conversation starts with the account's permissions; change them in its row.
-        await call("set_permissions", { account: account.id, conversation: id.value, read: permissions.read, write: permissions.write });
+        // A new conversation starts with the account's permissions as they are now (they may have
+        // changed since this section was drawn); change them in its row.
+        const now = await call("permissions", { account: account.id });
+        await call("set_permissions", { account: account.id, conversation: id.value, read: now.read, write: now.write });
         await renderPermissions();
       }),
     );
@@ -387,12 +389,26 @@ function waitingCard(preview) {
     await renderWaiting();
   };
   const row = el("div", null, "row");
-  row.append(button("Zatwierdź", decide(true), "primary"), button("Odrzuć", decide(false), "danger"));
+  const approve = button("Zatwierdź", decide(true), "primary");
+  if (preview.target_cut) {
+    // Nothing is approved that is not on screen in full.
+    approve.disabled = true;
+    card.append(el("p", "Wiadomość, której dotyczy akcja, jest za długa, by pokazać ją w całości - akcję można tylko odrzucić.", "error"));
+  }
+  row.append(approve, button("Odrzuć", decide(false), "danger"));
   card.append(row);
   return card;
 }
 
-async function renderWaiting() {
+/** One refresh at a time, in order, so an older answer never undoes a newer one. */
+let waitingRefresh = Promise.resolve();
+
+function renderWaiting() {
+  waitingRefresh = waitingRefresh.then(refreshWaiting, refreshWaiting);
+  return waitingRefresh;
+}
+
+async function refreshWaiting() {
   const waiting = await call("waiting");
   const root = content("waiting");
   if (!document.getElementById("waiting-outcome")) {

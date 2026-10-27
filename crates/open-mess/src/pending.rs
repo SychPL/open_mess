@@ -136,6 +136,8 @@ pub struct Preview {
     pub reaction: Option<String>,
     /// The current text of the message replied to, edited or reacted to.
     pub target_text: Option<String>,
+    /// That text was longer than an approval shows, so this action can only be rejected.
+    pub target_cut: bool,
 }
 
 // Hand-written so that a `{:?}` never prints names or text.
@@ -499,6 +501,7 @@ fn preview(action: &str, kind: Kind, account: &Account, args: &Value, target: Ta
         participants: target.participants.iter().map(|participant| cut(&participant.display_name, MAX_NAME)).collect(),
         text: arg("text"),
         reaction: arg("reaction"),
+        target_cut: target.target_text.as_deref().is_some_and(|text| text.chars().count() > MAX_TEXT),
         target_text: target.target_text.as_deref().map(|text| cut(text, MAX_TEXT)),
     }
 }

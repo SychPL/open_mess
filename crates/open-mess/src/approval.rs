@@ -176,12 +176,17 @@ pub async fn run(pending: Arc<Pending>, present: impl Fn(&Preview), withdraw: im
 pub fn start(runtime: &Runtime, pending: Arc<Pending>) {
     // ponytail: without the registration Windows may show no toast; reported once a log sink exists.
     let _ = toast::register();
-    let (handle, shown) = (runtime.handle().clone(), Arc::clone(&pending));
-    let withdrawn = runtime.handle().clone();
+    // Toasts are shown and taken away one after the other on one thread (showing waits for
+    // Windows), so taking one away never takes the next one with it.
+    let (jobs, queue) = std::sync::mpsc::channel::<toast::Job>();
+    // ponytail: without the thread no toast shows (the window still lists the actions); reported
+    // once a log sink exists.
+    let _ = std::thread::Builder::new().name("open-mess-toasts".into()).spawn(move || queue.into_iter().for_each(|job| job()));
+    let (handle, shown, withdrawn) = (runtime.handle().clone(), Arc::clone(&pending), jobs.clone());
     runtime.spawn(run(
         pending,
-        move |preview| toast::show(&shown, &handle, Prompt::new(preview), preview.action.clone()),
-        move || toast::withdraw(&withdrawn),
+        move |preview| drop(jobs.send(toast::show(&shown, &handle, Prompt::new(preview), preview.action.clone()))),
+        move || drop(withdrawn.send(Box::new(toast::withdraw))),
     ));
 }
 
@@ -210,16 +215,18 @@ mod toast {
         key.set_value("DisplayName", &"open_mess")
     }
 
-    /// Shows the toast of one action; it stays on screen until the user acts on it. Off the async
-    /// threads: showing waits for Windows.
-    pub(super) fn show(pending: &Arc<Pending>, runtime: &Handle, prompt: Prompt, action: String) {
+    /// Work for the toast thread.
+    pub(super) type Job = Box<dyn FnOnce() + Send>;
+
+    /// Shows the toast of one action; it stays on screen until the user acts on it.
+    pub(super) fn show(pending: &Arc<Pending>, runtime: &Handle, prompt: Prompt, action: String) -> Job {
         let (pending, decide_on) = (Arc::clone(pending), runtime.clone());
         // The outcome is for `pending` to report.
         let decide = move |approve: bool| {
             let (pending, action) = (Arc::clone(&pending), action.clone());
             decide_on.spawn(async move { pending.decide(&action, approve).await });
         };
-        runtime.spawn_blocking(move || {
+        Box::new(move || {
             let shown = prompt.toast();
             let mut toast = Toast::new(APP_ID).title(&prompt.title).text1(&shown.context).text2(&shown.line).scenario(Scenario::Reminder);
             for (label, argument) in shown.buttons {
@@ -245,17 +252,15 @@ mod toast {
             // ponytail: a toast Windows refuses leaves the action waiting until it expires;
             // reported once a log sink exists.
             let _ = toast.show();
-        });
+        })
     }
 
     /// Takes open_mess's toasts off the screen and out of the notification center. One action is
     /// on screen at a time, so this is the toast of the action that is no longer waiting.
-    pub(super) fn withdraw(runtime: &Handle) {
-        runtime.spawn_blocking(|| {
-            // ponytail: a toast Windows keeps stays until the user dismisses it (clicking it decides
-            // nothing then); reported once a log sink exists.
-            let _ = ToastNotificationManager::History().and_then(|history| history.ClearWithId(&HSTRING::from(APP_ID)));
-        });
+    pub(super) fn withdraw() {
+        // ponytail: a toast Windows keeps stays until the user dismisses it (clicking it decides
+        // nothing then); reported once a log sink exists.
+        let _ = ToastNotificationManager::History().and_then(|history| history.ClearWithId(&HSTRING::from(APP_ID)));
     }
 
     /// Everything in a modal dialog: Yes approves, No rejects, closing decides nothing. Content too
@@ -293,6 +298,7 @@ mod tests {
             text: Some("on my way".into()),
             reaction: None,
             target_text: None,
+            target_cut: false,
         }
     }
 
