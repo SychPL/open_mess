@@ -191,10 +191,13 @@ async fn status_and_mcp_command() {
         commands.claude,
         "claude mcp add --transport http --scope user open_mess http://127.0.0.1:7341/mcp --header \"Authorization: Bearer t0ken\""
     );
-    // For Codex's config.toml: the token never goes into the user's environment, which every program
-    // inherits.
-    assert_eq!(commands.codex, "[mcp_servers.open_mess]\nurl = \"http://127.0.0.1:7341/mcp\"\nhttp_headers = { Authorization = \"Bearer t0ken\" }");
-    assert!(!commands.codex.contains("setx"));
+    // For Codex the token is set only in the window that starts it: never in the user's environment
+    // for good, which every program inherits, nor in Codex's config, which codex mcp list prints.
+    assert_eq!(
+        commands.codex,
+        "codex mcp add open_mess --url http://127.0.0.1:7341/mcp --bearer-token-env-var OPEN_MESS_TOKEN\n$env:OPEN_MESS_TOKEN = \"t0ken\"; codex"
+    );
+    assert!(!commands.codex.contains("setx") && !commands.codex.contains("Bearer"));
 }
 
 #[tokio::test]

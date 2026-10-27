@@ -238,13 +238,13 @@ async function renderIntegrations() {
     button("Pokaż polecenie", async () => {
       const commands = await call("mcp_command");
       shown.replaceChildren();
-      for (const [label, command] of [["Claude Code", commands.claude], ["Codex (do pliku %USERPROFILE%\\.codex\\config.toml)", commands.codex]]) {
+      for (const [label, command] of [["Claude Code", commands.claude], ["Codex (PowerShell)", commands.codex]]) {
         shown.append(el("h2", label), el("pre", command, "content-text"), button("Kopiuj", () => navigator.clipboard.writeText(command)));
       }
       shown.append(
         el(
           "p",
-          "Codex dostaje token z pliku config.toml, tak jak Claude Code ze swojej konfiguracji. Nie zapisuj go w zmiennych środowiskowych (setx): dziedziczy je każdy uruchomiony program, także powłoki agentów.",
+          "Codex: pierwsze polecenie wystarczy raz; drugie uruchamia Codex z tokenem ustawionym tylko w tym oknie PowerShella. Nie zapisuj tokenu na stałe (setx): zmienne środowiskowe dziedziczy każdy uruchomiony program, także powłoki agentów.",
           "muted",
         ),
       );
