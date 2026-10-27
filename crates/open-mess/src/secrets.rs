@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use keyring_core::Entry;
+#[cfg(windows)]
 use keyring_core::api::CredentialStoreApi as _;
 
 use crate::Error;
