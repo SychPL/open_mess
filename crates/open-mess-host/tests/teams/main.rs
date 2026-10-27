@@ -763,6 +763,14 @@ async fn describe_target_lists_members() {
 }
 
 #[tokio::test]
+async fn describe_target_does_not_hide_a_needed_sign_in() {
+    let teams = Teams::signed_in().await;
+    let roster = target_server(GROUP, Some("Synthetic group"), json!({"members": [{"id": ME}, {"id": OTHER}]}));
+    teams.fake.on(move |s| if s.path == messages_path(GROUP) { Some(Reply::status(401)) } else { roster(s) });
+    assert!(matches!(module_error(teams.module.describe_target(ME_OID, GROUP, None).await), ModuleError::AuthRequired(_)));
+}
+
+#[tokio::test]
 async fn describe_target_reads_the_target_text() {
     let teams = Teams::signed_in().await;
     teams.fake.on(target_server(GROUP, Some("Synthetic group"), json!({"members": [{"id": ME}, {"id": OTHER}]})));
