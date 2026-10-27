@@ -740,7 +740,7 @@ async fn describe_target_lists_members() {
         {"id": OTHER, "role": "User"},
         {"id": "8:orgid:00000000-0000-0000-0000-000000000003", "role": "User"},
     ]});
-    teams.fake.on(target_server(GROUP, Some("Synthetic group"), members));
+    teams.fake.on(target_server(GROUP, Some("Synthetic group"), members.clone()));
     let target = teams.module.describe_target(ME_OID, GROUP, None).await.unwrap();
     assert_eq!(target.conversation_title, "Synthetic group");
     let participants: Vec<(&str, &str)> = target.participants.iter().map(|p| (p.id.as_str(), p.display_name.as_str())).collect();
@@ -749,6 +749,12 @@ async fn describe_target_lists_members() {
     assert_eq!(target.target_text, None);
     // Reads only.
     assert!(writes(&teams.fake).is_empty());
+
+    // The names are a help, not a condition: messages that cannot be read leave the MRI.
+    let roster = target_server(GROUP, Some("Synthetic group"), members);
+    teams.fake.on(move |s| if s.path == messages_path(GROUP) { Some(Reply::status(403)) } else { roster(s) });
+    let unnamed = teams.module.describe_target(ME_OID, GROUP, None).await.unwrap();
+    assert_eq!(unnamed.participants.get(1).map(|p| p.display_name.as_str()), Some(OTHER));
 
     // A channel is the target itself: no roster.
     teams.fake.on(target_server(CHANNEL, Some("Synthetic channel"), json!({"members": [{"id": ME}]})));

@@ -475,7 +475,7 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
         } else {
             let request = chat::members(&session.directory, conversation);
             let mut members = chat::decode_members(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
-            name_members(session, conversation, &mut members)?;
+            name_members(session, conversation, &mut members);
             members.into_iter().map(|m| Participant { display_name: m.name.unwrap_or_else(|| m.id.clone()), id: m.id }).collect()
         };
         let me = session.me();
@@ -495,21 +495,27 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
 
 /// The members list has no names ("Live results" 7): the user is named by the session, the others
 /// by their newest message on the conversation's first page. One who wrote none of them stays
-/// nameless, an MRI in the approval.
-fn name_members(session: &mut Session, conversation: &str, members: &mut [chat::Member]) -> Result<(), ModuleError> {
+/// nameless, an MRI in the approval. Names only help the user read the approval (the fingerprint
+/// is made of ids), so a page that cannot be read leaves them out instead of failing the write.
+fn name_members(session: &mut Session, conversation: &str, members: &mut [chat::Member]) {
     let me = session.me();
     for m in members.iter_mut().filter(|m| m.name.is_none() && m.id == me) {
         m.name = Some(session.name.clone());
     }
-    if members.iter().all(|m| m.name.is_some()) {
-        return Ok(());
+    if members.iter().all(|m| m.name.is_some()) || !api::has_time() {
+        return;
     }
-    let request = chat::read_messages(&session.directory, conversation, None, PAGE_SIZE, None).map_err(api::proto)?;
-    let page = chat::decode_messages(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+    let page = chat::read_messages(&session.directory, conversation, None, PAGE_SIZE, None)
+        .ok()
+        .and_then(|request| api::read(session, Service::Chat, &request).ok())
+        .and_then(|body| chat::decode_messages(&body).ok());
+    let Some(page) = page else {
+        host::log(1, "the members' names could not be read; the approval shows their ids");
+        return;
+    };
     for m in members.iter_mut().filter(|m| m.name.is_none()) {
         m.name = page.items.iter().find(|message| message.sender_id == m.id).and_then(|message| message.sender_name.clone());
     }
-    Ok(())
 }
 
 /// Messages read, newest first, and the link to the next page when the pages ran out first.
