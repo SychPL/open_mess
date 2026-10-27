@@ -486,6 +486,18 @@ async function refreshSignIn() {
     }
   } else if (prompt.kind === "page") {
     dialog.append(el("p", "Zaloguj się w osobnym oknie strony logowania (" + prompt.url + "). Hasło wpisujesz tylko tam."));
+  } else if (prompt.kind === "wam-pick") {
+    const answer = (done) => () => call("sign_in_answer", { request_id: prompt.id, reply: { done } });
+    dialog.append(el("p", "Wybierz konto Windows, którym moduł ma się zalogować:"));
+    if (prompt.accounts.length === 0) dialog.append(el("p", "Windows nie zna jeszcze żadnego konta służbowego dla tego modułu.", "muted"));
+    // The same name in several organizations (as a guest, say) shows the organization's id.
+    const total = new Map();
+    for (const account of prompt.accounts) total.set(account.user_name, (total.get(account.user_name) || 0) + 1);
+    for (const account of prompt.accounts) {
+      const label = account.user_name + (total.get(account.user_name) > 1 ? " (organizacja " + (account.tenant || "?") + ")" : "");
+      dialog.append(button(label, answer(account.id), "choice"));
+    }
+    dialog.append(button("Inne konto Windows...", answer(null), "choice"));
   }
   const row = el("div", null, "row");
   row.append(button("Anuluj", () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"));

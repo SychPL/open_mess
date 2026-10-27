@@ -15,6 +15,7 @@ use crate::bindings::{PlatformModule, PlatformModulePre};
 use crate::error::{HostError, ModuleError};
 use crate::limits::{self, Limits};
 use crate::runtime::{AccountInfo, Attachment, HostState, ModuleEnv, Target};
+use crate::sign_in::Caller;
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
@@ -46,6 +47,19 @@ pub(crate) enum Request {
         message: Option<String>,
         reply: Reply<Target>,
     },
+}
+
+impl Request {
+    /// Whose call this is, for the sign-in imports.
+    fn caller(&self) -> Caller {
+        match self {
+            Request::SignIn(_) => Caller::SignIn,
+            Request::Restore(account, _) | Request::SignOut(account, _) | Request::Call { account, .. } => Caller::Account(account.clone()),
+            Request::GetAttachment { ids: [account, ..], .. } | Request::DescribeTarget { ids: [account, ..], .. } => {
+                Caller::Account(account.clone())
+            }
+        }
+    }
 }
 
 /// What a module instance's sockets and timers deliver to its `events` export, through the actor
@@ -176,6 +190,8 @@ pub(crate) struct Actor {
     events: Option<mpsc::Receiver<GuestEvent>>,
     crashes: u32,
     state: watch::Sender<ModuleState>,
+    /// Whose call the next `run` makes.
+    caller: Caller,
 }
 
 impl Actor {
@@ -186,7 +202,8 @@ impl Actor {
         env: Arc<ModuleEnv>,
     ) -> (Actor, watch::Receiver<ModuleState>) {
         let (state, watch) = watch::channel(ModuleState::Running);
-        let actor = Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, events: None, crashes: 0, state };
+        let actor =
+            Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, events: None, crashes: 0, state, caller: Caller::Event };
         (actor, watch)
     }
 
@@ -247,6 +264,9 @@ impl Actor {
                 (store, module)
             }
         };
+        let data = store.data_mut();
+        data.caller = std::mem::take(&mut self.caller);
+        data.pick = None;
         let value = within(&self.deadline, export(&module, &mut store)).await?;
         self.instance = Some((store, module));
         Ok(value)
@@ -286,6 +306,7 @@ impl Actor {
     }
 
     async fn deliver(&mut self, event: GuestEvent) {
+        self.caller = Caller::Event;
         // A crash is recorded by `run`; there is nobody else to tell.
         let _delivered = match event {
             GuestEvent::WsMessage { conn, text } => {
@@ -315,9 +336,17 @@ impl Actor {
     }
 
     async fn answer(&mut self, request: Request) {
+        self.caller = request.caller();
         match request {
             Request::SignIn(reply) => {
-                let result = self.run(|m, s| Box::pin(m.open_mess_module_module().call_sign_in(s))).await;
+                let result = self
+                    .run(|m, s| {
+                        Box::pin(async move {
+                            let result = m.open_mess_module_module().call_sign_in(&mut *s).await?;
+                            Ok(s.data_mut().signed_in(result))
+                        })
+                    })
+                    .await;
                 reply.send(module_result(result).map(Into::into)).ok();
             }
             Request::Restore(account, reply) => {

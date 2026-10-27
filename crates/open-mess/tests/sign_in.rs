@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use common::{Daemon, ECHO, daemon};
 use open_mess::ui::UiState;
 use open_mess::ui::commands::{self, AccountDto, AnswerDto, SignInPromptDto};
-use open_mess::ui::sign_in::{BUSY, NOT_FROM_WINDOW};
-use open_mess_host::{SignInReply, SignInRequest};
+use open_mess::ui::sign_in::{BUSY, NO_WINDOW, NOT_FROM_WINDOW};
+use open_mess_host::{SignInReply, SignInRequest, WamAccount};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -36,7 +36,7 @@ fn add_account(state: &Arc<UiState>) -> JoinHandle<Result<AccountDto, String>> {
 
 /// Waits until the window shows a prompt of `kind`.
 async fn prompt(state: &UiState, kind: &str) -> SignInPromptDto {
-    for _ in 0..500 {
+    for _ in 0..1500 {
         if let Some(prompt) = commands::sign_in_request(state).filter(|prompt| prompt.kind == kind) {
             return prompt;
         }
@@ -117,6 +117,63 @@ async fn cancel_reaches_the_module() {
     prompt(&state, "page").await;
     state.sign_ins.window_closed();
     assert!(signing_in.await.unwrap().unwrap_err().contains("cancelled"));
+}
+
+#[tokio::test]
+async fn windows_accounts_are_picked_in_the_window() {
+    let d = daemon(&[]).await;
+    let state = state(&d);
+    let _active = state.sign_ins.begin("m").unwrap();
+    let offer = |request| {
+        let (reply, answer) = oneshot::channel();
+        state.sign_ins.offer(request, reply);
+        answer
+    };
+    let account = |id: &str| WamAccount { id: id.into(), user_name: "ann@contoso.example".into(), tenant: format!("tenant-{id}") };
+    let picked = offer(SignInRequest::WamPick { module: "m".into(), accounts: vec![account("w1"), account("w2")] });
+    let shown = commands::sign_in_request(&state).unwrap();
+    assert_eq!(shown.kind, "wam-pick");
+    let listed: Vec<_> = shown.accounts.iter().map(|account| (account.id.as_str(), account.user_name.as_str(), account.tenant.as_str())).collect();
+    assert_eq!(listed, [("w1", "ann@contoso.example", "tenant-w1"), ("w2", "ann@contoso.example", "tenant-w2")]);
+    commands::sign_in_answer(&state, shown.id, AnswerDto::Done(Some("w2".into()))).unwrap();
+    assert_eq!(picked.await, Ok(SignInReply::Done(Some("w2".into()))));
+
+    // The WAM dialog's owner is the open window, answered without the user.
+    assert_eq!(offer(SignInRequest::WamWindow { module: "m".into() }).await, Ok(SignInReply::Refused(NO_WINDOW.into())));
+    state.sign_ins.window_opened(7);
+    assert_eq!(offer(SignInRequest::WamWindow { module: "m".into() }).await, Ok(SignInReply::Window(7)));
+    assert!(commands::sign_in_request(&state).is_none());
+    state.sign_ins.window_closed();
+    assert_eq!(offer(SignInRequest::WamWindow { module: "m".into() }).await, Ok(SignInReply::Refused(NO_WINDOW.into())));
+    // Not for a module that is not signing in.
+    state.sign_ins.window_opened(7);
+    assert_eq!(offer(SignInRequest::WamWindow { module: "other".into() }).await, Ok(SignInReply::Refused(NOT_FROM_WINDOW.into())));
+}
+
+/// The manual check of WAM (plan E2, Task 2): test-echo signs in with the Teams client id, the
+/// first Windows account is picked as the user would in the window, and the module gets a token,
+/// of which only the length is shown. Talks to Windows, never to Teams; leaves no secret behind.
+/// `cargo test -p open-mess --test sign_in -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "talks to Windows' account manager; run by hand"]
+#[allow(clippy::print_stdout)]
+async fn windows_account_live() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    echo.call("x", "sign-in-with", r#"{"how": "windows"}"#).await.unwrap();
+    let signing_in = add_account(&state);
+    let pick = prompt(&state, "wam-pick").await;
+    println!("the window lists {} Windows account(s)", pick.accounts.len());
+    let first = pick.accounts.first().expect("Windows knows no work account for the Teams client id");
+    commands::sign_in_answer(&state, pick.id, AnswerDto::Done(Some(first.id.clone()))).unwrap();
+    let signed_in = signing_in.await.unwrap();
+    // The secret the pick left (in Credential Manager) goes, whatever happened.
+    let credentials = open_mess_host::credential_store().unwrap();
+    open_mess_host::delete_account_secrets(&*credentials, d.dir.path(), "test-echo", "windows").unwrap();
+    let added = signed_in.unwrap();
+    println!("signed in: {}", added.display_name);
+    assert!(added.display_name.starts_with("Windows token of "));
 }
 
 #[tokio::test]

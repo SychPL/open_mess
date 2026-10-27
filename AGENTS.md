@@ -39,6 +39,9 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
     `wit-bindgen` (`generate!` and `export!`); no unsafe is written by hand there.
   - `modules/test-echo/src/lib.rs`, `modules/test-spin/src/lib.rs`, `modules/test-hog/src/lib.rs`,
     module `guest::bindings`: the same `wit-bindgen` glue in the module host's test guests.
+  - `crates/open-mess-host/src/wam.rs`, function `request_for_window`: the WAM sign-in dialog,
+    `IWebAuthenticationCoreManagerInterop::RequestTokenForWindowAsync`, an interop call the
+    `windows` crate exposes only as `unsafe`.
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
   returns an error ("not supported yet: ..."); it never panics.
 - **Everything from the network is hostile:** server responses, WebSocket events, message

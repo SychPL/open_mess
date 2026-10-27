@@ -25,7 +25,7 @@ use open_mess::module::{host, http, secrets, storage, types, websocket};
 impl HostState {
     /// The module's storage, opened on first use. Not while the manifest is read at load: the
     /// module has no name yet.
-    fn storage(&mut self) -> Result<&mut Storage, StorageError> {
+    pub(crate) fn storage(&mut self) -> Result<&mut Storage, StorageError> {
         if self.env.name.is_empty() {
             return Err(StorageError::Failed("storage is not available while the module loads".to_string()));
         }
@@ -35,7 +35,7 @@ impl HostState {
         self.storage.as_mut().ok_or_else(|| StorageError::Failed("storage did not open".to_string()))
     }
 
-    fn secret_store(&self) -> Result<Arc<CredentialStore>, String> {
+    pub(crate) fn secret_store(&self) -> Result<Arc<CredentialStore>, String> {
         if self.env.name.is_empty() {
             return Err("secrets are not available while the module loads".to_string());
         }

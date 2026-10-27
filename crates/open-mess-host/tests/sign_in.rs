@@ -22,7 +22,8 @@ async fn signing_in(budget: Duration) -> (JoinHandle<String>, mpsc::Receiver<Pro
     (tokio::spawn(async move { echo.call("a", "sign-in", "{}").await.unwrap() }), prompts)
 }
 
-const WAM: &str = "refused: Windows account sign-in not available yet";
+/// test-echo asks for a scope its manifest does not declare.
+const WAM: &str = r#"refused: scope \"scope\" is not in the module's manifest"#;
 
 #[tokio::test]
 async fn device_code_reaches_the_window() {

@@ -14,6 +14,8 @@ pub const NOT_FROM_WINDOW: &str = "logowanie można zacząć tylko w oknie konfi
 pub const BUSY: &str = "trwa już inne logowanie - dokończ je albo anuluj";
 /// Why an answer is refused when its prompt no longer waits.
 pub const GONE: &str = "ta prośba o logowanie już nie czeka";
+/// Why the WAM dialog can't open.
+pub const NO_WINDOW: &str = "okno konfiguracji nie jest otwarte";
 
 /// The sign-in in progress and the prompt the window shows. Clones share it.
 #[derive(Clone, Default)]
@@ -32,6 +34,8 @@ struct State {
     module: Option<String>,
     shown: Option<Shown>,
     next_id: u64,
+    /// The configuration window's handle while it is open: the owner of the WAM dialog.
+    owner: Option<isize>,
 }
 
 /// The prompt on screen; `reply` is None once nothing waits for its answer.
@@ -106,6 +110,11 @@ impl SignIns {
                 let _ = reply.send(SignInReply::Refused(NOT_FROM_WINDOW.into()));
                 return;
             }
+            // Answered here: the user sees the WAM dialog itself.
+            if let SignInRequest::WamWindow { .. } = request {
+                let _ = reply.send(state.owner.map_or_else(|| SignInReply::Refused(NO_WINDOW.into()), SignInReply::Window));
+                return;
+            }
             state.next_id += 1;
             let id = state.next_id;
             state.shown.replace(Shown { id, request, reply: Some(reply) })
@@ -137,9 +146,18 @@ impl SignIns {
         Ok(())
     }
 
+    /// The configuration window opened, with this handle (`HWND`).
+    pub fn window_opened(&self, owner: isize) {
+        self.state().owner = Some(owner);
+    }
+
     /// The window closed: what it showed is cancelled.
     pub fn window_closed(&self) {
-        let shown = self.state().shown.take();
+        let shown = {
+            let mut state = self.state();
+            state.owner = None;
+            state.shown.take()
+        };
         if let Some(shown) = shown {
             shown.cancel();
             self.changed();

@@ -63,6 +63,13 @@ impl Storage {
         Ok(keys)
     }
 
+    /// The accounts that have a secret named `key`.
+    pub(crate) fn secret_accounts(&self, key: &str) -> Result<Vec<String>, StorageError> {
+        let mut statement = self.db.prepare("SELECT account FROM secrets WHERE key = ?1 ORDER BY account")?;
+        let accounts = statement.query_map([key], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        Ok(accounts)
+    }
+
     pub(crate) fn remove_secret(&self, account: &str, key: &str) -> Result<(), StorageError> {
         self.db.execute("DELETE FROM secrets WHERE account = ?1 AND key = ?2", [account, key])?;
         Ok(())

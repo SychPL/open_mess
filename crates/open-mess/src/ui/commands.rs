@@ -451,7 +451,7 @@ pub fn mcp_command(state: &UiState) -> McpCommandsDto {
 pub struct SignInPromptDto {
     /// What [`sign_in_answer`] names.
     pub id: u64,
-    /// `device-code`, `qr` or `page`.
+    /// `device-code`, `qr`, `page` or `wam-pick`.
     pub kind: &'static str,
     pub module: String,
     pub code: Option<String>,
@@ -459,6 +459,17 @@ pub struct SignInPromptDto {
     pub url: Option<String>,
     /// The QR code, as an SVG image.
     pub qr_svg: Option<String>,
+    /// The Windows accounts to pick from.
+    pub accounts: Vec<WamAccountDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WamAccountDto {
+    /// What the answer names.
+    pub id: String,
+    pub user_name: String,
+    /// The organization's id, to tell apart one user name in several organizations.
+    pub tenant: String,
 }
 
 /// The window's answer to a sign-in prompt: `{"done": value}` or `"cancelled"`.
@@ -483,11 +494,20 @@ pub async fn sign_in_start(state: &UiState, module: &str) -> Result<AccountDto, 
 pub fn sign_in_request(state: &UiState) -> Option<SignInPromptDto> {
     let (id, request) = state.sign_ins.shown()?;
     let module = request.module().to_owned();
-    let dto = |kind| SignInPromptDto { id, kind, module, code: None, url: None, qr_svg: None };
+    let dto = |kind| SignInPromptDto { id, kind, module, code: None, url: None, qr_svg: None, accounts: Vec::new() };
     Some(match request {
         SignInRequest::DeviceCode { code, url, .. } => SignInPromptDto { code: Some(code), url: Some(url), ..dto("device-code") },
         SignInRequest::Qr { data, .. } => SignInPromptDto { qr_svg: qr_svg(&data), ..dto("qr") },
         SignInRequest::OpenPage { url, .. } => SignInPromptDto { url: Some(host_of(&url)), ..dto("page") },
+        SignInRequest::WamPick { accounts, .. } => SignInPromptDto {
+            accounts: accounts
+                .into_iter()
+                .map(|account| WamAccountDto { id: account.id, user_name: account.user_name, tenant: account.tenant })
+                .collect(),
+            ..dto("wam-pick")
+        },
+        // Answered by the daemon, never shown.
+        SignInRequest::WamWindow { .. } => return None,
     })
 }
 

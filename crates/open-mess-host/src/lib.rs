@@ -13,6 +13,7 @@ mod secrets;
 mod sign_in;
 mod storage;
 mod timers;
+mod wam;
 mod ws;
 
 pub use actor::ModuleState;
@@ -25,4 +26,5 @@ pub use runtime::{
 pub use secrets::{delete_account_secrets, platform_store as credential_store};
 #[cfg(any(test, feature = "test-support"))]
 pub use sign_in::FakeWam;
-pub use sign_in::{Prompt, SIGN_IN_BUDGET, SignInPrompts, SignInReply, SignInRequest};
+pub use sign_in::{Prompt, SIGN_IN_BUDGET, SignInPrompts, SignInReply, SignInRequest, WAM_ACCOUNT};
+pub use wam::WamAccount;

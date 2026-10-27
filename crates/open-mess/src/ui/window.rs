@@ -241,15 +241,19 @@ fn open_window<R: tauri::Runtime>(app: &AppHandle<R>, profile: &Path) -> Result<
         let _ = window.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("open_mess - ustawienia")
         .inner_size(960.0, 680.0)
         .min_inner_size(640.0, 420.0)
         .data_directory(profile.to_path_buf())
         .on_navigation(own_page)
         .build()
-        .map(drop)
-        .map_err(|err| format!("the window did not open: {err}"))
+        .map_err(|err| format!("the window did not open: {err}"))?;
+    // The WAM dialog of a sign-in opens over this window.
+    if let (Some(state), Ok(hwnd)) = (app.try_state::<UiState>(), window.hwnd()) {
+        state.sign_ins.window_opened(hwnd.0 as isize);
+    }
+    Ok(())
 }
 
 /// The embedded pages only: the window never goes to a remote address.

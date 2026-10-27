@@ -13,9 +13,10 @@ use crate::error::HostError;
 use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
 use crate::net::Net;
-use crate::sign_in::SignInPrompts;
+use crate::sign_in::{Caller, SignInPrompts};
 use crate::storage::Storage;
 use crate::timers::Timers;
+use crate::wam::WamAccount;
 use crate::ws::Sockets;
 
 /// Mirrors `manifest` in `wit/module.wit`.
@@ -157,6 +158,8 @@ pub(crate) struct ModuleEnv {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) timer_cap: Option<u32>,
     pub(crate) sign_in: SignInPrompts,
+    /// The manifest's Windows account identity, the only one `wam-token` asks for.
+    pub(crate) wam: Option<WamIdentity>,
 }
 
 /// The state a module instance runs with: a WASI context with nothing inherited, plus the host
@@ -174,6 +177,10 @@ pub(crate) struct HostState {
     pub(crate) max_body: usize,
     /// Where this instance's sockets and timers send what they deliver.
     pub(crate) guest_events: mpsc::Sender<GuestEvent>,
+    /// Whose call runs now, set by the actor before each call.
+    pub(crate) caller: Caller,
+    /// The Windows account picked during the `sign-in` call that runs.
+    pub(crate) pick: Option<WamAccount>,
 }
 
 impl HostState {
@@ -197,6 +204,8 @@ impl HostState {
             storage: None,
             max_body: limits::MAX_BODY,
             guest_events,
+            caller: Caller::default(),
+            pick: None,
         }
     }
 }
@@ -316,6 +325,7 @@ impl Engine {
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: None,
             sign_in: sign_in.clone(),
+            wam: None,
         };
         let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
@@ -338,6 +348,7 @@ impl Engine {
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: self.timer_cap,
             sign_in,
+            wam: manifest.wam.clone(),
         }));
         let (requests, queue) = mpsc::channel(QUEUE);
         tokio::spawn(actor.serve(queue));
