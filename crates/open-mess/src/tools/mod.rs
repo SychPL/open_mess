@@ -262,7 +262,7 @@ pub(crate) async fn within<T>(module: &str, call: impl Future<Output = Result<T,
 
 /// Runs a shared tool on one account's module: the result parsed, without what the agent may not
 /// read, cut to the limit and labelled with the account, without the untrusted notice.
-async fn call_account(accounts: &Accounts, account: &Account, tool: &str, args: &Value) -> Result<Value, ToolError> {
+pub(crate) async fn call_account(accounts: &Accounts, account: &Account, tool: &str, args: &Value) -> Result<Value, ToolError> {
     let handle = module(accounts, account)?;
     let json = within(&account.module, handle.call(&account.module_account, tool, &args.to_string())).await?;
     let mut result = shared::parse(tool, &json)?;

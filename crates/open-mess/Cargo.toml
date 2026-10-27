@@ -16,11 +16,18 @@ path = "src/lib.rs"
 name = "om"
 path = "src/main.rs"
 
+# Test helper: the program the trigger tests start for a rule (tests/spawn.rs). Not for users.
+[[bin]]
+name = "open-mess-record-run"
+path = "tests/bin/record_run.rs"
+test = false
+doc = false
+
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
-# RFC 3339 times in the `pending` tool and the quiet hours of trigger rules; rmcp builds it
-# already, serde included.
-chrono = { version = "0.4.45", default-features = false, features = ["alloc", "serde"] }
+# RFC 3339 times in the `pending` tool and the local quiet hours of trigger rules; rmcp builds it
+# already, with these features.
+chrono = { version = "0.4.45", default-features = false, features = ["alloc", "clock", "serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom = "0.4.3"
 # keyring 4's own facade always installs the platform store on first use, so tests can't swap in
@@ -40,7 +47,7 @@ serde_json = "1.0.154"
 # Module files and manifests are approved by their SHA-256.
 sha2 = "0.10.9"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 # The `Show all` dialog of an approval.

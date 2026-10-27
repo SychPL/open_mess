@@ -220,7 +220,8 @@ async fn quiet_period_batches() {
     assert_eq!(calls.len(), 1);
     assert_eq!((ids(&calls[0].1), calls[0].1.count), (vec!["m1", "m2", "m3"], 3));
     assert_eq!(calls[0].2 - t.started, Duration::from_secs(80));
-    assert!(calls[0].1.first_ms < calls[0].1.last_ms);
+    // Wall-clock times, which tokio's paused clock does not move.
+    assert!(calls[0].1.first_ms <= calls[0].1.last_ms);
 }
 
 #[tokio::test(start_paused = true)]

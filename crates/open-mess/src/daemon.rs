@@ -17,6 +17,8 @@ use crate::instance::InstanceLock;
 use crate::modules::Modules;
 use crate::store::Store;
 use crate::tools::Registry;
+use crate::triggers::spawn::{self, Runs};
+use crate::triggers::{self, Actions};
 use crate::{Error, api, approval, paths, secrets};
 
 /// Why the last `om daemon` failed to start, one line, in the data folder. The CLI shows it when
@@ -65,8 +67,17 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, String, 
     // After the local API token: from here on keyring-core's default store is the platform one.
     let credentials = open_mess_host::credential_store().map_err(|why| Error::Secrets(keyring_core::Error::PlatformFailure(why.into())))?;
     let accounts = Arc::new(Accounts::new(store, modules, dir.to_path_buf(), credentials));
-    // ponytail: nothing subscribes yet; the triggers of milestone D take a clone of the bus.
-    runtime.spawn(Bus::default().forward(host_events, Arc::clone(&accounts)));
+    let bus = Bus::default();
+    let registry = Registry::new(started, Arc::clone(&accounts));
+    {
+        // Inside the runtime: the engine spawns its tasks there.
+        let _entered = runtime.enter();
+        // Files of runs a daemon that stopped left behind are deleted here (spec 8.7, R6).
+        let actions = Actions { accounts: Arc::clone(&accounts), runs: Runs::new(dir.join("runs"), spawn::RUN_TIMEOUT) };
+        let counters = registry.trigger_counters().clone();
+        triggers::engine::spawn(&bus, Arc::clone(&accounts), Arc::new(actions), counters, || chrono::Local::now().time());
+    }
+    runtime.spawn(bus.forward(host_events, Arc::clone(&accounts)));
     // Sessions come back in the background; the tools answer meanwhile.
     runtime.spawn({
         let accounts = Arc::clone(&accounts);
@@ -75,7 +86,6 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, String, 
             let _ = accounts.restore().await;
         }
     });
-    let registry = Registry::new(started, accounts);
     if let Some(pending) = registry.pending() {
         pending.recover()?;
         runtime.spawn(Arc::clone(pending).sweep());

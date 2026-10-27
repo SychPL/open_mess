@@ -61,6 +61,9 @@ pub struct BatchedMessage {
     /// The sender's platform id.
     pub sender: String,
     pub at_ms: u64,
+    /// Other people's content (sender name, text) as the module's `read_messages` gives it, filled
+    /// in by the action; None until then, or when the module could not say.
+    pub untrusted: Option<serde_json::Value>,
 }
 
 /// Where batches go: the rules' actions, or a recorder in tests.
@@ -119,7 +122,7 @@ impl<D: Delivery> Engine<D> {
                 event = events.recv() => match event {
                     Ok(Event::Message { account, conversation, message, sender, own, mentions_me, direct }) => {
                         if !own {
-                            self.add(&account, &conversation, BatchedMessage { id: message, sender, at_ms: now_ms() }, mentions_me, direct);
+                            self.add(&account, &conversation, BatchedMessage { id: message, sender, at_ms: now_ms(), untrusted: None }, mentions_me, direct);
                         }
                     }
                     Ok(Event::Session { .. }) => {}

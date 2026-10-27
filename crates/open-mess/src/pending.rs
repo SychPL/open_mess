@@ -440,7 +440,7 @@ fn ttl_ms() -> i64 {
 }
 
 /// Milliseconds since 1970 as RFC 3339, UTC.
-fn time(ms: i64) -> String {
+pub(crate) fn time(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
