@@ -32,23 +32,24 @@ if ($built.Count -eq 0) {
     throw "No platform modules in $wasmDir - run: cargo build --release --target wasm32-wasip2 -p open-mess-teams"
 }
 
-# 1. Stop the daemon: the scheduled task, then any om.exe daemon of this user. The task is disabled
-# first, so its 5-minute trigger cannot start the old daemon in the middle of the install.
-$existing = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
-if ($existing) {
-    Disable-ScheduledTask -TaskName $taskName | Out-Null
-    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-}
+# 1. Stop the daemon: the scheduled task, then any om.exe daemon of this user.
 # ponytail: a hard stop; pending actions are recovered at the next start (spec 8.6). Add `om stop`
 # for a graceful one if anything ever needs it.
 # Stopping the task ends the agents its triggers started too; a daemon run by hand leaves its own.
-Get-CimInstance Win32_Process -Filter "Name='om.exe'" |
-    Where-Object { $_.CommandLine -match '\bdaemon\b' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+function Stop-Daemon {
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    }
+    Get-CimInstance Win32_Process -Filter "Name='om.exe'" |
+        Where-Object { $_.CommandLine -match '\bdaemon\b' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 500
+}
+$existing = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
+Stop-Daemon
 
-# Steps 2 and 3 replace files; if one fails, the task is enabled and started again, so the previous
-# install keeps running (step 2 puts the previous om.exe back itself).
+# Steps 2 and 3 replace files; if one fails, the task is started again, so the previous install
+# keeps running (step 2 puts the previous om.exe back itself).
 try {
     # 2. The binary. A running copy cannot be overwritten on Windows, so move it aside first.
     New-Item -ItemType Directory -Force $bin | Out-Null
@@ -82,10 +83,7 @@ try {
             }
         }
 } catch {
-    if ($existing) {
-        Enable-ScheduledTask -TaskName $taskName | Out-Null
-        Start-ScheduledTask -TaskName $taskName
-    }
+    if ($existing -and -not $NoStart) { Start-ScheduledTask -TaskName $taskName }
     throw
 }
 
@@ -102,6 +100,10 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
     -Description 'open_mess daemon (scripts/install.ps1)' -Force | Out-Null
 Write-Host "scheduled task '$taskName' starts the daemon at logon and every 5 minutes if it stopped"
+
+# The 5-minute trigger may have started the old daemon while files were replaced (it keeps running
+# from om.old.exe), and IgnoreNew would then keep it: stop it once more before starting.
+Stop-Daemon
 
 if (-not $NoStart) {
     Start-ScheduledTask -TaskName $taskName
