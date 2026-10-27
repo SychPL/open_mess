@@ -4,6 +4,7 @@ use std::fmt;
 
 /// One request for `http.fetch`. No `Debug` on purpose: headers carry tokens and the body carries
 /// message text, and neither may reach a log (AGENTS.md).
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,

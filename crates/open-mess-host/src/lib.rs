@@ -23,3 +23,5 @@ pub use runtime::{
     WamIdentity,
 };
 pub use secrets::{delete_account_secrets, platform_store as credential_store};
+#[cfg(any(test, feature = "test-support"))]
+pub use sign_in::FakeWam;

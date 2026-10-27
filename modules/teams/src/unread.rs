@@ -72,7 +72,14 @@ mod tests {
     }
 
     fn of(horizons: Horizons, app: Option<i64>) -> UnreadState {
-        let conv = Conversation { id: "19:x@thread.v2".to_string(), kind: ConversationKind::Group, title: None, last_message_id: None, horizons };
+        let conv = Conversation {
+            id: "19:x@thread.v2".to_string(),
+            kind: ConversationKind::Group,
+            title: None,
+            last_message_id: None,
+            last_message: None,
+            horizons,
+        };
         state(&conv, app, ME)
     }
 
@@ -146,8 +153,14 @@ mod tests {
 
     #[test]
     fn empty_user_is_never_the_sender() {
-        let conv =
-            Conversation { id: "19:x@thread.v2".to_string(), kind: ConversationKind::Group, title: None, last_message_id: None, horizons: base() };
+        let conv = Conversation {
+            id: "19:x@thread.v2".to_string(),
+            kind: ConversationKind::Group,
+            title: None,
+            last_message_id: None,
+            last_message: None,
+            horizons: base(),
+        };
         assert_eq!(state(&conv, Some(0), ""), UnreadState::Unread);
     }
 

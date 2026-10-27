@@ -13,12 +13,16 @@ pub const MAX_TABLE_ELEMENTS: usize = 1_000_000;
 pub const MAX_CRASHES: u32 = 3;
 /// How often the epoch ticker lets running WebAssembly check its deadline.
 pub const EPOCH_TICK: Duration = Duration::from_millis(10);
+/// A fetch ends as `timeout` this long before its call's limit, so the module can still answer
+/// instead of being unloaded (spec 8.3: the call limit counts time in imports).
+pub const FETCH_MARGIN: Duration = Duration::from_millis(500);
 /// HTTP response body; a longer one is cut off with `too-large`.
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
 /// An attachment: what `http.fetch` takes in a `get-attachment` call instead of `MAX_BODY`, and the
 /// most the core writes to disk (spec 8.5, R4 and R5).
 pub const MAX_ATTACHMENT: usize = 64 * 1024 * 1024;
-/// A `Retry-After` (seconds) above this ends the fetch with `throttled` instead of a response.
+/// A 429 whose `Retry-After` (seconds) is above this ends the fetch with `throttled` instead of a
+/// response.
 pub const MAX_RETRY_AFTER: u32 = 300;
 /// Establishing a TCP (and TLS) connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

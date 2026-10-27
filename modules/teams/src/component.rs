@@ -1,10 +1,9 @@
-//! The `platform-module` world of `wit/module.wit`. Milestone F1 serves the manifest; sign-in,
-//! tools and live events arrive with the network wiring in milestone F2.
+//! The `platform-module` world of `wit/module.wit`: the exports, handed to `api`.
 
 // The ABI glue wit-bindgen generates (bindings and the `export!` expansion) uses `unsafe`; no
 // unsafe is written by hand. Listed in AGENTS.md, "Never crash".
 #[allow(unsafe_code)]
-mod bindings {
+pub(crate) mod bindings {
     wit_bindgen::generate!({ world: "platform-module", path: "../../wit" });
 
     use super::Teams;
@@ -12,12 +11,15 @@ mod bindings {
 }
 
 use bindings::exports::open_mess::module::{events, module};
-use bindings::open_mess::module::types;
+use bindings::open_mess::module::{host, types};
+
+use crate::api;
 
 struct Teams;
 
-fn not_yet() -> types::ModuleError {
-    types::ModuleError::NotSupported("milestone F2".to_string())
+thread_local! {
+    /// Poll rounds so far, which pick the account each round starts with.
+    static ROUND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl module::Guest for Teams {
@@ -39,30 +41,32 @@ impl module::Guest for Teams {
     }
 
     fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
-        Err(not_yet())
+        api::begin();
+        api::sign_in()
     }
 
-    fn restore(_account: String) -> Result<(), types::ModuleError> {
-        Err(not_yet())
+    fn restore(account: String) -> Result<(), types::ModuleError> {
+        api::begin();
+        api::restore(&account)
     }
 
-    fn sign_out(_account: String) {}
-
-    fn call(_account: String, _tool: String, _args_json: String) -> Result<String, types::ModuleError> {
-        Err(not_yet())
+    fn sign_out(account: String) {
+        api::sign_out(&account);
     }
 
-    fn get_attachment(
-        _account: String,
-        _conversation: String,
-        _message: String,
-        _attachment: String,
-    ) -> Result<types::Attachment, types::ModuleError> {
-        Err(not_yet())
+    fn call(account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
+        api::begin();
+        crate::tools::call(&account, &tool, &args_json)
     }
 
-    fn describe_target(_account: String, _conversation: String, _message: Option<String>) -> Result<types::Target, types::ModuleError> {
-        Err(not_yet())
+    fn get_attachment(account: String, conversation: String, message: String, attachment: String) -> Result<types::Attachment, types::ModuleError> {
+        api::begin();
+        crate::tools::get_attachment(&account, &conversation, &message, &attachment)
+    }
+
+    fn describe_target(account: String, conversation: String, message: Option<String>) -> Result<types::Target, types::ModuleError> {
+        api::begin();
+        crate::tools::describe_target(&account, &conversation, message.as_deref())
     }
 }
 
@@ -71,5 +75,29 @@ impl events::Guest for Teams {
 
     fn on_ws_closed(_conn: u32, _reason: String) {}
 
-    fn on_timer(_id: u32) {}
+    /// The poll (`poll`): every signed-in account, each round starting with the next one so a
+    /// slow account cannot keep the others from their turn, then the timer again.
+    fn on_timer(id: u32) {
+        if id != crate::poll::TIMER {
+            return;
+        }
+        api::timer_fired();
+        api::begin();
+        let mut accounts = api::accounts();
+        accounts.sort();
+        let first = ROUND.get();
+        ROUND.set(first.wrapping_add(1));
+        let count = accounts.len();
+        if count > 0 {
+            accounts.rotate_left(first % count);
+        }
+        for account in &accounts {
+            if crate::tools::poll(account).is_err() {
+                host::log(1, "polling an account for new messages failed");
+            }
+        }
+        if !api::accounts().is_empty() {
+            api::polling_again();
+        }
+    }
 }

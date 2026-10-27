@@ -23,6 +23,8 @@ pub struct Session {
 pub struct ServiceDirectory {
     /// `chatServiceAfd`, required.
     pub chat_service: Url,
+    /// `chatService`, the regional host; paging links may name it.
+    pub chat_regional: Option<Url>,
     /// `calling_trouterUrl`.
     pub trouter: Option<Url>,
     /// `calling_registrarUrl`.
@@ -36,17 +38,13 @@ pub struct ServiceDirectory {
 }
 
 /// The authz request with the headers the live check sent (docs/protocols/teams.md "Live
-/// results" 2). The authz type is `ExplicitLogin`; the client sends `TokenRefresh` on a refresh,
-/// which F2 adds if the service needs it.
-pub fn request(entra_token: &str) -> HttpRequest {
-    let headers = [
-        ("Authorization", format!("Bearer {entra_token}").as_str()),
-        ("claimsChallengeCapable", "true"),
-        ("ms-teams-authz-type", "ExplicitLogin"),
-        ("X-MS-Migration", "True"),
-        ("x-ms-client-type", "web"),
-    ]
-    .map(|(name, value)| (name.to_string(), value.to_string()));
+/// results" 2), less the bearer token for `https://api.spaces.skype.com`, which the caller adds.
+/// The authz type is `ExplicitLogin`; the client sends `TokenRefresh` on a refresh, which F2b adds
+/// if the service needs it.
+pub fn request() -> HttpRequest {
+    let headers =
+        [("claimsChallengeCapable", "true"), ("ms-teams-authz-type", "ExplicitLogin"), ("X-MS-Migration", "True"), ("x-ms-client-type", "web")]
+            .map(|(name, value)| (name.to_string(), value.to_string()));
     HttpRequest { method: "POST".to_string(), url: AUTHZ_URL.to_string(), headers: headers.to_vec(), body: Vec::new() }
 }
 
@@ -62,6 +60,7 @@ pub fn decode(body: &[u8], now_ms: i64) -> Result<Session, ProtoError> {
     };
     let directory = ServiceDirectory {
         chat_service: url("chatServiceAfd")?.ok_or_else(|| incompatible("regionGtms.chatServiceAfd"))?,
+        chat_regional: url("chatService")?,
         trouter: url("calling_trouterUrl")?,
         registrar: url("calling_registrarUrl")?,
         ams: match url("amsV2")? {
@@ -97,6 +96,7 @@ mod tests {
     fn decodes_region_directory() {
         let s = decode(OK, NOW).unwrap();
         assert_eq!(s.directory.chat_service.as_str(), "https://teams.microsoft.com/api/chatsvc/emea");
+        assert_eq!(s.directory.chat_regional.as_ref().map(Url::as_str), Some("https://emea.ng.msg.teams.microsoft.com/"));
         assert_eq!(s.directory.ams.as_ref().map(Url::as_str), Some("https://eu-prod.asyncgw.teams.microsoft.com/"));
         assert_eq!(s.directory.search.as_ref().map(Url::as_str), Some("https://teams.microsoft.com/api/search/emea"));
         assert_eq!(s.skype_token.as_ref().map(SecretString::expose), Some("synthetic-skype-token-not-a-real-one"));
@@ -134,10 +134,10 @@ mod tests {
     }
 
     #[test]
-    fn request_sends_the_entra_token_to_authz() {
-        let r = request("entra-token");
+    fn request_posts_to_authz() {
+        let r = request();
         assert_eq!((r.method.as_str(), r.url.as_str()), ("POST", "https://teams.microsoft.com/api/authsvc/v1.0/authz"));
-        assert!(r.headers.contains(&("Authorization".to_string(), "Bearer entra-token".to_string())));
+        assert!(r.headers.contains(&("X-MS-Migration".to_string(), "True".to_string())));
         assert!(r.body.is_empty());
     }
 }

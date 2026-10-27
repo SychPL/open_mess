@@ -102,7 +102,7 @@ interface http {
         blocked(string),
         timeout,
         too-large,
-        // Retry-After was longer than the host's maximum wait.
+        // A 429 whose Retry-After was longer than the host's maximum wait: the request was refused.
         throttled(u32),
         network(string),
     }
@@ -153,8 +153,10 @@ interface sign-in {
     // Opens an approved HTTPS sign-in page in the configuration window and returns the URL of
     // the first navigation that starts with `redirect-prefix`.
     open-page: func(url: string, redirect-prefix: string) -> result<string, sign-in-error>;
-    // Silent or interactive token from Windows WAM for the manifest's approved identity.
-    wam-token: func(scopes: list<string>, interactive: bool) -> result<string, sign-in-error>;
+    // Silent or interactive token from Windows WAM for the manifest's approved identity. `claims`
+    // is the JSON of a claims challenge (CAE: a 401 with `WWW-Authenticate: ... claims=`), for a
+    // new token that satisfies it (spec 9.1).
+    wam-token: func(scopes: list<string>, interactive: bool, claims: option<string>) -> result<string, sign-in-error>;
 }
 
 interface host {

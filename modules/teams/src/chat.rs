@@ -43,6 +43,9 @@ pub struct Conversation {
     pub kind: ConversationKind,
     pub title: Option<String>,
     pub last_message_id: Option<String>,
+    /// The last message when it is a text message the decoder reads; a conversation is listed
+    /// even when its last message is not.
+    pub last_message: Option<Message>,
     pub horizons: Horizons,
 }
 
@@ -87,6 +90,15 @@ pub struct Message {
     pub mentions: Vec<Mention>,
     /// The root of the reply chain the message answers in (`rootMessageId`).
     pub reply_to: Option<String>,
+    /// AMS object ids of its images (`amsreferences`, docs 3.3).
+    pub attachments: Vec<String>,
+}
+
+/// A member of a thread, as `describe-target` shows them.
+pub struct Member {
+    /// The member's MRI.
+    pub id: String,
+    pub name: Option<String>,
 }
 
 pub struct Mention {
@@ -99,6 +111,32 @@ pub fn decode_conversations(body: &[u8]) -> Result<Page<Conversation>, ProtoErro
     let items =
         array(&v, "conversations")?.iter().enumerate().map(|(i, c)| conversation(c, &format!("conversations[{i}]"))).collect::<Result<_, _>>()?;
     page(&v, items, Vec::new())
+}
+
+/// One message (`GET .../messages/<id>`); only text messages are decoded.
+pub fn decode_message(body: &[u8]) -> Result<Message, ProtoError> {
+    let v = parse_json(body)?;
+    match req_str(&v, "", "messagetype")? {
+        kind @ ("RichText/Html" | "Text") => message(&v, "", kind == "Text"),
+        _ => Err(incompatible("messagetype")),
+    }
+}
+
+/// One conversation (`GET .../conversations/<id>`), in the list's shape.
+pub fn decode_conversation(body: &[u8]) -> Result<Conversation, ProtoError> {
+    conversation(&parse_json(body)?, "")
+}
+
+/// `members[]` of `GET v1/threads/<id>/members`: `id`, and `friendlyName` when the service gives
+/// one (UNCONFIRMED shape, to be checked live).
+pub fn decode_members(body: &[u8]) -> Result<Vec<Member>, ProtoError> {
+    let v = parse_json(body)?;
+    let member = |(i, m): (usize, &Value)| {
+        let path = format!("members[{i}]");
+        let name = opt_str(m, &path, "friendlyName")?.filter(|n| !n.is_empty()).map(str::to_string);
+        Ok(Member { id: req_str(m, &path, "id")?.to_string(), name })
+    };
+    array(&v, "members")?.iter().enumerate().map(member).collect()
 }
 
 pub fn decode_messages(body: &[u8]) -> Result<Page<Message>, ProtoError> {
@@ -133,11 +171,16 @@ fn conversation(c: &Value, path: &str) -> Result<Conversation, ProtoError> {
     };
     let call = opt_str(last, &last_path, "messagetype")?.is_some_and(|t| t.starts_with("Event/Call"));
     let last_call_initiator = if call { opt_str(last, &last_path, "content")?.and_then(initiator) } else { None };
+    let last_message = match opt_str(last, &last_path, "messagetype")? {
+        Some(kind @ ("RichText/Html" | "Text")) => message(last, &last_path, kind == "Text").ok(),
+        _ => None,
+    };
     Ok(Conversation {
         id: id.to_string(),
         kind: kind(id),
         title: opt_str(thread, &thread_path, "topic")?.map(str::to_string),
         last_message_id: opt_str(last, &last_path, "id")?.map(str::to_string),
+        last_message,
         horizons: Horizons {
             consumption: horizon_at("consumptionhorizon")?,
             bookmark,
@@ -152,7 +195,7 @@ fn conversation(c: &Value, path: &str) -> Result<Conversation, ProtoError> {
 
 /// The kind follows the id shapes of docs 3.1; 1:1 chats are confirmed live ("Live results" 5).
 /// `@thread.skype` is used by old channels and old group chats alike, so it stays `Other`.
-fn kind(id: &str) -> ConversationKind {
+pub fn kind(id: &str) -> ConversationKind {
     if id.starts_with("19:meeting_") {
         ConversationKind::Meeting
     } else if id.ends_with("@unq.gbl.spaces") {
@@ -203,7 +246,17 @@ fn message(m: &Value, path: &str, plain: bool) -> Result<Message, ProtoError> {
         html: if plain { escape_html(content) } else { content.to_string() },
         mentions: mentions(props, &props_path)?,
         reply_to: opt_str(m, path, "rootMessageId")?.filter(|root| *root != id).map(str::to_string),
+        attachments: ams_references(m, path)?,
     })
+}
+
+fn ams_references(m: &Value, path: &str) -> Result<Vec<String>, ProtoError> {
+    let path = at(path, "amsreferences");
+    match m.get("amsreferences") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(ids)) => ids.iter().map(|id| id.as_str().map(str::to_string).ok_or_else(|| incompatible(&path))).collect(),
+        Some(_) => Err(incompatible(&path)),
+    }
 }
 
 fn mentions(props: &Value, path: &str) -> Result<Vec<Mention>, ProtoError> {
@@ -242,7 +295,7 @@ fn array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], ProtoError> {
 }
 
 /// `v.key` as an object; absent or null reads as an empty one (every lookup in it is `None`).
-fn obj<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a Value, ProtoError> {
+pub(crate) fn obj<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a Value, ProtoError> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(&NULL),
         Some(o @ Value::Object(_)) => Ok(o),
@@ -251,7 +304,7 @@ fn obj<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a Value, ProtoError>
 }
 
 /// `v.key` as text: `None` when absent or null, an error for any other type.
-fn opt_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<Option<&'a str>, ProtoError> {
+pub(crate) fn opt_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<Option<&'a str>, ProtoError> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
@@ -259,7 +312,7 @@ fn opt_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<Option<&'a str>, P
     }
 }
 
-fn req_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a str, ProtoError> {
+pub(crate) fn req_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a str, ProtoError> {
     opt_str(v, path, key)?.ok_or_else(|| incompatible(&at(path, key)))
 }
 
@@ -274,21 +327,54 @@ fn opt_time(v: &Value, path: &str, key: &str) -> Result<Option<i64>, ProtoError>
     ms.map(Some).ok_or_else(|| incompatible(&at(path, key)))
 }
 
-pub fn list_conversations(dir: &ServiceDirectory, page: Option<&str>) -> Result<HttpRequest, ProtoError> {
-    let first = format!("view={VIEW_CONVERSATIONS}&pageSize={CONVERSATION_PAGE_SIZE}&startTime=1");
-    Ok(request("GET", paged(endpoint(dir, &[]), page, &first)?, None))
+/// The conversations updated since `start_ms` (1 for all of them), newest first.
+pub fn list_conversations(dir: &ServiceDirectory, page: Option<&str>, start_ms: i64) -> Result<HttpRequest, ProtoError> {
+    let first = format!("view={VIEW_CONVERSATIONS}&pageSize={CONVERSATION_PAGE_SIZE}&startTime={start_ms}");
+    Ok(request("GET", paged(dir, endpoint(dir, &[]), page, &first)?, None))
 }
 
-pub fn read_messages(dir: &ServiceDirectory, conv: &str, page: Option<&str>, limit: u16) -> Result<HttpRequest, ProtoError> {
-    let first = format!("view={VIEW_MESSAGES}&pageSize={limit}&startTime=1");
-    Ok(request("GET", paged(endpoint(dir, &[conv, "messages"]), page, &first)?, None))
+/// Messages newest first; with `end_ms`, those before it (the client's `endTime`, docs 3.2; its
+/// meaning is to be confirmed live, so callers still filter by time).
+pub fn read_messages(dir: &ServiceDirectory, conv: &str, page: Option<&str>, limit: u16, end_ms: Option<i64>) -> Result<HttpRequest, ProtoError> {
+    let end = end_ms.map(|ms| format!("&endTime={ms}")).unwrap_or_default();
+    let first = format!("view={VIEW_MESSAGES}&pageSize={limit}&startTime=1{end}");
+    Ok(request("GET", paged(dir, endpoint(dir, &[conv, "messages"]), page, &first)?, None))
 }
 
-/// The body follows the send accepted live ("Live results" 5), minus the sender's display name
-/// and the empty importance and subject.
-pub fn send(dir: &ServiceDirectory, conv: &str, html: &str, client_message_id: &str) -> HttpRequest {
-    let properties = json!({"mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
-    let body = json!({"content": html, "messagetype": "RichText/Html", "contenttype": "Text", "clientmessageid": client_message_id, "properties": properties});
+pub fn one_message(dir: &ServiceDirectory, conv: &str, message_id: &str) -> HttpRequest {
+    let mut url = endpoint(dir, &[conv, "messages", message_id]);
+    url.set_query(Some(&format!("view={VIEW_MESSAGES}")));
+    request("GET", url, None)
+}
+
+pub fn one_conversation(dir: &ServiceDirectory, conv: &str) -> HttpRequest {
+    let mut url = endpoint(dir, &[conv]);
+    url.set_query(Some(&format!("view={VIEW_CONVERSATIONS}")));
+    request("GET", url, None)
+}
+
+/// `<chat service>/v1/threads/<id>/members` (docs 3.2).
+pub fn members(dir: &ServiceDirectory, conv: &str) -> HttpRequest {
+    let mut url = dir.chat_service.clone();
+    // Never fails for https URLs, the only ones `authsvc::decode` accepts.
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.pop_if_empty().extend(["v1", "threads", conv, "members"]);
+    }
+    url.set_query(Some(&format!("view={VIEW_CONVERSATIONS}")));
+    request("GET", url, None)
+}
+
+/// The body of the send accepted live ("Live results" 5); `name` is the user's display name.
+pub fn send(dir: &ServiceDirectory, conv: &str, html: &str, client_message_id: &str, name: &str) -> HttpRequest {
+    let properties = json!({"importance": "", "subject": "", "mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
+    let body = json!({
+        "content": html,
+        "messagetype": "RichText/Html",
+        "contenttype": "Text",
+        "imdisplayname": name,
+        "clientmessageid": client_message_id,
+        "properties": properties,
+    });
     request("POST", endpoint(dir, &[conv, "messages"]), Some(body))
 }
 
@@ -324,15 +410,21 @@ fn endpoint(dir: &ServiceDirectory, segments: &[&str]) -> Url {
     url
 }
 
-/// The first page's query, or the paging query of a `backwardLink`. The link may name another
-/// (regional) host; only its query is used, so a link can't send the request and its token
-/// elsewhere.
-fn paged(mut url: Url, page: Option<&str>, first_page: &str) -> Result<Url, ProtoError> {
+/// The first page's query, or the paging query of a `backwardLink`. A link may name the chat
+/// service's regional host instead of the AFD one; a link to any other host is refused, and only
+/// the query of an accepted one is used, on our own host and path, so a link can't send the
+/// request and its token elsewhere.
+fn paged(dir: &ServiceDirectory, mut url: Url, page: Option<&str>, first_page: &str) -> Result<Url, ProtoError> {
     let query = match page {
         None => first_page.to_string(),
         Some(link) => {
-            let link = Url::parse(link).map_err(|_| incompatible("_metadata.backwardLink"))?;
-            link.query().ok_or_else(|| incompatible("_metadata.backwardLink"))?.to_string()
+            let refused = || incompatible("_metadata.backwardLink");
+            let link = Url::parse(link).map_err(|_| refused())?;
+            let same = |base: &Url| link.host_str() == base.host_str() && link.port() == base.port();
+            if link.scheme() != "https" || !(same(&url) || dir.chat_regional.as_ref().is_some_and(same)) {
+                return Err(refused());
+            }
+            link.query().ok_or_else(refused)?.to_string()
         }
     };
     url.set_query(Some(&query));
@@ -359,7 +451,8 @@ mod tests {
 
     fn dir() -> ServiceDirectory {
         let chat_service = Url::parse("https://teams.microsoft.com/api/chatsvc/emea").unwrap();
-        ServiceDirectory { chat_service, trouter: None, registrar: None, ams: None, middle_tier: None, search: None }
+        let chat_regional = Some(Url::parse("https://emea.ng.msg.teams.microsoft.com").unwrap());
+        ServiceDirectory { chat_service, chat_regional, trouter: None, registrar: None, ams: None, middle_tier: None, search: None }
     }
 
     fn conversations() -> Page<Conversation> {
@@ -380,6 +473,10 @@ mod tests {
         let group = &page.items[0];
         assert_eq!(group.id, GROUP);
         assert_eq!(group.last_message_id.as_deref(), Some("1800000000100"));
+        let last = group.last_message.as_ref().unwrap();
+        assert_eq!((last.sender_name.as_deref(), last.html.as_str()), (Some("Synthetic Person Two"), "<p>synthetic text</p>"));
+        // An empty last message, or one that is not text, is none.
+        assert!(page.items[1].last_message.is_none() && page.items[3].last_message.is_none());
         let consumption = Horizon { arrival_ms: 1_800_000_000_000, timestamp_ms: 1_800_000_000_050, client_message_id: "1111".to_string() };
         assert_eq!(group.horizons.consumption, Some(consumption));
         assert_eq!(group.horizons.bookmark.as_ref().map(|b| b.timestamp_ms), Some(1_800_000_000_060));
@@ -490,24 +587,77 @@ mod tests {
 
     #[test]
     fn first_and_next_page_requests() {
-        let first = list_conversations(&dir(), None).unwrap();
+        let since = list_conversations(&dir(), None, 1_800_000_000_000).unwrap();
+        assert!(since.url.ends_with("&startTime=1800000000000"));
+        let first = list_conversations(&dir(), None, 1).unwrap();
         assert_eq!((first.method.as_str(), first.url.as_str()), ("GET", &*format!("{BASE}?view=msnp24Equivalent&pageSize=50&startTime=1")));
-        let first = read_messages(&dir(), GROUP, None, 20).unwrap();
+        let before = read_messages(&dir(), GROUP, None, 20, Some(1_800_000_000_000)).unwrap();
+        assert!(before.url.ends_with("&startTime=1&endTime=1800000000000"), "{}", before.url);
+        let first = read_messages(&dir(), GROUP, None, 20, None).unwrap();
         assert_eq!(first.url, format!("{BASE}/{GROUP}/messages?view=msnp24Equivalent|supportsMessageProperties&pageSize=20&startTime=1"));
         // The next page keeps the link's paging query on our own host and path.
         let link = messages().backward_link.unwrap();
-        let next = read_messages(&dir(), GROUP, Some(&link), 20).unwrap();
+        let next = read_messages(&dir(), GROUP, Some(&link), 20, None).unwrap();
         assert!(next.url.starts_with(&format!("{BASE}/{GROUP}/messages?startTime=1&")), "{}", next.url);
         assert!(next.url.ends_with("syncState=b2xkZXI"));
-        assert!(matches!(read_messages(&dir(), GROUP, Some("not a link"), 20), Err(ProtoError::Incompatible(_))));
+        assert!(matches!(read_messages(&dir(), GROUP, Some("not a link"), 20, None), Err(ProtoError::Incompatible(_))));
+        let one = one_message(&dir(), GROUP, "1800000000300");
+        assert_eq!(one.url, format!("{BASE}/{GROUP}/messages/1800000000300?view=msnp24Equivalent|supportsMessageProperties"));
+    }
+
+    #[test]
+    fn conversation_and_members_requests() {
+        assert_eq!(one_conversation(&dir(), GROUP).url, format!("{BASE}/{GROUP}?view=msnp24Equivalent"));
+        let r = members(&dir(), GROUP);
+        assert_eq!(
+            (r.method.as_str(), r.url.as_str()),
+            ("GET", &*format!("https://teams.microsoft.com/api/chatsvc/emea/v1/threads/{GROUP}/members?view=msnp24Equivalent"))
+        );
+    }
+
+    #[test]
+    fn decodes_members_unconfirmed_shape() {
+        let body = json!({"members": [{"id": ME, "role": "Admin", "friendlyName": "Synthetic Person One"}, {"id": "8:orgid:2", "friendlyName": ""}]});
+        let members = decode_members(body.to_string().as_bytes()).unwrap();
+        let pairs: Vec<_> = members.iter().map(|m| (m.id.as_str(), m.name.as_deref())).collect();
+        assert_eq!(pairs, [(ME, Some("Synthetic Person One")), ("8:orgid:2", None)]);
+        for bad in [json!({}), json!({"members": [{"role": "User"}]}), json!({"members": [{"id": 1}]})] {
+            assert!(matches!(decode_members(bad.to_string().as_bytes()), Err(ProtoError::Incompatible(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn backward_link_to_another_host_is_refused() {
+        for link in [
+            "https://evil.example/api/chatsvc/emea/v1/users/ME/conversations?syncState=x",
+            "http://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations?syncState=x",
+            "https://teams.microsoft.com:8443/api/chatsvc/emea/v1/users/ME/conversations?syncState=x",
+            "https://amer.ng.msg.teams.microsoft.com/v1/users/ME/conversations?syncState=x",
+        ] {
+            assert!(matches!(list_conversations(&dir(), Some(link), 1), Err(ProtoError::Incompatible(_))), "{link}");
+        }
+    }
+
+    #[test]
+    fn single_message_with_ams_references_unconfirmed_shape() {
+        let body = json!({"id": "1", "conversationid": GROUP, "from": ME, "messagetype": "RichText/Html", "content": "<p>x</p>",
+                          "originalarrivaltime": 1, "amsreferences": ["0-weu-d1-a", "0-weu-d1-b"]});
+        let m = decode_message(body.to_string().as_bytes()).unwrap();
+        assert_eq!(m.attachments, ["0-weu-d1-a", "0-weu-d1-b"]);
+        let event = json!({"id": "1", "messagetype": "ThreadActivity/AddMember", "content": ""});
+        assert!(matches!(decode_message(event.to_string().as_bytes()), Err(ProtoError::Incompatible(_))));
+        let bad = json!({"id": "1", "conversationid": GROUP, "from": ME, "messagetype": "Text", "content": "x", "originalarrivaltime": 1,
+                         "amsreferences": [1]});
+        assert!(matches!(decode_message(bad.to_string().as_bytes()), Err(ProtoError::Incompatible(p)) if p == "amsreferences"));
     }
 
     #[test]
     fn send_carries_client_message_id() {
-        let r = send(&dir(), GROUP, "<p>hi</p>", "9999");
+        let r = send(&dir(), GROUP, "<p>hi</p>", "9999", "Synthetic Person One");
         assert_eq!((r.method.as_str(), r.url.as_str()), ("POST", &*format!("{BASE}/{GROUP}/messages")));
-        let properties = json!({"mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
-        let expected = json!({"content": "<p>hi</p>", "messagetype": "RichText/Html", "contenttype": "Text", "clientmessageid": "9999", "properties": properties});
+        let properties = json!({"importance": "", "subject": "", "mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
+        let expected = json!({"content": "<p>hi</p>", "messagetype": "RichText/Html", "contenttype": "Text", "imdisplayname": "Synthetic Person One",
+                              "clientmessageid": "9999", "properties": properties});
         assert_eq!(body(&r), expected);
         assert!(r.headers.contains(&("BehaviorOverride".to_string(), "redirectAs404".to_string())));
     }
