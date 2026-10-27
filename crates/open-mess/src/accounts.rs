@@ -138,7 +138,8 @@ impl Accounts {
         } else if let Some(expected) = &expected {
             if info.id == expected.module_account {
                 if self.renew(&expected.id, &info.display_name)? {
-                    return self.get(&expected.id)?.ok_or_else(|| Error::Account(format!("konto {} usunięto w trakcie logowania", expected.id)));
+                    let renewed = self.get(&expected.id)?.filter(|account| account.state != REMOVING);
+                    return renewed.ok_or_else(|| Error::Account(format!("konto {} usunięto w trakcie logowania", expected.id)));
                 }
                 format!("konto {} usunięto w trakcie logowania", expected.id)
             } else {
@@ -151,7 +152,7 @@ impl Accounts {
             // Another account open_mess has: the module now holds its session, so it is online
             // (unless it is being removed).
             Some(other) if refusal == OTHER_ACCOUNT => {
-                self.set_state(module, &info.id, SessionState::Online)?;
+                self.renew(&other.id, &info.display_name)?;
                 return Err(Error::Account(format!("{OTHER_ACCOUNT} (zalogowano ponownie konto {})", other.id)));
             }
             Some(_) => {}
@@ -312,4 +313,36 @@ impl Accounts {
 
 fn account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account { id: row.get(0)?, module: row.get(1)?, module_account: row.get(2)?, display_name: row.get(3)?, state: row.get(4)? })
+}
+
+#[cfg(test)]
+mod tests {
+    use open_mess_host::ip_policy::AddressPolicy;
+    use open_mess_host::{Engine, ModuleContext, Net, SignInPrompts};
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_account_being_removed_is_not_signed_in_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.sqlite3")).unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let ctx = move |_: &str| ModuleContext {
+            data_dir: data_dir.clone(),
+            events: mpsc::channel(1).0,
+            net: Net::new(AddressPolicy::Strict),
+            sign_in: SignInPrompts::new(mpsc::channel(1).0),
+        };
+        let modules = Modules::scan(&store, &Engine::new().unwrap(), &dir.path().join("modules"), ctx).await.unwrap();
+        let accounts = Accounts::new(store, modules, dir.path().to_path_buf(), keyring_core::mock::Store::new().unwrap());
+        let info = || AccountInfo { id: "a".into(), display_name: "Ann".into() };
+        accounts.add("m", info()).unwrap();
+        // A removal cut short (the daemon stopped) leaves the row marked.
+        accounts.store().conn().execute("UPDATE accounts SET state = ?1", [REMOVING]).unwrap();
+        // Neither "Dodaj konto" nor "Zaloguj ponownie" brings it back.
+        assert!(accounts.add("m", info()).is_err());
+        assert!(!accounts.renew("m:a", "Ann").unwrap());
+        assert_eq!(accounts.get("m:a").unwrap().unwrap().state, REMOVING);
+    }
 }
