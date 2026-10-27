@@ -5,11 +5,13 @@
 
 mod common;
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use common::{Daemon, ECHO, daemon, echo, echo_rebuilt, echo_with_another_host, info, install, scan, store};
-use open_mess::pending::{Kind, Pending, State};
+use open_mess::approval;
+use open_mess::pending::{Kind, Pending, Preview, State};
+use open_mess::tools::ToolError;
 use open_mess::ui::UiState;
 use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto};
 use open_mess_host::Engine;
@@ -172,6 +174,111 @@ async fn status_and_mcp_command() {
         commands.codex,
         "setx OPEN_MESS_TOKEN \"t0ken\"\ncodex mcp add open_mess --url http://127.0.0.1:7341/mcp --bearer-token-env-var OPEN_MESS_TOKEN"
     );
+}
+
+#[tokio::test]
+async fn set_and_clear_override() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let state = state(&d);
+    let send = |conversation: &str| d.registry.call("send", json!({"account": "test-echo:a", "conversation": conversation, "text": "hi"}));
+
+    let defaults = commands::permissions(&state, "test-echo:a").unwrap();
+    assert_eq!((defaults.read, defaults.write.as_str(), defaults.overrides.len()), (true, "confirm", 0));
+
+    commands::set_permissions(&state, "test-echo:a", None, false, "never").unwrap();
+    commands::set_permissions(&state, "test-echo:a", Some("c1".into()), true, "autonomous").unwrap();
+    let set = commands::permissions(&state, "test-echo:a").unwrap();
+    assert_eq!((set.read, set.write.as_str()), (false, "never"));
+    assert_eq!(set.overrides.iter().map(|o| (o.conversation.as_str(), o.read, o.write.as_str())).collect::<Vec<_>>(), [("c1", true, "autonomous")]);
+    // The core enforces what the window set.
+    assert_eq!(send("c1").await.unwrap()["state"], "done");
+    assert!(matches!(send("c2").await, Err(ToolError::NotAllowed(_))));
+
+    commands::clear_permission_override(&state, "test-echo:a", "c1").unwrap();
+    assert!(commands::permissions(&state, "test-echo:a").unwrap().overrides.is_empty());
+    assert!(matches!(send("c1").await, Err(ToolError::NotAllowed(_))));
+
+    // Nonsense is refused, not stored.
+    assert!(commands::set_permissions(&state, "test-echo:a", None, true, "sometimes").is_err());
+    assert!(commands::set_permissions(&state, "test-echo:nobody", None, true, "never").is_err());
+    assert!(commands::set_permissions(&state, "test-echo:a", Some(" ".into()), true, "never").is_err());
+    assert!(commands::permissions(&state, "test-echo:nobody").is_err());
+}
+
+#[tokio::test]
+async fn decide_from_window_updates_state() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let state = state(&d);
+    let changed = state.pending.subscribe();
+    let text = format!("<img src=x onerror=alert(1)>\n{}", "line\n".repeat(3000));
+    let sent = d.registry.call("send", json!({"account": "test-echo:a", "conversation": "c1", "text": text, "reply_to": "m7"})).await.unwrap();
+    let action = sent["action"].as_str().unwrap().to_owned();
+    assert!(changed.has_changed().unwrap());
+
+    // The window gets all of it, as the toasts would show it.
+    let waiting = commands::waiting(&state);
+    assert_eq!(waiting.len(), 1);
+    let preview = &waiting[0];
+    assert_eq!((preview.action.as_str(), preview.kind), (action.as_str(), "send"));
+    assert_eq!(preview.account, "User a (test-echo:a)");
+    assert_eq!(preview.conversation, "Echo c1");
+    assert_eq!(preview.participants, ["Pat"]);
+    assert_eq!(preview.text.as_deref(), Some(text.as_str()));
+    assert_eq!(preview.target_text.as_deref(), Some("message m7"));
+
+    assert_eq!(commands::decide(&state, &action, true).await.unwrap(), "done");
+    assert!(commands::waiting(&state).is_empty());
+    // A second click changes nothing.
+    assert_eq!(commands::decide(&state, &action, false).await.unwrap(), "done");
+
+    let rejected = d.registry.call("send", json!({"account": "test-echo:a", "conversation": "c1", "text": "no"})).await.unwrap();
+    assert_eq!(commands::decide(&state, rejected["action"].as_str().unwrap(), false).await.unwrap(), "rejected");
+    assert!(commands::decide(&state, "nope", true).await.is_err());
+}
+
+#[tokio::test]
+async fn removing_account_clears_its_waiting_actions() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    d.accounts.add("test-echo", info("b")).unwrap();
+    let state = state(&d);
+    let (shown, withdrawn) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(0)));
+    tokio::spawn(approval::run(
+        Arc::clone(&state.pending),
+        {
+            let shown = Arc::clone(&shown);
+            move |preview: &Preview| shown.lock().unwrap().push(preview.action.clone())
+        },
+        {
+            let withdrawn = Arc::clone(&withdrawn);
+            move || *withdrawn.lock().unwrap() += 1
+        },
+    ));
+    let send = |account: &str| d.registry.call("send", json!({"account": account, "conversation": "c1", "text": "hi"}));
+    let a1 = send("test-echo:a").await.unwrap()["action"].as_str().unwrap().to_owned();
+    send("test-echo:a").await.unwrap();
+    let b1 = send("test-echo:b").await.unwrap()["action"].as_str().unwrap().to_owned();
+    wait_for(|| shown.lock().unwrap().len() == 1).await;
+    assert_eq!(*shown.lock().unwrap(), std::slice::from_ref(&a1));
+
+    commands::remove_account(&state, "test-echo:a").await.unwrap();
+    // Gone from the list, its toast taken off the screen, and the next account's shown.
+    assert_eq!(commands::waiting(&state).iter().map(|preview| preview.action.clone()).collect::<Vec<_>>(), std::slice::from_ref(&b1));
+    wait_for(|| shown.lock().unwrap().len() == 2).await;
+    assert_eq!(*shown.lock().unwrap(), [a1, b1]);
+    assert_eq!(*withdrawn.lock().unwrap(), 1);
+}
+
+async fn wait_for(done: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out");
 }
 
 #[tokio::test]

@@ -21,6 +21,7 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     tauri::async_runtime::set(runtime.handle().clone());
     // The webview's profile stays in the data folder (spec 8.4), not in a folder of its own.
     let profile = state.accounts.data_dir().join("webview");
+    let pending = std::sync::Arc::clone(&state.pending);
     let app = tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -31,7 +32,12 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::approve_module,
             ipc::set_module_enabled,
             ipc::rescan_modules,
-            ipc::mcp_command
+            ipc::mcp_command,
+            ipc::permissions,
+            ipc::set_permissions,
+            ipc::clear_permission_override,
+            ipc::waiting,
+            ipc::decide
         ])
         .build(tauri::generate_context!())
         .map_err(failed)?;
@@ -45,6 +51,17 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             let _ = handle.run_on_main_thread(move || {
                 let _ = request.send(open_window(&app, &profile));
             });
+        }
+    });
+    // The page's "pending-changed" event, sent by evaluating a line in the page, so the window
+    // needs no event permissions.
+    let (handle, mut changed) = (app.handle().clone(), pending.subscribe());
+    runtime.spawn(async move {
+        while changed.changed().await.is_ok() {
+            if let Some(window) = handle.get_webview_window(LABEL) {
+                // ponytail: a page that misses one refreshes on the next change or when shown.
+                let _ = window.eval("window.dispatchEvent(new Event('pending-changed'))");
+            }
         }
     });
     let handle = app.handle().clone();
@@ -75,7 +92,7 @@ mod ipc {
     use tauri::State;
 
     use crate::ui::UiState;
-    use crate::ui::commands::{self, AccountDto, McpCommandsDto, ModuleDto, StatusDto};
+    use crate::ui::commands::{self, AccountDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, StatusDto};
 
     #[tauri::command(rename_all = "snake_case")]
     pub async fn status(state: State<'_, UiState>) -> Result<StatusDto, String> {
@@ -115,6 +132,37 @@ mod ipc {
     #[tauri::command(rename_all = "snake_case")]
     pub async fn mcp_command(state: State<'_, UiState>) -> Result<McpCommandsDto, String> {
         Ok(commands::mcp_command(&state))
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn permissions(state: State<'_, UiState>, account: String) -> Result<PermissionsDto, String> {
+        commands::permissions(&state, &account)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn set_permissions(
+        state: State<'_, UiState>,
+        account: String,
+        conversation: Option<String>,
+        read: bool,
+        write: String,
+    ) -> Result<(), String> {
+        commands::set_permissions(&state, &account, conversation, read, &write)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn clear_permission_override(state: State<'_, UiState>, account: String, conversation: String) -> Result<(), String> {
+        commands::clear_permission_override(&state, &account, &conversation)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn waiting(state: State<'_, UiState>) -> Result<Vec<PreviewDto>, String> {
+        Ok(commands::waiting(&state))
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn decide(state: State<'_, UiState>, action: String, approve: bool) -> Result<String, String> {
+        commands::decide(&state, &action, approve).await
     }
 }
 

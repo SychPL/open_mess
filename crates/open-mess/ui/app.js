@@ -246,12 +246,190 @@ async function renderFooter() {
   badge.hidden = status.waiting === 0;
 }
 
+const WRITE_OPTIONS = [
+  ["never", "nigdy"],
+  ["confirm", "z potwierdzeniem"],
+  ["autonomous", "samodzielnie"],
+];
+
+/**
+ * The read box and write list for one account (conversation null) or conversation, saving both
+ * on every change; a change that fails is put back.
+ */
+function permissionControls(account, conversation, current) {
+  const box = el("input");
+  box.type = "checkbox";
+  box.checked = current.read;
+  const read = el("label", null, "row");
+  read.append(box, el("span", "czytanie"));
+  const write = el("select");
+  for (const [value, label] of WRITE_OPTIONS) {
+    const option = el("option", label);
+    option.value = value;
+    write.append(option);
+  }
+  write.value = current.write;
+  const save = async () => {
+    if (write.value === "autonomous" && current.write !== "autonomous") {
+      const sure = confirm("Samodzielnie: agent wyśle, poprawi i zareaguje bez pytania. Ustawić?");
+      if (!sure) {
+        write.value = current.write;
+        return;
+      }
+    }
+    try {
+      await call("set_permissions", { account, conversation, read: box.checked, write: write.value });
+      current = { read: box.checked, write: write.value };
+    } catch (err) {
+      box.checked = current.read;
+      write.value = current.write;
+      showError(err);
+    }
+  };
+  box.addEventListener("change", save);
+  write.addEventListener("change", save);
+  const writeLabel = el("label", null, "row");
+  writeLabel.append(el("span", "pisanie:"), write);
+  return [read, writeLabel];
+}
+
+async function renderPermissions() {
+  const accounts = await call("accounts");
+  const root = content("permissions");
+  root.replaceChildren();
+  root.append(
+    el(
+      "p",
+      "Te same uprawnienia dotyczą każdego agenta i polecenia om. Ustawienie rozmowy ma pierwszeństwo przed ustawieniem konta. Z potwierdzeniem: każde wysłanie, edycja i reakcja czeka na Twoją decyzję w powiadomieniu albo w sekcji Do zatwierdzenia.",
+      "muted",
+    ),
+  );
+  if (accounts.length === 0) root.append(el("p", "Nie ma jeszcze żadnego konta.", "muted"));
+  for (const account of accounts) {
+    const permissions = await call("permissions", { account: account.id });
+    const card = el("div", null, "card");
+    card.append(el("strong", account.display_name), el("div", account.id, "muted"));
+    const own = el("div", null, "row");
+    own.append(el("span", "Całe konto:"), ...permissionControls(account.id, null, permissions));
+    card.append(own, el("h2", "Rozmowy z własnymi uprawnieniami"));
+    const table = el("table");
+    for (const item of permissions.overrides) {
+      const row = el("tr");
+      const id = el("td");
+      id.append(el("code", item.conversation));
+      const controls = el("td", null, "row");
+      controls.append(...permissionControls(account.id, item.conversation, item));
+      const remove = el("td");
+      remove.append(
+        button("Usuń", async () => {
+          await call("clear_permission_override", { account: account.id, conversation: item.conversation });
+          await renderPermissions();
+        }, "danger"),
+      );
+      row.append(id, controls, remove);
+      table.append(row);
+    }
+    if (permissions.overrides.length === 0) card.append(el("p", "Brak - wszystkie rozmowy mają ustawienia konta.", "muted"));
+    else card.append(table);
+    const add = el("div", null, "row");
+    const id = el("input");
+    id.type = "text";
+    id.placeholder = "identyfikator rozmowy";
+    add.append(
+      id,
+      button("Dodaj rozmowę", async () => {
+        if (!id.value.trim()) return;
+        // A new conversation starts with the account's permissions; change them in its row.
+        await call("set_permissions", { account: account.id, conversation: id.value, read: permissions.read, write: permissions.write });
+        await renderPermissions();
+      }),
+    );
+    card.append(add);
+    root.append(card);
+  }
+}
+
+const KINDS = { send: "Wysłanie", edit: "Edycja", react: "Reakcja" };
+
+const OUTCOMES = {
+  done: "Wykonano.",
+  rejected: "Odrzucono.",
+  expired: "Wygasło - nic nie wysłano.",
+  voided: "Uczestnicy albo wiadomość zmienili się od pokazania - nic nie wysłano.",
+  uncertain: "Mogło dotrzeć - sprawdź rozmowę, zanim spróbujesz ponownie.",
+  failed: "Nie udało się - nic nie wysłano.",
+};
+
+/** The cards on screen by action, so a new or decided action leaves the others (and where they are scrolled) alone. */
+const waitingCards = new Map();
+
+/** One waiting action with everything it would do, in full; long content scrolls. */
+function waitingCard(preview) {
+  const card = el("div", null, "card");
+  card.append(el("strong", KINDS[preview.kind] || preview.kind));
+  const participants = preview.participants.length > 0 ? preview.participants.join(", ") : "brak (kanał)";
+  card.append(details([["Konto", preview.account], ["Rozmowa", preview.conversation], ["Uczestnicy", participants]]));
+  const block = (label, text) => card.append(el("h2", label), el("div", text, "content-text"));
+  if (preview.kind === "send") {
+    block("Treść", preview.text);
+    if (preview.target_text !== null) block("W odpowiedzi na", preview.target_text);
+  } else if (preview.kind === "edit") {
+    block("Przed", preview.target_text);
+    block("Po", preview.text);
+  } else {
+    block("Reakcja", preview.reaction);
+    block("Pod wiadomością", preview.target_text);
+  }
+  const decide = (approve) => async () => {
+    const outcome = await call("decide", { action: preview.action, approve });
+    document.getElementById("waiting-outcome").textContent = OUTCOMES[outcome] || outcome;
+    await renderWaiting();
+  };
+  const row = el("div", null, "row");
+  row.append(button("Zatwierdź", decide(true), "primary"), button("Odrzuć", decide(false), "danger"));
+  card.append(row);
+  return card;
+}
+
+async function renderWaiting() {
+  const waiting = await call("waiting");
+  const root = content("waiting");
+  if (!document.getElementById("waiting-outcome")) {
+    const outcome = el("p", null, "muted");
+    outcome.id = "waiting-outcome";
+    root.append(outcome, el("p", "Nic nie czeka na zatwierdzenie.", "muted empty"));
+  }
+  const ids = new Set(waiting.map((preview) => preview.action));
+  for (const [action, card] of waitingCards) {
+    if (!ids.has(action)) {
+      card.remove();
+      waitingCards.delete(action);
+    }
+  }
+  for (const preview of waiting) {
+    if (!waitingCards.has(preview.action)) {
+      const card = waitingCard(preview);
+      waitingCards.set(preview.action, card);
+      root.append(card);
+    }
+  }
+  root.querySelector(".empty").hidden = waiting.length > 0;
+}
+
 const RENDER = {
   accounts: renderAccounts,
+  permissions: renderPermissions,
+  waiting: renderWaiting,
   modules: renderModules,
   integrations: renderIntegrations,
   daemon: renderDaemon,
 };
+
+// Sent by the daemon whenever the waiting actions change.
+window.addEventListener("pending-changed", () => {
+  if (current === "waiting") renderWaiting().catch(showError);
+  renderFooter().catch(showError);
+});
 
 let current = null;
 

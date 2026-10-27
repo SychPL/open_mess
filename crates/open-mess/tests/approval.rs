@@ -36,7 +36,7 @@ async fn one_toast_at_a_time() {
         let presented = Arc::clone(&presented);
         move |preview: &Preview| presented.lock().unwrap().push(preview.action.clone())
     };
-    tokio::spawn(approval::run(Arc::clone(&pending), present));
+    tokio::spawn(approval::run(Arc::clone(&pending), present, || {}));
 
     // An agent sends in a loop: 20 wait, one is on screen.
     let mut actions = Vec::new();

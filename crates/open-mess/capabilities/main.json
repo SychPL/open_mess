@@ -10,6 +10,11 @@
     "allow-approve-module",
     "allow-set-module-enabled",
     "allow-rescan-modules",
-    "allow-mcp-command"
+    "allow-mcp-command",
+    "allow-permissions",
+    "allow-set-permissions",
+    "allow-clear-permission-override",
+    "allow-waiting",
+    "allow-decide"
   ]
 }

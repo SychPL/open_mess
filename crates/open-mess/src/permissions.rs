@@ -1,6 +1,6 @@
 //! Agent permissions (spec 8.6): per account, optionally overridden per conversation, the same for
 //! every caller (MCP, CLI, agents started by triggers). The core enforces them; no tool changes
-//! them: only the approval UI, the configuration window (milestone E) and tests call [`set`].
+//! them: only the configuration window and tests call [`set`] and [`clear_override`].
 
 use rusqlite::OptionalExtension;
 
@@ -25,7 +25,7 @@ impl Write {
         }
     }
 
-    fn parse(name: &str) -> Result<Write, Error> {
+    pub fn parse(name: &str) -> Result<Write, Error> {
         [Write::Never, Write::Confirm, Write::Autonomous]
             .into_iter()
             .find(|write| write.name() == name)
@@ -78,6 +78,25 @@ pub fn set(store: &Store, account: &str, conversation: Option<&str>, read: bool,
         (account, conversation.unwrap_or_default(), read, write.name()),
     )?;
     Ok(())
+}
+
+/// Removes a conversation's own permissions; the account's apply to it again.
+pub fn clear_override(store: &Store, account: &str, conversation: &str) -> Result<(), Error> {
+    store.conn().execute("DELETE FROM permissions WHERE account = ?1 AND conversation = ?2 AND conversation <> ''", (account, conversation))?;
+    Ok(())
+}
+
+/// The conversations of `account` with their own permissions, by conversation id.
+pub fn overrides(store: &Store, account: &str) -> Result<Vec<(String, Effective)>, Error> {
+    let mut statement =
+        store.conn().prepare("SELECT conversation, read, write FROM permissions WHERE account = ?1 AND conversation <> '' ORDER BY conversation")?;
+    let rows = statement.query_map([account], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, String>(2)?)))?;
+    let mut overrides = Vec::new();
+    for row in rows {
+        let (conversation, read, write) = row?;
+        overrides.push((conversation, Effective { read, write: Write::parse(&write)? }));
+    }
+    Ok(overrides)
 }
 
 #[cfg(test)]

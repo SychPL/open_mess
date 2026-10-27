@@ -1,6 +1,7 @@
 //! What the configuration window can do, as plain functions over the daemon's state (the Tauri
-//! commands in window.rs only wrap them). None of this is a tool: approving modules, removing
-//! accounts and showing the local API token happen only here, where the user is (spec 8.8, 15).
+//! commands in window.rs only wrap them). None of this is a tool: setting permissions, deciding
+//! waiting actions, approving modules, removing accounts and showing the local API token happen
+//! only here and in the toasts, where the user is (spec 8.6, 8.8, 15).
 //! Errors are messages for the window.
 
 use std::collections::BTreeSet;
@@ -11,8 +12,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::UiState;
-use crate::cli;
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
+use crate::{approval, cli, permissions};
 
 /// Why an approval is refused when the file on disk is not the one the window showed.
 pub const MODULE_CHANGED: &str = "plik modułu się zmienił - odśwież";
@@ -310,6 +311,112 @@ async fn rescan(state: &UiState, restart: Option<&str>) -> Result<(), String> {
     state.accounts.rescan_modules(restart).await.map_err(text)?;
     // The rescan expired the actions of modules that changed; this closes their toasts.
     state.pending.expire_due().map_err(text)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OverrideDto {
+    pub conversation: String,
+    pub read: bool,
+    /// `never`, `confirm` or `autonomous`.
+    pub write: String,
+}
+
+/// An account's agent permissions and the conversations with their own (spec 8.6).
+#[derive(Clone, Debug, Serialize)]
+pub struct PermissionsDto {
+    pub account: String,
+    pub read: bool,
+    pub write: String,
+    pub overrides: Vec<OverrideDto>,
+}
+
+/// The longest conversation id taken, as the tools take it.
+const MAX_CONVERSATION: usize = 1024;
+
+fn known_account(state: &UiState, account: &str) -> Result<(), String> {
+    match state.accounts.get(account).map_err(text)? {
+        Some(found) if found.state != crate::accounts::REMOVING => Ok(()),
+        _ => Err(format!("nie ma konta {account}")),
+    }
+}
+
+pub fn permissions(state: &UiState, account: &str) -> Result<PermissionsDto, String> {
+    known_account(state, account)?;
+    let store = state.accounts.store();
+    let own = permissions::effective(&store, account, None).map_err(text)?;
+    let overrides = permissions::overrides(&store, account).map_err(text)?;
+    Ok(PermissionsDto {
+        account: account.into(),
+        read: own.read,
+        write: own.write.name().into(),
+        overrides: overrides
+            .into_iter()
+            .map(|(conversation, set)| OverrideDto { conversation, read: set.read, write: set.write.name().into() })
+            .collect(),
+    })
+}
+
+/// Sets the permissions of an account (`conversation` None) or of one of its conversations.
+pub fn set_permissions(state: &UiState, account: &str, conversation: Option<String>, read: bool, write: &str) -> Result<(), String> {
+    known_account(state, account)?;
+    let write = permissions::Write::parse(write).map_err(text)?;
+    let conversation = conversation.map(|id| id.trim().to_owned());
+    if let Some(id) = &conversation
+        && (id.is_empty() || id.len() > MAX_CONVERSATION || id.chars().any(char::is_control))
+    {
+        return Err("podaj identyfikator rozmowy".into());
+    }
+    permissions::set(&state.accounts.store(), account, conversation.as_deref(), read, write).map_err(text)
+}
+
+/// Removes a conversation's own permissions; the account's apply to it again.
+pub fn clear_permission_override(state: &UiState, account: &str, conversation: &str) -> Result<(), String> {
+    permissions::clear_override(&state.accounts.store(), account, conversation).map_err(text)
+}
+
+/// A waiting action with everything its approval shows (spec 8.6), cleaned as the toasts clean it.
+#[derive(Clone, Debug, Serialize)]
+pub struct PreviewDto {
+    pub action: String,
+    /// `send`, `edit` or `react`.
+    pub kind: &'static str,
+    /// The account's name and id.
+    pub account: String,
+    pub conversation: String,
+    /// Every participant; none for a channel.
+    pub participants: Vec<String>,
+    /// The text to send, or an edit's new text.
+    pub text: Option<String>,
+    pub reaction: Option<String>,
+    /// The message replied to, edited or reacted to, as it is now.
+    pub target_text: Option<String>,
+}
+
+/// The actions waiting for approval, oldest first, in full: the window is where long content can
+/// be approved.
+pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
+    let clean = |text: &Option<String>| text.as_deref().map(approval::clean);
+    state
+        .pending
+        .waiting()
+        .iter()
+        .map(|preview| PreviewDto {
+            action: preview.action.clone(),
+            kind: preview.kind.name(),
+            account: approval::clean(&preview.account),
+            conversation: approval::clean(&preview.conversation_title),
+            participants: preview.participants.iter().map(|name| approval::clean(name)).collect(),
+            text: clean(&preview.text),
+            reaction: clean(&preview.reaction),
+            target_text: clean(&preview.target_text),
+        })
+        .collect()
+}
+
+/// The user's decision on one waiting action; an approved one runs before this returns. Returns
+/// the action's state: `done`, `rejected`, `expired`, `voided`, `uncertain` or `failed`.
+pub async fn decide(state: &UiState, action: &str, approve: bool) -> Result<String, String> {
+    Ok(state.pending.decide(action, approve).await.map_err(text)?.name().into())
 }
 
 #[derive(Clone, Debug, Serialize)]
