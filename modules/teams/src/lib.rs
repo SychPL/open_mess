@@ -8,6 +8,7 @@ pub mod authsvc;
 pub mod chat;
 pub mod http;
 pub mod manifest;
+pub mod poll;
 pub mod retry;
 pub mod search;
 pub mod session;

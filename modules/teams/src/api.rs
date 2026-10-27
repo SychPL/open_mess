@@ -12,8 +12,9 @@ use crate::ProtoError;
 use crate::authsvc;
 use crate::component::bindings::open_mess::module::host::{self, SessionState};
 use crate::component::bindings::open_mess::module::types::{AccountInfo, ModuleError};
-use crate::component::bindings::open_mess::module::{http, sign_in};
+use crate::component::bindings::open_mess::module::{http, sign_in, storage};
 use crate::http::HttpRequest;
+use crate::poll;
 use crate::retry::{self, GiveUpReason, Retry};
 use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, SEARCH_SCOPE, Session};
 
@@ -116,19 +117,31 @@ pub fn sign_in() -> Result<AccountInfo, ModuleError> {
     begin();
     let session = establish(token, claims)?;
     let info = AccountInfo { id: session.account.clone(), display_name: session.name.clone() };
-    SESSIONS.with(|s| s.borrow_mut().insert(session.account.clone(), session));
+    keep(session);
     Ok(info)
 }
 
 /// A session for `account` again, with tokens WAM gives without asking.
 pub fn restore(account: &str) -> Result<(), ModuleError> {
     let session = open(account)?;
-    SESSIONS.with(|s| s.borrow_mut().insert(session.account.clone(), session));
+    keep(session);
     Ok(())
 }
 
 pub fn sign_out(account: &str) {
     SESSIONS.with(|s| s.borrow_mut().remove(account));
+    storage::delete(&poll::key(account));
+}
+
+/// The accounts with a session in this instance.
+pub fn accounts() -> Vec<String> {
+    SESSIONS.with(|s| s.borrow().keys().cloned().collect())
+}
+
+/// Keeps a new session and starts polling for its messages (the timer is replaced if set).
+fn keep(session: Session) {
+    SESSIONS.with(|s| s.borrow_mut().insert(session.account.clone(), session));
+    host::set_timer(poll::TIMER, poll::INTERVAL_MS);
 }
 
 fn open(account: &str) -> Result<Session, ModuleError> {
@@ -161,7 +174,8 @@ pub fn with_session<T>(account: &str, f: impl FnOnce(&mut Session) -> Result<T, 
     let taken = SESSIONS.with(|s| s.borrow_mut().remove(account));
     let result = match taken {
         Some(session) => Ok(session),
-        None => open(account),
+        // A reloaded instance lost its timer with its memory: polling starts again.
+        None => open(account).inspect(|_| host::set_timer(poll::TIMER, poll::INTERVAL_MS)),
     }
     .and_then(|mut session| {
         let result = f(&mut session);

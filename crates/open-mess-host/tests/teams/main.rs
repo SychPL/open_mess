@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use fake::{AUTHZ_PATH, CHAT, CHAT_PATH, Fake, ME, ME_NAME, ME_OID, OTHER, Reply, Wam, WamCall, conversation, message, page};
 use open_mess_host::ip_policy::AddressPolicy;
-use open_mess_host::{AccountInfo, Engine, HostError, HostEvent, ModuleContext, ModuleError, ModuleHandle, Net, SessionState, limits};
+use open_mess_host::{AccountInfo, Engine, HostError, HostEvent, ModuleContext, ModuleError, ModuleHandle, Net, NewMessage, SessionState, limits};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -42,8 +42,21 @@ impl Teams {
     async fn start() -> Teams {
         let data = tempfile::tempdir().unwrap();
         let (fake, wam) = (Fake::start().await, Wam::new());
-        let (module, events) = load(&fake, &wam, data.path()).await;
+        let (module, events) = load(&fake, &wam, data.path(), None).await;
         Teams { module, events, fake, wam, _data: data }
+    }
+
+    /// Signed in, with the module's timers (its 60 s poll) firing within `POLL` instead.
+    async fn polling() -> Teams {
+        let data = tempfile::tempdir().unwrap();
+        let (fake, wam) = (Fake::start().await, Wam::new());
+        let (module, events) = load(&fake, &wam, data.path(), Some(POLL)).await;
+        module.sign_in().await.unwrap();
+        Teams { module, events, fake, wam, _data: data }
+    }
+
+    async fn next_message(&mut self) -> Option<NewMessage> {
+        next_message(&mut self.events).await
     }
 
     /// The module signed in as the test user.
@@ -64,8 +77,14 @@ fn conversations_page(items: Vec<Value>) -> impl Fn(&fake::Seen) -> Option<Reply
     move |s| (s.path == CHAT_PATH).then(|| Reply::json(page("conversations", items.clone(), None)))
 }
 
-async fn load(fake: &Fake, wam: &Wam, data_dir: &Path) -> (ModuleHandle, mpsc::Receiver<HostEvent>) {
-    let engine = Engine::with_limits(limits::for_tests()).unwrap().with_fake_wam(wam.hook());
+/// The longest a module timer waits in the polling tests, in milliseconds.
+const POLL: u32 = 300;
+
+async fn load(fake: &Fake, wam: &Wam, data_dir: &Path, timer_cap: Option<u32>) -> (ModuleHandle, mpsc::Receiver<HostEvent>) {
+    let mut engine = Engine::with_limits(limits::for_tests()).unwrap().with_fake_wam(wam.hook());
+    if let Some(cap) = timer_cap {
+        engine = engine.with_timer_cap(cap);
+    }
     let net = Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests()).serving_hosts_from(fake.addr);
     let (events, receiver) = mpsc::channel(64);
     let module = engine.load(&common::wasm("open_mess_teams"), ModuleContext { data_dir: data_dir.to_path_buf(), events, net }).await.unwrap();
@@ -719,4 +738,112 @@ async fn one_to_one_id_checks_both_orders() {
     let none = teams.call("send", json!({"conversation": "8:orgid:00000000-0000-0000-0000-000000000004", "text": "hi"})).await;
     assert!(matches!(module_error(none), ModuleError::Platform(_)));
     assert_eq!(writes(&teams.fake).len(), 1);
+}
+
+// Task 5: polling events.
+
+fn now_ms() -> i64 {
+    i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap()
+}
+
+/// The next message event, if one comes within a few polls.
+async fn next_message(events: &mut mpsc::Receiver<HostEvent>) -> Option<NewMessage> {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(POLL) * 6);
+    loop {
+        match tokio::time::timeout_at(deadline.into(), events.recv()).await {
+            Ok(Some(HostEvent::MessageArrived(message))) => return Some(message),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn new_message_emits_an_event() {
+    let mut teams = Teams::polling().await;
+    let started = now_ms();
+    let last = message("1900000000001", GROUP, OTHER, "<p>new</p>", started + 1000);
+    teams.fake.on(conversations_page(vec![conversation(GROUP, Some("Synthetic group"), Some(last))]));
+    let event = teams.next_message().await.unwrap();
+    let expected = NewMessage {
+        module: "teams".to_string(),
+        account: ME_OID.to_string(),
+        conversation: GROUP.to_string(),
+        message: "1900000000001".to_string(),
+        sender: OTHER.to_string(),
+        own: false,
+        mentions_me: false,
+        direct: false,
+    };
+    assert_eq!(event, expected);
+    // Once only, and polling only reads: the list of conversations updated lately.
+    assert_eq!(teams.next_message().await, None);
+    let polls = teams.fake.requests(CHAT_PATH);
+    for poll in &polls {
+        let start: i64 = poll.query.split("startTime=").nth(1).unwrap().split('&').next().unwrap().parse().unwrap();
+        assert!(start > started - 10 * 60_000 && start < started + 60_000, "{}", poll.query);
+    }
+    assert!(teams.fake.seen().iter().all(|s| s.method == "GET" || s.path == AUTHZ_PATH));
+}
+
+#[tokio::test]
+async fn own_messages_are_flagged() {
+    let mut teams = Teams::polling().await;
+    let mine = message("1900000000002", GROUP, ME, "<p>mine</p>", now_ms() + 1000);
+    teams.fake.on(conversations_page(vec![conversation(GROUP, None, Some(mine))]));
+    let event = teams.next_message().await.unwrap();
+    assert_eq!((event.message.as_str(), event.sender.as_str(), event.own), ("1900000000002", ME, true));
+    assert_eq!(teams.next_message().await, None);
+}
+
+#[tokio::test]
+async fn mentions_and_direct_are_set() {
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let direct = message("1900000000003", DIRECT, OTHER, "<p>hi</p>", at);
+    let mention = mentioning(message("1900000000004", GROUP, OTHER, "<p>hey One</p>", at), ME);
+    teams.fake.on(conversations_page(vec![conversation(DIRECT, None, Some(direct)), conversation(GROUP, None, Some(mention))]));
+    let mut events = [teams.next_message().await.unwrap(), teams.next_message().await.unwrap()];
+    events.sort_by(|a, b| a.message.cmp(&b.message));
+    let flags: Vec<_> = events.iter().map(|e| (e.conversation.as_str(), e.direct, e.mentions_me, e.own)).collect();
+    assert_eq!(flags, [(DIRECT, true, false, false), (GROUP, false, true, false)]);
+}
+
+#[tokio::test]
+async fn restart_does_not_replay_old_messages() {
+    let data = tempfile::tempdir().unwrap();
+    let (fake, wam) = (Fake::start().await, Wam::new());
+    let old = conversation(GROUP, None, Some(message("1900000000005", GROUP, OTHER, "<p>old</p>", now_ms() + 1000)));
+    let listed = Arc::new(std::sync::Mutex::new(vec![old]));
+    let list = listed.clone();
+    fake.on(move |s| (s.path == CHAT_PATH).then(|| Reply::json(page("conversations", list.lock().unwrap().clone(), None))));
+    {
+        let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL)).await;
+        module.sign_in().await.unwrap();
+        assert_eq!(next_message(&mut events).await.map(|m| m.message).as_deref(), Some("1900000000005"));
+    }
+    // A new instance, as after a crash or a daemon restart: the same storage, nothing in memory.
+    let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL)).await;
+    module.restore(ME_OID).await.unwrap();
+    assert_eq!(next_message(&mut events).await, None);
+    let new = conversation(GROUP, None, Some(message("1900000000006", GROUP, OTHER, "<p>new</p>", now_ms() + 1000)));
+    *listed.lock().unwrap() = vec![new];
+    assert_eq!(next_message(&mut events).await.map(|m| m.message).as_deref(), Some("1900000000006"));
+}
+
+#[tokio::test]
+async fn sign_out_stops_polling() {
+    let teams = Teams::polling().await;
+    teams.fake.on(conversations_page(Vec::new()));
+    for _ in 0..20 {
+        if !teams.fake.requests(CHAT_PATH).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!teams.fake.requests(CHAT_PATH).is_empty(), "the module polls once signed in");
+    teams.module.sign_out(ME_OID).await.unwrap();
+    let polled = teams.fake.requests(CHAT_PATH).len();
+    tokio::time::sleep(Duration::from_millis(u64::from(POLL) * 4)).await;
+    assert_eq!(teams.fake.requests(CHAT_PATH).len(), polled);
 }

@@ -8,9 +8,10 @@ use serde_json::{Value, json};
 
 use crate::api::{self, Service};
 use crate::chat::{self, Conversation, ConversationKind, Message};
-use crate::component::bindings::open_mess::module::host;
 use crate::component::bindings::open_mess::module::types::{Attachment, ModuleError, Participant, Target};
+use crate::component::bindings::open_mess::module::{host, storage};
 use crate::http::HttpRequest;
+use crate::poll::PollState;
 use crate::session::Session;
 use crate::text::{html_to_markdown, markdown_to_html};
 use crate::unread::{self, UnreadState};
@@ -427,5 +428,40 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
             }
         };
         Ok(Target { conversation_title, participants, target_text })
+    })
+}
+
+/// One poll of an account (`poll`): the conversations updated lately, one `message-arrived` for
+/// each new last message. Reads only.
+pub fn poll(account: &str) -> Result<(), ModuleError> {
+    api::with_session(account, |session| {
+        let key = crate::poll::key(account);
+        let started = api::now_ms();
+        let mut state = storage::get(&key).and_then(|bytes| PollState::decode(&bytes)).unwrap_or_else(|| PollState::new(started));
+        let me = session.me();
+        let mut arrivals = Vec::new();
+        conversations(session, state.start_ms(), |c| {
+            arrivals.extend(state.arrival(&c, &me));
+            true
+        })?;
+        state.finish(started);
+        // Stored before they are reported, so a crash in between loses them rather than
+        // reporting them twice.
+        if storage::set(&key, &state.encode()).is_err() {
+            host::log(1, "the poll state was not stored; messages may be reported again");
+        }
+        for a in arrivals {
+            let message = host::NewMessage {
+                account: account.to_string(),
+                conversation: a.conversation,
+                message: a.message,
+                sender: a.sender,
+                own: a.own,
+                mentions_me: a.mentions_me,
+                direct: a.direct,
+            };
+            host::message_arrived(&message);
+        }
+        Ok(())
     })
 }

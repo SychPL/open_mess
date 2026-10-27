@@ -11,7 +11,7 @@ pub(crate) mod bindings {
 }
 
 use bindings::exports::open_mess::module::{events, module};
-use bindings::open_mess::module::types;
+use bindings::open_mess::module::{host, types};
 
 use crate::api;
 
@@ -70,5 +70,19 @@ impl events::Guest for Teams {
 
     fn on_ws_closed(_conn: u32, _reason: String) {}
 
-    fn on_timer(_id: u32) {}
+    /// The poll (`poll`): every signed-in account, then the timer again.
+    fn on_timer(id: u32) {
+        if id != crate::poll::TIMER {
+            return;
+        }
+        api::begin();
+        for account in api::accounts() {
+            if crate::tools::poll(&account).is_err() {
+                host::log(1, "polling an account for new messages failed");
+            }
+        }
+        if !api::accounts().is_empty() {
+            host::set_timer(crate::poll::TIMER, crate::poll::INTERVAL_MS);
+        }
+    }
 }

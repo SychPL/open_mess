@@ -158,6 +158,8 @@ impl host::Host for HostState {
     }
 
     async fn set_timer(&mut self, id: u32, after_ms: u32) {
+        #[cfg(any(test, feature = "test-support"))]
+        let after_ms = self.env.timer_cap.map_or(after_ms, |cap| after_ms.min(cap));
         if !self.timers.set(id, after_ms, &self.guest_events) {
             tracing::warn!(module = %self.env.name, "timer not set: {} timers are pending", limits::MAX_TIMERS);
         }
