@@ -141,9 +141,14 @@ impl Deadline {
         state.at.map(|_| state.limit.map_or(poll, |limit| limit.min(poll)))
     }
 
-    /// Time left in the call in progress; `None` outside a call.
+    /// Time left in the call in progress; `None` outside a call. While the clock is paused (a
+    /// sign-in code on screen, which the module polls for) it is what was left when it stopped,
+    /// and no more than the time to the pause's limit.
     pub(crate) fn remaining(&self) -> Option<Duration> {
-        self.state().at.map(|at| at.saturating_duration_since(Instant::now()))
+        let (state, now) = (self.state(), Instant::now());
+        let at = state.at?;
+        let left = at.saturating_duration_since(state.paused_since.unwrap_or(now));
+        Some(state.limit.map_or(left, |limit| left.min(limit.saturating_duration_since(now))))
     }
 
     pub(crate) fn expired(&self) -> bool {
@@ -455,6 +460,21 @@ mod tests {
         assert!(!deadline.expired());
         std::thread::sleep(Duration::from_millis(80));
         assert!(deadline.expired());
+    }
+
+    #[test]
+    fn remaining_time_stands_still_while_paused() {
+        let deadline = Deadline::default();
+        deadline.set(Some(Instant::now() + Duration::from_millis(500)));
+        deadline.pause_until(Instant::now() + Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(600));
+        // Past the call's own end in wall time, but its clock stopped with about 500 ms left.
+        let left = deadline.remaining().unwrap();
+        assert!(left > Duration::from_millis(400) && left <= Duration::from_millis(500), "{left:?}");
+        // Never past the pause's limit.
+        deadline.set(Some(Instant::now() + Duration::from_secs(30)));
+        deadline.pause_until(Instant::now() + Duration::from_millis(200));
+        assert!(deadline.remaining().unwrap() <= Duration::from_millis(200));
     }
 
     #[test]

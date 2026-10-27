@@ -123,16 +123,19 @@ async function renderAccounts() {
     if (!signingIn && account.state !== "removing" && modules.some((module) => module.name === account.module)) {
       card.append(button("Zaloguj ponownie", () => signIn(account.module, account.id)));
     }
-    card.append(
-      button("Usuń", async () => {
-        const sure = confirm(
-          "Usunąć konto " + account.display_name + "?\n\nZnikną jego sekrety, uprawnienia, akcje czekające na zatwierdzenie i pobrane załączniki.",
-        );
-        if (!sure) return;
-        await call("remove_account", { id: account.id });
-        await renderAccounts();
-      }, "danger"),
-    );
+    // Not while a sign-in runs: it might be signing in this very account.
+    if (!signingIn) {
+      card.append(
+        button("Usuń", async () => {
+          const sure = confirm(
+            "Usunąć konto " + account.display_name + "?\n\nZnikną jego sekrety, uprawnienia, akcje czekające na zatwierdzenie i pobrane załączniki.",
+          );
+          if (!sure) return;
+          await call("remove_account", { id: account.id });
+          await renderAccounts();
+        }, "danger"),
+      );
+    }
     root.append(card);
   }
 }

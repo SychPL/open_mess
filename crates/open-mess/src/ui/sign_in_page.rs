@@ -165,7 +165,11 @@ mod window {
             .on_navigation(on_navigation)
             // The title always names the host of the page shown.
             .on_page_load(move |window, payload| {
-                let _ = window.set_title(&title(payload.url()));
+                // A navigation stopped by the policy loads no page of a host (about:blank, say):
+                // the title keeps the last host.
+                if payload.url().host_str().is_some() {
+                    let _ = window.set_title(&title(payload.url()));
+                }
             })
             // No pop-ups and no downloads: they would escape the navigation policy.
             .on_new_window(|_, _| NewWindowResponse::Deny)

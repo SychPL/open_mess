@@ -181,6 +181,12 @@ impl SignIns {
     /// The user's answer to prompt or question `id`. A prompt goes off the screen, and a cancel
     /// cancels the rest of the sign-in too; a question is answered yes by anything but a cancel.
     pub fn answer(&self, id: u64, reply: SignInReply) -> Result<(), String> {
+        self.end_prompt(id, reply, false)
+    }
+
+    /// Answers prompt `id`; `end` (or a cancel) also ends the rest of the sign-in, in the same step,
+    /// so no prompt of the module slips in between.
+    fn end_prompt(&self, id: u64, reply: SignInReply, end: bool) -> Result<(), String> {
         let shown = {
             let mut state = self.state();
             if let Some(question) = state.question.take_if(|question| question.id == id) {
@@ -192,7 +198,7 @@ impl SignIns {
             if state.shown.as_ref().is_none_or(|shown| shown.id != id) {
                 return Err(GONE.into());
             }
-            state.cancelled |= reply == SignInReply::Cancelled;
+            state.cancelled |= end || reply == SignInReply::Cancelled;
             match state.take_shown() {
                 Some(shown) => shown,
                 None => return Err(GONE.into()),
@@ -207,9 +213,7 @@ impl SignIns {
     /// and the rest of the sign-in with it (spec 8.3, R10). A refusal for a technical reason is an
     /// ordinary [`SignIns::answer`], after which the module may try another way.
     pub fn refuse(&self, id: u64, why: String) -> Result<(), String> {
-        self.answer(id, SignInReply::Refused(why))?;
-        self.state().cancelled = true;
-        Ok(())
+        self.end_prompt(id, SignInReply::Refused(why), true)
     }
 
     /// The sign-in window of prompt `page` closed: if the prompt still waits, the user cancelled.

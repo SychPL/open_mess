@@ -129,27 +129,42 @@ impl Accounts {
             None => None,
         };
         let info = handle.sign_in().await.map_err(|err| Error::Account(format!("logowanie nie powiodło się: {err}")))?;
-        if let Some(expected) = expected
-            && info.id != expected.module_account
-        {
-            // The module may have kept secrets for the account it signed in; they go unless it
-            // is an account open_mess has.
-            if self.get(&format!("{module}:{}", info.id))?.is_none() {
+        // The sign-in took a while: the module may have been turned off or replaced meanwhile, and
+        // the account signed in again may have been removed.
+        let refusal = if !self.modules.handle(module).is_some_and(|current| current.same(&handle)) {
+            Some(format!("moduł {module} wyłączono albo podmieniono w trakcie logowania"))
+        } else if let Some(expected) = &expected {
+            match self.get(&expected.id)? {
+                Some(account) if account.state != REMOVING => (info.id != expected.module_account).then(|| OTHER_ACCOUNT.to_owned()),
+                _ => Some(format!("konto {} usunięto w trakcie logowania", expected.id)),
+            }
+        } else {
+            None
+        };
+        let Some(refusal) = refusal else { return self.add(module, info) };
+        match self.get(&format!("{module}:{}", info.id))? {
+            // Another account open_mess has: the module now holds its session, so it is online.
+            Some(other) if other.state != REMOVING && refusal == OTHER_ACCOUNT => {
+                self.add(module, info)?;
+                return Err(Error::Account(format!("{OTHER_ACCOUNT} (zalogowano ponownie konto {})", other.id)));
+            }
+            Some(_) => {}
+            // One open_mess does not have: its session and the secrets the module kept go.
+            None => {
                 let _ = handle.sign_out(&info.id).await;
                 let (credentials, data_dir, module, account) = (Arc::clone(&self.credentials), self.data_dir.clone(), module.to_owned(), info.id);
                 let deleted =
                     tokio::task::spawn_blocking(move || open_mess_host::delete_account_secrets(&*credentials, &data_dir, &module, &account))
                         .await
                         .unwrap_or_else(|err| Err(err.to_string()));
-                // Said, so the user knows something of the other account stayed in Credential
-                // Manager (under open_mess/module/<module>).
+                // Said, so the user knows something of that account stayed in Credential Manager
+                // (under open_mess/module/<module>).
                 if let Err(why) = deleted {
-                    return Err(Error::Account(format!("{OTHER_ACCOUNT} (sekretów tamtego konta nie udało się usunąć: {why})")));
+                    return Err(Error::Account(format!("{refusal} (sekretów tamtego konta nie udało się usunąć: {why})")));
                 }
             }
-            return Err(Error::Account(OTHER_ACCOUNT.into()));
         }
-        self.add(module, info)
+        Err(Error::Account(refusal))
     }
 
     /// Records what a module reported about one of its accounts. Unknown accounts and accounts

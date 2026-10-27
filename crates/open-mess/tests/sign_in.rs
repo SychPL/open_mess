@@ -344,6 +344,57 @@ async fn re_sign_in_must_match_the_account() {
     assert_eq!(listed(&state), [("test-echo:b".to_string(), "online".to_string())]);
 }
 
+/// Starts signing in through test-echo's page and waits for the page; `finish` answers it.
+async fn page_open(state: &Arc<UiState>, again: Option<&str>) -> (JoinHandle<Result<AccountDto, String>>, u64) {
+    let signing_in = {
+        let (state, again) = (Arc::clone(state), again.map(str::to_owned));
+        tokio::spawn(async move { commands::sign_in_start(&state, "test-echo", again.as_deref()).await })
+    };
+    (signing_in, prompt(state, "page").await.id)
+}
+
+fn finish(state: &UiState, page: u64, account: &str) {
+    let redirect = format!("https://login.example.com/done?account={account}");
+    state.sign_ins.answer(page, SignInReply::Done(Some(redirect))).unwrap();
+}
+
+#[tokio::test]
+async fn what_changed_during_a_sign_in_is_respected() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    // The module is turned off while its sign-in runs: nothing is added under it.
+    let (signing_in, page) = page_open(&state, None).await;
+    commands::set_module_enabled(&state, "test-echo", false).await.unwrap();
+    finish(&state, page, "a");
+    assert!(signing_in.await.unwrap().unwrap_err().contains("wyłączono"));
+    assert!(listed(&state).is_empty());
+    commands::set_module_enabled(&state, "test-echo", true).await.unwrap();
+
+    // The account signed in again is removed meanwhile: it does not come back.
+    sign_in_as(&state, None, "a").await.unwrap();
+    let (signing_in, page) = page_open(&state, Some("test-echo:a")).await;
+    // The removal signs the account out after the module's sign-in call, so it waits for it.
+    let removing = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move { commands::remove_account(&state, "test-echo:a").await })
+    };
+    while d.accounts.get("test-echo:a").unwrap().is_some_and(|account| account.state != open_mess::accounts::REMOVING) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    finish(&state, page, "a");
+    assert!(signing_in.await.unwrap().unwrap_err().contains("usunięto"));
+    removing.await.unwrap().unwrap();
+    assert!(listed(&state).is_empty());
+
+    // Signed in again as another account open_mess has: refused, but that one is online now.
+    sign_in_as(&state, None, "a").await.unwrap();
+    sign_in_as(&state, None, "b").await.unwrap();
+    d.accounts.set_state("test-echo", "b", SessionState::AuthRequired).unwrap();
+    let refused = sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err();
+    assert!(refused.starts_with(OTHER_ACCOUNT), "{refused}");
+    assert_eq!(listed(&state), [("test-echo:a".to_string(), "online".to_string()), ("test-echo:b".to_string(), "online".to_string())]);
+}
+
 #[tokio::test]
 async fn failed_sign_in_adds_nothing() {
     let d = daemon(&[ECHO]).await;
