@@ -16,10 +16,11 @@ sed "s#@SPEC@#$spec#g" "$root/scripts/review/prompts/spec.md" > "$prompt"
 
 win() { cygpath -w "$1"; }
 
+# REVIEW_TIMEOUT (seconds, default 480) is each reviewer attempt's limit; raise it for a long spec.
 # Plain background jobs of this shell: GLM through opencode hangs when started from a detached pwsh.
 review() {
   pwsh -NoProfile -File "$root/scripts/review/run-reviewer.ps1" -Reviewer "$1" -PromptFile "$(win "$prompt")" \
-    -OutFile "$(win "$dir/$slug-$1-r$round.txt")" -RepoDir "$(win "$root")"
+    -OutFile "$(win "$dir/$slug-$1-r$round.txt")" -RepoDir "$(win "$root")" -TimeoutSec "${REVIEW_TIMEOUT:-480}"
 }
 review codex & codex_pid=$!
 review glm & glm_pid=$!
