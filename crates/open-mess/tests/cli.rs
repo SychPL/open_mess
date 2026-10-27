@@ -225,6 +225,20 @@ fn cli_without_daemon_shows_the_last_start_error() {
 }
 
 #[test]
+fn apply_update_is_hidden_and_does_nothing_without_a_stage_file() {
+    let dir = data_dir();
+    let output = om(dir.path(), free_port(), TOKEN, &["apply-update", "--data-dir", dir.path().to_str().unwrap()]);
+    if cfg!(windows) {
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(!dir.path().join("last-update.txt").exists());
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    }
+    let help = om(dir.path(), free_port(), TOKEN, &["--help"]);
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("apply-update"));
+}
+
+#[test]
 fn cli_takes_only_a_held_lock_as_a_running_daemon() {
     let dir = data_dir();
     std::fs::write(dir.path().join("last-start-error.txt"), "port 7341 is already in use\n").unwrap();

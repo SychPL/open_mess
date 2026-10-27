@@ -1,22 +1,47 @@
 //! The Windows side of an update (spec 2026-10-27-self-update, 7): the scheduled task
-//! `open_mess-update` that runs the helper. Its own task gives the helper its own job object, so it
-//! outlives the daemon and can start the daemon's task `open_mess` again. Tests never come here;
-//! they use fakes.
+//! `open_mess-update` that runs the helper, and what the helper does to the daemon: stop it, start
+//! it and ask how it is. Its own task gives the helper its own job object, so it outlives the
+//! daemon and can start the daemon's task `open_mess` again. Tests never come here; they use fakes.
 
 use std::ffi::OsStr;
 use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
 
 use super::UpdateError;
+use super::apply::{Health, Judgement, System, judge};
 use super::quiesce::Launcher;
+use crate::instance::InstanceLock;
 use crate::triggers::spawn::CREATE_NO_WINDOW;
+use crate::{cli, secrets, store};
 
 /// The helper's scheduled task.
 pub const TASK: &str = "open_mess-update";
+/// The daemon's scheduled task (`scripts/install.ps1`).
+const DAEMON_TASK: &str = "open_mess";
+/// How often the new daemon is asked for its `status`.
+const POLL: Duration = Duration::from_secs(1);
+/// One `status` answer; the daemon gives it at once.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// What the new daemon gets to come up, its account restore aside (spec 7.2).
+const READY_WITHIN: Duration = Duration::from_secs(60);
+/// The account restore's own limit, from the start of the check: fixed, since the modules' timers
+/// run between the accounts (spec 7.2).
+const ACCOUNTS_WITHIN: Duration = Duration::from_secs(10 * 60);
+/// Ends what `schtasks /End` leaves: every `om.exe` of this user whose command line says `daemon`,
+/// from any folder, with the filter of `scripts/install.ps1` (`Stop-Daemon`). Fixed text: nothing
+/// from outside goes into it, and no double quote that the command line would have to escape.
+const STOP_DAEMONS: &str = r"Get-CimInstance Win32_Process -Filter 'Name=''om.exe''' | Where-Object { $_.CommandLine -match '\bdaemon\b' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
 
-/// Task Scheduler for real.
-pub struct WindowsSystem;
+/// Task Scheduler and the daemon for real.
+pub struct WindowsSystem {
+    /// The daemon's data folder, for its instance lock, port and `status`: the helper's
+    /// `--data-dir`. The launcher gets its own.
+    pub data: PathBuf,
+}
 
 impl Launcher for WindowsSystem {
     /// Registers the task again, with this helper and data folder, and runs it.
@@ -35,16 +60,99 @@ impl Launcher for WindowsSystem {
     }
 }
 
+impl System for WindowsSystem {
+    fn wait_daemon_lock_free(&self, wait: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            // Taken for an instant and let go; a daemon starting meanwhile retries (daemon.rs).
+            if InstanceLock::acquire(&self.data).is_ok() {
+                return true;
+            }
+            if started.elapsed() >= wait {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn stop_daemon(&self) -> Result<(), UpdateError> {
+        // Fails when the task does not run; its processes are looked for all the same.
+        let _ = schtasks(&[OsStr::new("/End"), OsStr::new("/TN"), OsStr::new(DAEMON_TASK)]);
+        let powershell = system32().join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+        hidden(&powershell, &["-NoProfile", "-NonInteractive", "-Command", STOP_DAEMONS].map(OsStr::new))
+    }
+
+    fn start_daemon(&self) -> Result<(), UpdateError> {
+        schtasks(&[OsStr::new("/Run"), OsStr::new("/TN"), OsStr::new(DAEMON_TASK)])
+    }
+
+    fn health(&self, active_modules: &[String]) -> Health {
+        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime.block_on(self.watch(active_modules)),
+            Err(err) => Health::Failed(format!("cannot ask the new daemon: {err}")),
+        }
+    }
+}
+
+impl WindowsSystem {
+    /// Asks the new daemon for its `status` every second until [`judge`] decides or a limit passes.
+    async fn watch(&self, active_modules: &[String]) -> Health {
+        let started = Instant::now();
+        loop {
+            let (limit, why) = match self.status().await {
+                Ok(status) => match judge(&status, active_modules) {
+                    Judgement::Healthy => return Health::Healthy,
+                    Judgement::Failed(why) => return Health::Failed(why),
+                    Judgement::Pending { accounts_only: true } => (ACCOUNTS_WITHIN, "the accounts were not restored within 10 minutes".to_owned()),
+                    Judgement::Pending { accounts_only: false } => (READY_WITHIN, "the window or a module was not ready within 60 s".to_owned()),
+                },
+                Err(err) => (READY_WITHIN, format!("the new daemon did not answer within 60 s: {err}")),
+            };
+            if started.elapsed() >= limit {
+                return Health::Failed(why);
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    /// The daemon's `status` over its local API, asked as the CLI asks it.
+    async fn status(&self) -> Result<Value, String> {
+        let port = store::read_port(&self.data.join("state.sqlite3")).map_err(|err| err.to_string())?;
+        let token = secrets::stored_local_api_token().map_err(|err| err.to_string())?.ok_or_else(|| "no local API token".to_owned())?;
+        let response = cli::local_client()
+            .map_err(|err| err.to_string())?
+            .post(format!("http://127.0.0.1:{port}/api/call/status"))
+            .bearer_auth(token)
+            .json(&json!({}))
+            .timeout(STATUS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        response.json().await.map_err(|err| err.to_string())
+    }
+}
+
+fn system32() -> PathBuf {
+    std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join("System32")
+}
+
 fn schtasks(args: &[&OsStr]) -> Result<(), UpdateError> {
-    let system = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let status = Command::new(system.join("System32").join("schtasks.exe"))
+    hidden(&system32().join("schtasks.exe"), args)
+}
+
+/// Runs a program without a window and waits for it.
+fn hidden(program: &Path, args: &[&OsStr]) -> Result<(), UpdateError> {
+    let status = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .status()?;
-    if status.success() { Ok(()) } else { Err(UpdateError::Io(std::io::Error::other(format!("schtasks failed: {status}")))) }
+    if status.success() { Ok(()) } else { Err(UpdateError::Io(std::io::Error::other(format!("{} failed: {status}", program.display())))) }
 }
 
 /// The task, Task Scheduler schema 1.2: the helper hidden behind `conhost --headless` (as

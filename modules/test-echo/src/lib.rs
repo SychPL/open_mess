@@ -51,6 +51,8 @@ mod guest {
     /// The manifest's hosts, padded so the core's tests can add one by patching the built file
     /// (a rebuild with another manifest under the same name).
     const HOSTS: &str = "localhost                               ";
+    /// The manifest's version, padded the same way so the update tests can change only the version.
+    const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "                ");
     /// The Windows account identity: the Teams desktop client id and the chat service's scope
     /// (docs/protocols/teams.md, "Live results" item 1), for the manual check of WAM.
     const TEAMS_CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
@@ -224,7 +226,7 @@ mod guest {
             host::session("a", host::SessionState::Online);
             types::Manifest {
                 name: "test-echo".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: std::hint::black_box(VERSION).trim_end().to_string(),
                 platform: "test".to_string(),
                 // black_box: the padded string stays in the file as written.
                 hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),

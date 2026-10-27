@@ -60,8 +60,9 @@ impl Store {
         Ok(Store { conn })
     }
 
-    /// The connection, for the modules and accounts tables.
-    pub(crate) fn conn(&self) -> &Connection {
+    /// The connection, for the modules and accounts tables, and for what takes a plain connection
+    /// (update/consent.rs, the module approvals).
+    pub fn conn(&self) -> &Connection {
         &self.conn
     }
 

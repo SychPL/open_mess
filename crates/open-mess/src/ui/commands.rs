@@ -286,8 +286,8 @@ pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, mani
     }
     {
         let store = state.accounts.store();
-        modules::approve(&store, name, file_sha256, manifest_sha256).map_err(text)?;
-        modules::remember_approved(&store, &manifest).map_err(text)?;
+        modules::approve(store.conn(), name, file_sha256, manifest_sha256).map_err(text)?;
+        modules::remember_approved(store.conn(), &manifest).map_err(text)?;
     }
     rescan(state, Some(name)).await
 }

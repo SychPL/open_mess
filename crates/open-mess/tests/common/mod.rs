@@ -36,13 +36,22 @@ pub fn echo() -> Vec<u8> {
 
 /// test-echo rebuilt with one more host in its manifest: its padded host list is patched.
 pub fn echo_with_another_host() -> Vec<u8> {
-    let bytes = echo();
-    let (from, to) = (format!("{:40}", "localhost"), format!("{:40}", "localhost extra.example.com"));
+    patch(echo(), &format!("{:40}", "localhost"), "localhost extra.example.com")
+}
+
+/// test-echo rebuilt with another version in its manifest and nothing else changed: its padded
+/// version is patched.
+pub fn echo_with_version(version: &str) -> Vec<u8> {
+    patch(echo(), &format!("{}{:16}", env!("CARGO_PKG_VERSION"), ""), version)
+}
+
+/// Replaces the padded string `from`, which must occur once, with `to` padded to the same length.
+fn patch(mut bytes: Vec<u8>, from: &str, to: &str) -> Vec<u8> {
+    assert!(to.len() <= from.len(), "{to:?} is longer than the padded {from:?}");
     let at: Vec<usize> = bytes.windows(from.len()).enumerate().filter(|(_, window)| *window == from.as_bytes()).map(|(at, _)| at).collect();
-    assert_eq!(at.len(), 1, "the host list must occur once in test-echo");
-    let mut patched = bytes;
-    patched.splice(at[0]..at[0] + to.len(), to.bytes());
-    patched
+    assert_eq!(at.len(), 1, "{from:?} must occur once in test-echo");
+    bytes.splice(at[0]..at[0] + from.len(), format!("{to:width$}", width = from.len()).bytes());
+    bytes
 }
 
 /// test-echo rebuilt with the same manifest: a custom section appended changes only the file.
@@ -90,7 +99,7 @@ pub async fn scan(store: &Store, engine: &Engine, data_dir: &Path) -> Modules {
 /// Approves every module file the scan found, as the user would in the window.
 pub fn approve_all(store: &Store, modules: &Modules) {
     for info in modules.list() {
-        modules::approve(store, &info.name, &info.file_sha256, &info.manifest_sha256).unwrap();
+        modules::approve(store.conn(), &info.name, &info.file_sha256, &info.manifest_sha256).unwrap();
     }
 }
 

@@ -1,5 +1,6 @@
 //! Self-update: signed release manifests, downloads and installation (spec 2026-10-27-self-update).
 
+pub mod apply;
 pub mod consent;
 pub mod fetch;
 pub mod quiesce;

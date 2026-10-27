@@ -5,6 +5,9 @@
 //! The CLI asks the running daemon which tools exist, so the CLI and MCP always offer the same tools.
 
 use std::io::Write as _;
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +21,8 @@ use crate::daemon::{self, LAST_START_ERROR_FILE};
 use crate::instance::InstanceLock;
 use crate::store::{self, DEFAULT_PORT};
 use crate::tools::ToolInfo;
+#[cfg(windows)]
+use crate::update::{apply, release::RELEASE_KEY, state::Paths, system::WindowsSystem};
 use crate::{Error, paths, secrets};
 
 #[derive(Debug, Parser)]
@@ -38,6 +43,13 @@ enum Action {
     McpStdio,
     /// Open the configuration window of the running daemon (Windows).
     Config,
+    /// The update helper, run as `om.update.exe` by the scheduled task `open_mess-update`: installs
+    /// the update the user accepted, or finishes an interrupted one. Without either it does nothing.
+    #[command(hide = true)]
+    ApplyUpdate {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// A tool: om <tool> [--<param> <value>]... [--json-args '<json>'] [--json]
     #[command(external_subcommand)]
     Tool(Vec<String>),
@@ -101,6 +113,7 @@ pub fn run() -> ExitCode {
         Action::McpCommand => mcp_command(),
         Action::McpStdio => mcp_stdio(),
         Action::Config => open_config(),
+        Action::ApplyUpdate { data_dir } => apply_update(data_dir),
         Action::Tool(args) => run_tool(&args),
     };
     match result {
@@ -122,6 +135,22 @@ fn mcp_command() -> Result<(), Failure> {
 /// configuration window shows it.
 pub fn mcp_add_command(port: u16, token: &str) -> String {
     format!("claude mcp add --transport http --scope user open_mess http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\"")
+}
+
+/// `om.update.exe apply-update` (update/apply.rs): `%LOCALAPPDATA%\open_mess` is the folder above
+/// the helper's own `bin`. Its result goes to `last-update.txt`; the exit code is always 0.
+#[cfg(windows)]
+fn apply_update(data: PathBuf) -> Result<(), Failure> {
+    let exe = std::env::current_exe().map_err(|err| failed(err.to_string()))?;
+    let local = exe.parent().and_then(Path::parent).ok_or_else(|| failed(format!("{} is not in a bin folder", exe.display())))?;
+    let paths = Paths { data: data.clone(), local: local.to_path_buf() };
+    apply::run(&paths, &WindowsSystem { data }, RELEASE_KEY, crate::pending::now_ms);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_update(_data: PathBuf) -> Result<(), Failure> {
+    Err(failed("updates install only on Windows"))
 }
 
 /// `om mcp-stdio` (bridge.rs): runs until Claude Code closes the session.
@@ -263,6 +292,11 @@ fn block_on<T>(future: impl std::future::Future<Output = Result<T, Failure>>) ->
 }
 
 fn client() -> Result<reqwest::Client, Failure> {
+    local_client().map_err(|err| failed(err.to_string()))
+}
+
+/// A client for the daemon's local API; the update helper asks `status` with it too.
+pub(crate) fn local_client() -> reqwest::Result<reqwest::Client> {
     // reqwest is built without a TLS crypto provider (see Cargo.toml); install ring once.
     // Err only means one is already installed.
     rustls::crypto::ring::default_provider().install_default().ok();
@@ -272,7 +306,6 @@ fn client() -> Result<reqwest::Client, Failure> {
         .connect_timeout(Duration::from_secs(5))
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .map_err(|err| failed(err.to_string()))
 }
 
 async fn call(port: u16, token: &str, tool: &str, args: Value, from_flags: bool) -> Result<Value, Failure> {

@@ -471,7 +471,7 @@ pub(crate) fn time(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
