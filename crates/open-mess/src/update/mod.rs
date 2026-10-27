@@ -1,5 +1,6 @@
 //! Self-update: signed release manifests, downloads and installation (spec 2026-10-27-self-update).
 
+pub mod fetch;
 pub mod release;
 
 /// Everything that can go wrong while checking for, downloading or installing an update.

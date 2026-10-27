@@ -116,6 +116,10 @@ pub fn verify(manifest: &[u8], signature: &str, public_key: &str) -> Result<Mani
         }
         total = total.saturating_add(file.size);
     }
+    // A later step copies the release `om.exe` to start the installer helper.
+    if !parsed.files.iter().any(|file| file.name == "om.exe") {
+        return Err(UpdateError::Rejected("release has no om.exe".into()));
+    }
     if total > MAX_TOTAL_SIZE {
         return Err(UpdateError::Rejected("release is larger than 256 MiB".into()));
     }
@@ -188,11 +192,17 @@ mod tests {
             assert!(matches!(result, Err(UpdateError::Rejected(_))), "{bad} accepted");
         }
         for good in ["teams.wasm", "test-x9.wasm"] {
-            check(&manifest_json(&[(good, "module", 1)])).expect(good);
+            check(&manifest_json(&[("om.exe", "exe", 1), (good, "module", 1)])).expect(good);
         }
         // `om.exe` must be the exe and the exe must be `om.exe`.
         assert!(check(&manifest_json(&[("om.exe", "module", 1)])).is_err());
         assert!(check(&manifest_json(&[("teams.wasm", "exe", 1)])).is_err());
+    }
+
+    #[test]
+    fn manifest_without_om_exe_is_rejected() {
+        let json = manifest_json(&[("teams.wasm", "module", 1)]);
+        assert!(matches!(check(&json), Err(UpdateError::Rejected(_))));
     }
 
     #[test]

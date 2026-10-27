@@ -39,8 +39,10 @@ keyring-core = "1.0.1"
 open-mess-host = { path = "../open-mess-host" }
 # QR codes of sign-in prompts, drawn as SVG for the configuration window.
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
-# Talks only to http://127.0.0.1: no TLS, no system proxy.
-reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+# Loopback API calls, and the release downloads (HTTPS with the system proxy and certificate store,
+# like the module host). The host builds reqwest without a crypto provider; ring is installed by
+# hand (update/fetch.rs).
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "system-proxy"] }
 # The MCP server on /mcp, and `om mcp-stdio`, a client of it.
 rmcp = { version = "3.7.0", default-features = false, features = [
     "client",
