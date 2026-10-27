@@ -105,12 +105,14 @@ pub struct NewMessage {
     pub account: String,
     pub conversation: String,
     pub message: String,
+    /// The sender's platform id.
+    pub sender: String,
     pub own: bool,
     pub mentions_me: bool,
     pub direct: bool,
 }
 
-// Hand-written so that a `{:?}` in a log line never prints the message id or text.
+// Hand-written so that a `{:?}` in a log line never prints the message or sender id.
 impl std::fmt::Debug for NewMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NewMessage")

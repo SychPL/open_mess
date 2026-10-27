@@ -40,6 +40,8 @@ commit.
 | `crates/open-mess/src/tools/` | the tool registry: every tool, for MCP and the CLI alike; `shared.rs` has the shared tools' schemas and results |
 | `crates/open-mess/src/api.rs` | the local API on `127.0.0.1`: bearer token, `/mcp` (MCP) and `/api` (CLI) |
 | `crates/open-mess/src/cli.rs` | the `om` command line, generated from the registry |
+| `crates/open-mess/src/triggers/` | trigger rules and their engine: matching, batching, limits, and the actions (channel notification, program run) |
+| `crates/open-mess/src/bridge.rs` | `om mcp-stdio`: the stdio MCP server a Claude Code session with channels runs, forwarding to the daemon |
 | `crates/open-mess/tests/` | integration tests: the API, the CLI and the daemon process |
 | `crates/open-mess-host/` | the module host: loads platform modules and runs them under limits |
 | `modules/teams/` | the Teams platform module, a WebAssembly component implementing `wit/module.wit` |

@@ -168,6 +168,9 @@ interface host {
         account: string,
         conversation: string,
         message: string,
+        // The sender's stable platform id (a participant's `id`, never a display name); the `from`
+        // trigger condition compares it.
+        sender: string,
         // True when the message is from the signed-in user; such messages never fire triggers.
         // `own` is a WIT keyword, so the name is escaped with `%`; bindings still call it `own`.
         %own: bool,

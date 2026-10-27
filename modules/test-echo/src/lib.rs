@@ -5,7 +5,7 @@
 //! or `{"error"}` (the `http-error` case name); `ws` opens a WebSocket to `{"url"}`, sends "ping"
 //! and returns `{"conn"}` or `{"error"}`; `store` sets key "k" to `{"size"}` bytes and returns the
 //! length read back (`{"len"}`, plus `{"error"}` when the set failed); `timer` sets timer 7 to
-//! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` in
+//! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` from "p1" in
 //! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
 //! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
@@ -151,6 +151,7 @@ mod guest {
                     account: "a".to_string(),
                     conversation: "c".to_string(),
                     message: text("text"),
+                    sender: "p1".to_string(),
                     own: false,
                     mentions_me: true,
                     direct: false,

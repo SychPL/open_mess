@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod api;
 pub mod approval;
+pub mod bridge;
 pub mod cli;
 pub mod daemon;
 pub mod events;
@@ -14,6 +15,7 @@ pub mod permissions;
 pub mod secrets;
 pub mod store;
 pub mod tools;
+pub mod triggers;
 
 /// Everything that can go wrong in the daemon and the CLI.
 #[derive(Debug, thiserror::Error)]

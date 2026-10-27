@@ -24,6 +24,8 @@ use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::ModuleState;
 use crate::pending::{Kind, Pending, State};
 use crate::permissions;
+use crate::triggers::Counters;
+use crate::triggers::channel::Sessions;
 
 /// A tool as both front ends describe it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,18 +64,32 @@ pub struct Registry {
     accounts: Option<Arc<Accounts>>,
     /// The accounts' writes; None with the accounts.
     pending: Option<Arc<Pending>>,
+    /// What the trigger engine delivered and dropped, for `status`.
+    triggers: Counters,
+    /// The MCP sessions that take trigger notifications.
+    sessions: Sessions,
 }
 
 impl Registry {
     /// The tools with no modules and no accounts; `started` is when the daemon started, for
     /// `status`.
     pub fn with_builtin(started: Instant) -> Registry {
-        Registry { started, accounts: None, pending: None }
+        Registry { started, accounts: None, pending: None, triggers: Counters::default(), sessions: Sessions::default() }
     }
 
     pub fn new(started: Instant, accounts: Arc<Accounts>) -> Registry {
         let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
-        Registry { started, accounts: Some(accounts), pending: Some(pending) }
+        Registry { started, accounts: Some(accounts), pending: Some(pending), triggers: Counters::default(), sessions: Sessions::default() }
+    }
+
+    /// The trigger engine's counters, for the engine to count into.
+    pub fn trigger_counters(&self) -> &Counters {
+        &self.triggers
+    }
+
+    /// The MCP sessions that declared the channel capability, kept by the API.
+    pub fn channel_sessions(&self) -> &Sessions {
+        &self.sessions
     }
 
     /// The pending actions, for the approval UI and the configuration window.
@@ -156,6 +172,7 @@ impl Registry {
             "uptime_seconds": self.started.elapsed().as_secs(),
             "modules": modules,
             "accounts": accounts,
+            "triggers": {"channel_sessions": self.sessions.len(), "counters": self.triggers.to_json()},
         }))
     }
 }
@@ -253,7 +270,7 @@ pub(crate) async fn within<T>(module: &str, call: impl Future<Output = Result<T,
 
 /// Runs a shared tool on one account's module: the result parsed, without what the agent may not
 /// read, cut to the limit and labelled with the account, without the untrusted notice.
-async fn call_account(accounts: &Accounts, account: &Account, tool: &str, args: &Value) -> Result<Value, ToolError> {
+pub(crate) async fn call_account(accounts: &Accounts, account: &Account, tool: &str, args: &Value) -> Result<Value, ToolError> {
     let handle = module(accounts, account)?;
     let json = within(&account.module, handle.call(&account.module_account, tool, &args.to_string())).await?;
     let mut result = shared::parse(tool, &json)?;
