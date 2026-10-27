@@ -68,23 +68,28 @@ impl PollState {
         self.seen.iter().find(|(c, _)| c == conversation).map(|(_, id)| id.as_str())
     }
 
-    /// Whether the conversation's last message may be new: after the floor and not the one seen.
-    pub fn changed(&self, c: &Conversation) -> bool {
-        c.last_message.as_ref().is_some_and(|m| m.sent_ms > self.floor_ms && self.seen(&c.id) != Some(m.id.as_str()))
+    /// Whether `m` of `conversation` is new: after the floor and not the message seen last there.
+    pub fn fresh(&self, conversation: &str, m: &Message) -> bool {
+        m.sent_ms > self.floor_ms && self.seen(conversation) != Some(m.id.as_str())
     }
 
-    /// The new messages of a changed conversation, oldest first, from its newest messages
-    /// (`newest_first`; empty when they could not be read, and then only the last message
-    /// counts). The last message is remembered.
-    pub fn arrivals(&mut self, c: &Conversation, newest_first: &[Message], me: &str) -> Vec<Arrival> {
+    /// Whether the conversation's last message is new.
+    pub fn changed(&self, c: &Conversation) -> bool {
+        c.last_message.as_ref().is_some_and(|m| self.fresh(&c.id, m))
+    }
+
+    /// The arrivals of a changed conversation, oldest first, from its new messages (newest first,
+    /// read until the first one not `fresh`); `None` when they may not be read, and then the
+    /// list's last message stands for them. The newest message is remembered: it may be newer
+    /// than the list's last one, if it came while the poll ran.
+    pub fn arrivals(&mut self, c: &Conversation, new_newest_first: Option<&[Message]>, me: &str) -> Vec<Arrival> {
         let Some(last) = &c.last_message else { return Vec::new() };
-        let seen = self.seen(&c.id).map(str::to_string);
-        let fresh = |m: &&Message| m.sent_ms > self.floor_ms && seen.as_deref() != Some(m.id.as_str());
-        let page: Vec<&Message> = if newest_first.is_empty() { vec![last] } else { newest_first.iter().take_while(fresh).collect() };
+        let messages: Vec<&Message> = new_newest_first.map_or_else(|| vec![last], |new| new.iter().collect());
+        let newest = messages.first().map_or_else(|| last.id.clone(), |m| m.id.clone());
         let direct = c.kind == ConversationKind::Direct;
-        let mut arrivals: Vec<Arrival> = page
+        let mut arrivals: Vec<Arrival> = messages
             .into_iter()
-            .filter(|m| fresh(m) && !m.deleted)
+            .filter(|m| !m.deleted)
             .map(|m| Arrival {
                 conversation: c.id.clone(),
                 message: m.id.clone(),
@@ -96,7 +101,7 @@ impl PollState {
             .collect();
         arrivals.reverse();
         self.seen.retain(|(conversation, _)| *conversation != c.id);
-        self.seen.push((c.id.clone(), last.id.clone()));
+        self.seen.push((c.id.clone(), newest));
         if self.seen.len() > MAX_SEEN {
             self.seen.remove(0);
         }
@@ -134,15 +139,21 @@ mod tests {
         decode_messages(json!({"messages": messages, "_metadata": {}}).to_string().as_bytes()).unwrap().items
     }
 
+    /// What `tools::poll` reads: messages newest first, until the first one not fresh.
+    fn new(state: &PollState, conv: &str, newest_first: Vec<Value>) -> Vec<Message> {
+        page(newest_first).into_iter().take_while(|m| state.fresh(conv, m)).collect()
+    }
+
     #[test]
     fn every_new_message_arrives_once_oldest_first() {
         let mut state = PollState::new(NOW);
         let mention = message("19:a@thread.v2", "2", OTHER, NOW + 2, Some(ME));
         let plain = message("19:a@thread.v2", "3", OTHER, NOW + 3, None);
+        let old = message("19:a@thread.v2", "1", OTHER, NOW - 1, Some(ME));
         let c = conversation("19:a@thread.v2", plain.clone());
         assert!(state.changed(&c));
-        let old = message("19:a@thread.v2", "1", OTHER, NOW - 1, Some(ME));
-        let arrivals = state.arrivals(&c, &page(vec![plain, mention, old]), ME);
+        let fresh = new(&state, "19:a@thread.v2", vec![plain, mention, old]);
+        let arrivals = state.arrivals(&c, Some(&fresh), ME);
         let got: Vec<_> = arrivals.iter().map(|a| (a.message.as_str(), a.mentions_me)).collect();
         // The mention before the last message is not lost; the one before the floor is old.
         assert_eq!(got, [("2", true), ("3", false)]);
@@ -153,11 +164,24 @@ mod tests {
     fn reading_stops_at_the_message_seen() {
         let mut state = PollState::new(NOW);
         let first = message("19:a@thread.v2", "2", OTHER, NOW + 2, None);
-        state.arrivals(&conversation("19:a@thread.v2", first.clone()), &page(vec![first.clone()]), ME);
+        let c = conversation("19:a@thread.v2", first.clone());
+        let fresh = new(&state, "19:a@thread.v2", vec![first.clone()]);
+        state.arrivals(&c, Some(&fresh), ME);
         let second = message("19:a@thread.v2", "3", ME, NOW + 3, None);
-        let c = conversation("19:a@thread.v2", second.clone());
-        let arrivals = state.arrivals(&c, &page(vec![second, first]), ME);
+        let fresh = new(&state, "19:a@thread.v2", vec![second.clone(), first]);
+        let arrivals = state.arrivals(&conversation("19:a@thread.v2", second), Some(&fresh), ME);
         assert_eq!(arrivals.iter().map(|a| (a.message.as_str(), a.own)).collect::<Vec<_>>(), [("3", true)]);
+    }
+
+    #[test]
+    fn a_message_that_came_during_the_poll_is_remembered() {
+        // The list showed 2 as the last message; 3 came before the history was read.
+        let mut state = PollState::new(NOW);
+        let (two, three) = (message("19:a@thread.v2", "2", OTHER, NOW + 2, None), message("19:a@thread.v2", "3", OTHER, NOW + 3, None));
+        let fresh = new(&state, "19:a@thread.v2", vec![three.clone(), two.clone()]);
+        assert_eq!(state.arrivals(&conversation("19:a@thread.v2", two), Some(&fresh), ME).len(), 2);
+        // The next poll's list shows 3: nothing new.
+        assert!(!state.changed(&conversation("19:a@thread.v2", three)));
     }
 
     #[test]
@@ -165,7 +189,7 @@ mod tests {
         let mut state = PollState::new(NOW);
         let direct = "19:00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002@unq.gbl.spaces";
         let c = conversation(direct, message(direct, "5", OTHER, NOW + 5, Some(ME)));
-        let arrivals = state.arrivals(&c, &[], ME);
+        let arrivals = state.arrivals(&c, None, ME);
         assert_eq!(arrivals.len(), 1);
         let a = &arrivals[0];
         assert!(a.direct && a.mentions_me && !a.own && a.sender == OTHER && a.message == "5");
@@ -193,7 +217,7 @@ mod tests {
         let mut state = PollState::new(NOW);
         for i in 0..=MAX_SEEN {
             let conv = format!("19:{i}@thread.v2");
-            state.arrivals(&conversation(&conv, message(&conv, "1", OTHER, NOW + 1, None)), &[], ME);
+            state.arrivals(&conversation(&conv, message(&conv, "1", OTHER, NOW + 1, None)), None, ME);
         }
         assert_eq!(state.seen.len(), MAX_SEEN);
         assert_eq!(state.seen[0].0, "19:1@thread.v2");

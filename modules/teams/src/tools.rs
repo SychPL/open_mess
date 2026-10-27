@@ -462,6 +462,39 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
     })
 }
 
+/// The new messages of a conversation, newest first, page by page until the first one not new;
+/// `None` when they may not be read (403, 404), and then the list's last message stands for them.
+/// Any other failure ends the poll, which the next one repeats.
+fn new_messages(session: &mut Session, conversation: &str, state: &PollState) -> Result<Option<Vec<Message>>, ModuleError> {
+    let slow = || ModuleError::Platform("Teams answers too slowly; polling again later".to_string());
+    let mut link: Option<String> = None;
+    let mut new = Vec::new();
+    for _ in 0..MAX_PAGES {
+        if !api::has_time() {
+            return Err(slow());
+        }
+        let request = chat::read_messages(&session.directory, conversation, link.as_deref(), PAGE_SIZE, None).map_err(api::proto)?;
+        let response = api::send(session, Service::Chat, &request, false)?;
+        if link.is_none() && matches!(response.status, 403 | 404) {
+            return Ok(None);
+        }
+        let page = chat::decode_messages(&api::ok(response)?).map_err(api::proto)?;
+        let mut more = !(page.items.is_empty() && page.skipped.is_empty());
+        for m in page.items {
+            if !state.fresh(conversation, &m) {
+                more = false;
+                break;
+            }
+            new.push(m);
+        }
+        match page.backward_link {
+            Some(next) if more => link = Some(next),
+            _ => return Ok(Some(new)),
+        }
+    }
+    Ok(Some(new))
+}
+
 /// One poll of an account (`poll`): the conversations updated lately, one `message-arrived` for
 /// each new last message. Reads only.
 pub fn poll(account: &str) -> Result<(), ModuleError> {
@@ -483,17 +516,8 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
         // from the same floor.
         let mut arrivals = Vec::new();
         for c in changed {
-            if !api::has_time() {
-                return Err(ModuleError::Platform("Teams answers too slowly; polling again later".to_string()));
-            }
-            let request = chat::read_messages(&session.directory, &c.id, None, PAGE_SIZE, None).map_err(api::proto)?;
-            // Messages that cannot be read leave the last one, which the list gave.
-            let newest_first = match api::read(session, Service::Chat, &request) {
-                Ok(body) => chat::decode_messages(&body).map(|page| page.items).unwrap_or_default(),
-                Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
-                Err(_) => Vec::new(),
-            };
-            arrivals.extend(state.arrivals(&c, &newest_first, &me));
+            let new = new_messages(session, &c.id, &state)?;
+            arrivals.extend(state.arrivals(&c, new.as_deref(), &me));
         }
         state.finish(started);
         // Stored before they are reported, so a crash in between loses them rather than

@@ -721,6 +721,8 @@ async fn timeout_after_post_is_uncertain() {
         // Asking for a long wait does not make a 5xx a refusal (a 429 is one: see below).
         Reply::status(503).header("Retry-After", "1000"),
         Reply::status(500).header("Retry-After", "Fri, 01 Jan 2100 00:00:00 GMT"),
+        // 507 is never retried, and still may follow work done.
+        Reply::status(507),
     ];
     for reply in replies {
         let teams = Teams::signed_in().await;
@@ -839,6 +841,28 @@ async fn messages_between_polls_all_arrive() {
     let second = teams.next_message().await.unwrap();
     assert_eq!((first.message.as_str(), first.mentions_me), ("1900000000011", true));
     assert_eq!((second.message.as_str(), second.mentions_me), ("1900000000012", false));
+    assert_eq!(teams.next_message().await, None);
+}
+
+#[tokio::test]
+async fn many_messages_between_polls_all_arrive() {
+    // More new messages than one page: the poll reads on, back to the last one it knew.
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let path = messages_path(GROUP);
+    let older = format!("{CHAT}/v1/users/ME/conversations/{GROUP}/messages?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=older");
+    let mention = mentioning(message("1900000000031", GROUP, OTHER, "<p>hey One</p>", at), ME);
+    let newest = message("1900000000032", GROUP, OTHER, "<p>more</p>", at + 1);
+    let list = vec![conversation(GROUP, None, Some(newest.clone()))];
+    teams.fake.on(move |s| match s.path.as_str() {
+        CHAT_PATH => Some(Reply::json(page("conversations", list.clone(), None))),
+        p if p == path && s.query.contains("syncState=older") => Some(Reply::json(page("messages", vec![mention.clone()], None))),
+        p if p == path => Some(Reply::json(page("messages", vec![newest.clone()], Some(&older)))),
+        _ => None,
+    });
+    let first = teams.next_message().await.unwrap();
+    assert_eq!((first.message.as_str(), first.mentions_me), ("1900000000031", true));
+    assert_eq!(teams.next_message().await.unwrap().message, "1900000000032");
     assert_eq!(teams.next_message().await, None);
 }
 

@@ -300,10 +300,12 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
             continue;
         }
         let status = response.status;
+        // A 5xx may come after the service took the write, whatever its Retry-After says.
+        if write && (500..=599).contains(&status) {
+            return Err(ModuleError::Uncertain(format!("the service failed (HTTP {status})")));
+        }
         match retry::decide(status, header(&response.headers, "retry-after"), attempt, now_ms()) {
             Retry::Done => return Ok(response),
-            // A 5xx may come after the service took the write, whatever its Retry-After says.
-            _ if write && (500..=599).contains(&status) => return Err(ModuleError::Uncertain(format!("the service failed (HTTP {status})"))),
             Retry::After(ms) => {
                 if !pause(ms) {
                     return Err(ModuleError::Platform(format!("the service asks to wait {} s; try again later", ms.div_ceil(1000))));
