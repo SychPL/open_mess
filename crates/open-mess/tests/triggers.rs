@@ -367,6 +367,38 @@ async fn held_bytes_are_capped() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_message_that_cannot_fit_takes_nothing_with_it() {
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    let long = "p".repeat(64 * 1024);
+    // One conversation takes nearly all of the rule's share.
+    for n in 0..31 {
+        t.bus.publish(from("c1", &format!("m{n}"), &long, Kind::Direct));
+    }
+    // Another has a small message, then one too large for what is left even without it.
+    t.bus.publish(message("c2", "s1", Kind::Direct));
+    t.bus.publish(from("c2", &long, &long, Kind::Direct));
+    sleep(Duration::from_secs(61)).await;
+    let calls = t.calls();
+    let c2 = calls.iter().find(|(_, batch, _)| batch.conversation == "c2").map(|(_, batch, _)| batch).unwrap();
+    assert_eq!((ids(c2), c2.count), (vec!["s1"], 1));
+    assert_eq!(t.counters.rule("r").dropped_queue, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_message_pushed_out_of_its_batch_still_fires_once() {
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    for n in 0..=engine::MAX_BATCH {
+        t.bus.publish(message("c1", &format!("m{n}"), Kind::Direct));
+    }
+    sleep(Duration::from_secs(61)).await;
+    assert_eq!(t.calls()[0].1.messages.first().map(|message| message.id.as_str()), Some("m1"));
+    // The first one, no longer in the batch that went out, reported again.
+    t.bus.publish(message("c1", "m0", Kind::Direct));
+    sleep(Duration::from_secs(61)).await;
+    assert_eq!(t.calls().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_message_reported_again_fires_once() {
     let t = setup(&[rule("r", Condition::Direct)]).await;
     // Twice while its batch is collected, and again once it went out.
@@ -394,6 +426,16 @@ async fn a_message_reported_again_fires_once() {
     sleep(Duration::from_secs(61)).await;
     let count = |sql: &str| db.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap();
     assert_eq!((count("SELECT count(*) FROM trigger_seen"), count("SELECT count(*) FROM trigger_seen WHERE at_ms = 0")), (2, 0));
+    // The same ids on another account are another message: the rule, moved there, fires for it.
+    t.d.accounts.add("test-echo", info("b")).unwrap();
+    rules::put(&t.store(), &Rule::new("r", "test-echo:b", Condition::Direct, Action::Channel { fallback_spawn: None })).unwrap();
+    let mut on_b = message("c1", "m1", Kind::Direct);
+    if let Event::Message { account, .. } = &mut on_b {
+        *account = "test-echo:b".into();
+    }
+    bus.publish(on_b);
+    sleep(Duration::from_secs(61)).await;
+    assert_eq!(t.calls().last().map(|(_, batch, _)| batch.account.as_str()), Some("test-echo:b"));
 }
 
 #[tokio::test(start_paused = true)]
