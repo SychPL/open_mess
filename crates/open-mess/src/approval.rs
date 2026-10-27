@@ -8,6 +8,7 @@
 //! [`Pending::decide`]: no tool does. Other platforms leave the actions waiting until they expire.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 
@@ -130,13 +131,17 @@ pub(crate) fn clean(text: &str) -> String {
         .collect()
 }
 
+/// Actions that join the notice of several within this time of it are merged into it; ones that
+/// come later bring it back, with the count then, so a later burst is announced too.
+pub const MERGE: Duration = Duration::from_secs(60);
+
 /// What a notification shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Shown {
     /// One action, by id.
     Action(String),
-    /// That several wait, however many.
-    Several,
+    /// That several wait: those announced, and when.
+    Several { announced: Vec<String>, at: Instant },
 }
 
 /// What is to change on screen.
@@ -171,20 +176,32 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// What changes on screen for these waiting actions: one action's toast for a single one, one
-    /// notice for several, none for none. Nothing changes while the same one still holds, so a
-    /// notice is not shown again for each action that joins.
-    pub fn update<'a>(&mut self, waiting: &'a [Preview]) -> Change<'a> {
-        let (wanted, show) = match waiting {
+    /// What changes on screen for these waiting actions at `now`: one action's toast for a single
+    /// one, one notice for several, none for none. Nothing changes while the same one still holds;
+    /// actions that join a notice within [`MERGE`] are merged into it, later ones show it again.
+    pub fn update<'a>(&mut self, waiting: &'a [Preview], now: Instant) -> Change<'a> {
+        let unchanged = Change { withdraw: false, show: None };
+        let (shown, show) = match waiting {
+            [] if self.shown.is_none() => return unchanged,
             [] => (None, None),
+            [one] if self.shown.as_ref().is_some_and(|shown| *shown == Shown::Action(one.action.clone())) => return unchanged,
             [one] => (Some(Shown::Action(one.action.clone())), Some(Notice::Action(one))),
-            several => (Some(Shown::Several), Some(Notice::Several(several.len()))),
+            several => {
+                let ids = || several.iter().map(|preview| preview.action.clone()).collect();
+                if let Some(Shown::Several { announced, at }) = &mut self.shown {
+                    if several.iter().all(|preview| announced.contains(&preview.action)) {
+                        return unchanged;
+                    }
+                    if now.saturating_duration_since(*at) < MERGE {
+                        *announced = ids();
+                        return unchanged;
+                    }
+                }
+                (Some(Shown::Several { announced: ids(), at: now }), Some(Notice::Several(several.len())))
+            }
         };
-        if wanted == self.shown {
-            return Change { withdraw: false, show: None };
-        }
         let withdraw = self.shown.is_some();
-        self.shown = wanted;
+        self.shown = shown;
         Change { withdraw, show }
     }
 }
@@ -197,7 +214,7 @@ pub async fn run(pending: Arc<Pending>, present: impl Fn(&Preview), several: imp
     let mut queue = Queue::default();
     loop {
         let waiting = pending.waiting();
-        let change = queue.update(&waiting);
+        let change = queue.update(&waiting, Instant::now());
         if change.withdraw {
             withdraw();
         }
@@ -312,7 +329,7 @@ mod toast {
                     let window = window.clone();
                     // ponytail: a window that fails to open says nothing here; reported once a log
                     // sink exists (the tray opens it too).
-                    runtime.spawn(async move { window.open().await });
+                    runtime.spawn(async move { window.open_waiting().await });
                     Ok(())
                 });
             // ponytail: a toast Windows refuses leaves the actions to the window's list; reported
@@ -441,23 +458,29 @@ mod tests {
 
     #[test]
     fn one_notification_at_a_time() {
-        let [a, b, c] = ["a", "b", "c"].map(|id| preview(id, Kind::Send));
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|id| preview(id, Kind::Send));
         let mut queue = Queue::default();
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
         let nothing = Change { withdraw: false, show: None };
-        assert_eq!(queue.update(&[]), nothing);
+        assert_eq!(queue.update(&[], at(0)), nothing);
         // One waits: its own toast.
-        assert_eq!(queue.update(std::slice::from_ref(&a)), Change { withdraw: false, show: Some(Notice::Action(&a)) });
-        assert_eq!(queue.update(std::slice::from_ref(&a)), nothing);
-        // Another joins: one notice instead, not shown again for each one more.
+        assert_eq!(queue.update(std::slice::from_ref(&a), at(0)), Change { withdraw: false, show: Some(Notice::Action(&a)) });
+        assert_eq!(queue.update(std::slice::from_ref(&a), at(0)), nothing);
+        // Another joins: one notice instead, not shown again for each one more soon after.
         let two = [a.clone(), b.clone()];
-        assert_eq!(queue.update(&two), Change { withdraw: true, show: Some(Notice::Several(2)) });
-        assert_eq!(queue.update(&[a.clone(), b.clone(), c.clone()]), nothing);
+        assert_eq!(queue.update(&two, at(1)), Change { withdraw: true, show: Some(Notice::Several(2)) });
+        assert_eq!(queue.update(&[a.clone(), b.clone(), c.clone()], at(30)), nothing);
+        // Decided in the window, nothing new: nothing changes, however late.
+        assert_eq!(queue.update(&[b.clone(), c.clone()], at(600)), nothing);
+        // A new one long after the notice: shown again, with the count now.
+        assert_eq!(queue.update(&[b.clone(), c.clone(), d.clone()], at(601)), Change { withdraw: true, show: Some(Notice::Several(3)) });
         // Down to one, whichever: its own toast again; none left: nothing on screen.
-        assert_eq!(queue.update(std::slice::from_ref(&c)), Change { withdraw: true, show: Some(Notice::Action(&c)) });
-        assert_eq!(queue.update(std::slice::from_ref(&b)), Change { withdraw: true, show: Some(Notice::Action(&b)) });
-        assert_eq!(queue.update(&[]), Change { withdraw: true, show: None });
-        assert_eq!(queue.update(&[]), nothing);
+        assert_eq!(queue.update(std::slice::from_ref(&c), at(602)), Change { withdraw: true, show: Some(Notice::Action(&c)) });
+        assert_eq!(queue.update(std::slice::from_ref(&b), at(603)), Change { withdraw: true, show: Some(Notice::Action(&b)) });
+        assert_eq!(queue.update(&[], at(604)), Change { withdraw: true, show: None });
+        assert_eq!(queue.update(&[], at(605)), nothing);
         // Several at once from nothing: the notice alone.
-        assert_eq!(queue.update(&two), Change { withdraw: false, show: Some(Notice::Several(2)) });
+        assert_eq!(queue.update(&two, at(606)), Change { withdraw: false, show: Some(Notice::Several(2)) });
     }
 }

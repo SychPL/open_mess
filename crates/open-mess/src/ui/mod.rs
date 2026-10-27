@@ -11,6 +11,7 @@ mod window;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
@@ -48,6 +49,8 @@ pub type OpenRequest = oneshot::Sender<Result<(), String>>;
 pub struct Opener {
     requests: mpsc::Sender<OpenRequest>,
     queue: Arc<Mutex<mpsc::Receiver<OpenRequest>>>,
+    /// The window is asked for on the list of actions waiting for approval.
+    waiting: Arc<AtomicBool>,
 }
 
 /// Open requests waiting for the event loop; more are refused.
@@ -58,11 +61,23 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 impl Default for Opener {
     fn default() -> Opener {
         let (requests, queue) = mpsc::channel(OPEN_QUEUE);
-        Opener { requests, queue: Arc::new(Mutex::new(queue)) }
+        Opener { requests, queue: Arc::new(Mutex::new(queue)), waiting: Arc::default() }
     }
 }
 
 impl Opener {
+    /// [`Opener::open`], on the list of actions waiting for approval (the notice that several
+    /// wait opens it).
+    pub async fn open_waiting(&self) -> Result<(), Error> {
+        self.waiting.store(true, Ordering::Relaxed);
+        self.open().await
+    }
+
+    /// Whether the window was asked for on the list of waiting actions; asking clears it.
+    pub fn take_waiting(&self) -> bool {
+        self.waiting.swap(false, Ordering::Relaxed)
+    }
+
     /// Asks for the window and waits until it is open, so a window that cannot open is an error
     /// for whoever asked.
     pub async fn open(&self) -> Result<(), Error> {
@@ -108,4 +123,24 @@ pub fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl Future<
 pub fn run(runtime: &Runtime, _state: UiState, _opener: Opener, quit: impl Future<Output = ()> + Send + 'static) -> Result<(), Error> {
     runtime.block_on(quit);
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_notice_of_several_asks_for_the_waiting_list() {
+        let opener = Opener::default();
+        let asking = {
+            let opener = opener.clone();
+            tokio::spawn(async move { opener.open_waiting().await })
+        };
+        let request = opener.next().await.unwrap();
+        // Asked once: the next request, from the tray say, opens the window as it is.
+        assert!(opener.take_waiting());
+        assert!(!opener.take_waiting());
+        request.send(Ok(())).unwrap();
+        asking.await.unwrap().unwrap();
+    }
 }
