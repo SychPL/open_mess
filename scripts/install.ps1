@@ -83,7 +83,11 @@ try {
             }
         }
 } catch {
-    if ($existing -and -not $NoStart) { Start-ScheduledTask -TaskName $taskName }
+    if ($existing -and -not $NoStart) {
+        # Enabled first: a task someone disabled would ignore the start.
+        Enable-ScheduledTask -TaskName $taskName | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+    }
     throw
 }
 
