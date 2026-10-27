@@ -129,11 +129,13 @@ impl SignInPrompts {
     }
 }
 
-/// A device or QR code on screen, which the module's `sign-in` polls for (with `http.fetch`) while
-/// the user uses it elsewhere: the call's clock stops meanwhile, up to the budget.
+/// Device or QR codes shown in a `sign-in` call, which the module polls for (with `http.fetch`)
+/// while the user uses them elsewhere: the call's clock stops meanwhile, up to one budget for all
+/// of them. Kept for the rest of the call.
 pub(crate) struct CodeShown {
-    /// Answered (or dropped) once the user cancels or the sign-in ends.
-    answer: oneshot::Receiver<SignInReply>,
+    /// The answer to the code on screen, answered (or dropped) once the user cancels or the
+    /// sign-in ends; None while the clock runs.
+    answer: Option<oneshot::Receiver<SignInReply>>,
     /// When the budget runs out.
     until: Instant,
 }
@@ -172,7 +174,7 @@ type DialogResult = Result<(String, WamAccount), SignInError>;
 pub(crate) struct WamCalls {
     pub(crate) accounts: fn(&str) -> Result<Vec<WamAccount>, SignInError>,
     pub(crate) silent: fn(&str, &[String], &str) -> Result<String, SignInError>,
-    pub(crate) interactive: fn(isize, &str, &[String]) -> DialogResult,
+    pub(crate) interactive: fn(isize, &str, &[String], Duration) -> DialogResult,
 }
 
 const WINDOWS: WamCalls = WamCalls { accounts: wam::accounts, silent: wam::token_silent, interactive: wam::token_interactive };
@@ -276,9 +278,10 @@ impl Wam<'_> {
             _ => return Err(SignInError::Cancelled),
         };
         let (dialog, client, scopes) = (self.calls.interactive, client.to_string(), scopes.to_vec());
-        // The dialog has the sign-in budget too; one left open past it is abandoned (it closes with
-        // the configuration window, its owner).
-        let waiting = tokio::time::timeout(self.prompts.budget, blocking(move || dialog(window, &client, &scopes)));
+        // The dialog has the sign-in budget too: WAM cancels one left open past it, and the wait
+        // here ends then too, whatever WAM does.
+        let budget = self.prompts.budget;
+        let waiting = tokio::time::timeout(budget, blocking(move || dialog(window, &client, &scopes, budget)));
         let (token, account) = wait_for_user(self.deadline, waiting).await.map_err(|_| SignInError::TimedOut)??;
         Ok((account, Some(token)))
     }
@@ -302,19 +305,29 @@ impl HostState {
     /// Shows a device or QR code. In a sign-in the clock stops until the user cancels it, the
     /// budget runs out or the module moves on (spec 8.3, R4).
     fn show_code(&mut self, request: SignInRequest) {
+        // The budget is the code wait's, not each code's: a module that shows code after code gets
+        // no more time, and none at all once the user cancelled.
+        let now = Instant::now();
+        let abandoned = self.code_abandoned().is_some();
         self.code_done();
         let Ok(prompts) = self.prompts() else { return };
-        let (answer, budget) = (prompts.show(request), prompts.budget);
-        if let (Some(answer), Caller::SignIn) = (answer, &self.caller) {
-            let until = Instant::now() + budget;
+        let until = match &self.code_shown {
+            _ if abandoned => now,
+            Some(shown) => shown.until,
+            None => now + prompts.budget,
+        };
+        let answer = prompts.show(request).filter(|_| self.caller == Caller::SignIn && until > now);
+        if answer.is_some() {
             self.deadline.pause_until(until + CODE_GRACE);
-            self.code_shown = Some(CodeShown { answer, until });
         }
+        self.code_shown = Some(CodeShown { answer, until });
     }
 
     /// The module moved on from a code on screen: the clock runs again.
     fn code_done(&mut self) {
-        if self.code_shown.take().is_some() {
+        if let Some(shown) = &mut self.code_shown
+            && shown.answer.take().is_some()
+        {
             self.deadline.resume();
         }
     }
@@ -323,7 +336,8 @@ impl HostState {
     /// sign-in ended), or its budget ran out. The clock runs again from then on.
     pub(crate) fn code_abandoned(&mut self) -> Option<&'static str> {
         let shown = self.code_shown.as_mut()?;
-        let why = match shown.answer.try_recv() {
+        let answer = shown.answer.as_mut()?;
+        let why = match answer.try_recv() {
             Err(oneshot::error::TryRecvError::Empty) if Instant::now() < shown.until => return None,
             Err(oneshot::error::TryRecvError::Empty) => "sign-in timed out",
             _ => "sign-in cancelled",
@@ -436,7 +450,7 @@ mod tests {
     const FAKE: WamCalls = WamCalls {
         accounts: |_| Ok(vec![account("w1"), account("w2")]),
         silent: |client, scopes, account| Ok(format!("token {client} {} {account}", scopes.join(" "))),
-        interactive: |window, client, _| Ok((format!("dialog {window} {client}"), account("w3"))),
+        interactive: |window, client, _, _| Ok((format!("dialog {window} {client}"), account("w3"))),
     };
 
     struct Setup {
@@ -486,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn wam_is_limited_to_the_manifest() {
         let mut t = setup();
-        let no_wam = WamCalls { accounts: |_| panic!("listed"), silent: |_, _, _| panic!("asked"), interactive: |_, _, _| panic!("dialog") };
+        let no_wam = WamCalls { accounts: |_| panic!("listed"), silent: |_, _, _| panic!("asked"), interactive: |_, _, _, _| panic!("dialog") };
         let mut pick = Some(account("w1"));
         // A scope the user did not approve never reaches Windows, nor does a module without a
         // WAM identity.
@@ -564,7 +578,7 @@ mod tests {
         });
         // The user leaves the WAM dialog open.
         let slow = WamCalls {
-            interactive: |_, _, _| {
+            interactive: |_, _, _, _| {
                 std::thread::sleep(Duration::from_secs(1));
                 Ok(("late".into(), account("w9")))
             },

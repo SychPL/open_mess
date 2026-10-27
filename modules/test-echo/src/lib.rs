@@ -23,7 +23,8 @@
 //! `sign-in-with` `{"how": "windows"}` it signs in account "windows" with a WAM token for the
 //! manifest's identity (the Teams client id; for the manual check only) instead, and after
 //! `{"how": "device-code"}` it shows a device code and polls `http.fetch` until the host refuses
-//! with "sign-in ...", which it returns as a platform error, and after `{"how": "microsoft"}` its
+//! with "sign-in ...", which it returns as a platform error; `{"how": "qr-loop"}` shows QR codes
+//! forever without polling (a misbehaving module); and after `{"how": "microsoft"}` its
 //! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
 //! named after any other.
@@ -226,6 +227,13 @@ mod guest {
                     {
                         return Err(types::ModuleError::Platform(why));
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            if storage::get("sign-in-with").as_deref() == Some(b"qr-loop") {
+                // Misbehaves: shows a new QR code every 100 ms and never stops.
+                loop {
+                    sign_in::show_qr("otpauth://open-mess-test");
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }

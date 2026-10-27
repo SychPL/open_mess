@@ -36,7 +36,9 @@ mod platform {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::WinRT::IWebAuthenticationCoreManagerInterop;
     use windows::core::HSTRING;
-    use windows_future::IAsyncOperation;
+    use windows_future::{AsyncStatus, IAsyncOperation};
+
+    use std::time::{Duration, Instant};
 
     use super::{INTERACTION_REQUIRED, MAX_ACCOUNTS, SignInError, WamAccount};
 
@@ -44,6 +46,8 @@ mod platform {
     const PROVIDER: &str = "https://login.microsoft.com";
     const AUTHORITY: &str = "organizations";
     const AUTHORITY_URL: &str = "https://login.microsoftonline.com/organizations";
+    /// How often a waiting dialog is looked at.
+    const DIALOG_POLL: Duration = Duration::from_millis(200);
 
     fn failed(what: &str) -> impl Fn(windows::core::Error) -> SignInError {
         move |e| SignInError::Refused(format!("Windows account {what} failed ({})", e.code()))
@@ -122,13 +126,25 @@ mod platform {
     }
 
     /// A token through the WAM dialog, owned by the configuration window `window`; the user picks
-    /// or adds the account there.
-    pub(crate) fn token_interactive(window: isize, client_id: &str, scopes: &[String]) -> Result<(String, WamAccount), SignInError> {
+    /// or adds the account there. A dialog still open after `budget` is cancelled.
+    pub(crate) fn token_interactive(
+        window: isize,
+        client_id: &str,
+        scopes: &[String],
+        budget: Duration,
+    ) -> Result<(String, WamAccount), SignInError> {
         let provider = provider()?;
         let request = request(&provider, client_id, scopes)?;
-        let result =
-            request_for_window(HWND(window as *mut core::ffi::c_void), &request).and_then(|operation| operation.join()).map_err(failed("dialog"))?;
-        let (token, found) = token(&result)?;
+        let operation = request_for_window(HWND(window as *mut core::ffi::c_void), &request).map_err(failed("dialog"))?;
+        let until = Instant::now() + budget;
+        while operation.Status().map_err(failed("dialog"))? == AsyncStatus::Started {
+            if Instant::now() >= until {
+                let _ = operation.Cancel();
+                return Err(SignInError::TimedOut);
+            }
+            std::thread::sleep(DIALOG_POLL);
+        }
+        let (token, found) = token(&operation.GetResults().map_err(failed("dialog"))?)?;
         Ok((token, account(&found)?))
     }
 
@@ -161,6 +177,11 @@ pub(crate) fn token_silent(_client_id: &str, _scopes: &[String], _account_id: &s
 }
 
 #[cfg(not(windows))]
-pub(crate) fn token_interactive(_window: isize, _client_id: &str, _scopes: &[String]) -> Result<(String, WamAccount), SignInError> {
+pub(crate) fn token_interactive(
+    _window: isize,
+    _client_id: &str,
+    _scopes: &[String],
+    _budget: std::time::Duration,
+) -> Result<(String, WamAccount), SignInError> {
     Err(unsupported())
 }

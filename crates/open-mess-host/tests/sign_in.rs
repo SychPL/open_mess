@@ -12,7 +12,7 @@ use common::{context, context_in, wasm};
 use open_mess_host::{
     AccountInfo, Engine, HostError, ModuleContext, ModuleError, ModuleHandle, ModuleState, Prompt, SignInPrompts, SignInReply, SignInRequest, limits,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// test-echo's `sign-in` tool running, with the prompts it sends.
@@ -65,11 +65,20 @@ async fn device_code(
     data_dir: &std::path::Path,
     budget: Duration,
 ) -> (ModuleHandle, JoinHandle<Result<AccountInfo, HostError>>, mpsc::Receiver<Prompt>) {
+    sign_in_with(data_dir, "device-code", budget).await
+}
+
+/// test-echo signing in the way `how` names (its `sign-in-with` tool), in its own data folder.
+async fn sign_in_with(
+    data_dir: &std::path::Path,
+    how: &str,
+    budget: Duration,
+) -> (ModuleHandle, JoinHandle<Result<AccountInfo, HostError>>, mpsc::Receiver<Prompt>) {
     let engine = Engine::with_limits(limits::for_tests()).unwrap();
     let (sender, prompts) = mpsc::channel(8);
     let ctx = ModuleContext { sign_in: SignInPrompts::with_budget(sender, budget), ..context_in(data_dir.to_path_buf()) };
     let echo = engine.load(&wasm("open_mess_test_echo"), ctx).await.unwrap();
-    echo.call("a", "sign-in-with", r#"{"how": "device-code"}"#).await.unwrap();
+    echo.call("a", "sign-in-with", &format!(r#"{{"how": "{how}"}}"#)).await.unwrap();
     let signing_in = tokio::spawn({
         let echo = echo.clone();
         async move { echo.sign_in().await }
@@ -101,6 +110,35 @@ async fn code_budget_expires_as_timed_out() {
     let result = signing_in.await.unwrap();
     assert!(matches!(&result, Err(HostError::Module(ModuleError::Platform(why))) if why == "sign-in timed out"), "{result:?}");
     assert_eq!(echo.state(), ModuleState::Running);
+}
+
+#[tokio::test]
+async fn cancel_stops_a_module_that_keeps_showing_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_echo, signing_in, mut prompts) = sign_in_with(dir.path(), "qr-loop", Duration::from_secs(30)).await;
+    let started = std::time::Instant::now();
+    let cancel_at = limits::for_tests().call_timeout + Duration::from_secs(1);
+    // As the window's side does: a newer code replaces the shown one, and once the user cancelled,
+    // every later one is cancelled at once.
+    let window = tokio::spawn(async move {
+        let mut shown: Option<oneshot::Sender<SignInReply>> = None;
+        while let Some((_, reply)) = prompts.recv().await {
+            if let Some(old) = shown.take() {
+                let _ = old.send(SignInReply::Cancelled);
+            }
+            if started.elapsed() < cancel_at {
+                shown = Some(reply);
+            } else {
+                let _ = reply.send(SignInReply::Cancelled);
+            }
+        }
+    });
+    // Until the cancel the codes stop the clock; after it the call limit stops the module, which
+    // would show codes forever.
+    let result = signing_in.await.unwrap();
+    assert!(matches!(result, Err(HostError::Timeout)), "{result:?}");
+    assert!(started.elapsed() > cancel_at, "{:?}", started.elapsed());
+    window.abort();
 }
 
 #[tokio::test]
