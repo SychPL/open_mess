@@ -58,7 +58,9 @@ impl PollState {
     /// The stored state; `None` when there is none or it does not read.
     pub fn decode(bytes: &[u8]) -> Option<PollState> {
         let v: Value = serde_json::from_slice(bytes).ok()?;
-        let entry = |e: &Value| Some((e.get(0)?.as_str()?.to_string(), e.get(1)?.as_str()?.to_string(), e.get(2)?.as_i64()?));
+        // An entry without the message's time (as first stored) compares by id alone.
+        let time = |e: &Value| e.get(2).map_or(Some(0), Value::as_i64);
+        let entry = |e: &Value| Some((e.get(0)?.as_str()?.to_string(), e.get(1)?.as_str()?.to_string(), time(e)?));
         let seen = v.get("seen")?.as_array()?.iter().map(entry).collect::<Option<_>>()?;
         let held_since_ms = match v.get("held") {
             None | Some(Value::Null) => None,
@@ -282,7 +284,13 @@ mod tests {
         assert_eq!(state.seen.len(), MAX_SEEN);
         assert_eq!(state.seen[0].0, "19:1@thread.v2");
         assert_eq!(PollState::decode(&state.encode()), Some(state));
-        for bad in [&b"not json"[..], br#"{"floor": 1}"#, br#"{"floor": 1, "seen": [[1, 2]]}"#, br#"{"floor": 1, "seen": [["a", "b"]]}"#] {
+        let mut held = PollState::new(NOW);
+        held.finish(NOW + 1, true);
+        assert_eq!(PollState::decode(&held.encode()), Some(held));
+        // The first stored form, without message times, still reads.
+        let first = PollState::decode(br#"{"floor": 5, "seen": [["19:a@thread.v2", "1"]]}"#).unwrap();
+        assert_eq!((first.start_ms(), first.seen("19:a@thread.v2")), (5, Some(("1", 0))));
+        for bad in [&b"not json"[..], br#"{"floor": 1}"#, br#"{"floor": 1, "seen": [[1, 2]]}"#, br#"{"floor": 1, "seen": [["a", "b", "c"]]}"#] {
             assert_eq!(PollState::decode(bad), None);
         }
     }
