@@ -17,10 +17,6 @@ use crate::api;
 
 struct Teams;
 
-fn not_yet() -> types::ModuleError {
-    types::ModuleError::NotSupported("milestone F2".to_string())
-}
-
 impl module::Guest for Teams {
     fn manifest() -> types::Manifest {
         let m = crate::manifest::manifest();
@@ -63,8 +59,9 @@ impl module::Guest for Teams {
         crate::tools::get_attachment(&account, &conversation, &message, &attachment)
     }
 
-    fn describe_target(_account: String, _conversation: String, _message: Option<String>) -> Result<types::Target, types::ModuleError> {
-        Err(not_yet())
+    fn describe_target(account: String, conversation: String, message: Option<String>) -> Result<types::Target, types::ModuleError> {
+        api::begin();
+        crate::tools::describe_target(&account, &conversation, message.as_deref())
     }
 }
 

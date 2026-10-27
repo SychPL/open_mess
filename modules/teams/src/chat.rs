@@ -94,6 +94,13 @@ pub struct Message {
     pub attachments: Vec<String>,
 }
 
+/// A member of a thread, as `describe-target` shows them.
+pub struct Member {
+    /// The member's MRI.
+    pub id: String,
+    pub name: Option<String>,
+}
+
 pub struct Mention {
     pub mri: String,
     pub name: Option<String>,
@@ -113,6 +120,23 @@ pub fn decode_message(body: &[u8]) -> Result<Message, ProtoError> {
         kind @ ("RichText/Html" | "Text") => message(&v, "", kind == "Text"),
         _ => Err(incompatible("messagetype")),
     }
+}
+
+/// One conversation (`GET .../conversations/<id>`), in the list's shape.
+pub fn decode_conversation(body: &[u8]) -> Result<Conversation, ProtoError> {
+    conversation(&parse_json(body)?, "")
+}
+
+/// `members[]` of `GET v1/threads/<id>/members`: `id`, and `friendlyName` when the service gives
+/// one (UNCONFIRMED shape, to be checked live).
+pub fn decode_members(body: &[u8]) -> Result<Vec<Member>, ProtoError> {
+    let v = parse_json(body)?;
+    let member = |(i, m): (usize, &Value)| {
+        let path = format!("members[{i}]");
+        let name = opt_str(m, &path, "friendlyName")?.filter(|n| !n.is_empty()).map(str::to_string);
+        Ok(Member { id: req_str(m, &path, "id")?.to_string(), name })
+    };
+    array(&v, "members")?.iter().enumerate().map(member).collect()
 }
 
 pub fn decode_messages(body: &[u8]) -> Result<Page<Message>, ProtoError> {
@@ -171,7 +195,7 @@ fn conversation(c: &Value, path: &str) -> Result<Conversation, ProtoError> {
 
 /// The kind follows the id shapes of docs 3.1; 1:1 chats are confirmed live ("Live results" 5).
 /// `@thread.skype` is used by old channels and old group chats alike, so it stays `Other`.
-fn kind(id: &str) -> ConversationKind {
+pub fn kind(id: &str) -> ConversationKind {
     if id.starts_with("19:meeting_") {
         ConversationKind::Meeting
     } else if id.ends_with("@unq.gbl.spaces") {
@@ -320,11 +344,34 @@ pub fn one_message(dir: &ServiceDirectory, conv: &str, message_id: &str) -> Http
     request("GET", url, None)
 }
 
-/// The body follows the send accepted live ("Live results" 5), minus the sender's display name
-/// and the empty importance and subject.
-pub fn send(dir: &ServiceDirectory, conv: &str, html: &str, client_message_id: &str) -> HttpRequest {
-    let properties = json!({"mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
-    let body = json!({"content": html, "messagetype": "RichText/Html", "contenttype": "Text", "clientmessageid": client_message_id, "properties": properties});
+pub fn one_conversation(dir: &ServiceDirectory, conv: &str) -> HttpRequest {
+    let mut url = endpoint(dir, &[conv]);
+    url.set_query(Some(&format!("view={VIEW_CONVERSATIONS}")));
+    request("GET", url, None)
+}
+
+/// `<chat service>/v1/threads/<id>/members` (docs 3.2).
+pub fn members(dir: &ServiceDirectory, conv: &str) -> HttpRequest {
+    let mut url = dir.chat_service.clone();
+    // Never fails for https URLs, the only ones `authsvc::decode` accepts.
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.pop_if_empty().extend(["v1", "threads", conv, "members"]);
+    }
+    url.set_query(Some(&format!("view={VIEW_CONVERSATIONS}")));
+    request("GET", url, None)
+}
+
+/// The body of the send accepted live ("Live results" 5); `name` is the user's display name.
+pub fn send(dir: &ServiceDirectory, conv: &str, html: &str, client_message_id: &str, name: &str) -> HttpRequest {
+    let properties = json!({"importance": "", "subject": "", "mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
+    let body = json!({
+        "content": html,
+        "messagetype": "RichText/Html",
+        "contenttype": "Text",
+        "imdisplayname": name,
+        "clientmessageid": client_message_id,
+        "properties": properties,
+    });
     request("POST", endpoint(dir, &[conv, "messages"]), Some(body))
 }
 
@@ -554,6 +601,27 @@ mod tests {
     }
 
     #[test]
+    fn conversation_and_members_requests() {
+        assert_eq!(one_conversation(&dir(), GROUP).url, format!("{BASE}/{GROUP}?view=msnp24Equivalent"));
+        let r = members(&dir(), GROUP);
+        assert_eq!(
+            (r.method.as_str(), r.url.as_str()),
+            ("GET", &*format!("https://teams.microsoft.com/api/chatsvc/emea/v1/threads/{GROUP}/members?view=msnp24Equivalent"))
+        );
+    }
+
+    #[test]
+    fn decodes_members_unconfirmed_shape() {
+        let body = json!({"members": [{"id": ME, "role": "Admin", "friendlyName": "Synthetic Person One"}, {"id": "8:orgid:2", "friendlyName": ""}]});
+        let members = decode_members(body.to_string().as_bytes()).unwrap();
+        let pairs: Vec<_> = members.iter().map(|m| (m.id.as_str(), m.name.as_deref())).collect();
+        assert_eq!(pairs, [(ME, Some("Synthetic Person One")), ("8:orgid:2", None)]);
+        for bad in [json!({}), json!({"members": [{"role": "User"}]}), json!({"members": [{"id": 1}]})] {
+            assert!(matches!(decode_members(bad.to_string().as_bytes()), Err(ProtoError::Incompatible(_))), "{bad}");
+        }
+    }
+
+    #[test]
     fn backward_link_to_another_host_is_refused() {
         for link in [
             "https://evil.example/api/chatsvc/emea/v1/users/ME/conversations?syncState=x",
@@ -580,10 +648,11 @@ mod tests {
 
     #[test]
     fn send_carries_client_message_id() {
-        let r = send(&dir(), GROUP, "<p>hi</p>", "9999");
+        let r = send(&dir(), GROUP, "<p>hi</p>", "9999", "Synthetic Person One");
         assert_eq!((r.method.as_str(), r.url.as_str()), ("POST", &*format!("{BASE}/{GROUP}/messages")));
-        let properties = json!({"mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
-        let expected = json!({"content": "<p>hi</p>", "messagetype": "RichText/Html", "contenttype": "Text", "clientmessageid": "9999", "properties": properties});
+        let properties = json!({"importance": "", "subject": "", "mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
+        let expected = json!({"content": "<p>hi</p>", "messagetype": "RichText/Html", "contenttype": "Text", "imdisplayname": "Synthetic Person One",
+                              "clientmessageid": "9999", "properties": properties});
         assert_eq!(body(&r), expected);
         assert!(r.headers.contains(&("BehaviorOverride".to_string(), "redirectAs404".to_string())));
     }

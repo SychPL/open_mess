@@ -1,15 +1,17 @@
 //! The shared tools (spec 8.5) on Teams: the core's arguments in, its result shapes out
 //! (`crates/open-mess/src/tools/shared.rs`). Other people's text goes under `untrusted` only.
-//! Nothing here writes read state: every request is a GET, except search's query POST.
+//! Nothing writes read state: the reads are GETs (and search's query POST), and the writes are a
+//! message POST or PUT and the `emotions` property, the only one `chat::property_write` allows
+//! (spec 9.2).
 
 use serde_json::{Value, json};
 
 use crate::api::{self, Service};
 use crate::chat::{self, Conversation, ConversationKind, Message};
-use crate::component::bindings::open_mess::module::types::{Attachment, ModuleError};
+use crate::component::bindings::open_mess::module::types::{Attachment, ModuleError, Participant, Target};
 use crate::http::HttpRequest;
 use crate::session::Session;
-use crate::text::html_to_markdown;
+use crate::text::{html_to_markdown, markdown_to_html};
 use crate::unread::{self, UnreadState};
 use crate::writing::{self, Purpose};
 use crate::{search, time};
@@ -35,6 +37,9 @@ pub fn call(account: &str, tool: &str, args_json: &str) -> Result<String, Module
         "read_messages" => read_messages,
         "search" => search,
         "writing_context" => writing_context,
+        "send" => send,
+        "edit_message" => edit_message,
+        "react" => react,
         _ => return Err(ModuleError::NotSupported(tool.to_string())),
     };
     api::with_session(account, |session| run(session, &args)).map(|result| result.to_string())
@@ -302,5 +307,107 @@ pub fn get_attachment(account: &str, conversation: &str, message: &str, attachme
         };
         let data = api::ok(response)?;
         Ok(Attachment { file_name: format!("{attachment}.{extension}"), content_type, data })
+    })
+}
+
+/// A conversation id, or a person's MRI (`8:orgid:<oid>`) for the 1:1 chat with them. That chat's
+/// id joins both object ids in an order not settled yet ("Live results" 5), so both orders are
+/// looked up; a chat is never created here.
+fn resolve(session: &mut Session, conversation: &str) -> Result<String, ModuleError> {
+    let Some(other) = conversation.strip_prefix("8:orgid:") else { return Ok(conversation.to_string()) };
+    if other.is_empty() || !other.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err(ModuleError::InvalidArgs("not a conversation id or a person's id".to_string()));
+    }
+    let me = session.account.clone();
+    for id in [format!("19:{me}_{other}@unq.gbl.spaces"), format!("19:{other}_{me}@unq.gbl.spaces")] {
+        let response = api::send(session, Service::Chat, &chat::one_conversation(&session.directory, &id), false)?;
+        if response.status != 404 {
+            api::ok(response)?;
+            return Ok(id);
+        }
+    }
+    Err(ModuleError::Platform("there is no chat with this person yet".to_string()))
+}
+
+/// Sends a write once (spec 8.5: one that may have been taken is `uncertain`, never repeated) and
+/// returns its `Location`, if any.
+fn write(session: &mut Session, request: &HttpRequest) -> Result<Option<String>, ModuleError> {
+    let response = api::send(session, Service::Chat, request, true)?;
+    let location = api::header(&response.headers, "location").map(str::to_string);
+    api::ok(response)?;
+    Ok(location)
+}
+
+/// A message, or in a channel a reply in the thread of `reply_to`. A quoted reply in a chat has no
+/// confirmed format yet, so it is refused rather than sent without its quote.
+fn send(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let conversation = resolve(session, required(args, "conversation")?)?;
+    let target = match text(args, "reply_to") {
+        None => conversation,
+        Some(root) if chat::kind(&conversation) == ConversationKind::Channel => format!("{conversation};messageid={root}"),
+        Some(_) => return Err(ModuleError::NotSupported("a reply to a chat message; send it without reply_to".to_string())),
+    };
+    let html = markdown_to_html(required(args, "text")?);
+    let request = chat::send(&session.directory, &target, &html, &api::random().to_string(), &session.name);
+    let location = write(session, &request)?;
+    // The new message's id ends the `Location` (docs 3.2).
+    let id = location.as_deref().and_then(|l| l.rsplit('/').next()).filter(|id| !id.is_empty());
+    Ok(json!({ "id": id }))
+}
+
+fn edit_message(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let conversation = resolve(session, required(args, "conversation")?)?;
+    let request = chat::edit(&session.directory, &conversation, required(args, "message")?, &markdown_to_html(required(args, "text")?));
+    write(session, &request)?;
+    Ok(json!({}))
+}
+
+/// Teams' own keys for the emoji agents are likely to send; anything else goes as it is.
+fn reaction_key(reaction: &str) -> &str {
+    match reaction.trim_end_matches('\u{fe0f}') {
+        "\u{1f44d}" => "like",
+        "\u{2764}" => "heart",
+        "\u{1f602}" | "\u{1f606}" => "laugh",
+        "\u{1f62e}" => "surprised",
+        "\u{1f622}" => "sad",
+        "\u{1f620}" | "\u{1f621}" => "angry",
+        _ => reaction,
+    }
+}
+
+fn react(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let conversation = resolve(session, required(args, "conversation")?)?;
+    let key = reaction_key(required(args, "reaction")?);
+    let request = chat::react(&session.directory, &conversation, required(args, "message")?, key, api::now_ms()).map_err(api::proto)?;
+    write(session, &request)?;
+    Ok(json!({}))
+}
+
+/// What a write in `conversation` is about (spec 8.6): its title, its members (none for a
+/// channel, which is the target itself) and the text of `message`. Reads only.
+pub fn describe_target(account: &str, conversation: &str, message: Option<&str>) -> Result<Target, ModuleError> {
+    api::with_session(account, |session| {
+        let conversation = resolve(session, conversation)?;
+        let request = chat::one_conversation(&session.directory, &conversation);
+        let c = chat::decode_conversation(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+        let participants: Vec<Participant> = if c.kind == ConversationKind::Channel {
+            Vec::new()
+        } else {
+            let request = chat::members(&session.directory, &conversation);
+            let members = chat::decode_members(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+            members.into_iter().map(|m| Participant { display_name: m.name.unwrap_or_else(|| m.id.clone()), id: m.id }).collect()
+        };
+        let me = session.me();
+        let others = || participants.iter().filter(|p| p.id != me).map(|p| p.display_name.as_str()).collect::<Vec<_>>().join(", ");
+        let conversation_title = c.title.clone().unwrap_or_else(others);
+        let target_text = match message {
+            None => None,
+            Some(id) => {
+                let request = chat::one_message(&session.directory, &conversation, id);
+                let m = chat::decode_message(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+                Some(html_to_markdown(&m.html))
+            }
+        };
+        Ok(Target { conversation_title, participants, target_text })
     })
 }

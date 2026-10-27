@@ -509,3 +509,188 @@ async fn get_attachment_fetches_ams_image() {
     assert!(matches!(module_error(other), ModuleError::InvalidArgs(_)));
     assert_eq!(teams.fake.requests("/v1/objects/").len(), 1);
 }
+
+// Task 4: writes and targets.
+
+/// Writes the fake saw: anything but a GET, apart from sign-in.
+fn writes(fake: &Fake) -> Vec<fake::Seen> {
+    fake.seen().into_iter().filter(|s| s.method != "GET" && s.path != AUTHZ_PATH).collect()
+}
+
+#[tokio::test]
+async fn send_posts_the_live_accepted_body() {
+    let teams = Teams::signed_in().await;
+    let path = messages_path(GROUP);
+    teams.fake.on(move |s| {
+        (s.path == path && s.method == "POST").then(|| {
+            Reply::json(json!({"OriginalArrivalTime": T0}))
+                .with_status(201)
+                .header("Location", &format!("{CHAT}/v1/users/ME/conversations/{GROUP}/messages/1800000000999"))
+        })
+    });
+    let result = teams.call("send", json!({"conversation": GROUP, "text": "**hi** <there>"})).await.unwrap();
+    assert_eq!(result, json!({"id": "1800000000999"}));
+    let sent = writes(&teams.fake);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (sent[0].method.as_str(), sent[0].path.as_str(), sent[0].host.as_str()),
+        ("POST", messages_path(GROUP).as_str(), "teams.microsoft.com")
+    );
+    assert_eq!(sent[0].audience().as_deref(), Some("https://ic3.teams.office.com"));
+    let mut body = sent[0].json();
+    let client_message_id = body["clientmessageid"].take();
+    assert!(client_message_id.as_str().is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())), "{client_message_id}");
+    let properties = json!({"importance": "", "subject": "", "mentions": "[]", "files": "[]", "formatVariant": "TEAMS"});
+    let expected = json!({
+        "content": "<b>hi</b> &lt;there&gt;",
+        "messagetype": "RichText/Html",
+        "contenttype": "Text",
+        "imdisplayname": ME_NAME,
+        "clientmessageid": null,
+        "properties": properties,
+    });
+    assert_eq!(body, expected);
+}
+
+#[tokio::test]
+async fn reply_goes_to_the_channel_thread() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(|s| (s.method == "POST").then(|| Reply::status(201)));
+    teams.call("send", json!({"conversation": CHANNEL, "text": "ok", "reply_to": "1800000000100"})).await.unwrap();
+    assert_eq!(writes(&teams.fake)[0].path, format!("{CHAT_PATH}/{CHANNEL};messageid=1800000000100/messages"));
+    // A quote reply in a chat has no confirmed format yet: refused, nothing sent.
+    let quote = teams.call("send", json!({"conversation": GROUP, "text": "ok", "reply_to": "1800000000100"})).await;
+    assert!(matches!(module_error(quote), ModuleError::NotSupported(_)));
+    assert_eq!(writes(&teams.fake).len(), 1);
+}
+
+#[tokio::test]
+async fn edit_puts_the_message() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(|s| (s.method == "PUT").then(|| Reply::status(200)));
+    teams.call("edit_message", json!({"conversation": GROUP, "message": "1800000000300", "text": "_fixed_"})).await.unwrap();
+    let sent = writes(&teams.fake);
+    assert_eq!(sent.len(), 1);
+    assert_eq!((sent[0].method.as_str(), sent[0].path.as_str()), ("PUT", format!("{}/1800000000300", messages_path(GROUP)).as_str()));
+    assert_eq!(sent[0].json(), json!({"content": "<i>fixed</i>", "messagetype": "RichText/Html", "contenttype": "Text"}));
+    // A refusal is the platform's error, not a success.
+    teams.fake.on(|s| (s.method == "PUT").then(|| Reply::status(403)));
+    let refused = teams.call("edit_message", json!({"conversation": GROUP, "message": "1800000000300", "text": "x"})).await;
+    assert!(matches!(module_error(refused), ModuleError::Platform(_)));
+}
+
+#[tokio::test]
+async fn react_writes_only_emotions() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(|s| (s.method == "PUT").then(|| Reply::status(200)));
+    let before = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap();
+    for reaction in ["like", "\u{2764}\u{fe0f}"] {
+        teams.call("react", json!({"conversation": GROUP, "message": "1800000000300", "reaction": reaction})).await.unwrap();
+    }
+    let sent = writes(&teams.fake);
+    assert_eq!(sent.len(), 2);
+    for (request, key) in sent.iter().zip(["like", "heart"]) {
+        assert_eq!((request.method.as_str(), request.query.as_str()), ("PUT", "name=emotions"));
+        assert_eq!(request.path, format!("{}/1800000000300/properties", messages_path(GROUP)));
+        let body = request.json();
+        assert_eq!(body["emotions"]["key"], key);
+        assert!(body["emotions"]["value"].as_i64().unwrap() >= before);
+        assert_eq!(body.as_object().unwrap().len(), 1);
+    }
+}
+
+/// Answers the conversation, its members and one message, for describe-target.
+fn target_server(conversation: &'static str, topic: Option<&'static str>, members: Value) -> impl Fn(&fake::Seen) -> Option<Reply> {
+    move |s| {
+        if s.path == format!("{CHAT_PATH}/{conversation}") {
+            Some(Reply::json(fake::conversation(conversation, topic, None)))
+        } else if s.path == format!("/api/chatsvc/emea/v1/threads/{conversation}/members") {
+            Some(Reply::json(members.clone()))
+        } else if s.path == format!("{}/1800000000300", messages_path(conversation)) {
+            Some(Reply::json(message("1800000000300", conversation, OTHER, "<p>the <b>target</b></p>", T0)))
+        } else {
+            None
+        }
+    }
+}
+
+#[tokio::test]
+async fn describe_target_lists_members() {
+    let teams = Teams::signed_in().await;
+    let members = json!({"members": [
+        {"id": ME, "role": "Admin", "friendlyName": ME_NAME},
+        {"id": OTHER, "role": "User", "friendlyName": "Synthetic Person Two"},
+        {"id": "8:orgid:00000000-0000-0000-0000-000000000003", "role": "User"},
+    ]});
+    teams.fake.on(target_server(GROUP, Some("Synthetic group"), members));
+    let target = teams.module.describe_target(ME_OID, GROUP, None).await.unwrap();
+    assert_eq!(target.conversation_title, "Synthetic group");
+    let participants: Vec<(&str, &str)> = target.participants.iter().map(|p| (p.id.as_str(), p.display_name.as_str())).collect();
+    let third = "8:orgid:00000000-0000-0000-0000-000000000003";
+    assert_eq!(participants, [(ME, ME_NAME), (OTHER, "Synthetic Person Two"), (third, third)]);
+    assert_eq!(target.target_text, None);
+    // Reads only.
+    assert!(writes(&teams.fake).is_empty());
+
+    // A channel is the target itself: no roster.
+    teams.fake.on(target_server(CHANNEL, Some("Synthetic channel"), json!({"members": [{"id": ME}]})));
+    let channel = teams.module.describe_target(ME_OID, CHANNEL, None).await.unwrap();
+    assert_eq!((channel.conversation_title.as_str(), channel.participants.len()), ("Synthetic channel", 0));
+}
+
+#[tokio::test]
+async fn describe_target_reads_the_target_text() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(target_server(GROUP, Some("Synthetic group"), json!({"members": [{"id": ME}, {"id": OTHER}]})));
+    let target = teams.module.describe_target(ME_OID, GROUP, Some("1800000000300")).await.unwrap();
+    assert_eq!(target.target_text.as_deref(), Some("the **target**"));
+    let missing = teams.module.describe_target(ME_OID, GROUP, Some("1800000000301")).await;
+    assert!(matches!(module_error(missing), ModuleError::Platform(_)));
+    assert!(writes(&teams.fake).is_empty());
+}
+
+#[tokio::test]
+async fn timeout_after_post_is_uncertain() {
+    // The answer comes after the host's read timeout (1 s in tests), or the service fails: the
+    // message may have been taken, and it is never sent twice.
+    for reply in [Reply::status(201).delayed(Duration::from_millis(1500)), Reply::status(503)] {
+        let teams = Teams::signed_in().await;
+        let reply = std::sync::Mutex::new(Some(reply));
+        teams.fake.on(move |s| (s.method == "POST").then(|| reply.lock().unwrap().take().unwrap_or_else(|| Reply::status(201))));
+        let result = teams.call("send", json!({"conversation": GROUP, "text": "once"})).await;
+        assert!(matches!(module_error(result), ModuleError::Uncertain(_)));
+        assert_eq!(writes(&teams.fake).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn one_to_one_id_checks_both_orders() {
+    let teams = Teams::signed_in().await;
+    let other_oid = OTHER.trim_start_matches("8:orgid:");
+    let (mine_first, theirs_first) = (format!("19:{ME_OID}_{other_oid}@unq.gbl.spaces"), format!("19:{other_oid}_{ME_OID}@unq.gbl.spaces"));
+    let existing = theirs_first.clone();
+    teams.fake.on(move |s| {
+        if s.method == "POST" {
+            Some(Reply::status(201))
+        } else if s.path == format!("{CHAT_PATH}/{existing}") {
+            Some(Reply::json(fake::conversation(&existing, None, None)))
+        } else if s.path.contains("/members") {
+            Some(Reply::json(json!({"members": [{"id": ME}, {"id": OTHER, "friendlyName": "Synthetic Person Two"}]})))
+        } else {
+            None
+        }
+    });
+    teams.call("send", json!({"conversation": OTHER, "text": "hi"})).await.unwrap();
+    let probes: Vec<String> = teams.fake.seen().into_iter().filter(|s| s.method == "GET").map(|s| s.path).collect();
+    assert_eq!(probes, [format!("{CHAT_PATH}/{mine_first}"), format!("{CHAT_PATH}/{theirs_first}")]);
+    assert_eq!(writes(&teams.fake)[0].path, messages_path(&theirs_first));
+    // The approval shows the same chat.
+    let target = teams.module.describe_target(ME_OID, OTHER, None).await.unwrap();
+    assert_eq!(target.conversation_title, "Synthetic Person Two");
+
+    // No chat with this person yet: refused, nothing sent.
+    teams.fake.on(|s| (s.method == "POST").then(|| Reply::status(201)));
+    let none = teams.call("send", json!({"conversation": "8:orgid:00000000-0000-0000-0000-000000000004", "text": "hi"})).await;
+    assert!(matches!(module_error(none), ModuleError::Platform(_)));
+    assert_eq!(writes(&teams.fake).len(), 1);
+}
