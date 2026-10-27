@@ -24,10 +24,19 @@ $exe = Join-Path $Source 'target\release\om.exe'
 $wasmDir = Join-Path $Source 'target\wasm32-wasip2\release'
 $taskName = 'open_mess'
 
+# Everything to install is checked before the running daemon is touched.
 if (-not (Test-Path $exe)) { throw "No release build at $exe - run: cargo build --release -p open-mess" }
+$built = @(Get-ChildItem $wasmDir -Filter 'open_mess_*.wasm' -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -notmatch '^open_mess_test_' })
+if ($built.Count -eq 0) {
+    throw "No platform modules in $wasmDir - run: cargo build --release --target wasm32-wasip2 -p open-mess-teams"
+}
 
-# 1. Stop the daemon: the scheduled task, then any om.exe daemon of this user.
-if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+# 1. Stop the daemon: the scheduled task, then any om.exe daemon of this user. The task is disabled
+# first, so its 5-minute trigger cannot start the old daemon in the middle of the install.
+$existing = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
+if ($existing) {
+    Disable-ScheduledTask -TaskName $taskName | Out-Null
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 }
 # ponytail: a hard stop; pending actions are recovered at the next start (spec 8.6). Add `om stop`
@@ -38,42 +47,47 @@ Get-CimInstance Win32_Process -Filter "Name='om.exe'" |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 500
 
-# 2. The binary. A running copy cannot be overwritten on Windows, so move it aside first.
-New-Item -ItemType Directory -Force $bin | Out-Null
-$target = Join-Path $bin 'om.exe'
-$old = Join-Path $bin 'om.old.exe'
-if (Test-Path $target) {
-    Remove-Item $old -Force -ErrorAction SilentlyContinue
-    Move-Item $target $old -Force
-}
+# Steps 2 and 3 replace files; if one fails, the task is enabled and started again, so the previous
+# install keeps running (step 2 puts the previous om.exe back itself).
 try {
-    Copy-Item $exe $target
+    # 2. The binary. A running copy cannot be overwritten on Windows, so move it aside first.
+    New-Item -ItemType Directory -Force $bin | Out-Null
+    $target = Join-Path $bin 'om.exe'
+    $old = Join-Path $bin 'om.old.exe'
+    if (Test-Path $target) {
+        Remove-Item $old -Force -ErrorAction SilentlyContinue
+        Move-Item $target $old -Force
+    }
+    try {
+        Copy-Item $exe $target
+    } catch {
+        # A full disk, say: put the previous binary back so the task still has one to start.
+        if (Test-Path $old) { Move-Item $old $target -Force }
+        throw
+    }
+    Write-Host "om.exe -> $target"
+
+    # 3. Platform modules: open_mess_<name>.wasm -> <name>.wasm; test guests are never installed.
+    New-Item -ItemType Directory -Force $modules | Out-Null
+    $built |
+        ForEach-Object {
+            $name = $_.BaseName -replace '^open_mess_', ''
+            $dest = Join-Path $modules "$name.wasm"
+            $same = (Test-Path $dest) -and ((Get-FileHash $dest).Hash -eq (Get-FileHash $_.FullName).Hash)
+            if ($same) {
+                Write-Host "module $name unchanged"
+            } else {
+                Copy-Item $_.FullName $dest -Force
+                Write-Host "module $name -> $dest (approve it again in the window)"
+            }
+        }
 } catch {
-    # A full disk, say: put the previous binary back so the task still has one to start.
-    if (Test-Path $old) { Move-Item $old $target -Force }
+    if ($existing) {
+        Enable-ScheduledTask -TaskName $taskName | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+    }
     throw
 }
-Write-Host "om.exe -> $target"
-
-# 3. Platform modules: open_mess_<name>.wasm -> <name>.wasm; test guests are never installed.
-New-Item -ItemType Directory -Force $modules | Out-Null
-$built = @(Get-ChildItem $wasmDir -Filter 'open_mess_*.wasm' -ErrorAction SilentlyContinue |
-    Where-Object { $_.BaseName -notmatch '^open_mess_test_' })
-if ($built.Count -eq 0) {
-    throw "No platform modules in $wasmDir - run: cargo build --release --target wasm32-wasip2 -p open-mess-teams"
-}
-$built |
-    ForEach-Object {
-        $name = $_.BaseName -replace '^open_mess_', ''
-        $dest = Join-Path $modules "$name.wasm"
-        $same = (Test-Path $dest) -and ((Get-FileHash $dest).Hash -eq (Get-FileHash $_.FullName).Hash)
-        if ($same) {
-            Write-Host "module $name unchanged"
-        } else {
-            Copy-Item $_.FullName $dest -Force
-            Write-Host "module $name -> $dest (approve it again in the window)"
-        }
-    }
 
 # 4. Start at logon, hidden (conhost --headless keeps the console window away), and every 5 minutes:
 # conhost exits 0 whatever the daemon did, so the restart-on-failure settings alone never fire.
