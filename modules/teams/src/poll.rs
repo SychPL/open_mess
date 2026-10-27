@@ -1,14 +1,15 @@
 //! New-message events by polling (docs/protocols/teams.md 3.2): each poll lists the conversations
-//! updated since the previous one; a conversation whose last message is new has its messages read
-//! back to the last one seen, and each new message reports one `message-arrived`, so a mention
-//! followed by another message is not lost. A conversation whose messages cannot be read this time
+//! updated since the previous one; a conversation whose last item (a message, or a call or other
+//! event) is new has its messages read back to the last one seen, and each new message reports one
+//! `message-arrived`, so a mention followed by another message is not lost. More new pages than a
+//! poll reads are read on by the next polls. A conversation whose messages cannot be read this time
 //! holds the floor, so the next poll tries it again without the others waiting. Read-only:
 //! nothing here touches read state. What was reported is kept in module storage, so a restarted
 //! instance does not report it again. Trouter (live events) needs live checks first (F2b).
 
 use serde_json::{Value, json};
 
-use crate::chat::{Conversation, ConversationKind, Message};
+use crate::chat::{self, Conversation, ConversationKind, Message};
 
 /// The host timer that runs the poll, and its interval.
 pub const TIMER: u32 = 1;
@@ -22,6 +23,8 @@ const MAX_SEEN: usize = 1000;
 /// stands for what could not be read, so one broken conversation cannot make every poll list
 /// ever more conversations.
 const MAX_HOLD_MS: i64 = 60 * 60_000;
+/// Conversations whose older pages wait for the next polls; past it the oldest is given up.
+const MAX_BEHIND: usize = 20;
 
 /// Where an account's state is stored.
 pub fn key(account: &str) -> String {
@@ -47,12 +50,63 @@ pub struct PollState {
     seen: Vec<(String, String, i64)>,
     /// When a conversation that could not be read began to hold the floor.
     held_since_ms: Option<i64>,
+    /// Older pages of conversations that had more new messages than one poll reads.
+    behind: Vec<Behind>,
+}
+
+/// The older pages of one conversation still to read: from `link` on, back to the first message
+/// that was not new when the conversation fell behind.
+#[derive(Debug, PartialEq)]
+pub struct Behind {
+    pub conversation: String,
+    /// The chat service's `backwardLink` to the next page.
+    pub link: String,
+    floor_ms: i64,
+    /// The message seen last in the conversation then, if any.
+    seen: Option<(String, i64)>,
+    since_ms: i64,
+}
+
+impl Behind {
+    /// Whether `m` was new when the conversation fell behind.
+    pub fn fresh(&self, m: &Message) -> bool {
+        m.sent_ms > self.floor_ms && self.seen.as_ref().is_none_or(|(id, ms)| m.id != *id && m.sent_ms >= *ms)
+    }
+
+    fn encode(&self) -> Value {
+        json!({"conversation": self.conversation, "link": self.link, "floor": self.floor_ms, "seen": self.seen, "since": self.since_ms})
+    }
+
+    fn decode(v: &Value) -> Option<Behind> {
+        let seen = match v.get("seen")? {
+            Value::Null => None,
+            seen => Some((seen.get(0)?.as_str()?.to_string(), seen.get(1)?.as_i64()?)),
+        };
+        Some(Behind {
+            conversation: v.get("conversation")?.as_str()?.to_string(),
+            link: v.get("link")?.as_str()?.to_string(),
+            floor_ms: v.get("floor")?.as_i64()?,
+            seen,
+            since_ms: v.get("since")?.as_i64()?,
+        })
+    }
+}
+
+fn arrival(conversation: &str, m: &Message, direct: bool, me: &str) -> Arrival {
+    Arrival {
+        conversation: conversation.to_string(),
+        message: m.id.clone(),
+        sender: m.sender_id.clone(),
+        own: m.sender_id == me,
+        mentions_me: m.mentions.iter().any(|mention| mention.mri == me),
+        direct,
+    }
 }
 
 impl PollState {
     /// An account whose messages count from `now_ms` on: when it signs in or is restored.
     pub fn new(now_ms: i64) -> PollState {
-        PollState { floor_ms: now_ms, seen: Vec::new(), held_since_ms: None }
+        PollState { floor_ms: now_ms, seen: Vec::new(), held_since_ms: None, behind: Vec::new() }
     }
 
     /// The stored state; `None` when there is none or it does not read.
@@ -66,11 +120,17 @@ impl PollState {
             None | Some(Value::Null) => None,
             Some(ms) => Some(ms.as_i64()?),
         };
-        Some(PollState { floor_ms: v.get("floor")?.as_i64()?, seen, held_since_ms })
+        // Stored before there were older pages to keep: none.
+        let behind = match v.get("behind") {
+            None => Vec::new(),
+            Some(list) => list.as_array()?.iter().map(Behind::decode).collect::<Option<_>>()?,
+        };
+        Some(PollState { floor_ms: v.get("floor")?.as_i64()?, seen, held_since_ms, behind })
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        json!({"floor": self.floor_ms, "seen": self.seen, "held": self.held_since_ms}).to_string().into_bytes()
+        let behind: Vec<Value> = self.behind.iter().map(Behind::encode).collect();
+        json!({"floor": self.floor_ms, "seen": self.seen, "held": self.held_since_ms, "behind": behind}).to_string().into_bytes()
     }
 
     /// The list's `startTime`: conversations updated since then.
@@ -82,49 +142,91 @@ impl PollState {
         self.seen.iter().find(|(c, ..)| c == conversation).map(|(_, id, ms)| (id.as_str(), *ms))
     }
 
-    /// Whether `m` of `conversation` is new: after the floor, and neither the message seen last
-    /// there nor older than it (a list that lags behind the history shows an older one).
-    pub fn fresh(&self, conversation: &str, m: &Message) -> bool {
-        m.sent_ms > self.floor_ms && self.seen(conversation).is_none_or(|(id, ms)| m.id != id && m.sent_ms >= ms)
+    /// Whether the item `id` of `conversation`, sent at `ms`, is new: after the floor, and neither
+    /// the item seen last there nor older than it (a list that lags behind the history shows an
+    /// older one).
+    fn fresh_item(&self, conversation: &str, id: &str, ms: i64) -> bool {
+        ms > self.floor_ms && self.seen(conversation).is_none_or(|(seen, seen_ms)| id != seen && ms >= seen_ms)
     }
 
-    /// Whether the conversation's last message is new.
+    /// Whether `m` of `conversation` is new.
+    pub fn fresh(&self, conversation: &str, m: &Message) -> bool {
+        self.fresh_item(conversation, &m.id, m.sent_ms)
+    }
+
+    /// Whether the conversation's last item is new, a text message or not: a call or a member
+    /// added after a mention must not hide the mention.
     pub fn changed(&self, c: &Conversation) -> bool {
-        c.last_message.as_ref().is_some_and(|m| self.fresh(&c.id, m))
+        match (&c.last_message_id, c.horizons.last_message_ms) {
+            (Some(id), Some(ms)) => self.fresh_item(&c.id, id, ms),
+            _ => false,
+        }
     }
 
     /// The arrivals of a changed conversation, oldest first, from its new messages (newest first,
     /// read until the first one not `fresh`); `None` when they may not be read, and then the
-    /// list's last message stands for them. The newest message is remembered: it may be newer
-    /// than the list's last one, if it came while the poll ran.
+    /// list's last message stands for them. Remembered is the newest of what was read and the
+    /// list's last item: the history may be ahead of the list, if a message came while the poll
+    /// ran, and the list's last item may be no text message.
     pub fn arrivals(&mut self, c: &Conversation, new_newest_first: Option<&[Message]>, me: &str) -> Vec<Arrival> {
-        let Some(last) = &c.last_message else { return Vec::new() };
         // An empty answer did not show the new last message: the list's word stands.
         let messages: Vec<&Message> = match new_newest_first {
             Some(new) if !new.is_empty() => new.iter().collect(),
-            _ => vec![last],
+            _ => c.last_message.iter().collect(),
         };
-        let newest = messages.first().map_or_else(|| (last.id.clone(), last.sent_ms), |m| (m.id.clone(), m.sent_ms));
+        let read = messages.first().map(|m| (m.id.clone(), m.sent_ms));
+        let listed = c.last_message_id.clone().zip(c.horizons.last_message_ms);
+        let newest = match (read, listed) {
+            (Some(read), Some(listed)) if listed.1 > read.1 => Some(listed),
+            (read, listed) => read.or(listed),
+        };
         let direct = c.kind == ConversationKind::Direct;
-        let mut arrivals: Vec<Arrival> = messages
-            .into_iter()
-            .filter(|m| !m.deleted)
-            .map(|m| Arrival {
-                conversation: c.id.clone(),
-                message: m.id.clone(),
-                sender: m.sender_id.clone(),
-                own: m.sender_id == me,
-                mentions_me: m.mentions.iter().any(|mention| mention.mri == me),
-                direct,
-            })
-            .collect();
+        let mut arrivals: Vec<Arrival> = messages.into_iter().filter(|m| !m.deleted).map(|m| arrival(&c.id, m, direct, me)).collect();
         arrivals.reverse();
-        self.seen.retain(|(conversation, ..)| *conversation != c.id);
-        self.seen.push((c.id.clone(), newest.0, newest.1));
-        if self.seen.len() > MAX_SEEN {
-            self.seen.remove(0);
+        if let Some((id, ms)) = newest {
+            self.seen.retain(|(conversation, ..)| *conversation != c.id);
+            self.seen.push((c.id.clone(), id, ms));
+            if self.seen.len() > MAX_SEEN {
+                self.seen.remove(0);
+            }
         }
         arrivals
+    }
+
+    /// Notes that a conversation had more new messages than one poll reads: the pages from `link`
+    /// on are read by the next polls, back to where this one would have stopped. Call it before
+    /// [`PollState::arrivals`] moves what was seen there. False when that pushed out the oldest
+    /// conversation that fell behind, whose older messages are then not reported.
+    pub fn fall_behind(&mut self, conversation: &str, link: String, now_ms: i64) -> bool {
+        let seen = self.seen(conversation).map(|(id, ms)| (id.to_string(), ms));
+        self.behind.push(Behind { conversation: conversation.to_string(), link, floor_ms: self.floor_ms, seen, since_ms: now_ms });
+        if self.behind.len() > MAX_BEHIND {
+            self.behind.remove(0);
+            return false;
+        }
+        true
+    }
+
+    /// The older pages to read in this poll; [`PollState::keep_behind`] puts back what is left.
+    pub fn take_behind(&mut self) -> Vec<Behind> {
+        std::mem::take(&mut self.behind)
+    }
+
+    /// Older pages to read in a later poll: what is left of them, or the same after a failure,
+    /// for an hour from when the conversation fell behind. False when that hour is over and they
+    /// are given up.
+    pub fn keep_behind(&mut self, b: Behind, now_ms: i64) -> bool {
+        if now_ms.saturating_sub(b.since_ms) >= MAX_HOLD_MS {
+            return false;
+        }
+        self.behind.push(b);
+        true
+    }
+
+    /// The arrivals of older messages read for `b` (newest first), oldest first.
+    pub fn older_arrivals(b: &Behind, older_newest_first: &[Message], me: &str) -> Vec<Arrival> {
+        let direct = chat::kind(&b.conversation) == ConversationKind::Direct;
+        older_newest_first.iter().rev().filter(|m| !m.deleted).map(|m| arrival(&b.conversation, m, direct, me)).collect()
     }
 
     /// Whether a conversation that could not be read at `now_ms` may hold the floor for the next
@@ -255,6 +357,56 @@ mod tests {
         // A minute later the list still shows 2: it is not new, so nothing is read or reported.
         assert!(!state.changed(&conversation("19:a@thread.v2", two)));
         assert!(!state.changed(&conversation("19:a@thread.v2", three)));
+    }
+
+    #[test]
+    fn a_call_after_a_mention_does_not_hide_it() {
+        let mut state = PollState::new(NOW);
+        let call = json!({"id": "3", "conversationid": "19:a@thread.v2", "from": OTHER, "messagetype": "Event/Call",
+                          "content": "<partlist/>", "originalarrivaltime": NOW + 3});
+        let c = conversation("19:a@thread.v2", call);
+        assert!(c.last_message.is_none() && state.changed(&c));
+        let fresh = new(&state, "19:a@thread.v2", vec![message("19:a@thread.v2", "2", OTHER, NOW + 2, Some(ME))]);
+        let arrivals = state.arrivals(&c, Some(&fresh), ME);
+        assert_eq!(arrivals.iter().map(|a| (a.message.as_str(), a.mentions_me)).collect::<Vec<_>>(), [("2", true)]);
+        // The call is what was seen last: the next poll finds nothing new there.
+        assert!(!state.changed(&c));
+        // Not readable: nothing to report, and the call is remembered all the same.
+        let mut state = PollState::new(NOW);
+        assert!(state.arrivals(&c, None, ME).is_empty());
+        assert!(!state.changed(&c));
+    }
+
+    #[test]
+    fn older_pages_are_read_back_to_where_the_poll_would_have_stopped() {
+        let mut state = PollState::new(NOW);
+        let conv = "19:a@thread.v2";
+        let first = message(conv, "1", OTHER, NOW + 1, None);
+        state.arrivals(&conversation(conv, first.clone()), Some(&page(vec![first.clone()])), ME);
+        // More new pages than one poll reads: the newest are reported, the rest wait.
+        let newest = message(conv, "9", OTHER, NOW + 9, None);
+        assert!(state.fall_behind(conv, "https://link/older".into(), NOW + 10));
+        state.arrivals(&conversation(conv, newest.clone()), Some(&page(vec![newest])), ME);
+        let behind = state.take_behind();
+        assert_eq!((behind.len(), behind[0].link.as_str()), (1, "https://link/older"));
+        // Back to the message seen before, not the one seen now.
+        let older = page(vec![message(conv, "3", OTHER, NOW + 3, Some(ME)), message(conv, "2", OTHER, NOW + 2, None), first.clone()]);
+        let fresh: Vec<Message> = older.into_iter().take_while(|m| behind[0].fresh(m)).collect();
+        let arrivals = PollState::older_arrivals(&behind[0], &fresh, ME);
+        assert_eq!(arrivals.iter().map(|a| (a.message.as_str(), a.mentions_me)).collect::<Vec<_>>(), [("2", false), ("3", true)]);
+        // Kept for a later poll, through storage, for an hour.
+        let b = behind.into_iter().next().unwrap();
+        assert!(state.keep_behind(b, NOW + 10 + MAX_HOLD_MS - 1));
+        let mut stored = PollState::decode(&state.encode()).unwrap();
+        assert_eq!(stored, state);
+        let b = stored.take_behind().pop().unwrap();
+        assert!(!stored.keep_behind(b, NOW + 10 + MAX_HOLD_MS));
+        // A bounded number of conversations wait.
+        for i in 0..=MAX_BEHIND {
+            let kept = stored.fall_behind(&format!("19:{i}@thread.v2"), "https://link".into(), NOW);
+            assert_eq!(kept, i < MAX_BEHIND);
+        }
+        assert_eq!(stored.take_behind().len(), MAX_BEHIND);
     }
 
     #[test]

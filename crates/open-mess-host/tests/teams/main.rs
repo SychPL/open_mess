@@ -309,6 +309,33 @@ async fn list_conversations_maps_kinds() {
     assert_eq!(ids(&teams.call("list_conversations", json!({"query": "person two"})).await.unwrap(), "id"), [DIRECT]);
     // The core applies the limit after its read filter, so the module leaves no match out.
     assert_eq!(ids(&teams.call("list_conversations", json!({"limit": 2})).await.unwrap(), "id").len(), 5);
+    // An agent's requests go at the default priority; only the poll's are background ones.
+    assert!(teams.fake.requests(CHAT_PATH).iter().all(|s| s.header("x-ms-request-priority").is_none()));
+}
+
+#[tokio::test]
+async fn a_direct_chat_the_user_wrote_last_in_is_found_by_name() {
+    let teams = Teams::signed_in().await;
+    let members_path = format!("/api/chatsvc/emea/v1/threads/{DIRECT}/members");
+    let members = json!({"members": [{"id": ME, "friendlyName": ME_NAME}, {"id": OTHER, "friendlyName": "Synthetic Person Two"}]});
+    let list =
+        vec![conversation(DIRECT, None, Some(numbered(101, DIRECT, ME, "<p>see you</p>"))), conversation(GROUP, Some("Synthetic group"), None)];
+    let path = members_path.clone();
+    teams.fake.on(move |s| {
+        if s.path == CHAT_PATH {
+            Some(Reply::json(page("conversations", list.clone(), None)))
+        } else {
+            (s.path == path).then(|| Reply::json(members.clone()))
+        }
+    });
+    // The list names the chat after no one: its members do.
+    let found = teams.call("list_conversations", json!({"query": "person two"})).await.unwrap();
+    assert_eq!(ids(&found, "id"), [DIRECT]);
+    assert_eq!(found["items"][0]["untrusted"], json!({"title": "Synthetic Person Two"}));
+    // Without a query nothing more is asked for.
+    let asked = teams.fake.requests(&members_path).len();
+    assert_eq!(ids(&teams.call("list_conversations", json!({})).await.unwrap(), "id"), [DIRECT, GROUP]);
+    assert_eq!(teams.fake.requests(&members_path).len(), asked);
 }
 
 #[tokio::test]
@@ -824,6 +851,8 @@ async fn new_message_emits_an_event() {
     for poll in &polls {
         let start: i64 = poll.query.split("startTime=").nth(1).unwrap().split('&').next().unwrap().parse().unwrap();
         assert!(start > started - 10 * 60_000 && start < started + 60_000, "{}", poll.query);
+        // Background requests, as the official client marks them (spec 9.2).
+        assert_eq!(poll.header("x-ms-request-priority"), Some("20"));
     }
     assert!(teams.fake.seen().iter().all(|s| s.method == "GET" || s.path == AUTHZ_PATH));
 }
@@ -868,6 +897,63 @@ async fn many_messages_between_polls_all_arrive() {
     let first = teams.next_message().await.unwrap();
     assert_eq!((first.message.as_str(), first.mentions_me), ("1900000000031", true));
     assert_eq!(teams.next_message().await.unwrap().message, "1900000000032");
+    assert_eq!(teams.next_message().await, None);
+}
+
+#[tokio::test]
+async fn more_new_pages_than_a_poll_reads_arrive_with_the_next() {
+    // One message a page, one page more than a poll reads: the oldest, a mention, comes with the
+    // next poll, from where the first one stopped.
+    const PAGES: usize = 21;
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let messages: Vec<Value> = (0..PAGES)
+        .map(|i| {
+            let m = message(&format!("19000000001{i:02}"), GROUP, OTHER, "<p>x</p>", at + i64::try_from(i).unwrap());
+            if i == 0 { mentioning(m, ME) } else { m }
+        })
+        .collect();
+    let (list, path) = (vec![conversation(GROUP, None, Some(messages[PAGES - 1].clone()))], messages_path(GROUP));
+    teams.fake.on(move |s| match s.path.as_str() {
+        CHAT_PATH => Some(Reply::json(page("conversations", list.clone(), None))),
+        p if p == path => {
+            // Page k (0 the newest) holds message PAGES - 1 - k.
+            let k: usize = s.query.split("syncState=p").nth(1).map_or(0, |k| k.split('&').next().unwrap().parse().unwrap());
+            let next =
+                format!("{CHAT}/v1/users/ME/conversations/{GROUP}/messages?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=p{}", k + 1);
+            Some(Reply::json(page("messages", vec![messages[PAGES - 1 - k].clone()], (k + 1 < PAGES).then_some(next.as_str()))))
+        }
+        _ => None,
+    });
+    let mut arrived = Vec::new();
+    while let Some(event) = teams.next_message().await {
+        arrived.push(event);
+    }
+    let mut ids: Vec<&str> = arrived.iter().map(|event| event.message.as_str()).collect();
+    assert_eq!(ids.len(), PAGES, "{ids:?}");
+    assert_eq!(arrived.last().map(|event| (event.message.as_str(), event.mentions_me)), Some(("1900000000100", true)));
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), PAGES);
+    assert!(teams.fake.requests(&messages_path(GROUP)).iter().any(|s| s.query.contains(&format!("syncState=p{}", PAGES - 1))));
+}
+
+#[tokio::test]
+async fn a_call_after_a_mention_does_not_hide_it() {
+    // The list's last item is a call, which is no text message: the mention before it still comes.
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let mention = mentioning(message("1900000000051", GROUP, OTHER, "<p>hey One</p>", at), ME);
+    let mut call = message("1900000000052", GROUP, OTHER, "<partlist/>", at + 1);
+    call["messagetype"] = "Event/Call".into();
+    let (list, path) = (vec![conversation(GROUP, None, Some(call.clone()))], messages_path(GROUP));
+    teams.fake.on(move |s| match s.path.as_str() {
+        CHAT_PATH => Some(Reply::json(page("conversations", list.clone(), None))),
+        p if p == path => Some(Reply::json(page("messages", vec![call.clone(), mention.clone()], None))),
+        _ => None,
+    });
+    let event = teams.next_message().await.unwrap();
+    assert_eq!((event.message.as_str(), event.mentions_me), ("1900000000051", true));
     assert_eq!(teams.next_message().await, None);
 }
 

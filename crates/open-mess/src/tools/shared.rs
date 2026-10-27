@@ -71,7 +71,9 @@ pub fn tools() -> Vec<ToolInfo> {
         ),
         tool(
             "mentions",
-            "Messages that mention the user.",
+            "Messages that mention the user, from the conversations active most recently: a platform may read only some of them \
+             (Teams: the 20 most recently active since `since`, the last 1000 messages of each), so a mention in a quieter \
+             conversation can be missing. read_messages on that conversation, or search, finds it.",
             json!({"account": optional_account, "since": string("Only mentions after this time (RFC 3339).")}),
             &[],
         ),

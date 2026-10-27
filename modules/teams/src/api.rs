@@ -31,11 +31,20 @@ thread_local! {
     static POLLING: Cell<bool> = const { Cell::new(false) };
     /// When the current call's budget ends.
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Whether the current call works in the background (the poll), not for an agent.
+    static BACKGROUND: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Starts a call's budget; every export calls it first.
 pub fn begin() {
     DEADLINE.set(Some(Instant::now() + CALL_BUDGET));
+    BACKGROUND.set(false);
+}
+
+/// Marks the rest of the current call as background work: its requests go at the low priority the
+/// official client gives background requests (spec 9.2, docs/protocols/teams.md 8).
+pub fn background() {
+    BACKGROUND.set(true);
 }
 
 /// Whether the call's budget has time left for more requests.
@@ -286,6 +295,9 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
         }
         let mut headers = req.headers.clone();
         headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        if BACKGROUND.get() {
+            headers.push(("x-ms-request-priority".to_string(), "20".to_string()));
+        }
         let request = http::Request { method: req.method.clone(), url: url.clone(), headers, body: req.body.clone() };
         let response = http::fetch(&request).map_err(|e| transport(&e, write))?;
         if redirects

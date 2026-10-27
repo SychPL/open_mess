@@ -143,8 +143,7 @@ fn message_item(m: &Message, me: &str) -> Value {
 }
 
 /// The conversation's topic. A 1:1 chat has none: the other person's name from their last message
-/// stands in. ponytail: a 1:1 chat whose last message is the user's own stays nameless; the
-/// members request of `describe-target` names everyone, at one request per chat.
+/// stands in; [`name_direct_chats`] names the others when a query needs it.
 fn title(c: &Conversation, me: &str) -> Option<String> {
     let other = || c.last_message.as_ref().filter(|m| m.sender_id != me).and_then(|m| m.sender_name.clone());
     c.title.clone().or_else(|| if c.kind == ConversationKind::Direct { other() } else { None })
@@ -159,25 +158,54 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
     // A person's MRI finds the 1:1 chat with them.
     if let Some(other) = query.as_deref().and_then(|q| q.strip_prefix("8:orgid:")) {
         let found = one_to_one(session, other)?.filter(|c| kind.is_none_or(|k| k == kind_name(c.kind)));
-        let items: Vec<Value> = found.iter().map(|c| conversation_item(c, &me)).collect();
+        let items: Vec<Value> = found.iter().map(|c| conversation_item(c, title(c, &me))).collect();
         return Ok(json!({ "items": items }));
     }
-    let mut items = Vec::new();
+    let mut found = Vec::new();
     conversations(session, 1, true, |c| {
-        let title = title(&c, &me);
-        let title_matches = query.as_deref().is_none_or(|q| title.as_deref().is_some_and(|t| t.to_lowercase().contains(q)));
-        if kind.is_none_or(|k| k == kind_name(c.kind)) && title_matches {
-            items.push(conversation_item(&c, &me));
+        if kind.is_none_or(|k| k == kind_name(c.kind)) {
+            let title = title(&c, &me);
+            found.push((c, title));
         }
         true
     })?;
+    if let Some(query) = &query {
+        name_direct_chats(session, &mut found, &me)?;
+        found.retain(|(_, title)| title.as_deref().is_some_and(|t| t.to_lowercase().contains(query.as_str())));
+    }
+    let items: Vec<Value> = found.into_iter().map(|(c, title)| conversation_item(&c, title)).collect();
     Ok(json!({ "items": items }))
 }
 
-fn conversation_item(c: &Conversation, me: &str) -> Value {
+/// 1:1 chats named from their members a query looks at, at most this many a call.
+const MAX_NAMED: usize = 50;
+
+/// Names the 1:1 chats the list leaves nameless (the user's own message is the last one) from
+/// their members, newest first, within [`MAX_NAMED`] and the call's time, so a query by the other
+/// person's name finds them. A chat whose members can't be read stays nameless.
+fn name_direct_chats(session: &mut Session, found: &mut [(Conversation, Option<String>)], me: &str) -> Result<(), ModuleError> {
+    let nameless = found.iter_mut().filter(|(c, title)| title.is_none() && c.kind == ConversationKind::Direct);
+    for (c, title) in nameless.take(MAX_NAMED) {
+        if !api::has_time() {
+            break;
+        }
+        let request = chat::members(&session.directory, &c.id);
+        match api::read(session, Service::Chat, &request) {
+            Ok(body) => {
+                let members = chat::decode_members(&body).unwrap_or_default();
+                *title = members.into_iter().find(|m| m.id != me).and_then(|m| m.name);
+            }
+            Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn conversation_item(c: &Conversation, title: Option<String>) -> Value {
     // Absent values go as null, which the core reads as left out.
     let last_activity = c.horizons.last_message_ms.map(time::rfc3339);
-    json!({"id": c.id, "kind": kind_name(c.kind), "last_activity": last_activity, "untrusted": {"title": title(c, me)}})
+    json!({"id": c.id, "kind": kind_name(c.kind), "last_activity": last_activity, "untrusted": {"title": title}})
 }
 
 /// The official client's rule (docs/protocols/teams.md 3.4), reading horizons only. Where the
@@ -206,7 +234,8 @@ fn unread(session: &mut Session, _args: &Value) -> Result<Value, ModuleError> {
     Ok(json!({ "items": items }))
 }
 
-/// Messages that mention the user, from the conversations active since `since`.
+/// Messages that mention the user, from the [`MENTION_CONVERSATIONS`] conversations active most
+/// recently since `since`; the shared tool's description tells agents so.
 fn mentions(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let since = since(args)?.unwrap_or_else(|| api::now_ms().saturating_sub(MENTIONS_DEFAULT_MS));
     let me = session.me();
@@ -462,26 +491,33 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
     })
 }
 
-/// The new messages of a conversation, newest first, page by page until the first one not new;
-/// `None` when they may not be read (403, 404), and then the list's last message stands for them.
-/// Any other failure leaves the conversation for the next poll.
-fn new_messages(session: &mut Session, conversation: &str, state: &PollState) -> Result<Option<Vec<Message>>, ModuleError> {
+/// Messages read, newest first, and the link to the next page when the pages ran out first.
+type Fresh = (Vec<Message>, Option<String>);
+
+/// A conversation's messages from `link` on (from the newest without one), newest first, page by
+/// page while `fresh` holds, with the link to the next page when `MAX_PAGES` ran out first; `None`
+/// when they may not be read (403, 404). Any other failure leaves them for the next poll.
+fn fresh_messages(
+    session: &mut Session,
+    conversation: &str,
+    mut link: Option<String>,
+    fresh: impl Fn(&Message) -> bool,
+) -> Result<Option<Fresh>, ModuleError> {
     let slow = || ModuleError::Platform("Teams answers too slowly; polling again later".to_string());
-    let mut link: Option<String> = None;
     let mut new = Vec::new();
-    for _ in 0..MAX_PAGES {
+    for page_number in 0..MAX_PAGES {
         if !api::has_time() {
             return Err(slow());
         }
         let request = chat::read_messages(&session.directory, conversation, link.as_deref(), PAGE_SIZE, None).map_err(api::proto)?;
         let response = api::send(session, Service::Chat, &request, false)?;
-        if link.is_none() && matches!(response.status, 403 | 404) {
+        if page_number == 0 && matches!(response.status, 403 | 404) {
             return Ok(None);
         }
         let page = chat::decode_messages(&api::ok(response)?).map_err(api::proto)?;
         let mut more = !(page.items.is_empty() && page.skipped.is_empty());
         for m in page.items {
-            if !state.fresh(conversation, &m) {
+            if !fresh(&m) {
                 more = false;
                 break;
             }
@@ -489,15 +525,16 @@ fn new_messages(session: &mut Session, conversation: &str, state: &PollState) ->
         }
         match page.backward_link {
             Some(next) if more => link = Some(next),
-            _ => return Ok(Some(new)),
+            _ => return Ok(Some((new, None))),
         }
     }
-    Ok(Some(new))
+    Ok(Some((new, link)))
 }
 
 /// One poll of an account (`poll`): the conversations updated lately, one `message-arrived` for
-/// each new last message. Reads only.
+/// each new message. Reads only, as background requests.
 pub fn poll(account: &str) -> Result<(), ModuleError> {
+    api::background();
     api::with_session(account, |session| {
         let key = crate::poll::key(account);
         let started = api::now_ms();
@@ -512,12 +549,39 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
             }
             true
         })?;
+        let mut arrivals = Vec::new();
+        // Older pages earlier polls could not read come first: their messages came first.
+        for mut b in state.take_behind() {
+            match fresh_messages(session, &b.conversation, Some(b.link.clone()), |m| b.fresh(m)) {
+                Ok(Some((older, next))) => {
+                    arrivals.extend(PollState::older_arrivals(&b, &older, &me));
+                    let Some(next) = next else { continue };
+                    b.link = next;
+                }
+                // No longer readable: nothing to report.
+                Ok(None) => continue,
+                Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
+                // Tried again by the next poll.
+                Err(_) => {}
+            }
+            if !state.keep_behind(b, started) {
+                host::log(1, "older messages of a conversation were not read within an hour; they are not reported");
+            }
+        }
         // A conversation whose messages cannot be read now is left for the next poll, which starts
         // from the same floor; the others are reported. A list that cannot be read ends the poll.
-        let (mut arrivals, mut held) = (Vec::new(), false);
+        let mut held = false;
         for c in changed {
-            match new_messages(session, &c.id, &state) {
-                Ok(new) => arrivals.extend(state.arrivals(&c, new.as_deref(), &me)),
+            match fresh_messages(session, &c.id, None, |m| state.fresh(&c.id, m)) {
+                Ok(Some((new, next))) => {
+                    if let Some(next) = next
+                        && !state.fall_behind(&c.id, next, started)
+                    {
+                        host::log(1, "too many conversations fell behind; the older messages of one are not reported");
+                    }
+                    arrivals.extend(state.arrivals(&c, Some(&new), &me));
+                }
+                Ok(None) => arrivals.extend(state.arrivals(&c, None, &me)),
                 Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
                 Err(_) if state.can_hold(started) => held = true,
                 Err(_) => arrivals.extend(state.arrivals(&c, None, &me)),
