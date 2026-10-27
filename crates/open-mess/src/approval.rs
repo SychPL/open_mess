@@ -1,9 +1,10 @@
 //! Approval of waiting writes in Windows notifications (spec 8.6). One action at a time: the next
 //! toast appears only once the shown action is decided or expires, so a burst of writes never piles
-//! up toasts to approve blindly. Content too long for a toast gets only a `Show all` button, which
-//! opens a dialog with all of it. No toast or dialog decides more than one action, and only the
-//! user's click reaches [`Pending::decide`]: no tool does. Other platforms leave the actions waiting
-//! until they expire.
+//! up toasts to approve blindly. Nothing is approved that was not on screen in full: a toast offers
+//! `Approve` only when every participant is named and all of it fits the lines Windows shows,
+//! otherwise only `Show all`, which opens a dialog with everything. No toast or dialog decides more
+//! than one action, and only the user's click reaches [`Pending::decide`]: no tool does. Other
+//! platforms leave the actions waiting until they expire.
 
 use std::sync::Arc;
 
@@ -13,20 +14,42 @@ use crate::pending::{Kind, Pending, Preview};
 
 /// The AppUserModelID the toasts show under, registered for the current user at daemon start.
 pub const APP_ID: &str = "open_mess.daemon";
-/// The most content a toast shows, in characters; longer content only gets `Show all`.
-pub const MAX_TOAST_TEXT: usize = 280;
 /// Participants a toast names; the others are counted.
 const NAMED_PARTICIPANTS: usize = 5;
+/// Windows shows at most four lines of a toast's two text elements (the title has its own two).
+/// Counted at 24 narrow characters a line (see [`lines`]), which holds even for the widest letters
+/// at the default text size, so what a toast can approve is never cut off.
+const TOAST_LINES: usize = 4;
+const TOAST_WIDTH: usize = 24;
+/// The dialog has no scroll bar: what it approves must fit a small screen. Longer content can't be
+/// approved before the configuration window (milestone E) shows it.
+const DIALOG_LINES: usize = 25;
+const DIALOG_WIDTH: usize = 40;
+const APPROVE: &[(&str, &str)] = &[("Approve", "approve"), ("Reject", "reject")];
+const SHOW_ALL: &[(&str, &str)] = &[("Show all", "show")];
 
 /// What the approval of one action shows: the account, the conversation, the participants and the
 /// whole content (spec 8.6), cleaned of control characters and direction marks.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Prompt {
     pub title: String,
-    /// The account, the conversation and its participants.
-    pub context: String,
+    /// The account and the conversation.
+    pub conversation: String,
+    /// Every participant's name; none for a channel.
+    pub participants: Vec<String>,
     /// The text; an edit's text before and after; a reaction and the message it is under.
     pub content: String,
+}
+
+/// What a toast shows.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ToastText {
+    /// The conversation and the first participants.
+    pub context: String,
+    /// The content, or how to read it.
+    pub line: String,
+    /// Label and argument of each button.
+    pub buttons: &'static [(&'static str, &'static str)],
 }
 
 impl Prompt {
@@ -36,11 +59,8 @@ impl Prompt {
             Kind::Edit => "edit",
             Kind::React => "reaction",
         };
-        let mut context = format!("{} - {}", clean(&preview.account), clean(&preview.conversation_title));
-        if !preview.participants.is_empty() {
-            context.push_str("\nWith ");
-            context.push_str(&participants(&preview.participants));
-        }
+        let conversation = format!("{} - {}", clean(&preview.account), clean(&preview.conversation_title));
+        let participants = preview.participants.iter().map(|name| clean(name)).collect();
         let field = |text: &Option<String>| clean(text.as_deref().unwrap_or_default());
         let content = match (preview.kind, &preview.target_text) {
             (Kind::Send, None) => field(&preview.text),
@@ -48,27 +68,54 @@ impl Prompt {
             (Kind::Edit, _) => format!("Before: {}\nAfter: {}", field(&preview.target_text), field(&preview.text)),
             (Kind::React, _) => format!("{} on: {}", field(&preview.reaction), field(&preview.target_text)),
         };
-        Prompt { title: format!("open_mess: approve {what}"), context, content }
+        Prompt { title: format!("open_mess: approve {what}"), conversation, participants, content }
     }
 
-    /// The toast's content line and its buttons (label, argument): the content with `Approve` and
-    /// `Reject`, or, when it is too long to read there, only `Show all`.
-    pub fn toast(&self) -> (&str, &'static [(&'static str, &'static str)]) {
-        if self.content.chars().count() <= MAX_TOAST_TEXT {
-            (&self.content, &[("Approve", "approve"), ("Reject", "reject")])
-        } else {
-            ("Too long for a notification: open it to read all of it before you decide.", &[("Show all", "show")])
+    /// The conversation and the first `named` participants.
+    fn context(&self, named: usize) -> String {
+        let mut context = self.conversation.clone();
+        if !self.participants.is_empty() {
+            context.push_str("\nWith ");
+            context.push_str(&participants(&self.participants, named));
         }
+        context
+    }
+
+    /// The content with `Approve` and `Reject` when all of it fits the toast, else only `Show all`.
+    pub fn toast(&self) -> ToastText {
+        let context = self.context(NAMED_PARTICIPANTS);
+        let fits = lines(&context, TOAST_WIDTH) + lines(&self.content, TOAST_WIDTH) <= TOAST_LINES;
+        if fits && self.participants.len() <= NAMED_PARTICIPANTS {
+            ToastText { context, line: self.content.clone(), buttons: APPROVE }
+        } else {
+            ToastText { context, line: "Open it to read all of it before you decide.".into(), buttons: SHOW_ALL }
+        }
+    }
+
+    /// Everything, for the dialog: every participant and the whole content; None when that is too
+    /// long to be read there in full.
+    pub fn dialog(&self) -> Option<String> {
+        let text = format!("{}\n\n{}", self.context(usize::MAX), self.content);
+        (lines(&text, DIALOG_WIDTH) <= DIALOG_LINES).then_some(text)
     }
 }
 
-/// The first names, then how many more.
-pub fn participants(names: &[String]) -> String {
-    let mut shown: Vec<String> = names.iter().take(NAMED_PARTICIPANTS).map(|name| clean(name)).collect();
-    if names.len() > NAMED_PARTICIPANTS {
-        shown.push(format!("+{}", names.len() - NAMED_PARTICIPANTS));
+/// The first `named` names, then how many more.
+pub fn participants(names: &[String], named: usize) -> String {
+    let mut shown: Vec<&str> = names.iter().take(named).map(String::as_str).collect();
+    let more = names.len().saturating_sub(named);
+    let more = format!("+{more}");
+    if names.len() > named {
+        shown.push(&more);
     }
     shown.join(", ")
+}
+
+/// About how many lines `text` takes at `width` narrow characters a line, on the safe side: the font
+/// is not known here, so a wide character (CJK, emoji and the like) counts as two.
+fn lines(text: &str, width: usize) -> usize {
+    let units = |line: &str| line.chars().map(|c| if u32::from(c) < 0x1100 { 1 } else { 2 }).sum::<usize>();
+    text.split('\n').map(|line| units(line).div_ceil(width).max(1)).sum()
 }
 
 /// Without control characters (line breaks stay) and the direction marks that would make a text
@@ -155,9 +202,9 @@ mod toast {
             decide_on.spawn(async move { pending.decide(&action, approve).await });
         };
         runtime.spawn_blocking(move || {
-            let (line, buttons) = prompt.toast();
-            let mut toast = Toast::new(APP_ID).title(&prompt.title).text1(&prompt.context).text2(line).scenario(Scenario::Reminder);
-            for (label, argument) in buttons {
+            let shown = prompt.toast();
+            let mut toast = Toast::new(APP_ID).title(&prompt.title).text1(&shown.context).text2(&shown.line).scenario(Scenario::Reminder);
+            for (label, argument) in shown.buttons {
                 toast = toast.add_button(label, argument);
             }
             let prompt = Arc::new(prompt);
@@ -183,15 +230,18 @@ mod toast {
         });
     }
 
-    /// The whole content in a modal dialog: Yes approves, No rejects, closing decides nothing.
-    /// (Buttons named Approve and Reject would need common controls 6 and an application manifest.)
+    /// Everything in a modal dialog: Yes approves, No rejects, closing decides nothing. Content too
+    /// long to show in full is only explained. (Buttons named Approve and Reject would need common
+    /// controls 6 and an application manifest.)
     fn ask(prompt: &Prompt) -> Option<bool> {
-        let answer = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title(&prompt.title)
-            .set_description(format!("{}\n\n{}\n\nApprove this? Yes approves it, No rejects it.", prompt.context, prompt.content))
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show();
+        let dialog = rfd::MessageDialog::new().set_level(rfd::MessageLevel::Warning).set_title(&prompt.title);
+        let Some(text) = prompt.dialog() else {
+            let why = "This is too long to show here in full, so it can't be approved here. It stays waiting until it expires.";
+            dialog.set_description(why).set_buttons(rfd::MessageButtons::Ok).show();
+            return None;
+        };
+        let answer =
+            dialog.set_description(format!("{text}\n\nApprove this? Yes approves it, No rejects it.")).set_buttons(rfd::MessageButtons::YesNo).show();
         match answer {
             rfd::MessageDialogResult::Yes => Some(true),
             rfd::MessageDialogResult::No => Some(false),
@@ -222,22 +272,36 @@ mod tests {
         let mut send = preview("a1", Kind::Send);
         let prompt = Prompt::new(&send);
         assert_eq!(prompt.title, "open_mess: approve send");
-        assert_eq!(prompt.context, "Ann (teams:ann) - Project\nWith Pat, Sam");
-        assert_eq!(prompt.toast(), ("on my way", &[("Approve", "approve"), ("Reject", "reject")][..]));
+        let toast = prompt.toast();
+        assert_eq!(toast.context, "Ann (teams:ann) - Project\nWith Pat, Sam");
+        assert_eq!((toast.line.as_str(), toast.buttons), ("on my way", APPROVE));
 
-        send.text = Some("x".repeat(MAX_TOAST_TEXT));
-        assert_eq!(Prompt::new(&send).toast().1, [("Approve", "approve"), ("Reject", "reject")]);
+        // The context takes three of the four lines Windows shows: one line of content fits.
+        send.text = Some("x".repeat(TOAST_WIDTH));
+        assert_eq!(Prompt::new(&send).toast().buttons, APPROVE);
         // One character more and the toast shows none of it, only the way to all of it.
-        send.text = Some("x".repeat(MAX_TOAST_TEXT + 1));
+        send.text = Some("x".repeat(TOAST_WIDTH + 1));
         let prompt = Prompt::new(&send);
-        let (line, buttons) = prompt.toast();
-        assert!(!line.contains('x'));
-        assert_eq!(buttons, [("Show all", "show")]);
-        assert_eq!(prompt.content, "x".repeat(MAX_TOAST_TEXT + 1));
+        let toast = prompt.toast();
+        assert!(!toast.line.contains('x'));
+        assert_eq!(toast.buttons, SHOW_ALL);
+        assert_eq!(prompt.content, "x".repeat(TOAST_WIDTH + 1));
+        // Short lines count as lines, wide characters as two.
+        send.text = Some("a\nb".into());
+        assert_eq!(Prompt::new(&send).toast().buttons, SHOW_ALL);
+        send.text = Some("\u{4f60}".repeat(TOAST_WIDTH / 2 + 1));
+        assert_eq!(Prompt::new(&send).toast().buttons, SHOW_ALL);
         // A reply's target counts too.
         send.text = Some("ok".into());
-        send.target_text = Some("y".repeat(MAX_TOAST_TEXT));
-        assert_eq!(Prompt::new(&send).toast().1, [("Show all", "show")]);
+        send.target_text = Some("fine".into());
+        assert_eq!(Prompt::new(&send).toast().buttons, SHOW_ALL);
+
+        // The dialog shows everything, up to what fits a screen.
+        send.target_text = None;
+        send.text = Some("x".repeat(DIALOG_WIDTH * 20));
+        assert!(Prompt::new(&send).dialog().unwrap().ends_with(&"x".repeat(DIALOG_WIDTH * 20)));
+        send.text = Some("x".repeat(DIALOG_WIDTH * DIALOG_LINES));
+        assert_eq!(Prompt::new(&send).dialog(), None);
 
         let mut edit = preview("a2", Kind::Edit);
         edit.target_text = Some("on my wya".into());
@@ -257,13 +321,21 @@ mod tests {
     #[test]
     fn participants_are_shortened() {
         let names = |n: usize| (1..=n).map(|i| format!("P{i}")).collect::<Vec<_>>();
-        assert_eq!(participants(&names(1)), "P1");
-        assert_eq!(participants(&names(5)), "P1, P2, P3, P4, P5");
-        assert_eq!(participants(&names(8)), "P1, P2, P3, P4, P5, +3");
-        assert_eq!(participants(&[]), "");
+        assert_eq!(participants(&names(1), NAMED_PARTICIPANTS), "P1");
+        assert_eq!(participants(&names(5), NAMED_PARTICIPANTS), "P1, P2, P3, P4, P5");
+        assert_eq!(participants(&names(8), NAMED_PARTICIPANTS), "P1, P2, P3, P4, P5, +3");
+        assert_eq!(participants(&[], NAMED_PARTICIPANTS), "");
+        // A sixth person is not named in the toast, so it can't approve: the dialog names everyone.
+        let mut group = preview("a1", Kind::Send);
+        group.text = Some("ok".into());
+        group.participants = names(6);
+        let prompt = Prompt::new(&group);
+        assert_eq!(prompt.toast().context, "Ann (teams:ann) - Project\nWith P1, P2, P3, P4, P5, +1");
+        assert_eq!(prompt.toast().buttons, SHOW_ALL);
+        assert!(prompt.dialog().unwrap().contains("P1, P2, P3, P4, P5, P6\n"));
         let mut channel = preview("a1", Kind::Send);
         channel.participants.clear();
-        assert_eq!(Prompt::new(&channel).context, "Ann (teams:ann) - Project");
+        assert_eq!(Prompt::new(&channel).toast().context, "Ann (teams:ann) - Project");
     }
 
     #[test]
