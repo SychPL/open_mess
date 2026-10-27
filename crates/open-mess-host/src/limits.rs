@@ -21,7 +21,8 @@ pub const MAX_BODY: usize = 16 * 1024 * 1024;
 /// An attachment: what `http.fetch` takes in a `get-attachment` call instead of `MAX_BODY`, and the
 /// most the core writes to disk (spec 8.5, R4 and R5).
 pub const MAX_ATTACHMENT: usize = 64 * 1024 * 1024;
-/// A `Retry-After` (seconds) above this ends the fetch with `throttled` instead of a response.
+/// A 429 whose `Retry-After` (seconds) is above this ends the fetch with `throttled` instead of a
+/// response.
 pub const MAX_RETRY_AFTER: u32 = 300;
 /// Establishing a TCP (and TLS) connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

@@ -158,7 +158,7 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
     let me = session.me();
     // A person's MRI finds the 1:1 chat with them.
     if let Some(other) = query.as_deref().and_then(|q| q.strip_prefix("8:orgid:")) {
-        let found = one_to_one(session, other)?;
+        let found = one_to_one(session, other)?.filter(|c| kind.is_none_or(|k| k == kind_name(c.kind)));
         let items: Vec<Value> = found.iter().map(|c| conversation_item(c, &me)).collect();
         return Ok(json!({ "items": items }));
     }

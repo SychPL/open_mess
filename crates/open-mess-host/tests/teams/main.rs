@@ -718,8 +718,7 @@ async fn timeout_after_post_is_uncertain() {
     let replies = [
         Reply::status(201).delayed(Duration::from_millis(1500)),
         Reply::status(503),
-        // Asking for a long wait does not make it a refusal: the host ends this one as throttled,
-        // and the module gives up on the other.
+        // Asking for a long wait does not make a 5xx a refusal (a 429 is one: see below).
         Reply::status(503).header("Retry-After", "1000"),
         Reply::status(500).header("Retry-After", "Fri, 01 Jan 2100 00:00:00 GMT"),
     ];
@@ -731,6 +730,11 @@ async fn timeout_after_post_is_uncertain() {
         assert!(matches!(module_error(result), ModuleError::Uncertain(_)));
         assert_eq!(writes(&teams.fake).len(), 1);
     }
+    // A 429 asking for a long wait was not taken: it fails, and may be sent again.
+    let teams = Teams::signed_in().await;
+    teams.fake.on(|s| (s.method == "POST").then(|| Reply::status(429).header("Retry-After", "1000")));
+    let refused = teams.call("send", json!({"conversation": GROUP, "text": "once"})).await;
+    assert!(matches!(module_error(refused), ModuleError::Platform(_)));
 }
 
 #[tokio::test]
@@ -754,7 +758,9 @@ async fn one_to_one_id_checks_both_orders() {
     let found = teams.call("list_conversations", json!({"query": OTHER})).await.unwrap();
     assert_eq!(ids(&found, "id"), std::slice::from_ref(&theirs_first));
     assert_eq!(found["items"][0]["kind"], "direct");
-    let probes: Vec<String> = teams.fake.seen().into_iter().filter(|s| s.method == "GET").map(|s| s.path).collect();
+    let channels = teams.call("list_conversations", json!({"query": OTHER, "kind": "channel"})).await.unwrap();
+    assert_eq!(ids(&channels, "id"), Vec::<String>::new());
+    let probes: Vec<String> = teams.fake.seen().into_iter().filter(|s| s.method == "GET").map(|s| s.path).take(2).collect();
     assert_eq!(probes, [format!("{CHAT_PATH}/{mine_first}"), format!("{CHAT_PATH}/{theirs_first}")]);
     // No chat with this person yet: nothing found.
     let none = teams.call("list_conversations", json!({"query": "8:orgid:00000000-0000-0000-0000-000000000004"})).await.unwrap();

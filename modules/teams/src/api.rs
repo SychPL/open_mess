@@ -339,9 +339,10 @@ fn transport(e: &http::HttpError, write: bool) -> ModuleError {
         http::HttpError::Throttled(secs) => format!("the service asks to wait {secs} s; try again later"),
         http::HttpError::Network(why) => format!("network error: {why}"),
     };
-    // `throttled` is a 429 or a 503 with a long Retry-After; after a 503 the write may be taken.
+    // Blocked never left; throttled is a 429, a refusal. Any other failure may follow a write the
+    // service took.
     match e {
-        http::HttpError::Blocked(_) => ModuleError::Platform(why),
+        http::HttpError::Blocked(_) | http::HttpError::Throttled(_) => ModuleError::Platform(why),
         _ if write => ModuleError::Uncertain(why),
         _ => ModuleError::Platform(why),
     }

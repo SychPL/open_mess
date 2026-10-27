@@ -20,7 +20,8 @@ use open_mess_host::{Engine, HttpError, ModuleState, Net, Request, limits};
 
 /// Serves `/ok`, `/redirect` (302 to its own `/ok`), `/endless` (a body that never ends),
 /// `/slow` (answers after 10 s), `/trickle` (a byte every 300 ms, forever), `/throttle/<secs>`
-/// (429 with Retry-After) and `/big` (one byte over the general body limit).
+/// (429 with Retry-After), `/unavailable/<secs>` (503 with Retry-After) and `/big` (one byte over
+/// the general body limit).
 async fn server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -53,6 +54,12 @@ async fn server() -> SocketAddr {
                 "/throttle/{secs}",
                 get(|axum::extract::Path(secs): axum::extract::Path<String>| async move {
                     (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, secs)])
+                }),
+            )
+            .route(
+                "/unavailable/{secs}",
+                get(|axum::extract::Path(secs): axum::extract::Path<String>| async move {
+                    (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, secs)])
                 }),
             );
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -142,6 +149,9 @@ async fn long_retry_after_is_throttled() {
     // Up to the maximum the module gets the 429 and decides itself.
     let response = test_net().fetch(&list, get_request(format!("http://{addr}/throttle/300"))).await.unwrap();
     assert_eq!(response.status, 429);
+    // A 503 may follow work the server did: it always reaches the module.
+    let response = test_net().fetch(&list, get_request(format!("http://{addr}/unavailable/301"))).await.unwrap();
+    assert_eq!(response.status, 503);
 }
 
 #[tokio::test]

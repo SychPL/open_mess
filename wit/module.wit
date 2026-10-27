@@ -102,7 +102,7 @@ interface http {
         blocked(string),
         timeout,
         too-large,
-        // Retry-After was longer than the host's maximum wait.
+        // A 429 whose Retry-After was longer than the host's maximum wait: the request was refused.
         throttled(u32),
         network(string),
     }

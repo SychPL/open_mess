@@ -219,7 +219,9 @@ impl Net {
         let host = url.host_str().unwrap_or_default().to_string();
         let mut response = client.request(method.clone(), url).headers(headers).body(req.body).send().await.map_err(network)?;
         let status = response.status().as_u16();
-        if matches!(status, 429 | 503)
+        // Only a 429 is a refusal to wait for; a 503 may come after the server did the work (a
+        // write the module must call uncertain), so it reaches the module as it is.
+        if status == 429
             && let Some(secs) = retry_after(response.headers())
             && secs > limits::MAX_RETRY_AFTER
         {
