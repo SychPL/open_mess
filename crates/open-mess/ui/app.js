@@ -194,15 +194,16 @@ async function renderIntegrations() {
   const status = await call("status");
   const root = content("integrations");
   root.replaceChildren();
-  root.append(el("h2", "Claude Code (MCP)"));
-  root.append(el("p", "Polecenie zawiera token lokalnego API: każdy, kto go zna, może używać open_mess jak agent.", "muted"));
+  root.append(el("h2", "Claude Code i Codex (MCP)"));
+  root.append(el("p", "Polecenia zawierają token lokalnego API: każdy, kto go zna, może używać open_mess jak agent.", "muted"));
   const shown = el("div");
   shown.append(
     button("Pokaż polecenie", async () => {
-      const command = await call("mcp_command");
-      const pre = el("pre", command, "content-text");
-      const copy = button("Kopiuj", () => navigator.clipboard.writeText(command));
-      shown.replaceChildren(pre, copy);
+      const commands = await call("mcp_command");
+      shown.replaceChildren();
+      for (const [label, command] of [["Claude Code", commands.claude], ["Codex", commands.codex]]) {
+        shown.append(el("h2", label), el("pre", command, "content-text"), button("Kopiuj", () => navigator.clipboard.writeText(command)));
+      }
     }),
   );
   root.append(shown);

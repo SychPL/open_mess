@@ -26,6 +26,10 @@ fn state(d: &Daemon) -> UiState {
     }
 }
 
+fn modules(state: &UiState) -> Vec<ModuleDto> {
+    commands::modules(state).unwrap()
+}
+
 fn module<'a>(list: &'a [ModuleDto], status: &str) -> &'a ModuleDto {
     list.iter().find(|module| module.status == status).unwrap_or_else(|| panic!("no {status} module in {list:?}"))
 }
@@ -46,7 +50,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
 #[tokio::test]
 async fn module_dto_lists_hosts_and_identity() {
     let (_dir, state) = unapproved(&[("teams.wasm", std::fs::read(common::wasm("open_mess_teams")).unwrap())]).await;
-    let list = commands::modules(&state);
+    let list = modules(&state);
     assert_eq!(list.len(), 1);
     let teams = &list[0];
     assert_eq!((teams.name.as_str(), teams.status, teams.detail.as_str()), ("teams", "awaiting-approval", "czeka na zatwierdzenie: nowy moduł"));
@@ -65,7 +69,7 @@ async fn module_dto_lists_hosts_and_identity() {
 #[tokio::test]
 async fn stale_module_approval_is_refused() {
     let (dir, state) = unapproved(&[("echo.wasm", echo())]).await;
-    let shown = commands::modules(&state)[0].clone();
+    let shown = modules(&state)[0].clone();
     // The file changes after the window showed it.
     install(dir.path(), "echo.wasm", &echo_rebuilt());
     let refused = commands::approve_module(&state, "test-echo", &shown.file_sha256, &shown.manifest_sha256).await;
@@ -76,15 +80,15 @@ async fn stale_module_approval_is_refused() {
 
     // Refreshed, the window shows the new file, and approving that loads it.
     commands::rescan_modules(&state).await.unwrap();
-    let fresh = commands::modules(&state)[0].clone();
+    let fresh = modules(&state)[0].clone();
     assert_ne!(fresh.file_sha256, shown.file_sha256);
     commands::approve_module(&state, "test-echo", &fresh.file_sha256, &fresh.manifest_sha256).await.unwrap();
-    assert_eq!(commands::modules(&state)[0].status, "active");
+    assert_eq!(modules(&state)[0].status, "active");
     assert!(state.accounts.modules().handle("test-echo").is_some());
 
     // Turned off and on again without a restart.
     commands::set_module_enabled(&state, "test-echo", false).await.unwrap();
-    assert_eq!(commands::modules(&state)[0].status, "disabled");
+    assert_eq!(modules(&state)[0].status, "disabled");
     assert!(state.accounts.modules().handle("test-echo").is_none());
     commands::set_module_enabled(&state, "test-echo", true).await.unwrap();
     assert!(state.accounts.modules().handle("test-echo").is_some());
@@ -103,7 +107,7 @@ async fn rescan_keeps_running_version_until_approved() {
     commands::rescan_modules(&state).await.unwrap();
     let running = d.accounts.modules().handle("test-echo").unwrap();
     assert_eq!(running.manifest().unwrap().hosts, ["localhost"]);
-    let list = commands::modules(&state);
+    let list = modules(&state);
     assert_eq!(list.len(), 2);
     assert_eq!(module(&list, "active").hosts, ["localhost"]);
     let replacement = module(&list, "replacement").clone();
@@ -115,11 +119,11 @@ async fn rescan_keeps_running_version_until_approved() {
     assert_eq!(state.pending.state(&waiting.action).unwrap(), State::Waiting);
     // Another rescan changes nothing.
     commands::rescan_modules(&state).await.unwrap();
-    assert_eq!(commands::modules(&state).len(), 2);
+    assert_eq!(modules(&state).len(), 2);
 
     // Approved, the new file takes over; what the old one described for approval expires.
     commands::approve_module(&state, "test-echo", &replacement.file_sha256, &replacement.manifest_sha256).await.unwrap();
-    let list = commands::modules(&state);
+    let list = modules(&state);
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].status, "active");
     assert_eq!(d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap().hosts, ["localhost", "extra.example.com"]);
@@ -159,8 +163,80 @@ async fn status_and_mcp_command() {
     assert_eq!(status.port, 7341);
     assert_eq!(status.problems.len(), 1);
     assert!(status.problems[0].starts_with("broken.wasm (broken.wasm): to nie jest prawidłowy moduł"), "{:?}", status.problems);
+    let commands = commands::mcp_command(&state);
     assert_eq!(
-        commands::mcp_command(&state),
+        commands.claude,
         "claude mcp add --transport http --scope user open_mess http://127.0.0.1:7341/mcp --header \"Authorization: Bearer t0ken\""
     );
+    assert_eq!(
+        commands.codex,
+        "setx OPEN_MESS_TOKEN \"t0ken\"\ncodex mcp add open_mess --url http://127.0.0.1:7341/mcp --bearer-token-env-var OPEN_MESS_TOKEN"
+    );
+}
+
+#[tokio::test]
+async fn disabling_stops_a_module_whose_replacement_waits() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let state = state(&d);
+    install(d.dir.path(), "echo.wasm", &echo_with_another_host());
+    commands::rescan_modules(&state).await.unwrap();
+    assert!(d.accounts.modules().handle("test-echo").is_some());
+
+    commands::set_module_enabled(&state, "test-echo", false).await.unwrap();
+    assert!(d.accounts.modules().handle("test-echo").is_none());
+    assert_eq!(commands::accounts(&state).unwrap()[0].state, "offline");
+}
+
+#[tokio::test]
+async fn unreadable_file_leaves_the_running_version() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("known")).unwrap();
+    let state = state(&d);
+    // Read while it is being copied over, or broken.
+    install(d.dir.path(), "echo.wasm", b"\0asm half a file");
+    commands::rescan_modules(&state).await.unwrap();
+    assert!(d.accounts.modules().handle("test-echo").is_some());
+    let list = modules(&state);
+    assert_eq!(module(&list, "active").name, "test-echo");
+    assert_eq!(module(&list, "invalid").file, "echo.wasm");
+    assert_eq!(commands::accounts(&state).unwrap()[0].state, "online");
+    // So does a file that is gone.
+    std::fs::remove_file(d.dir.path().join("modules").join("echo.wasm")).unwrap();
+    commands::rescan_modules(&state).await.unwrap();
+    assert!(d.accounts.modules().handle("test-echo").is_some());
+}
+
+#[tokio::test]
+async fn crashed_module_restarts_only_when_asked() {
+    let d = daemon(&[("hog.wasm", "open_mess_test_hog")]).await;
+    d.accounts.add("test-hog", info("h")).unwrap();
+    let state = state(&d);
+    // The hog crashes on every call; after a few the host stops it.
+    for _ in 0..open_mess_host::limits::MAX_CRASHES {
+        let _ = d.registry.call("read_messages", json!({"account": "test-hog:h", "conversation": "c1"})).await;
+    }
+    assert_eq!(modules(&state)[0].status, "crashed");
+
+    // Refreshing the folder does not bring it back by itself.
+    commands::rescan_modules(&state).await.unwrap();
+    assert_eq!(modules(&state)[0].status, "crashed");
+    // The user does.
+    commands::set_module_enabled(&state, "test-hog", true).await.unwrap();
+    assert_eq!(modules(&state)[0].status, "active");
+}
+
+#[tokio::test]
+async fn replacing_a_disabled_module_shows_what_changed() {
+    let (dir, state) = unapproved(&[("echo.wasm", echo())]).await;
+    let shown = modules(&state)[0].clone();
+    commands::approve_module(&state, "test-echo", &shown.file_sha256, &shown.manifest_sha256).await.unwrap();
+    commands::set_module_enabled(&state, "test-echo", false).await.unwrap();
+
+    install(dir.path(), "echo.wasm", &echo_with_another_host());
+    commands::rescan_modules(&state).await.unwrap();
+    let replacement = modules(&state)[0].clone();
+    assert_eq!(replacement.detail, "czeka na zatwierdzenie: zmieniony manifest");
+    assert_eq!(replacement.changes, ["nowy host: extra.example.com"]);
+    assert!(replacement.takes_over);
 }

@@ -16,7 +16,7 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use open_mess_host::{Engine, Manifest, ModuleContext, ModuleHandle};
 use rusqlite::OptionalExtension;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::Error;
@@ -176,42 +176,44 @@ impl Modules {
         load(&self.engine, &self.dir, &*self.ctx).await
     }
 
-    /// Takes what [`Modules::load`] found. A running module whose file is unchanged keeps running
-    /// as it is, sessions and all; one whose file was replaced by a file not approved yet keeps
-    /// running too, and the new file waits as its replacement (spec 8.3). Returns the modules that
-    /// stopped, started or were replaced.
-    pub(crate) fn adopt(&self, store: &Store, found: Found) -> Result<Vec<String>, Error> {
+    /// Takes what [`Modules::load`] found. A loaded module goes on as it is, sessions and all,
+    /// until the user turns it off or approves a file that replaces it: a new file waiting for
+    /// approval, a file that is gone or one that does not load (still being written, say) leave it
+    /// running (spec 8.3). A module stopped after repeated crashes starts again only when `restart`
+    /// names it. Returns the modules that stopped, started or were replaced.
+    pub(crate) fn adopt(&self, store: &Store, found: Found, restart: Option<&str>) -> Result<Vec<String>, Error> {
         let mut fresh = decide(store, found)?;
         let mut entries = self.write();
         let mut changed = BTreeSet::new();
         let mut kept = BTreeSet::new();
-        for old in entries.drain(..) {
+        for old in entries.drain(..).filter(|old| old.handle.is_some()) {
             let name = old.info.name.clone();
-            if old.state() != ModuleState::Active {
-                // A crashed module stops here, and starts again if it is still approved.
-                if old.handle.is_some() {
-                    changed.insert(name);
+            let enabled = Row::get(store, &name)?.is_some_and(|row| row.enabled);
+            let crashed = old.state() == ModuleState::Crashed;
+            let at = fresh.iter().position(|entry| entry.is_current(&name) && entry.info.manifest.is_some());
+            let keep = match at.and_then(|at| fresh.get(at)) {
+                _ if !enabled => false,
+                _ if crashed && restart == Some(name.as_str()) => false,
+                Some(current) if current.info.state == ModuleState::Active => {
+                    let same = current.info.file_sha256 == old.info.file_sha256 && current.info.manifest_sha256 == old.info.manifest_sha256;
+                    // Another approved file replaces it; a crashed one stays stopped.
+                    same || crashed
                 }
+                _ => true,
+            };
+            if !keep {
+                changed.insert(name);
                 continue;
             }
-            let Some(at) = fresh.iter().position(|entry| entry.is_current(&name) && entry.info.manifest.is_some()) else {
-                // The file is gone.
-                changed.insert(name);
-                continue;
-            };
-            let Some(slot) = fresh.get_mut(at) else { continue };
-            let same = slot.info.file_sha256 == old.info.file_sha256 && slot.info.manifest_sha256 == old.info.manifest_sha256;
-            if slot.info.state == ModuleState::Active && same {
-                // The new instance is dropped; the running one goes on.
-                *slot = old;
-                kept.insert(name);
-            } else if matches!(slot.info.state, ModuleState::AwaitingApproval { .. }) {
-                slot.info.state = ModuleState::PendingReplacement;
-                fresh.insert(at, old);
-                kept.insert(name);
-            } else {
-                // Replaced by an approved file, or disabled.
-                changed.insert(name);
+            kept.insert(name);
+            match at.and_then(|at| fresh.get_mut(at).map(|current| (at, current))) {
+                // The copy loaded now is dropped.
+                Some((_, current)) if current.info.state == ModuleState::Active => *current = old,
+                Some((at, current)) => {
+                    current.info.state = ModuleState::PendingReplacement;
+                    fresh.insert(at, old);
+                }
+                None => fresh.push(old),
             }
         }
         for entry in fresh.iter().filter(|entry| entry.info.state == ModuleState::Active && !kept.contains(&entry.info.name)) {
@@ -401,12 +403,17 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 /// SHA-256 of the manifest as JSON with sorted keys (serde_json's map is ordered by key).
 fn manifest_sha256(manifest: &Manifest) -> String {
+    sha256_hex(canonical(manifest).to_string().as_bytes())
+}
+
+/// The manifest as JSON, as it is hashed and remembered.
+pub fn canonical(manifest: &Manifest) -> Value {
     let tools: Vec<_> = manifest
         .extra_tools
         .iter()
         .map(|tool| json!({"description": tool.description, "input_schema": tool.input_schema, "name": tool.name, "writes": tool.writes}))
         .collect();
-    let canonical = json!({
+    json!({
         "extra_tools": tools,
         "hosts": manifest.hosts,
         "name": manifest.name,
@@ -414,8 +421,22 @@ fn manifest_sha256(manifest: &Manifest) -> String {
         "sign_in_hosts": manifest.sign_in_hosts,
         "version": manifest.version,
         "wam": manifest.wam.as_ref().map(|wam| json!({"client_id": wam.client_id, "scopes": wam.scopes})),
-    });
-    sha256_hex(canonical.to_string().as_bytes())
+    })
+}
+
+fn approved_manifest_key(name: &str) -> String {
+    format!("approved_manifest:{name}")
+}
+
+/// Remembers the manifest the user approved for its module, so that the approval of a later file
+/// can show what changed even when no version of the module runs.
+pub fn remember_approved(store: &Store, manifest: &Manifest) -> Result<(), Error> {
+    store.set_config(&approved_manifest_key(&manifest.name), &canonical(manifest).to_string())
+}
+
+/// The manifest last approved in the window for module `name`, as [`canonical`] gives it.
+pub fn approved_manifest(store: &Store, name: &str) -> Result<Option<Value>, Error> {
+    Ok(store.get_config(&approved_manifest_key(name))?.and_then(|json| serde_json::from_str(&json).ok()))
 }
 
 #[cfg(test)]

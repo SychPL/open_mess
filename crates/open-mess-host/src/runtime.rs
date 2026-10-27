@@ -321,6 +321,11 @@ impl ModuleHandle {
         self.state.borrow().clone()
     }
 
+    /// Whether both handles are the same loaded module (clones of one handle), not two loads.
+    pub fn same(&self, other: &ModuleHandle) -> bool {
+        self.requests.same_channel(&other.requests)
+    }
+
     async fn request<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, HostError> {
         let (reply, answer) = oneshot::channel();
         self.requests.send(request(reply)).await.map_err(|_| HostError::Closed)?;

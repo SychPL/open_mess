@@ -75,7 +75,7 @@ mod ipc {
     use tauri::State;
 
     use crate::ui::UiState;
-    use crate::ui::commands::{self, AccountDto, ModuleDto, StatusDto};
+    use crate::ui::commands::{self, AccountDto, McpCommandsDto, ModuleDto, StatusDto};
 
     #[tauri::command(rename_all = "snake_case")]
     pub async fn status(state: State<'_, UiState>) -> Result<StatusDto, String> {
@@ -94,7 +94,7 @@ mod ipc {
 
     #[tauri::command(rename_all = "snake_case")]
     pub async fn modules(state: State<'_, UiState>) -> Result<Vec<ModuleDto>, String> {
-        Ok(commands::modules(&state))
+        commands::modules(&state)
     }
 
     #[tauri::command(rename_all = "snake_case")]
@@ -113,7 +113,7 @@ mod ipc {
     }
 
     #[tauri::command(rename_all = "snake_case")]
-    pub async fn mcp_command(state: State<'_, UiState>) -> Result<String, String> {
+    pub async fn mcp_command(state: State<'_, UiState>) -> Result<McpCommandsDto, String> {
         Ok(commands::mcp_command(&state))
     }
 }
