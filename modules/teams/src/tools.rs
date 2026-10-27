@@ -182,7 +182,8 @@ const MAX_NAMED: usize = 50;
 
 /// Names the 1:1 chats the list leaves nameless (the user's own message is the last one) from
 /// their members, newest first, within [`MAX_NAMED`] and the call's time, so a query by the other
-/// person's name finds them. A chat whose members can't be read stays nameless.
+/// person's name finds them. A chat whose members may not be read stays nameless; members in a
+/// shape the module does not know end the call as incompatible (spec 9.3).
 fn name_direct_chats(session: &mut Session, found: &mut [(Conversation, Option<String>)], me: &str) -> Result<(), ModuleError> {
     let nameless = found.iter_mut().filter(|(c, title)| title.is_none() && c.kind == ConversationKind::Direct);
     for (c, title) in nameless.take(MAX_NAMED) {
@@ -192,10 +193,10 @@ fn name_direct_chats(session: &mut Session, found: &mut [(Conversation, Option<S
         let request = chat::members(&session.directory, &c.id);
         match api::read(session, Service::Chat, &request) {
             Ok(body) => {
-                let members = chat::decode_members(&body).unwrap_or_default();
+                let members = chat::decode_members(&body).map_err(api::proto)?;
                 *title = members.into_iter().find(|m| m.id != me).and_then(|m| m.name);
             }
-            Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
+            Err(e @ (ModuleError::AuthRequired(_) | ModuleError::Incompatible(_))) => return Err(e),
             Err(_) => {}
         }
     }
@@ -549,28 +550,10 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
             }
             true
         })?;
-        let mut arrivals = Vec::new();
-        // Older pages earlier polls could not read come first: their messages came first.
-        for mut b in state.take_behind() {
-            match fresh_messages(session, &b.conversation, Some(b.link.clone()), |m| b.fresh(m)) {
-                Ok(Some((older, next))) => {
-                    arrivals.extend(PollState::older_arrivals(&b, &older, &me));
-                    let Some(next) = next else { continue };
-                    b.link = next;
-                }
-                // No longer readable: nothing to report.
-                Ok(None) => continue,
-                Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
-                // Tried again by the next poll.
-                Err(_) => {}
-            }
-            if !state.keep_behind(b, started) {
-                host::log(1, "older messages of a conversation were not read within an hour; they are not reported");
-            }
-        }
+        let behind = state.take_behind();
+        let (mut arrivals, mut held) = (Vec::new(), false);
         // A conversation whose messages cannot be read now is left for the next poll, which starts
         // from the same floor; the others are reported. A list that cannot be read ends the poll.
-        let mut held = false;
         for c in changed {
             match fresh_messages(session, &c.id, None, |m| state.fresh(&c.id, m)) {
                 Ok(Some((new, next))) => {
@@ -585,6 +568,25 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
                 Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
                 Err(_) if state.can_hold(started) => held = true,
                 Err(_) => arrivals.extend(state.arrivals(&c, None, &me)),
+            }
+        }
+        // Older pages earlier polls left, with the time that is left: a long backlog never holds
+        // back what is new.
+        for mut b in behind {
+            match fresh_messages(session, &b.conversation, Some(b.link.clone()), |m| b.fresh(m)) {
+                Ok(Some((older, next))) => {
+                    arrivals.extend(PollState::older_arrivals(&b, &older, &me));
+                    let Some(next) = next else { continue };
+                    b.link = next;
+                }
+                // No longer readable: nothing to report.
+                Ok(None) => continue,
+                Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
+                // Tried again by the next poll.
+                Err(_) => {}
+            }
+            if !state.keep_behind(b, started) {
+                host::log(1, "older messages of a conversation were not read within an hour; they are not reported");
             }
         }
         state.finish(started, held);

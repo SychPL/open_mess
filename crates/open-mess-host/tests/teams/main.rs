@@ -336,6 +336,17 @@ async fn a_direct_chat_the_user_wrote_last_in_is_found_by_name() {
     let asked = teams.fake.requests(&members_path).len();
     assert_eq!(ids(&teams.call("list_conversations", json!({})).await.unwrap(), "id"), [DIRECT, GROUP]);
     assert_eq!(teams.fake.requests(&members_path).len(), asked);
+    // Members in a shape the module does not know: an explicit error, not a chat silently left out.
+    let list = vec![conversation(DIRECT, None, Some(numbered(101, DIRECT, ME, "<p>see you</p>")))];
+    teams.fake.on(move |s| {
+        if s.path == CHAT_PATH {
+            Some(Reply::json(page("conversations", list.clone(), None)))
+        } else {
+            (s.path == members_path).then(|| Reply::json(json!({"roster": []})))
+        }
+    });
+    let unknown = teams.call("list_conversations", json!({"query": "person two"})).await;
+    assert!(matches!(module_error(unknown), ModuleError::Incompatible(_)));
 }
 
 #[tokio::test]

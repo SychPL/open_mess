@@ -165,9 +165,12 @@ impl PollState {
 
     /// The arrivals of a changed conversation, oldest first, from its new messages (newest first,
     /// read until the first one not `fresh`); `None` when they may not be read, and then the
-    /// list's last message stands for them. Remembered is the newest of what was read and the
-    /// list's last item: the history may be ahead of the list, if a message came while the poll
-    /// ran, and the list's last item may be no text message.
+    /// list's last message stands for them. Remembered is the newest message read: the history may
+    /// be ahead of the list, if a message came while the poll ran, or behind it, and then the next
+    /// poll reads again. A last item that is no text message (a call) is remembered when it is
+    /// newer, since no history shows it. ponytail: a text message the history shows only after
+    /// such an item, while the list already has it, is then missed; remembering both needs a
+    /// second id per conversation.
     pub fn arrivals(&mut self, c: &Conversation, new_newest_first: Option<&[Message]>, me: &str) -> Vec<Arrival> {
         // An empty answer did not show the new last message: the list's word stands.
         let messages: Vec<&Message> = match new_newest_first {
@@ -175,10 +178,10 @@ impl PollState {
             _ => c.last_message.iter().collect(),
         };
         let read = messages.first().map(|m| (m.id.clone(), m.sent_ms));
-        let listed = c.last_message_id.clone().zip(c.horizons.last_message_ms);
-        let newest = match (read, listed) {
-            (Some(read), Some(listed)) if listed.1 > read.1 => Some(listed),
-            (read, listed) => read.or(listed),
+        let event = c.last_message_id.clone().zip(c.horizons.last_message_ms).filter(|_| c.last_message.is_none());
+        let newest = match (read, event) {
+            (Some(read), Some(event)) if event.1 > read.1 => Some(event),
+            (read, event) => read.or(event),
         };
         let direct = c.kind == ConversationKind::Direct;
         let mut arrivals: Vec<Arrival> = messages.into_iter().filter(|m| !m.deleted).map(|m| arrival(&c.id, m, direct, me)).collect();
@@ -357,6 +360,19 @@ mod tests {
         // A minute later the list still shows 2: it is not new, so nothing is read or reported.
         assert!(!state.changed(&conversation("19:a@thread.v2", two)));
         assert!(!state.changed(&conversation("19:a@thread.v2", three)));
+    }
+
+    #[test]
+    fn a_history_behind_the_list_is_read_again() {
+        // The list shows 5 already; the history, read after it, ends at 3.
+        let mut state = PollState::new(NOW);
+        let conv = "19:a@thread.v2";
+        let (three, five) = (message(conv, "3", OTHER, NOW + 3, None), message(conv, "5", OTHER, NOW + 5, Some(ME)));
+        let fresh = new(&state, conv, vec![three]);
+        let arrivals = state.arrivals(&conversation(conv, five.clone()), Some(&fresh), ME);
+        assert_eq!(arrivals.iter().map(|a| a.message.as_str()).collect::<Vec<_>>(), ["3"]);
+        // 5 was not read, so it is not taken as seen: the next poll reads it.
+        assert!(state.changed(&conversation(conv, five)));
     }
 
     #[test]
