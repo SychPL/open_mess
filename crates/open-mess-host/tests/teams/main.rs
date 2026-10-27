@@ -722,6 +722,8 @@ fn target_server(conversation: &'static str, topic: Option<&'static str>, member
             Some(Reply::json(members.clone()))
         } else if s.path == format!("{}/1800000000300", messages_path(conversation)) {
             Some(Reply::json(message("1800000000300", conversation, OTHER, "<p>the <b>target</b></p>", T0)))
+        } else if s.path == messages_path(conversation) {
+            Some(Reply::json(page("messages", vec![message("1800000000300", conversation, OTHER, "<p>hi</p>", T0)], None)))
         } else {
             None
         }
@@ -731,9 +733,11 @@ fn target_server(conversation: &'static str, topic: Option<&'static str>, member
 #[tokio::test]
 async fn describe_target_lists_members() {
     let teams = Teams::signed_in().await;
+    // The live shape has no names ("Live results" 7): they come from the newest messages, and a
+    // member who wrote none of them stays an MRI.
     let members = json!({"members": [
         {"id": ME, "role": "Admin", "friendlyName": ME_NAME},
-        {"id": OTHER, "role": "User", "friendlyName": "Synthetic Person Two"},
+        {"id": OTHER, "role": "User"},
         {"id": "8:orgid:00000000-0000-0000-0000-000000000003", "role": "User"},
     ]});
     teams.fake.on(target_server(GROUP, Some("Synthetic group"), members));

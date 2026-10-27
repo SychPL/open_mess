@@ -128,7 +128,7 @@ pub fn decode_conversation(body: &[u8]) -> Result<Conversation, ProtoError> {
 }
 
 /// `members[]` of `GET v1/threads/<id>/members`: `id`, and `friendlyName` when the service gives
-/// one (UNCONFIRMED shape, to be checked live).
+/// one; live it gave none ("Live results" 7).
 pub fn decode_members(body: &[u8]) -> Result<Vec<Member>, ProtoError> {
     let v = parse_json(body)?;
     let member = |(i, m): (usize, &Value)| {

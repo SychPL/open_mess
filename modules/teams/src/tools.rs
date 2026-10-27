@@ -474,7 +474,8 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
             Vec::new()
         } else {
             let request = chat::members(&session.directory, conversation);
-            let members = chat::decode_members(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+            let mut members = chat::decode_members(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+            name_members(session, conversation, &mut members)?;
             members.into_iter().map(|m| Participant { display_name: m.name.unwrap_or_else(|| m.id.clone()), id: m.id }).collect()
         };
         let me = session.me();
@@ -490,6 +491,25 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
         };
         Ok(Target { conversation_title, participants, target_text })
     })
+}
+
+/// The members list has no names ("Live results" 7): the user is named by the session, the others
+/// by their newest message on the conversation's first page. One who wrote none of them stays
+/// nameless, an MRI in the approval.
+fn name_members(session: &mut Session, conversation: &str, members: &mut [chat::Member]) -> Result<(), ModuleError> {
+    let me = session.me();
+    for m in members.iter_mut().filter(|m| m.name.is_none() && m.id == me) {
+        m.name = Some(session.name.clone());
+    }
+    if members.iter().all(|m| m.name.is_some()) {
+        return Ok(());
+    }
+    let request = chat::read_messages(&session.directory, conversation, None, PAGE_SIZE, None).map_err(api::proto)?;
+    let page = chat::decode_messages(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+    for m in members.iter_mut().filter(|m| m.name.is_none()) {
+        m.name = page.items.iter().find(|message| message.sender_id == m.id).and_then(|message| message.sender_name.clone());
+    }
+    Ok(())
 }
 
 /// Messages read, newest first, and the link to the next page when the pages ran out first.
