@@ -991,6 +991,62 @@ async fn new_messages_go_out_before_older_pages() {
 }
 
 #[tokio::test]
+async fn older_pages_are_read_a_few_a_poll_and_a_failing_one_holds_none_back() {
+    // Two conversations with eight pages more than a poll reads (one message a page). The group's
+    // older pages keep failing; the channel's are read, five pages a poll at most, and all arrive.
+    const PAGES: usize = 28;
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let numbered_in = |conversation: &str, base: i64| -> Vec<Value> {
+        (0..PAGES)
+            .map(|i| {
+                let i = i64::try_from(i).unwrap();
+                message(&(base + i).to_string(), conversation, OTHER, "<p>x</p>", at + i)
+            })
+            .collect()
+    };
+    let (in_group, in_channel) = (numbered_in(GROUP, 1_900_000_000_100), numbered_in(CHANNEL, 1_900_000_000_300));
+    let list = vec![conversation(GROUP, None, Some(in_group[PAGES - 1].clone())), conversation(CHANNEL, None, Some(in_channel[PAGES - 1].clone()))];
+    let (group, channel) = (messages_path(GROUP), messages_path(CHANNEL));
+    teams.fake.on(move |s| {
+        if s.path == CHAT_PATH {
+            return Some(Reply::json(page("conversations", list.clone(), None)));
+        }
+        let (messages, id) = if s.path == group {
+            (&in_group, GROUP)
+        } else if s.path == channel {
+            (&in_channel, CHANNEL)
+        } else {
+            return None;
+        };
+        let k: usize = s.query.split("syncState=p").nth(1).map_or(0, |k| k.split('&').next().unwrap().parse().unwrap());
+        if id == GROUP && k >= 20 {
+            return Some(Reply::status(400));
+        }
+        let next = format!("{CHAT}/v1/users/ME/conversations/{id}/messages?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=p{}", k + 1);
+        Some(Reply::json(page("messages", vec![messages[PAGES - 1 - k].clone()], (k + 1 < PAGES).then_some(next.as_str()))))
+    });
+    let mut arrived = Vec::new();
+    while let Some(event) = teams.next_message().await {
+        arrived.push(event.message);
+    }
+    // All of the channel's; of the group's, the newest twenty.
+    assert_eq!(arrived.iter().filter(|id| id.starts_with("19000000003")).count(), PAGES, "{arrived:?}");
+    assert_eq!(arrived.iter().filter(|id| id.starts_with("19000000001")).count(), 20, "{arrived:?}");
+    // Older pages (20 and on) asked for between two lists, that is in one poll: five at most.
+    let mut per_poll = vec![0];
+    for s in teams.fake.seen() {
+        let older = s.query.split("syncState=p").nth(1).and_then(|k| k.split('&').next()?.parse::<usize>().ok()).is_some_and(|k| k >= 20);
+        if s.path == CHAT_PATH {
+            per_poll.push(0);
+        } else if older {
+            *per_poll.last_mut().unwrap() += 1;
+        }
+    }
+    assert!(per_poll.iter().all(|pages| *pages <= 5), "{per_poll:?}");
+}
+
+#[tokio::test]
 async fn a_call_after_a_mention_does_not_hide_it() {
     // The list's last item is a call, which is no text message: the mention before it still comes.
     let mut teams = Teams::polling().await;

@@ -595,8 +595,9 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
                     // No longer readable: nothing to report.
                     Ok(None) => continue,
                     Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
-                    // Tried again by the next poll; no more this time.
-                    Err(_) => pages = 0,
+                    // Tried again by the next poll; one page of this one's, so a page that keeps
+                    // failing does not hold back the others. (Out of time, the others fail at once.)
+                    Err(_) => pages = pages.saturating_sub(1),
                 }
             }
             if !state.keep_behind(b, started) {
