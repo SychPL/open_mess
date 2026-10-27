@@ -493,20 +493,26 @@ pub fn describe_target(account: &str, conversation: &str, message: Option<&str>)
 }
 
 /// Messages read, newest first, and the link to the next page when the pages ran out first.
-type Fresh = (Vec<Message>, Option<String>);
+/// And the pages read.
+type Fresh = (Vec<Message>, Option<String>, usize);
 
-/// A conversation's messages from `link` on (from the newest without one), newest first, page by
-/// page while `fresh` holds, with the link to the next page when `MAX_PAGES` ran out first; `None`
-/// when they may not be read (403, 404). Any other failure leaves them for the next poll.
+/// Pages of older messages one poll reads over all conversations that fell behind: what one poll
+/// reports of them stays small next to the new messages and the core's event queue.
+const BEHIND_PAGES: usize = 5;
+
+/// A conversation's messages from `link` on (from the newest without one), newest first, at most
+/// `pages` pages while `fresh` holds, with the link to the next page when the pages ran out first;
+/// `None` when they may not be read (403, 404). Any other failure leaves them for the next poll.
 fn fresh_messages(
     session: &mut Session,
     conversation: &str,
     mut link: Option<String>,
+    pages: usize,
     fresh: impl Fn(&Message) -> bool,
 ) -> Result<Option<Fresh>, ModuleError> {
     let slow = || ModuleError::Platform("Teams answers too slowly; polling again later".to_string());
     let mut new = Vec::new();
-    for page_number in 0..MAX_PAGES {
+    for page_number in 0..pages {
         if !api::has_time() {
             return Err(slow());
         }
@@ -526,10 +532,10 @@ fn fresh_messages(
         }
         match page.backward_link {
             Some(next) if more => link = Some(next),
-            _ => return Ok(Some((new, None))),
+            _ => return Ok(Some((new, None, page_number + 1))),
         }
     }
-    Ok(Some((new, link)))
+    Ok(Some((new, link, pages)))
 }
 
 /// One poll of an account (`poll`): the conversations updated lately, one `message-arrived` for
@@ -555,8 +561,8 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
         // A conversation whose messages cannot be read now is left for the next poll, which starts
         // from the same floor; the others are reported. A list that cannot be read ends the poll.
         for c in changed {
-            match fresh_messages(session, &c.id, None, |m| state.fresh(&c.id, m)) {
-                Ok(Some((new, next))) => {
+            match fresh_messages(session, &c.id, None, MAX_PAGES, |m| state.fresh(&c.id, m)) {
+                Ok(Some((new, next, _))) => {
                     if let Some(next) = next
                         && !state.fall_behind(&c.id, next, started)
                     {
@@ -570,22 +576,28 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
                 Err(_) => arrivals.extend(state.arrivals(&c, None, &me)),
             }
         }
-        // Older pages earlier polls left, with the time that is left: a long backlog never holds
-        // back what is new. Their messages are reported after the new ones too, so that a call
-        // running out of time while it reports loses old messages, not new ones. (A trigger batch
-        // that also gets more than 100 old ones then lists the newest of those; it counts them all.)
+        // Older pages earlier polls left, [`BEHIND_PAGES`] of them, with the time that is left: a
+        // long backlog never holds back what is new. Their messages are reported after the new ones
+        // too, so that a call running out of time while it reports loses old messages, not new
+        // ones. (A trigger batch that also gets more than 100 old ones then lists the newest of
+        // those; it counts them all.)
+        let mut pages = BEHIND_PAGES;
         for mut b in behind {
-            match fresh_messages(session, &b.conversation, Some(b.link.clone()), |m| b.fresh(m)) {
-                Ok(Some((older, next))) => {
-                    arrivals.extend(PollState::older_arrivals(&b, &older, &me));
-                    let Some(next) = next else { continue };
-                    b.link = next;
+            // None left this time: the rest wait for the next poll.
+            if pages > 0 {
+                match fresh_messages(session, &b.conversation, Some(b.link.clone()), pages, |m| b.fresh(m)) {
+                    Ok(Some((older, next, read))) => {
+                        arrivals.extend(PollState::older_arrivals(&b, &older, &me));
+                        pages = pages.saturating_sub(read);
+                        let Some(next) = next else { continue };
+                        b.link = next;
+                    }
+                    // No longer readable: nothing to report.
+                    Ok(None) => continue,
+                    Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
+                    // Tried again by the next poll; no more this time.
+                    Err(_) => pages = 0,
                 }
-                // No longer readable: nothing to report.
-                Ok(None) => continue,
-                Err(e @ ModuleError::AuthRequired(_)) => return Err(e),
-                // Tried again by the next poll.
-                Err(_) => {}
             }
             if !state.keep_behind(b, started) {
                 host::log(1, "older messages of a conversation are given up: an hour passed, or too many conversations fell behind");

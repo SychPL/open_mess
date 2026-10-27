@@ -950,6 +950,47 @@ async fn more_new_pages_than_a_poll_reads_arrive_with_the_next() {
 }
 
 #[tokio::test]
+async fn new_messages_go_out_before_older_pages() {
+    // A group with one page more than a poll reads; once its last page can be read, a channel has
+    // a new message too: the new message is reported first, then the older page.
+    const PAGES: usize = 21;
+    let mut teams = Teams::polling().await;
+    let at = now_ms() + 1000;
+    let messages: Vec<Value> =
+        (0..PAGES).map(|i| message(&format!("19000000001{i:02}"), GROUP, OTHER, "<p>x</p>", at + i64::try_from(i).unwrap())).collect();
+    let fresh = message("1900000000200", CHANNEL, OTHER, "<p>new</p>", at + 100);
+    // The list, and whether the group's last page answers: from the first list with the channel on.
+    let shared = Arc::new(std::sync::Mutex::new((vec![conversation(GROUP, None, Some(messages[PAGES - 1].clone()))], false)));
+    let (state, group, channel, answer) = (shared.clone(), messages_path(GROUP), messages_path(CHANNEL), fresh.clone());
+    teams.fake.on(move |s| {
+        let mut state = state.lock().unwrap();
+        if s.path == CHAT_PATH {
+            state.1 = state.0.len() > 1;
+            return Some(Reply::json(page("conversations", state.0.clone(), None)));
+        }
+        if s.path == channel {
+            return Some(Reply::json(page("messages", vec![answer.clone()], None)));
+        }
+        (s.path == group).then(|| {
+            let k: usize = s.query.split("syncState=p").nth(1).map_or(0, |k| k.split('&').next().unwrap().parse().unwrap());
+            if k == PAGES - 1 && !state.1 {
+                // Failing for now: the page waits for a later poll.
+                return Reply::status(400);
+            }
+            let next =
+                format!("{CHAT}/v1/users/ME/conversations/{GROUP}/messages?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=p{}", k + 1);
+            Reply::json(page("messages", vec![messages[PAGES - 1 - k].clone()], (k + 1 < PAGES).then_some(next.as_str())))
+        })
+    });
+    for _ in 0..PAGES - 1 {
+        teams.next_message().await.unwrap();
+    }
+    shared.lock().unwrap().0.push(conversation(CHANNEL, None, Some(fresh)));
+    let next = [teams.next_message().await.unwrap().message, teams.next_message().await.unwrap().message];
+    assert_eq!(next, ["1900000000200", "1900000000100"]);
+}
+
+#[tokio::test]
 async fn a_call_after_a_mention_does_not_hide_it() {
     // The list's last item is a call, which is no text message: the mention before it still comes.
     let mut teams = Teams::polling().await;
