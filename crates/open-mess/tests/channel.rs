@@ -170,8 +170,11 @@ fn recorder(out: &std::path::Path) -> Spawn {
 async fn no_session_falls_back_to_spawn() {
     let d = common::daemon(&[]).await;
     let out = d.dir.path().join("out.json");
-    let actions =
-        Actions { accounts: Arc::clone(&d.accounts), sessions: Sessions::default(), runs: Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT) };
+    let actions = Actions {
+        accounts: Arc::clone(&d.accounts),
+        sessions: Sessions::default(),
+        runs: Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT, Counters::default()),
+    };
     let rule = Rule::new("r1", "test-echo:a", Condition::Mention, Action::Channel { fallback_spawn: Some(recorder(&out)) });
     assert_eq!(actions.deliver(rule, batch(None)).await, DeliveryResult::Delivered);
     wait_for("the fallback run", || out.exists()).await;
@@ -182,8 +185,11 @@ async fn no_session_and_no_spawn_is_counted() {
     let d = common::daemon(&[]).await;
     d.accounts.add("test-echo", info("a")).unwrap();
     rules::put(&common::store(d.dir.path()), &Rule::new("r1", "test-echo:a", Condition::Direct, Action::Channel { fallback_spawn: None })).unwrap();
-    let actions =
-        Actions { accounts: Arc::clone(&d.accounts), sessions: Sessions::default(), runs: Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT) };
+    let actions = Actions {
+        accounts: Arc::clone(&d.accounts),
+        sessions: Sessions::default(),
+        runs: Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT, Counters::default()),
+    };
     let (bus, counters) = (Bus::default(), Counters::default());
     let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(actions), counters.clone(), || chrono::Local::now().time());
     bus.publish(Event::Message {

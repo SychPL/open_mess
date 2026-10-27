@@ -317,3 +317,18 @@ async fn lagged_bus_is_counted() {
     sleep(Duration::from_secs(61)).await;
     assert_eq!(t.calls().len(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn open_batches_are_capped() {
+    // DMs from more conversations than the engine collects at once: the one too many is dropped and
+    // counted.
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    for n in 0..=engine::MAX_OPEN {
+        t.bus.publish(message(&format!("c{n}"), &format!("m{n}"), Kind::Direct));
+    }
+    sleep(Duration::from_secs(61)).await;
+    let counters = t.counters.rule("r");
+    assert_eq!(counters.dropped_queue, 1);
+    // The rest went out, as far as the hourly cap let them.
+    assert_eq!(counters.delivered + counters.dropped_rate, engine::MAX_OPEN as u64);
+}

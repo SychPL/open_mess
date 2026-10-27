@@ -18,8 +18,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
 
 use super::engine::{Batch, DeliveryResult};
-use super::payload;
 use super::rules::Spawn;
+use super::{Counters, payload};
 
 /// Programs running at once, over all rules.
 pub const MAX_RUNS: usize = 2;
@@ -30,10 +30,15 @@ pub const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The environment variable with the event file's path.
 pub const EVENT_FILE_VAR: &str = "OPEN_MESS_EVENT_FILE";
 
+/// Asked before a batch that waited starts; false drops it.
+pub type StillAllowed = Box<dyn Fn() -> bool + Send>;
+
 /// The runs of the daemon: what runs and what waits.
 pub struct Runs {
     dir: PathBuf,
     timeout: Duration,
+    /// Where programs that could not start are counted.
+    counters: Counters,
     state: Mutex<State>,
 }
 
@@ -49,19 +54,21 @@ struct Queued {
     rule: String,
     spawn: Spawn,
     input: Vec<u8>,
+    still_allowed: StillAllowed,
 }
 
 impl Runs {
-    /// Runs with their event files in `dir` (`<data_dir>/runs`), stopped after `timeout`. Files
-    /// left there by a daemon that stopped are deleted.
-    pub fn new(dir: PathBuf, timeout: Duration) -> Arc<Runs> {
+    /// Runs with their event files in `dir` (`<data_dir>/runs`), stopped after `timeout`, counting
+    /// programs that fail to start in `counters`. Files left there by a daemon that stopped are
+    /// deleted.
+    pub fn new(dir: PathBuf, timeout: Duration, counters: Counters) -> Arc<Runs> {
         // Best effort: a file that can't be deleted now is tried again at the next start.
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-        Arc::new(Runs { dir, timeout, state: Mutex::new(State::default()) })
+        Arc::new(Runs { dir, timeout, counters, state: Mutex::new(State::default()) })
     }
 
     /// Programs running now.
@@ -90,10 +97,10 @@ impl Runs {
 }
 
 /// Starts `spawn` for the batch of `rule`, or queues the batch when the rule's program is already
-/// running or [`MAX_RUNS`] are.
-pub fn deliver(runs: &Arc<Runs>, rule: &str, spawn: &Spawn, batch: &Batch) -> DeliveryResult {
+/// running or [`MAX_RUNS`] are; a queued batch starts only if `still_allowed` says so then.
+pub fn deliver(runs: &Arc<Runs>, rule: &str, spawn: &Spawn, batch: &Batch, still_allowed: StillAllowed) -> DeliveryResult {
     let input = serde_json::to_vec(&payload(rule, batch)).unwrap_or_default();
-    let queued = Queued { rule: rule.to_owned(), spawn: spawn.clone(), input };
+    let queued = Queued { rule: rule.to_owned(), spawn: spawn.clone(), input, still_allowed };
     let mut state = runs.lock();
     if state.running.contains(rule) || state.running.len() >= MAX_RUNS {
         let mut result = DeliveryResult::Delivered;
@@ -112,13 +119,17 @@ pub fn deliver(runs: &Arc<Runs>, rule: &str, spawn: &Spawn, batch: &Batch) -> De
     DeliveryResult::Delivered
 }
 
-/// Runs the batch, then whatever waited for the slot it frees.
+/// Runs the batch, then whatever waited for the slot it frees and may still run.
 async fn run_all(runs: Arc<Runs>, first: Queued) {
     let mut next = Some(first);
+    let mut waited = false;
     while let Some(run) = next {
-        // ponytail: a program that fails to start is not reported anywhere until a log sink exists.
-        let _ = run_one(&runs, &run.spawn, &run.input).await;
+        if (!waited || (run.still_allowed)()) && run_one(&runs, &run.spawn, &run.input).await.is_err() {
+            // ponytail: counted only; why it failed waits for a log sink.
+            runs.counters.count(&run.rule, |counters| &mut counters.failed_to_start);
+        }
         next = runs.finished(&run.rule);
+        waited = true;
     }
 }
 

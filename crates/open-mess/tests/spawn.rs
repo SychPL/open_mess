@@ -11,11 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{ECHO, info};
+use open_mess::permissions::{self, Write};
 use open_mess::tools::shared::UNTRUSTED_NOTICE;
-use open_mess::triggers::Actions;
 use open_mess::triggers::engine::{Batch, BatchedMessage, Delivery, DeliveryResult};
+use open_mess::triggers::rules;
 use open_mess::triggers::rules::{Action, Condition, Rule, Spawn};
+use open_mess::triggers::spawn::StillAllowed;
 use open_mess::triggers::spawn::{self, Runs};
+use open_mess::triggers::{Actions, Counters};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -57,12 +60,16 @@ async fn wait_for(what: &str, condition: impl Fn() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+fn always() -> StillAllowed {
+    Box::new(|| true)
+}
+
 fn read(out: &Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(out).unwrap()).unwrap()
 }
 
 fn runs(dir: &TempDir, timeout: Duration) -> Arc<Runs> {
-    Runs::new(dir.path().join("runs"), timeout)
+    Runs::new(dir.path().join("runs"), timeout, Counters::default())
 }
 
 #[tokio::test]
@@ -73,7 +80,7 @@ async fn spawn_gets_batch_on_stdin_and_file() {
     let work = tempfile::tempdir().unwrap();
     let program = Spawn { working_dir: Some(work.path().to_path_buf()), ..recorder(&out, &[]) };
     let untrusted = json!({"sender_name": "Pat", "text": "lunch?"});
-    assert_eq!(spawn::deliver(&runs, "r1", &program, &batch(vec![message("m1", Some(untrusted.clone()))])), DeliveryResult::Delivered);
+    assert_eq!(spawn::deliver(&runs, "r1", &program, &batch(vec![message("m1", Some(untrusted.clone()))]), always()), DeliveryResult::Delivered);
     wait_for("the run", || out.exists()).await;
 
     let record = read(&out);
@@ -103,7 +110,7 @@ async fn content_never_reaches_the_command_line() {
     let hostile = json!({"sender_name": "\"; rm -rf ~; \"", "text": "$(calc) & calc.exe | `calc` %COMSPEC%"});
     let mut evil = message("m1 & calc", Some(hostile.clone()));
     evil.sender = "\"$(calc)\"".into();
-    spawn::deliver(&runs, "r1", &program, &batch(vec![evil]));
+    spawn::deliver(&runs, "r1", &program, &batch(vec![evil]), always());
     wait_for("the run", || out.exists()).await;
 
     let record = read(&out);
@@ -120,7 +127,7 @@ async fn event_file_is_deleted_after_the_run() {
     let dir = tempfile::tempdir().unwrap();
     let runs = runs(&dir, spawn::RUN_TIMEOUT);
     let out = dir.path().join("out.json");
-    spawn::deliver(&runs, "r1", &recorder(&out, &[]), &batch(vec![message("m1", None)]));
+    spawn::deliver(&runs, "r1", &recorder(&out, &[]), &batch(vec![message("m1", None)]), always());
     wait_for("the run to end", || runs.running() == 0).await;
     let event_file = PathBuf::from(read(&out)["event_file"].as_str().unwrap());
     assert!(!event_file.exists());
@@ -145,7 +152,7 @@ async fn at_most_two_runs() {
     let slow = |rule: &str| recorder(&out(rule), &["--sleep", "1500"]);
     let one = batch(vec![message("m1", None)]);
     for rule in ["r1", "r2", "r3"] {
-        assert_eq!(spawn::deliver(&runs, rule, &slow(rule), &one), DeliveryResult::Delivered);
+        assert_eq!(spawn::deliver(&runs, rule, &slow(rule), &one, always()), DeliveryResult::Delivered);
     }
     // Two run at once; the third waits.
     assert_eq!((runs.running(), runs.queued()), (2, 1));
@@ -156,9 +163,9 @@ async fn at_most_two_runs() {
     // One run per rule: the rule's next batches wait, ten at most, the oldest dropped first.
     let busy = |n: usize| batch(vec![message(&format!("m{n}"), None)]);
     for n in 0..10 {
-        assert_eq!(spawn::deliver(&runs, "r3", &slow("r3"), &busy(n)), DeliveryResult::Delivered);
+        assert_eq!(spawn::deliver(&runs, "r3", &slow("r3"), &busy(n), always()), DeliveryResult::Delivered);
     }
-    assert_eq!(spawn::deliver(&runs, "r3", &slow("r3"), &busy(10)), DeliveryResult::DeliveredDroppingOldest);
+    assert_eq!(spawn::deliver(&runs, "r3", &slow("r3"), &busy(10), always()), DeliveryResult::DeliveredDroppingOldest);
     assert_eq!(runs.queued(), 10);
     // The next run of r3 gets the oldest batch still queued, m1; m0 was dropped.
     std::fs::remove_file(out("r3")).unwrap();
@@ -172,7 +179,7 @@ async fn run_timeout_kills() {
     let dir = tempfile::tempdir().unwrap();
     let runs = runs(&dir, Duration::from_secs(1));
     let out = dir.path().join("out.json");
-    spawn::deliver(&runs, "r1", &recorder(&out, &["--sleep", "60000"]), &batch(vec![message("m1", None)]));
+    spawn::deliver(&runs, "r1", &recorder(&out, &["--sleep", "60000"]), &batch(vec![message("m1", None)]), always());
     wait_for("the run", || out.exists()).await;
     wait_for("the run to be killed", || runs.running() == 0).await;
     let event_file = PathBuf::from(read(&out)["event_file"].as_str().unwrap());
@@ -189,7 +196,7 @@ async fn actions_fill_in_content() {
     d.accounts.add("test-echo", info("a")).unwrap();
     let out = d.dir.path().join("out.json");
     let rule = Rule::new("r1", "test-echo:a", Condition::Direct, Action::Spawn(recorder(&out, &[])));
-    let runs = Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT);
+    let runs = Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT, Counters::default());
     let actions = Actions { accounts: Arc::clone(&d.accounts), sessions: Default::default(), runs };
     assert_eq!(actions.deliver(rule, batch(vec![message("m1", None)])).await, DeliveryResult::Delivered);
     wait_for("the run", || out.exists()).await;
@@ -197,4 +204,38 @@ async fn actions_fill_in_content() {
     // test-echo's read_messages answers with message m1 from "Echo".
     assert_eq!(stdin["messages"][0]["untrusted"], json!({"sender_name": "Echo", "text": "hello a"}));
     assert_eq!(stdin["untrusted_notice"], UNTRUSTED_NOTICE);
+}
+
+#[tokio::test]
+async fn waiting_batch_is_checked_again() {
+    // A batch waits for the rule's program; meanwhile the user takes the read permission away. It
+    // must not start (spec 8.7, R7).
+    let d = common::daemon(&[]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let out = d.dir.path().join("out.json");
+    let rule = Rule::new("r1", "test-echo:a", Condition::Direct, Action::Spawn(recorder(&out, &["--sleep", "1500"])));
+    let store = common::store(d.dir.path());
+    rules::put(&store, &rule).unwrap();
+    let runs = Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT, Counters::default());
+    let actions = Actions { accounts: Arc::clone(&d.accounts), sessions: Default::default(), runs: Arc::clone(&runs) };
+    actions.deliver(rule.clone(), batch(vec![message("m1", None)])).await;
+    actions.deliver(rule, batch(vec![message("m2", None)])).await;
+    assert_eq!((runs.running(), runs.queued()), (1, 1));
+    permissions::set(&store, "test-echo:a", Some("c1"), false, Write::Confirm).unwrap();
+    wait_for("the queue to empty", || runs.running() == 0 && runs.queued() == 0).await;
+    let stdin: Value = serde_json::from_str(read(&out)["stdin"].as_str().unwrap()).unwrap();
+    assert_eq!(stdin["messages"][0]["id"], "m1");
+}
+
+#[tokio::test]
+async fn program_that_fails_to_start_is_counted() {
+    // The rule's program was moved after the rule was saved.
+    let dir = tempfile::tempdir().unwrap();
+    let counters = Counters::default();
+    let runs = Runs::new(dir.path().join("runs"), spawn::RUN_TIMEOUT, counters.clone());
+    let gone = Spawn { program: dir.path().join("moved-away.exe"), args: Vec::new(), working_dir: None };
+    spawn::deliver(&runs, "r1", &gone, &batch(vec![message("m1", None)]), always());
+    wait_for("the failed run", || counters.rule("r1").failed_to_start == 1).await;
+    assert_eq!(runs.running(), 0);
+    assert_eq!(std::fs::read_dir(dir.path().join("runs")).unwrap().count(), 0);
 }

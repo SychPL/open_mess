@@ -40,12 +40,24 @@ impl Delivery for Actions {
     async fn deliver(&self, rule: Rule, mut batch: Batch) -> DeliveryResult {
         fill_in_content(&self.accounts, &mut batch).await;
         match &rule.action {
-            Action::Spawn(program) => spawn::deliver(&self.runs, &rule.id, program, &batch),
+            Action::Spawn(program) => spawn::deliver(&self.runs, &rule.id, program, &batch, self.still_allowed(&rule.id, &batch)),
             Action::Channel { .. } if channel::deliver(&self.sessions, &rule.id, &batch).await => DeliveryResult::Delivered,
             // No session: the rule's program instead, if it has one (spec 8.7).
-            Action::Channel { fallback_spawn: Some(program) } => spawn::deliver(&self.runs, &rule.id, program, &batch),
+            Action::Channel { fallback_spawn: Some(program) } => {
+                spawn::deliver(&self.runs, &rule.id, program, &batch, self.still_allowed(&rule.id, &batch))
+            }
             Action::Channel { fallback_spawn: None } => DeliveryResult::NoSession,
         }
+    }
+}
+
+impl Actions {
+    /// Asked before a batch that waited for its run starts: the rule, the account or the read
+    /// permission may have gone meanwhile (spec 8.7, R7).
+    fn still_allowed(&self, rule: &str, batch: &Batch) -> spawn::StillAllowed {
+        let (accounts, rule, account, conversation) =
+            (Arc::clone(&self.accounts), rule.to_owned(), batch.account.clone(), batch.conversation.clone());
+        Box::new(move || engine::current_rule(&accounts, &rule, &account, &conversation).is_some())
     }
 }
 
@@ -124,6 +136,8 @@ pub struct RuleCounters {
     pub dropped_queue: u64,
     /// No session to notify and no program to start.
     pub dropped_no_session: u64,
+    /// The program could not be started (moved or deleted, say).
+    pub failed_to_start: u64,
 }
 
 /// The engine's counters, shared with `status`.

@@ -207,15 +207,8 @@ impl<D: Delivery> Engine<D> {
     /// Hands a batch to its rule's action, unless the rule, the account or the read permission is
     /// gone by now, or quiet hours or the hourly cap stop it.
     fn flush(&mut self, rule_id: &str, batch: Batch, now: Instant) {
-        if !self.known(&batch.account) {
+        let Some(rule) = current_rule(&self.accounts, rule_id, &batch.account, &batch.conversation) else {
             return;
-        }
-        let rule = {
-            let store = self.accounts.store();
-            match rules::get(&store, rule_id) {
-                Ok(Some(rule)) if rule.enabled && rule.account == batch.account && readable(&store, &batch.account, &batch.conversation) => rule,
-                _ => return,
-            }
         };
         if in_quiet_hours(rule.quiet_hours, (self.local_time)()) {
             self.counters.count(&rule.id, |counters| &mut counters.dropped_quiet_hours);
@@ -245,11 +238,27 @@ impl<D: Delivery> Engine<D> {
         });
     }
 
-    /// Whether the account exists and is not being removed; the bus still carries events of
-    /// accounts in either state.
     fn known(&self, account: &str) -> bool {
-        matches!(self.accounts.get(account), Ok(Some(found)) if found.state != REMOVING)
+        known(&self.accounts, account)
     }
+}
+
+/// The rule, if a batch of it from `conversation` may still go out: the rule exists and is enabled
+/// for the account, the account is known and not being removed, and the agent may read the
+/// conversation. Asked again right before a batch reaches an agent.
+pub(crate) fn current_rule(accounts: &Accounts, rule_id: &str, account: &str, conversation: &str) -> Option<Rule> {
+    if !known(accounts, account) {
+        return None;
+    }
+    let store = accounts.store();
+    let rule = rules::get(&store, rule_id).ok()??;
+    (rule.enabled && rule.account == account && readable(&store, account, conversation)).then_some(rule)
+}
+
+/// Whether the account exists and is not being removed; the bus still carries events of accounts
+/// in either state.
+fn known(accounts: &Accounts, account: &str) -> bool {
+    matches!(accounts.get(account), Ok(Some(found)) if found.state != REMOVING)
 }
 
 fn readable(store: &Store, account: &str, conversation: &str) -> bool {
