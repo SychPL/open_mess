@@ -1,0 +1,18 @@
+{
+  "productName": "open_mess",
+  "identifier": "open-mess.daemon",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost",
+      "capabilities": ["main"]
+    }
+  },
+  "bundle": {
+    "icon": ["icons/icon.ico", "icons/icon.png"]
+  }
+}

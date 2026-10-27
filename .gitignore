@@ -1,4 +1,6 @@
 /target*/
+# Written by tauri-build on every build (schemas for the Tauri CLI, which open_mess doesn't use).
+/crates/open-mess/gen/
 *~
 .DS_Store
 *.swp

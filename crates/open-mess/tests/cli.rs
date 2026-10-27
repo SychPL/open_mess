@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use open_mess::tools::Registry;
+use open_mess::ui::Opener;
 use rmcp::ServiceExt;
 use rmcp::model::ClientConfig;
 use rmcp::transport::StreamableHttpClientTransport;
@@ -22,13 +23,37 @@ const TOKEN: &str = "t0ken";
 
 /// Serves the API on an ephemeral port until the returned sender is dropped.
 async fn start() -> (u16, oneshot::Sender<()>) {
+    let (port, stop, _) = start_with_window().await;
+    (port, stop)
+}
+
+/// [`start`], with the opener of the configuration window.
+async fn start_with_window() -> (u16, oneshot::Sender<()>, Opener) {
     let listener = open_mess::api::bind(0).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (stop, stopped) = oneshot::channel::<()>();
-    tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), Arc::new(Registry::with_builtin(Instant::now())), async {
+    let opener = Opener::default();
+    tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), Arc::new(Registry::with_builtin(Instant::now())), opener.clone(), async {
         let _ = stopped.await;
     }));
-    (port, stop)
+    (port, stop, opener)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_config_opens_the_window() {
+    let (port, _stop, opener) = start_with_window().await;
+    let dir = data_dir();
+    let output = om(dir.path(), port, TOKEN, &["config"]);
+    if cfg!(windows) {
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(tokio::time::timeout(Duration::from_secs(1), opener.requested()).await.is_ok());
+    } else {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains("only on Windows"), "{}", stderr(&output));
+    }
+    // Without a daemon it says so.
+    let output = om(dir.path(), free_port(), TOKEN, &["config"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
 }
 
 /// `om` with its own data folder, port and token.

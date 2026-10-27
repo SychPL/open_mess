@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod secrets;
 pub mod store;
 pub mod tools;
+pub mod ui;
 
 /// Everything that can go wrong in the daemon and the CLI.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +41,10 @@ pub enum Error {
     Account(String),
     #[error("unknown action {0:?}")]
     UnknownAction(String),
+    #[error("the configuration window exists only on Windows")]
+    NoWindow,
+    #[error("configuration window: {0}")]
+    Ui(String),
     #[error("module host: {0}")]
     Host(#[from] open_mess_host::HostError),
     #[error(transparent)]

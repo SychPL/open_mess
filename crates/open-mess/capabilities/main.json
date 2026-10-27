@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "The configuration window: open_mess's own commands and nothing else (no plugin or core APIs).",
+  "windows": ["main"],
+  "permissions": []
+}
