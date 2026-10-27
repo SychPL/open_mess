@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 use crate::bridge::{self, Locate};
 use crate::daemon::{self, LAST_START_ERROR_FILE};
 use crate::instance::InstanceLock;
-use crate::store::{DEFAULT_PORT, Store};
+use crate::store::{self, DEFAULT_PORT};
 use crate::tools::ToolInfo;
 use crate::{Error, paths, secrets};
 
@@ -159,7 +159,7 @@ fn port() -> Result<u16, Failure> {
     if !db.exists() {
         return Ok(DEFAULT_PORT);
     }
-    Store::open(&db).and_then(|store| store.port()).map_err(|err| failed(err.to_string()))
+    store::read_port(&db).map_err(|err| failed(err.to_string()))
 }
 
 /// `OPEN_MESS_TOKEN`, else the token the daemon stored at its first start.

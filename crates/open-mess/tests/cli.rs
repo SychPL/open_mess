@@ -348,3 +348,20 @@ fn cli_version_and_bad_usage() {
     let output = om(dir.path(), free_port(), TOKEN, &["--no-such-flag"]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
 }
+
+/// The port comes from the daemon's database even when a newer daemon migrated it further: the CLI
+/// reads it without migrating or refusing.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_reaches_daemon_with_newer_schema() {
+    let (port, _stop) = start().await;
+    let dir = running();
+    let conn = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+    conn.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+    conn.execute("INSERT INTO config (key, value) VALUES ('port', ?1)", [port.to_string()]).unwrap();
+    conn.pragma_update(None, "user_version", 99).unwrap();
+    drop(conn);
+    let output = om_command(dir.path(), 1, TOKEN, &["status", "--json"]).env_remove("OPEN_MESS_PORT").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
