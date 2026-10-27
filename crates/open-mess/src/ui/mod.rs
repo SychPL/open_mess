@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use open_mess_host::HostEvent;
 use tokio::runtime::Runtime;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 use crate::Error;
 use crate::accounts::Accounts;
@@ -50,6 +50,8 @@ pub struct UiState {
     pub host_events: mpsc::Sender<HostEvent>,
     /// Set once the tray is up, for `status` (spec 7.2).
     pub ui_ready: Arc<AtomicBool>,
+    /// Ends the daemon as Ctrl+C does: an update whose helper started (spec 7.1).
+    pub exit: Arc<Notify>,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.

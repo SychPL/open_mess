@@ -95,6 +95,8 @@ minisign = "0.10.0"
 open-mess-host = { path = "../open-mess-host", features = ["test-support"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["sync", "test-util"] }
+# The module logs a test reads: test-echo logs the timer events it gets (tests/update_quiesce.rs).
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [lints]
 workspace = true

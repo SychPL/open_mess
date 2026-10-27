@@ -182,8 +182,9 @@ fn write_event_file(dir: &Path, input: &[u8]) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Starts a console program without a console window: the daemon has none to share.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Stops the program and the processes it started: `claude -p` and the like run children, which
 /// `Child::kill` alone would leave running.

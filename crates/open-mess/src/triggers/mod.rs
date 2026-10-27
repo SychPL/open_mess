@@ -142,7 +142,8 @@ pub struct Activity {
     pub delivering: AtomicUsize,
     /// When the last delivery ended, in milliseconds since 1970; 0 before the first.
     pub last_delivery_ms: AtomicU64,
-    /// While true the engine collects batches but hands none over.
+    /// While true the engine collects batches but hands none over. Set it with `send_replace`:
+    /// `send` changes nothing while no engine listens.
     pub hold: watch::Sender<bool>,
 }
 

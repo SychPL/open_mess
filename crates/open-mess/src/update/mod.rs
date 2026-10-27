@@ -2,7 +2,11 @@
 
 pub mod consent;
 pub mod fetch;
+pub mod quiesce;
 pub mod release;
+pub mod state;
+#[cfg(windows)]
+pub mod system;
 
 /// Everything that can go wrong while checking for, downloading or installing an update.
 #[derive(Debug, thiserror::Error)]
@@ -17,4 +21,7 @@ pub enum UpdateError {
     Io(#[from] std::io::Error),
     #[error("state database: {0}")]
     Store(#[from] rusqlite::Error),
+    /// The helper did not take `update.lock` in time; the daemon went back to work.
+    #[error("pomocnik nie wystartował")]
+    HelperNotStarted,
 }

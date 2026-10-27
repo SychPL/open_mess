@@ -162,6 +162,11 @@ impl Modules {
             .and_then(|entry| entry.handle.clone())
     }
 
+    /// Every loaded module: the active ones.
+    pub fn handles(&self) -> Vec<ModuleHandle> {
+        self.read().iter().filter_map(|entry| entry.handle.clone()).collect()
+    }
+
     pub fn list(&self) -> Vec<ModuleInfo> {
         self.read().iter().map(|entry| ModuleInfo { state: entry.state(), ..entry.info.clone() }).collect()
     }

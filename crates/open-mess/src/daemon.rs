@@ -30,8 +30,9 @@ use crate::{Error, api, approval, paths, secrets, ui};
 /// it can't reach the daemon; a successful start deletes it.
 pub const LAST_START_ERROR_FILE: &str = "last-start-error.txt";
 
-/// Runs the daemon until Ctrl+C or, on Windows, `Zakończ` in the tray menu. The tray and the
-/// configuration window take the main thread; the API runs on the runtime's threads.
+/// Runs the daemon until Ctrl+C, an update hands over to its helper or, on Windows, `Zakończ` in the
+/// tray menu. The tray and the configuration window take the main thread; the API runs on the
+/// runtime's threads.
 pub fn run() -> Result<(), Error> {
     let started = Instant::now();
     let dir = paths::data_dir()?;
@@ -43,6 +44,7 @@ pub fn run() -> Result<(), Error> {
         let _ = std::fs::write(&error_file, format!("{}\n", err.to_string().replace(['\r', '\n'], " ")));
     })?;
     let _ = std::fs::remove_file(&error_file);
+    let exit = Arc::clone(&ui.exit);
     // Never println!: it panics when the launcher has closed stdout.
     let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
     let (stop, stopped) = oneshot::channel::<()>();
@@ -59,21 +61,22 @@ pub fn run() -> Result<(), Error> {
             served
         }
     });
-    if let Err(err) = ui::run(&runtime, ui, window.clone(), until_stopped(Arc::clone(&ended))) {
+    if let Err(err) = ui::run(&runtime, ui, window.clone(), until_stopped(Arc::clone(&ended), Arc::clone(&exit))) {
         // Without the tray and the window the daemon still serves its agents; `om config` says so.
         let _ = writeln!(std::io::stderr(), "{err}");
         runtime.block_on(window.close());
-        runtime.block_on(until_stopped(ended));
+        runtime.block_on(until_stopped(ended, exit));
     }
     let _ = stop.send(());
     runtime.block_on(server).map_err(|err| Error::Io(std::io::Error::other(err)))?
 }
 
-/// Ctrl+C, or the API ended.
-async fn until_stopped(ended: Arc<Notify>) {
+/// Ctrl+C, the API ended, or `exit` was notified.
+async fn until_stopped(ended: Arc<Notify>, exit: Arc<Notify>) {
     tokio::select! {
         () = ctrl_c() => {}
         () = ended.notified() => {}
+        () = exit.notified() => {}
     }
 }
 
@@ -142,8 +145,22 @@ fn start(dir: &Path, started: Instant, window: &Opener) -> Result<(Runtime, TcpL
     approval::start(&runtime, Arc::clone(&pending), window.clone());
     let (counters, sessions) = (registry.trigger_counters().clone(), registry.channel_sessions().clone());
     let (gate, ui_ready) = (registry.gate().clone(), Arc::clone(registry.ui_ready()));
-    let ui =
-        UiState { accounts, pending, started, port, token, sign_ins, counters, sessions, gate, activity, runs, host_events: event_queue, ui_ready };
+    let ui = UiState {
+        accounts,
+        pending,
+        started,
+        port,
+        token,
+        sign_ins,
+        counters,
+        sessions,
+        gate,
+        activity,
+        runs,
+        host_events: event_queue,
+        ui_ready,
+        exit: Arc::default(),
+    };
     Ok((runtime, listener, registry, ui))
 }
 

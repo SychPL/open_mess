@@ -514,6 +514,16 @@ async fn held_engine_keeps_due_batches_and_flushes_on_release() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn hold_set_before_the_engine_runs_is_kept() {
+    let t = setup(&[rule("r", Condition::Direct)]).await;
+    // The engine task has not run yet; its hold already listens.
+    assert!(t.activity.hold.send(true).is_ok());
+    t.bus.publish(message("c1", "m1", Kind::Direct));
+    sleep(Duration::from_secs(600)).await;
+    assert!(t.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn consumed_matches_received_after_drain() {
     let t = setup(&[rule("r", Condition::Direct)]).await;
     // The modules' queue, as the daemon forwards it to the bus.

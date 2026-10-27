@@ -42,6 +42,7 @@ fn state(d: &Daemon) -> UiState {
         runs: Runs::new(d.dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
         host_events: tokio::sync::mpsc::channel(1).0,
         ui_ready: Arc::default(),
+        exit: Arc::default(),
     }
 }
 
@@ -77,6 +78,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         runs: Runs::new(dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
         host_events: tokio::sync::mpsc::channel(1).0,
         ui_ready: Arc::default(),
+        exit: Arc::default(),
     };
     (dir, state)
 }

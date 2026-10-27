@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveTime;
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
@@ -119,12 +120,14 @@ pub fn spawn<D: Delivery>(
     local_time: fn() -> NaiveTime,
 ) -> JoinHandle<()> {
     let events = bus.subscribe();
+    // Here, not in the task: a hold set before the task first runs is not lost.
+    let hold = activity.hold.subscribe();
     // Batches collected when the daemon stopped never went out: a module that reports their
     // messages again wakes the rules for them.
     // ponytail: a failed delete leaves them muted until they are forgotten (SEEN_FOR).
     let _ = accounts.store().conn().execute("DELETE FROM trigger_seen WHERE batch IS NOT NULL", []);
     let engine = Engine { accounts, delivery, counters, activity, local_time, open: HashMap::new(), sent: Arc::default(), remembered: 0, batches: 0 };
-    tokio::spawn(engine.run(events))
+    tokio::spawn(engine.run(events, hold))
 }
 
 /// When each rule's batches of the last hour went out, by rule id.
@@ -173,8 +176,7 @@ impl Open {
 }
 
 impl<D: Delivery> Engine<D> {
-    async fn run(mut self, mut events: broadcast::Receiver<Event>) {
-        let mut hold = self.activity.hold.subscribe();
+    async fn run(mut self, mut events: broadcast::Receiver<Event>, mut hold: watch::Receiver<bool>) {
         loop {
             // Held, due batches wait for the release rather than for a deadline already past.
             let due = if *hold.borrow_and_update() { None } else { self.open.values().map(Open::due).min() };

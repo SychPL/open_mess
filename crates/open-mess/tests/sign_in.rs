@@ -35,6 +35,7 @@ fn state(d: &Daemon) -> Arc<UiState> {
         runs: open_mess::triggers::spawn::Runs::new(d.dir.path().join("runs"), open_mess::triggers::spawn::RUN_TIMEOUT, Default::default()),
         host_events: tokio::sync::mpsc::channel(1).0,
         ui_ready: Arc::default(),
+        exit: Arc::default(),
     })
 }
 
