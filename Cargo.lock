@@ -1928,6 +1928,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-platform-verifier",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

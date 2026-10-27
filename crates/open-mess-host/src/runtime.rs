@@ -148,6 +148,8 @@ pub(crate) struct ModuleEnv {
     pub(crate) hosts: HostList,
     pub(crate) net: Net,
     pub(crate) events: mpsc::Sender<HostEvent>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fake_wam: Option<crate::FakeWam>,
 }
 
 /// The state a module instance runs with: a WASI context with nothing inherited, plus the host
@@ -203,6 +205,8 @@ pub struct Engine {
     engine: wasmtime::Engine,
     linker: Linker<HostState>,
     limits: Limits,
+    #[cfg(any(test, feature = "test-support"))]
+    fake_wam: Option<crate::FakeWam>,
 }
 
 impl Engine {
@@ -215,6 +219,13 @@ impl Engine {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_limits(limits: Limits) -> Result<Engine, HostError> {
         Self::build(limits)
+    }
+
+    /// Test support: modules loaded from now on get their `wam-token` answers from `wam`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_fake_wam(mut self, wam: crate::FakeWam) -> Engine {
+        self.fake_wam = Some(wam);
+        self
     }
 
     fn build(limits: Limits) -> Result<Engine, HostError> {
@@ -236,7 +247,13 @@ impl Engine {
                 }
             })
             .map_err(|e| HostError::Load(format!("epoch ticker: {e}")))?;
-        Ok(Engine { engine, linker, limits })
+        Ok(Engine {
+            engine,
+            linker,
+            limits,
+            #[cfg(any(test, feature = "test-support"))]
+            fake_wam: None,
+        })
     }
 
     /// Compiles a module file, reads its manifest (under the call limits) and starts its actor.
@@ -268,7 +285,15 @@ impl Engine {
         // its host events go nowhere.
         let ModuleContext { data_dir, events, net } = ctx;
         let (nowhere, _) = mpsc::channel(1);
-        let loading = ModuleEnv { name: String::new(), data_dir: data_dir.clone(), hosts: HostList::default(), net: net.clone(), events: nowhere };
+        let loading = ModuleEnv {
+            name: String::new(),
+            data_dir: data_dir.clone(),
+            hosts: HostList::default(),
+            net: net.clone(),
+            events: nowhere,
+            #[cfg(any(test, feature = "test-support"))]
+            fake_wam: None,
+        };
         let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
             .run(|m, s| Box::pin(m.open_mess_module_module().call_manifest(s)))
@@ -279,7 +304,15 @@ impl Engine {
         let hosts = HostList::parse(&manifest.hosts)?;
         // Not used until the sign-in window (milestone E), but a bad manifest is refused now.
         HostList::parse(&manifest.sign_in_hosts)?;
-        actor.reset(Arc::new(ModuleEnv { name: manifest.name.clone(), data_dir, hosts, net, events }));
+        actor.reset(Arc::new(ModuleEnv {
+            name: manifest.name.clone(),
+            data_dir,
+            hosts,
+            net,
+            events,
+            #[cfg(any(test, feature = "test-support"))]
+            fake_wam: self.fake_wam.clone(),
+        }));
         let (requests, queue) = mpsc::channel(QUEUE);
         tokio::spawn(actor.serve(queue));
         Ok(ModuleHandle { manifest, requests, state })

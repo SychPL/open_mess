@@ -1,10 +1,9 @@
-//! The `platform-module` world of `wit/module.wit`. Milestone F1 serves the manifest; sign-in,
-//! tools and live events arrive with the network wiring in milestone F2.
+//! The `platform-module` world of `wit/module.wit`: the exports, handed to `api`.
 
 // The ABI glue wit-bindgen generates (bindings and the `export!` expansion) uses `unsafe`; no
 // unsafe is written by hand. Listed in AGENTS.md, "Never crash".
 #[allow(unsafe_code)]
-mod bindings {
+pub(crate) mod bindings {
     wit_bindgen::generate!({ world: "platform-module", path: "../../wit" });
 
     use super::Teams;
@@ -39,14 +38,16 @@ impl module::Guest for Teams {
     }
 
     fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
-        Err(not_yet())
+        crate::api::sign_in()
     }
 
-    fn restore(_account: String) -> Result<(), types::ModuleError> {
-        Err(not_yet())
+    fn restore(account: String) -> Result<(), types::ModuleError> {
+        crate::api::restore(&account)
     }
 
-    fn sign_out(_account: String) {}
+    fn sign_out(account: String) {
+        crate::api::sign_out(&account);
+    }
 
     fn call(_account: String, _tool: String, _args_json: String) -> Result<String, types::ModuleError> {
         Err(not_yet())

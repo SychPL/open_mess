@@ -36,17 +36,13 @@ pub struct ServiceDirectory {
 }
 
 /// The authz request with the headers the live check sent (docs/protocols/teams.md "Live
-/// results" 2). The authz type is `ExplicitLogin`; the client sends `TokenRefresh` on a refresh,
-/// which F2 adds if the service needs it.
-pub fn request(entra_token: &str) -> HttpRequest {
-    let headers = [
-        ("Authorization", format!("Bearer {entra_token}").as_str()),
-        ("claimsChallengeCapable", "true"),
-        ("ms-teams-authz-type", "ExplicitLogin"),
-        ("X-MS-Migration", "True"),
-        ("x-ms-client-type", "web"),
-    ]
-    .map(|(name, value)| (name.to_string(), value.to_string()));
+/// results" 2), less the bearer token for `https://api.spaces.skype.com`, which the caller adds.
+/// The authz type is `ExplicitLogin`; the client sends `TokenRefresh` on a refresh, which F2b adds
+/// if the service needs it.
+pub fn request() -> HttpRequest {
+    let headers =
+        [("claimsChallengeCapable", "true"), ("ms-teams-authz-type", "ExplicitLogin"), ("X-MS-Migration", "True"), ("x-ms-client-type", "web")]
+            .map(|(name, value)| (name.to_string(), value.to_string()));
     HttpRequest { method: "POST".to_string(), url: AUTHZ_URL.to_string(), headers: headers.to_vec(), body: Vec::new() }
 }
 
@@ -134,10 +130,10 @@ mod tests {
     }
 
     #[test]
-    fn request_sends_the_entra_token_to_authz() {
-        let r = request("entra-token");
+    fn request_posts_to_authz() {
+        let r = request();
         assert_eq!((r.method.as_str(), r.url.as_str()), ("POST", "https://teams.microsoft.com/api/authsvc/v1.0/authz"));
-        assert!(r.headers.contains(&("Authorization".to_string(), "Bearer entra-token".to_string())));
+        assert!(r.headers.contains(&("X-MS-Migration".to_string(), "True".to_string())));
         assert!(r.body.is_empty());
     }
 }

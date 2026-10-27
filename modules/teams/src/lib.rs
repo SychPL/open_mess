@@ -9,10 +9,14 @@ pub mod chat;
 pub mod http;
 pub mod manifest;
 pub mod retry;
+pub mod session;
 pub mod text;
 mod time;
 pub mod unread;
 
+// The wiring to the host: wasm only, tested in the real host (crates/open-mess-host/tests/teams).
+#[cfg(target_arch = "wasm32")]
+mod api;
 #[cfg(target_arch = "wasm32")]
 mod component;
 

@@ -95,11 +95,26 @@ fn retry_after(headers: &HeaderMap) -> Option<u32> {
     Some(u32::try_from(secs).unwrap_or(u32::MAX))
 }
 
+/// `url` on the test server at `addr`, its host moved to the `Host` header.
+#[cfg(any(test, feature = "test-support"))]
+fn fake_url(mut url: url::Url, addr: SocketAddr, headers: &mut HeaderMap) -> Result<url::Url, HttpError> {
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_string(),
+    };
+    headers.insert(header::HOST, HeaderValue::from_str(&host).map_err(|_| blocked("invalid host"))?);
+    let moved = url.set_scheme("http").is_ok() && url.set_ip_host(addr.ip()).is_ok() && url.set_port(Some(addr.port())).is_ok();
+    if moved { Ok(url) } else { Err(blocked("cannot move the URL to the test server")) }
+}
+
 /// The network as modules see it. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct Net {
     policy: AddressPolicy,
     pub(crate) limits: Limits,
+    /// Test support: the loopback server that serves every allowed host over plain HTTP.
+    #[cfg(any(test, feature = "test-support"))]
+    fake_server: Option<SocketAddr>,
 }
 
 impl Net {
@@ -117,7 +132,22 @@ impl Net {
         // reqwest is built without a bundled crypto provider: ring becomes the process default,
         // unless the program installed another one already.
         rustls::crypto::ring::default_provider().install_default().ok();
-        Net { policy, limits }
+        Net {
+            policy,
+            limits,
+            #[cfg(any(test, feature = "test-support"))]
+            fake_server: None,
+        }
+    }
+
+    /// Test support: every host on a module's list is served by the loopback server at `addr`,
+    /// over plain HTTP, with the request's own host in its `Host` header. The host list is still
+    /// checked, and nothing is resolved, so a module under test never reaches the real host.
+    /// HTTP only; WebSockets are not redirected.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn serving_hosts_from(mut self, addr: SocketAddr) -> Net {
+        self.fake_server = Some(addr);
+        self
     }
 
     /// Checks the URL's host against the module's list, resolves it once and checks every
@@ -126,6 +156,10 @@ impl Net {
         let host = url.host_str().ok_or_else(|| blocked("the URL has no host"))?;
         if !hosts.allows(host) {
             return Err(blocked(format!("{host} is not in the module's host list")));
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(addr) = self.fake_server {
+            return Ok(vec![addr]);
         }
         let port = url.port_or_known_default().ok_or_else(|| blocked("the URL has no port"))?;
         let addrs: Vec<SocketAddr> = match url.host() {
@@ -161,7 +195,13 @@ impl Net {
         }
         let addrs = self.resolve(hosts, &url).await?;
         let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|_| HttpError::Network("invalid method".to_string()))?;
-        let headers = header_map(&req.headers)?;
+        #[cfg_attr(not(any(test, feature = "test-support")), allow(unused_mut))]
+        let mut headers = header_map(&req.headers)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let url = match self.fake_server {
+            Some(addr) => fake_url(url, addr, &mut headers)?,
+            None => url,
+        };
         // Through the system proxy the proxy connects; directly, only to the checked addresses.
         // The proxy comes from the static Windows settings (and the proxy environment variables):
         // reqwest does not run PAC scripts or WPAD, which spec 8.3 asks for. ponytail: PAC/WPAD

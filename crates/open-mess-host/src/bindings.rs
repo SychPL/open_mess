@@ -129,6 +129,10 @@ impl sign_in::Host for HostState {
     }
 
     async fn wam_token(&mut self, _scopes: Vec<String>, _interactive: bool) -> Result<String, sign_in::SignInError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(wam) = &self.env.fake_wam {
+            return wam(&_scopes, _interactive).map_err(sign_in::SignInError::Refused);
+        }
         wait_for_user(&self.deadline, async { Err(sign_in::SignInError::Refused(UNAVAILABLE.to_string())) }).await
     }
 }
