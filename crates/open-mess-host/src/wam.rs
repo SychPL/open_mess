@@ -29,8 +29,10 @@ pub(crate) struct TokenRequest {
 
 /// Why a silent token request failed when only the WAM dialog can go on; the module may ask again
 /// with `interactive`.
+#[cfg(windows)]
 pub(crate) const INTERACTION_REQUIRED: &str = "interaction required";
 /// The most accounts the window lists.
+#[cfg(windows)]
 pub(crate) const MAX_ACCOUNTS: u32 = 32;
 
 #[cfg(windows)]

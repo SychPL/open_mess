@@ -20,6 +20,11 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unic-char-property: through tauri-utils, unmaintained only" },
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: through tauri-utils, unmaintained only" },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: through tauri-utils, unmaintained only" },
+    # keyring's Linux store (Secret Service over D-Bus): only the Linux CI test build has it; the
+    # Windows build uses the Credential Manager.
+    { id = "RUSTSEC-2026-0370", reason = "zbus stack: keyring's Linux store, Linux CI only, unmaintained only" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus stack: keyring's Linux store, Linux CI only, unmaintained only" },
+    { id = "RUSTSEC-2026-0372", reason = "zbus stack: keyring's Linux store, Linux CI only, unmaintained only" },
 ]
 
 [licenses]
