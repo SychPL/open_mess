@@ -21,6 +21,11 @@ const COMMANDS: &[&str] = &[
     "sign_in_request",
     "sign_in_answer",
     "sign_in_open_link",
+    "rules",
+    "put_rule",
+    "delete_rule",
+    "pick_program",
+    "channel_setup",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

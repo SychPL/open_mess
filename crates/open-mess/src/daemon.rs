@@ -135,7 +135,8 @@ fn start(dir: &Path, started: Instant) -> Result<(Runtime, TcpListener, Registry
     pending.recover()?;
     runtime.spawn(Arc::clone(&pending).sweep());
     approval::start(&runtime, Arc::clone(&pending));
-    Ok((runtime, listener, registry, UiState { accounts, pending, started, port, token, sign_ins }))
+    let (counters, sessions) = (registry.trigger_counters().clone(), registry.channel_sessions().clone());
+    Ok((runtime, listener, registry, UiState { accounts, pending, started, port, token, sign_ins, counters, sessions }))
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.

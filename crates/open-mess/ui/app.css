@@ -104,7 +104,7 @@ h2 { font-size: 15px; margin: 24px 0 8px; }
 .dot.warn { background: var(--warn); }
 .dot.bad { background: var(--danger); }
 
-button.action, select, input[type="text"] {
+button.action, select, textarea, input[type="text"], input[type="number"], input[type="time"] {
   padding: 6px 12px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -161,6 +161,9 @@ code { font-family: Consolas, "Cascadia Mono", monospace; overflow-wrap: anywher
 .code { font: 600 28px/1.2 Consolas, "Cascadia Mono", monospace; letter-spacing: 2px; user-select: all; }
 
 .choice { width: 100%; text-align: left; margin-bottom: 6px; }
+
+textarea { width: 100%; font: 13px/1.45 Consolas, "Cascadia Mono", monospace; }
+input[type="text"] { min-width: 280px; }
 
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }

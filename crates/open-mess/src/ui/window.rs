@@ -44,7 +44,12 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::sign_in_start,
             ipc::sign_in_request,
             ipc::sign_in_answer,
-            ipc::sign_in_open_link
+            ipc::sign_in_open_link,
+            ipc::rules,
+            ipc::put_rule,
+            ipc::delete_rule,
+            ipc::pick_program,
+            ipc::channel_setup
         ])
         .build(tauri::generate_context!())
         .map_err(failed)?;
@@ -141,7 +146,10 @@ mod ipc {
     use tauri::State;
 
     use crate::ui::UiState;
-    use crate::ui::commands::{self, AccountDto, AnswerDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, SignInPromptDto, StatusDto};
+    use crate::ui::commands::{
+        self, AccountDto, AnswerDto, ChannelSetupDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, RuleDto, RuleViewDto, SignInPromptDto,
+        StatusDto,
+    };
 
     #[tauri::command(rename_all = "snake_case")]
     pub async fn status(state: State<'_, UiState>) -> Result<StatusDto, String> {
@@ -232,6 +240,31 @@ mod ipc {
     #[tauri::command(rename_all = "snake_case")]
     pub async fn sign_in_open_link(state: State<'_, UiState>, request_id: u64) -> Result<(), String> {
         commands::sign_in_open_link(&state, request_id)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn rules(state: State<'_, UiState>) -> Result<Vec<RuleViewDto>, String> {
+        commands::rules(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn put_rule(state: State<'_, UiState>, rule: RuleDto) -> Result<Option<String>, String> {
+        commands::put_rule(&state, rule)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn delete_rule(state: State<'_, UiState>, id: String) -> Result<(), String> {
+        commands::delete_rule(&state, &id)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn pick_program() -> Result<Option<String>, String> {
+        commands::pick_program().await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn channel_setup(state: State<'_, UiState>) -> Result<ChannelSetupDto, String> {
+        commands::channel_setup(&state)
     }
 }
 

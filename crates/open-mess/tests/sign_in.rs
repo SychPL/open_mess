@@ -28,6 +28,8 @@ fn state(d: &Daemon) -> Arc<UiState> {
         port: 7341,
         token: "t0ken".into(),
         sign_ins: d.sign_ins.clone(),
+        counters: d.registry.trigger_counters().clone(),
+        sessions: d.registry.channel_sessions().clone(),
     })
 }
 

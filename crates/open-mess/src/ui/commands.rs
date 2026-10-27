@@ -14,6 +14,8 @@ use serde_json::Value;
 use super::UiState;
 use crate::accounts::Account;
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
+use crate::triggers::RuleCounters;
+use crate::triggers::rules::{self, Rule};
 use crate::{approval, cli, permissions};
 
 /// Why an approval is refused when the file on disk is not the one the window showed.
@@ -562,3 +564,104 @@ fn open_in_browser(url: &str) -> Result<(), String> {
 fn open_in_browser(_url: &str) -> Result<(), String> {
     Err(crate::Error::NoWindow.to_string())
 }
+
+/// A trigger rule as the window edits it (spec 8.7): the rule's own fields, flattened.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleDto {
+    /// 1-64 characters, made by the window for a new rule.
+    pub id: String,
+    pub account: String,
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub rule: Rule,
+}
+
+/// A rule with what happened to its batches since the daemon started.
+#[derive(Clone, Debug, Serialize)]
+pub struct RuleViewDto {
+    #[serde(flatten)]
+    pub rule: RuleDto,
+    pub counters: RuleCounters,
+}
+
+/// What the window shows when a rule wakes agents that may write on their own (spec 8.7).
+pub const AUTONOMOUS_RULE: &str = "Agenci obudzeni przez tę regułę mogą wysyłać, poprawiać i reagować bez Twojej zgody, bo konto albo rozmowa, której dotyczy, ma pisanie \"samodzielnie\". Ustaw \"z potwierdzeniem\" w sekcji Uprawnienia agentów, jeśli mają pytać.";
+
+/// Every trigger rule, oldest first, with its counters.
+pub fn rules(state: &UiState) -> Result<Vec<RuleViewDto>, String> {
+    let rules = rules::list(&state.accounts.store()).map_err(text)?;
+    Ok(rules
+        .into_iter()
+        .map(|rule| RuleViewDto {
+            counters: state.counters.rule(&rule.id),
+            rule: RuleDto { id: rule.id.clone(), account: rule.account.clone(), enabled: rule.enabled, rule },
+        })
+        .collect())
+}
+
+/// Saves a rule, new or changed, for an account open_mess has. Returns the warning about agents
+/// that may write on their own; the rule is saved anyway.
+pub fn put_rule(state: &UiState, dto: RuleDto) -> Result<Option<String>, String> {
+    known_account(state, &dto.account)?;
+    let rule = Rule { id: dto.id, account: dto.account, enabled: dto.enabled, ..dto.rule };
+    let warning = rules::put(&state.accounts.store(), &rule).map_err(text)?;
+    Ok(warning.map(|_| AUTONOMOUS_RULE.to_owned()))
+}
+
+pub fn delete_rule(state: &UiState, id: &str) -> Result<(), String> {
+    match rules::delete(&state.accounts.store(), id).map_err(text)? {
+        true => Ok(()),
+        false => Err(format!("nie ma reguły {id}")),
+    }
+}
+
+/// The program a spawn action starts, chosen in a file dialog: its full path, or None.
+pub async fn pick_program() -> Result<Option<String>, String> {
+    pick_file().await
+}
+
+#[cfg(windows)]
+async fn pick_file() -> Result<Option<String>, String> {
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Program, który uruchomi reguła")
+            .add_filter("Programy", &["exe", "cmd", "bat"])
+            .add_filter("Wszystkie pliki", &["*"])
+            .pick_file()
+    });
+    Ok(picked.await.map_err(text)?.map(|path| path.display().to_string()))
+}
+
+#[cfg(not(windows))]
+async fn pick_file() -> Result<Option<String>, String> {
+    Err(crate::Error::NoWindow.to_string())
+}
+
+/// How to start a Claude Code session that takes trigger notifications (spec 8.7).
+#[derive(Clone, Debug, Serialize)]
+pub struct ChannelSetupDto {
+    /// Where the MCP configuration below is saved.
+    pub file: String,
+    /// The MCP configuration with `om mcp-stdio`.
+    pub json: String,
+    /// The command that starts Claude Code with it.
+    pub command: String,
+    /// MCP sessions that take notifications now.
+    pub sessions: usize,
+}
+
+/// The channel setup, with its MCP configuration saved in the data folder.
+pub fn channel_setup(state: &UiState) -> Result<ChannelSetupDto, String> {
+    let om = std::env::current_exe().map_err(text)?;
+    let config = serde_json::json!({"mcpServers": {"open_mess_channel": {"command": om, "args": ["mcp-stdio"]}}});
+    let json = serde_json::to_string_pretty(&config).map_err(text)?;
+    let file = state.accounts.data_dir().join(CHANNEL_CONFIG);
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(json.as_str()) {
+        std::fs::write(&file, &json).map_err(text)?;
+    }
+    let command = format!("claude --mcp-config \"{}\" --dangerously-load-development-channels server:open_mess_channel", file.display());
+    Ok(ChannelSetupDto { file: file.display().to_string(), json, command, sessions: state.sessions.len() })
+}
+
+/// The channel setup's MCP configuration, in the data folder.
+pub const CHANNEL_CONFIG: &str = "channel-mcp.json";

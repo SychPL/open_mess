@@ -19,6 +19,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::Error;
 use crate::accounts::Accounts;
 use crate::pending::Pending;
+use crate::triggers::Counters;
+use crate::triggers::channel::Sessions;
 use sign_in::SignIns;
 
 /// What the window's commands work on.
@@ -32,6 +34,10 @@ pub struct UiState {
     pub token: String,
     /// The sign-in in progress and its prompts.
     pub sign_ins: SignIns,
+    /// What the trigger rules delivered and dropped, and the sessions that take channel
+    /// notifications, for the Wyzwalacze section.
+    pub counters: Counters,
+    pub sessions: Sessions,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.
