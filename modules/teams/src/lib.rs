@@ -9,10 +9,12 @@ pub mod chat;
 pub mod http;
 pub mod manifest;
 pub mod retry;
+pub mod search;
 pub mod session;
 pub mod text;
 pub mod time;
 pub mod unread;
+pub mod writing;
 
 // The wiring to the host: wasm only, tested in the real host (crates/open-mess-host/tests/teams).
 #[cfg(target_arch = "wasm32")]

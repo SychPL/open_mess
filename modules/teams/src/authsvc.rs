@@ -23,6 +23,8 @@ pub struct Session {
 pub struct ServiceDirectory {
     /// `chatServiceAfd`, required.
     pub chat_service: Url,
+    /// `chatService`, the regional host; paging links may name it.
+    pub chat_regional: Option<Url>,
     /// `calling_trouterUrl`.
     pub trouter: Option<Url>,
     /// `calling_registrarUrl`.
@@ -58,6 +60,7 @@ pub fn decode(body: &[u8], now_ms: i64) -> Result<Session, ProtoError> {
     };
     let directory = ServiceDirectory {
         chat_service: url("chatServiceAfd")?.ok_or_else(|| incompatible("regionGtms.chatServiceAfd"))?,
+        chat_regional: url("chatService")?,
         trouter: url("calling_trouterUrl")?,
         registrar: url("calling_registrarUrl")?,
         ams: match url("amsV2")? {
@@ -93,6 +96,7 @@ mod tests {
     fn decodes_region_directory() {
         let s = decode(OK, NOW).unwrap();
         assert_eq!(s.directory.chat_service.as_str(), "https://teams.microsoft.com/api/chatsvc/emea");
+        assert_eq!(s.directory.chat_regional.as_ref().map(Url::as_str), Some("https://emea.ng.msg.teams.microsoft.com/"));
         assert_eq!(s.directory.ams.as_ref().map(Url::as_str), Some("https://eu-prod.asyncgw.teams.microsoft.com/"));
         assert_eq!(s.directory.search.as_ref().map(Url::as_str), Some("https://teams.microsoft.com/api/search/emea"));
         assert_eq!(s.skype_token.as_ref().map(SecretString::expose), Some("synthetic-skype-token-not-a-real-one"));

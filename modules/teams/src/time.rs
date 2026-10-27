@@ -38,6 +38,23 @@ pub(crate) fn http_date_ms(text: &str) -> Option<i64> {
     epoch_ms(year, month, day, hour, minute, second)
 }
 
+/// RFC 3339 as agents write it: `2027-01-15T08:00:00Z` or with an offset, `...T09:00:00+01:00`.
+pub fn rfc3339_ms(text: &str) -> Option<i64> {
+    if let Some(utc) = text.strip_suffix(['Z', 'z']) {
+        return iso8601_ms(&format!("{utc}Z"));
+    }
+    let split = text.len().checked_sub(6)?;
+    let (local, offset) = (text.get(..split)?, text.get(split..)?);
+    let sign = match offset.get(..1)? {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let (hours, minutes) = offset.get(1..)?.split_once(':')?;
+    let offset_ms = (digits(hours, 2)? * 60 + digits(minutes, 2)?) * 60_000;
+    Some(iso8601_ms(&format!("{local}Z"))? - sign * offset_ms)
+}
+
 /// Epoch milliseconds as RFC 3339 UTC, to the second: `2027-01-15T08:00:00Z`.
 pub fn rfc3339(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
@@ -97,6 +114,14 @@ mod tests {
         assert_eq!(rfc3339(1_800_000_000_123), "2027-01-15T08:00:00Z");
         assert_eq!(rfc3339(951_825_600_000), "2000-02-29T12:00:00Z");
         assert_eq!(rfc3339(-1000), "1969-12-31T23:59:59Z");
+        assert_eq!(rfc3339_ms("2027-01-15T08:00:00Z"), Some(1_800_000_000_000));
+        assert_eq!(rfc3339_ms("2027-01-15T09:30:00+01:30"), Some(1_800_000_000_000));
+        assert_eq!(rfc3339_ms("2027-01-15T07:00:00.5-01:00"), Some(1_800_000_000_500));
+        for bad in
+            ["", "Z", "2027-01-15T08:00:00", "2027-01-15T08:00:00*01:00", "2027-01-15T08:00:00+1:000", "x+01:00", "2027-01-15T08:00:00+0\u{e9}:0"]
+        {
+            assert_eq!(rfc3339_ms(bad), None, "{bad}");
+        }
     }
 
     #[test]

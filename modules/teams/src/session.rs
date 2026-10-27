@@ -121,6 +121,7 @@ mod tests {
     fn session() -> Session {
         let directory = ServiceDirectory {
             chat_service: Url::parse("https://teams.microsoft.com/api/chatsvc/emea").unwrap(),
+            chat_regional: None,
             trouter: None,
             registrar: None,
             ams: None,

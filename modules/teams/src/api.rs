@@ -15,7 +15,7 @@ use crate::component::bindings::open_mess::module::types::{AccountInfo, ModuleEr
 use crate::component::bindings::open_mess::module::{http, sign_in};
 use crate::http::HttpRequest;
 use crate::retry::{self, GiveUpReason, Retry};
-use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, Session};
+use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, SEARCH_SCOPE, Session};
 
 /// The part of the host's call limit (30 s) the module plans with: no wait starts that would end
 /// past it, so a slow service ends a call with an error, not a timeout that unloads the module.
@@ -65,14 +65,34 @@ pub(crate) fn proto(e: ProtoError) -> ModuleError {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Service {
     Chat,
+    Search,
+    /// AMS images, with the chat service's token (docs 7; which token AMS takes is to be
+    /// confirmed live).
+    Media,
 }
 
 impl Service {
     fn scope(self) -> &'static str {
         match self {
-            Service::Chat => CHAT_SCOPE,
+            Service::Chat | Service::Media => CHAT_SCOPE,
+            Service::Search => SEARCH_SCOPE,
         }
     }
+}
+
+/// 64 random bits from the host (`wasi:random` seeds the standard library's hasher keys, and each
+/// `RandomState` takes new ones).
+pub fn random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
+/// A random UUID, version 4.
+pub fn uuid() -> String {
+    let (a, b) = (random(), random());
+    let b = (b & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
+    let a = (a & 0xffff_ffff_ffff_0fff) | 0x4000;
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a >> 32, (a >> 16) & 0xffff, a & 0xffff, b >> 48, b & 0xffff_ffff_ffff)
 }
 
 /// A token for `scope` from WAM, and its claims. Only sign-in may ask the user.

@@ -58,13 +58,9 @@ impl module::Guest for Teams {
         crate::tools::call(&account, &tool, &args_json)
     }
 
-    fn get_attachment(
-        _account: String,
-        _conversation: String,
-        _message: String,
-        _attachment: String,
-    ) -> Result<types::Attachment, types::ModuleError> {
-        Err(not_yet())
+    fn get_attachment(account: String, conversation: String, message: String, attachment: String) -> Result<types::Attachment, types::ModuleError> {
+        api::begin();
+        crate::tools::get_attachment(&account, &conversation, &message, &attachment)
     }
 
     fn describe_target(_account: String, _conversation: String, _message: Option<String>) -> Result<types::Target, types::ModuleError> {

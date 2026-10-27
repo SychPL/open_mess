@@ -66,12 +66,23 @@ pub fn html_to_markdown(html: &str) -> String {
                 }
             }
             ("span", false) if attr(attrs, "itemtype").is_some_and(|t| t.ends_with("/Mention")) => out.push('@'),
-            ("img", false) => out.push_str(&attr(attrs, "alt").unwrap_or_default()),
+            // An inline image names its AMS object, the id `get_attachment` takes.
+            ("img", false) => match attr(attrs, "itemtype").filter(|t| t.ends_with("/AMSImage")).and_then(|_| ams_object(&attr(attrs, "src")?)) {
+                Some(id) => out.push_str(&format!("[image: {id}]")),
+                None => out.push_str(&attr(attrs, "alt").unwrap_or_default()),
+            },
             _ => {}
         }
     }
     push_text(&mut out, rest);
     out.trim_matches('\n').to_string()
+}
+
+/// The object id of an AMS URL, `.../v1/objects/<id>/views/<view>`.
+fn ams_object(src: &str) -> Option<String> {
+    let (_, rest) = src.split_once("/objects/")?;
+    let id = rest.split(['/', '?', '#']).next()?;
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 fn line_break(out: &mut String) {
@@ -286,6 +297,15 @@ mod tests {
     fn emoji_keeps_its_alt_text() {
         let html = "<p>ok <img itemtype=\"http://schema.skype.com/Emoji\" alt=\"\u{1f642}\" src=\"x\"></p>";
         assert_eq!(html_to_markdown(html), "ok \u{1f642}");
+    }
+
+    #[test]
+    fn inline_image_names_its_object() {
+        let html = "<p>see <img itemtype=\"http://schema.skype.com/AMSImage\" src=\"https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-weu-d1-x/views/imgo\" alt=\"pic\"></p>";
+        assert_eq!(html_to_markdown(html), "see [image: 0-weu-d1-x]");
+        // Not an AMS image, or no object in its address: the alt text.
+        assert_eq!(html_to_markdown("<img src=\"https://x.example/v1/objects/a/views/imgo\" alt=\"pic\">"), "pic");
+        assert_eq!(html_to_markdown("<img itemtype=\"http://schema.skype.com/AMSImage\" src=\"https://x.example/objects/\" alt=\"pic\">"), "pic");
     }
 
     #[test]

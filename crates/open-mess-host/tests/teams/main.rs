@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use fake::{AUTHZ_PATH, CHAT_PATH, Fake, ME_NAME, ME_OID, Reply, Wam, WamCall, conversation, page};
+use fake::{AUTHZ_PATH, CHAT, CHAT_PATH, Fake, ME, ME_NAME, ME_OID, OTHER, Reply, Wam, WamCall, conversation, message, page};
 use open_mess_host::ip_policy::AddressPolicy;
 use open_mess_host::{AccountInfo, Engine, HostError, HostEvent, ModuleContext, ModuleError, ModuleHandle, Net, SessionState, limits};
 use serde_json::{Value, json};
@@ -23,6 +23,11 @@ use tokio::sync::mpsc;
 const AUTHSVC_SCOPE: &str = "https://api.spaces.skype.com/.default";
 const CHAT_SCOPE: &str = "https://ic3.teams.office.com/.default";
 const GROUP: &str = "19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2";
+const DIRECT: &str = "19:00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002@unq.gbl.spaces";
+const CHANNEL: &str = "19:cccccccccccccccccccccccccccccccc@thread.tacv2";
+const MEETING: &str = "19:meeting_c3ludGhldGlj@thread.v2";
+/// 2027-01-15T08:00:00Z.
+const T0: i64 = 1_800_000_000_000;
 
 /// The Teams module, loaded with its hosts served by `fake` and its tokens from `wam`.
 struct Teams {
@@ -232,4 +237,271 @@ async fn regional_404_redirect_is_followed_on_the_chat_host_only() {
     teams.fake.on(|s| (s.path == AUTHZ_PATH).then(|| Reply::status(404).header("Location", "/api/authsvc/v1.0/elsewhere")));
     assert!(teams.module.sign_in().await.is_err());
     assert!(teams.fake.requests("/api/authsvc/v1.0/elsewhere").is_empty());
+}
+
+// Task 3: read tools.
+
+fn ids(result: &Value, key: &str) -> Vec<String> {
+    result["items"].as_array().unwrap().iter().map(|item| item[key].as_str().unwrap().to_string()).collect()
+}
+
+/// Message `n` (101, 102...) of `conversation`, sent `n - 100` minutes after `T0`.
+fn numbered(n: i64, conversation: &str, from: &str, html: &str) -> Value {
+    message(&n.to_string(), conversation, from, html, T0 + (n - 100) * 60_000)
+}
+
+fn messages_path(conversation: &str) -> String {
+    format!("{CHAT_PATH}/{conversation}/messages")
+}
+
+/// A mention of `mri` as the chat service stores it: a JSON list inside a string.
+fn mentioning(mut message: Value, mri: &str) -> Value {
+    message["properties"]["mentions"] = json!([{"mri": mri, "displayName": "Synthetic"}]).to_string().into();
+    message
+}
+
+#[tokio::test]
+async fn list_conversations_maps_kinds() {
+    let teams = Teams::signed_in().await;
+    let last = numbered(101, GROUP, OTHER, "<p>hi</p>");
+    teams.fake.on(conversations_page(vec![
+        conversation(GROUP, Some("Synthetic group"), Some(last)),
+        conversation(DIRECT, None, None),
+        conversation(CHANNEL, Some("Synthetic channel"), None),
+        conversation(MEETING, Some("Synthetic meeting"), None),
+        conversation("48:notes", None, None),
+    ]));
+    let result = teams.call("list_conversations", json!({"limit": 50})).await.unwrap();
+    let kinds: Vec<(String, String)> = ids(&result, "id").into_iter().zip(ids(&result, "kind")).collect();
+    let expected = [(GROUP, "group"), (DIRECT, "direct"), (CHANNEL, "channel"), (MEETING, "meeting"), ("48:notes", "group")];
+    assert_eq!(kinds, expected.map(|(id, kind)| (id.to_string(), kind.to_string())));
+    assert_eq!(result["items"][0]["last_activity"], "2027-01-15T08:01:00Z");
+    assert_eq!(result["items"][0]["untrusted"], json!({"title": "Synthetic group"}));
+    // Filters by kind and by part of the name.
+    assert_eq!(ids(&teams.call("list_conversations", json!({"kind": "channel"})).await.unwrap(), "id"), [CHANNEL]);
+    assert_eq!(ids(&teams.call("list_conversations", json!({"query": "MEETING"})).await.unwrap(), "id"), [MEETING]);
+    assert_eq!(ids(&teams.call("list_conversations", json!({"limit": 2})).await.unwrap(), "id"), [GROUP, DIRECT]);
+}
+
+#[tokio::test]
+async fn read_messages_pages_backwards() {
+    let teams = Teams::signed_in().await;
+    let path = messages_path(GROUP);
+    let older = format!("{CHAT}/v1/users/ME/conversations/{GROUP}/messages?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=older");
+    let newer =
+        vec![numbered(105, GROUP, OTHER, "<p>five</p>"), numbered(104, GROUP, ME, "<p><b>four</b></p>"), numbered(103, GROUP, OTHER, "three")];
+    let rest = vec![numbered(102, GROUP, OTHER, "two"), numbered(101, GROUP, OTHER, "one")];
+    teams.fake.on(move |s| {
+        (s.path == path).then(|| {
+            let (items, link) = if s.query.contains("syncState=older") { (rest.clone(), None) } else { (newer.clone(), Some(older.as_str())) };
+            Reply::json(page("messages", items, link))
+        })
+    });
+    let result = teams.call("read_messages", json!({"conversation": GROUP, "limit": 4})).await.unwrap();
+    assert_eq!(ids(&result, "id"), ["105", "104", "103", "102"]);
+    let first = &result["items"][0];
+    assert_eq!(
+        (first["conversation"].as_str(), first["sent_at"].as_str(), first["own"].as_bool()),
+        (Some(GROUP), Some("2027-01-15T08:05:00Z"), Some(false))
+    );
+    assert_eq!(first["untrusted"], json!({"sender_name": "Synthetic Person Two", "text": "five"}));
+    assert_eq!((result["items"][1]["own"].as_bool(), result["items"][1]["untrusted"]["text"].as_str()), (Some(true), Some("**four**")));
+    let pages = teams.fake.requests(&messages_path(GROUP));
+    assert_eq!(pages.len(), 2);
+    assert!(pages[1].query.contains("syncState=older") && pages[1].host == "teams.microsoft.com");
+    // The next page after a message, and only what came after a time.
+    assert_eq!(ids(&teams.call("read_messages", json!({"conversation": GROUP, "before": "103"})).await.unwrap(), "id"), ["102", "101"]);
+    let since = json!({"conversation": GROUP, "since": "2027-01-15T09:03:30+01:00"});
+    assert_eq!(ids(&teams.call("read_messages", since).await.unwrap(), "id"), ["105", "104"]);
+    let unknown = teams.call("read_messages", json!({"conversation": GROUP, "before": "999"})).await;
+    assert!(matches!(module_error(unknown), ModuleError::InvalidArgs(_)));
+}
+
+#[tokio::test]
+async fn foreign_backward_link_is_refused() {
+    let teams = Teams::signed_in().await;
+    let path = messages_path(GROUP);
+    let link = format!("https://evil.example/api/chatsvc/emea/v1/users/ME/conversations/{GROUP}/messages?syncState=older");
+    teams.fake.on(move |s| (s.path == path).then(|| Reply::json(page("messages", vec![numbered(101, GROUP, OTHER, "one")], Some(&link)))));
+    let result = teams.call("read_messages", json!({"conversation": GROUP, "limit": 10})).await;
+    assert!(matches!(module_error(result), ModuleError::Incompatible(_)));
+    // The token never went anywhere else, and the page was not asked for on our host either.
+    assert_eq!(teams.fake.seen().iter().filter(|s| s.path.contains("/messages")).count(), 1);
+    assert!(teams.fake.seen().iter().all(|s| s.host != "evil.example"));
+}
+
+/// A conversation with this consumption horizon (`None`: no property) and a last message from
+/// `from` at `T0 + at_ms` (`None`: no message at all).
+fn read_state(id: &str, horizon: Option<&str>, last: Option<(&str, i64)>) -> Value {
+    let mut c = conversation(id, None, last.map(|(from, at)| message("1", id, from, "<p>x</p>", T0 + at)));
+    c["properties"] = horizon.map_or_else(|| json!({}), |h| json!({"consumptionhorizon": h}));
+    c
+}
+
+#[tokio::test]
+async fn unread_uses_the_client_rule() {
+    let teams = Teams::signed_in().await;
+    let horizon = "1800000000000;1800000000000;1";
+    teams.fake.on(conversations_page(vec![
+        // A message after the horizon: unread by the conversation's own horizon, but "mark all
+        // as read" may have passed it, and that horizon is not readable yet.
+        read_state("19:after@thread.v2", Some(horizon), Some((OTHER, 100))),
+        read_state("19:before@thread.v2", Some(horizon), Some((OTHER, -100))),
+        read_state("19:mine@thread.v2", Some(horizon), Some((ME, 100))),
+        read_state("19:empty@thread.v2", Some(""), None),
+        read_state("19:nohorizon@thread.v2", None, Some((OTHER, 100))),
+    ]));
+    let result = teams.call("unread", json!({})).await.unwrap();
+    assert_eq!(ids(&result, "conversation"), ["19:after@thread.v2", "19:nohorizon@thread.v2"]);
+    assert_eq!(ids(&result, "unread"), ["unknown", "unknown"]);
+    assert_eq!(result["items"][0]["kind"], "group");
+    // Reading never writes: nothing but the conversation list was asked for.
+    assert!(teams.fake.seen().iter().all(|s| s.method == "GET" || s.path == AUTHZ_PATH));
+}
+
+#[tokio::test]
+async fn unread_pages_within_the_limit() {
+    // 300 conversations in pages of 50, then a list that never ends.
+    for endless in [false, true] {
+        let teams = Teams::signed_in().await;
+        teams.fake.on(move |s| {
+            (s.path == CHAT_PATH).then(|| {
+                let n: usize = s.query.split("syncState=p").nth(1).map_or(0, |n| n.split('&').next().unwrap().parse().unwrap());
+                let items = (0..50).map(|i| read_state(&format!("19:p{n}c{i}@thread.v2"), Some(""), Some((OTHER, 1)))).collect();
+                let link = format!("{CHAT}/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=p{}", n + 1);
+                Reply::json(page("conversations", items, (endless || n < 5).then_some(link.as_str())))
+            })
+        });
+        let result = teams.call("unread", json!({})).await.unwrap();
+        let pages = teams.fake.requests(CHAT_PATH);
+        assert!(pages.iter().all(|p| p.query.contains("pageSize=50")));
+        if endless {
+            // Bounded: 20 pages, then what was found so far.
+            assert_eq!((pages.len(), result["items"].as_array().unwrap().len()), (20, 1000));
+        } else {
+            assert_eq!((pages.len(), result["items"].as_array().unwrap().len()), (6, 300));
+        }
+    }
+}
+
+#[tokio::test]
+async fn mentions_from_recent_messages() {
+    let teams = Teams::signed_in().await;
+    let (group, channel) = (messages_path(GROUP), messages_path(CHANNEL));
+    let conversations = vec![
+        conversation(GROUP, None, Some(numbered(103, GROUP, OTHER, "x"))),
+        conversation(CHANNEL, None, Some(numbered(102, CHANNEL, OTHER, "x"))),
+    ];
+    teams.fake.on(move |s| {
+        let messages = if s.path == CHAT_PATH {
+            return Some(Reply::json(page("conversations", conversations.clone(), None)));
+        } else if s.path == group {
+            vec![
+                mentioning(numbered(103, GROUP, OTHER, "<p>hey <span itemtype=\"http://schema.skype.com/Mention\">One</span></p>"), ME),
+                numbered(102, GROUP, OTHER, "no mention"),
+                // Before `since`.
+                mentioning(numbered(99, GROUP, OTHER, "old"), ME),
+            ]
+        } else if s.path == channel {
+            vec![mentioning(numbered(102, CHANNEL, OTHER, "someone else"), OTHER), mentioning(numbered(101, CHANNEL, ME, "myself"), ME)]
+        } else {
+            return None;
+        };
+        Some(Reply::json(page("messages", messages, None)))
+    });
+    let result = teams.call("mentions", json!({"since": "2027-01-15T08:00:00Z"})).await.unwrap();
+    assert_eq!(ids(&result, "id"), ["103"]);
+    assert_eq!(result["items"][0]["untrusted"]["text"], "hey @One");
+    // Only conversations active since then were listed.
+    assert!(teams.fake.requests(CHAT_PATH)[0].query.contains("startTime=1800000000000"));
+}
+
+#[tokio::test]
+async fn search_posts_to_substrate() {
+    let teams = Teams::signed_in().await;
+    let hit = json!({"Source": {
+        "ItemId": "item-1",
+        "ClientConversationId": GROUP,
+        "DateTimeReceived": "2027-01-15T08:00:00Z",
+        "Preview": "the synthetic budget",
+        "From": {"EmailAddress": {"Name": "Synthetic Person Two", "Address": "person.two@synthetic.example"}},
+    }});
+    teams
+        .fake
+        .on(move |s| (s.path == "/search/api/v2/query").then(|| Reply::json(json!({"EntitySets": [{"ResultSets": [{"Results": [hit.clone()]}]}]}))));
+    let result = teams.call("search", json!({"query": "budget", "limit": 5})).await.unwrap();
+    let expected = json!({
+        "id": "item-1",
+        "conversation": GROUP,
+        "sent_at": "2027-01-15T08:00:00Z",
+        "edited": false,
+        "own": false,
+        "untrusted": {"sender_name": "Synthetic Person Two", "text": "the synthetic budget"},
+    });
+    assert_eq!(result["items"], json!([expected]));
+    let request = &teams.fake.requests("/search/api/v2/query")[0];
+    assert_eq!((request.method.as_str(), request.host.as_str()), ("POST", "substrate.office.com"));
+    assert_eq!(request.audience().as_deref(), Some("https://outlook.office.com"));
+    assert_eq!(request.header("x-anchormailbox"), Some("Oid:00000000-0000-0000-0000-000000000001@00000000-0000-0000-0000-0000000000aa"));
+    let body = request.json();
+    assert_eq!((body["entityRequests"][0]["query"]["queryString"].as_str(), body["entityRequests"][0]["size"].as_u64()), (Some("budget"), Some(5)));
+}
+
+#[tokio::test]
+async fn writing_context_filters_like_the_wrapper() {
+    let teams = Teams::signed_in().await;
+    let path = messages_path(GROUP);
+    let messages = vec![
+        numbered(110, GROUP, ME, "<p>ok, lecę na obiad</p>"),
+        numbered(109, GROUP, ME, "<p>deploy na prod przeszedł</p>"),
+        numbered(108, GROUP, ME, "<p>password: hunter2</p>"),
+        numbered(107, GROUP, ME, "<p>const x = 1</p>"),
+        numbered(106, GROUP, ME, "<p>https://example.com/x</p>"),
+        numbered(105, GROUP, ME, "<p>{\"a\": 1}</p>"),
+        numbered(104, GROUP, ME, "<p>zobacz <a href=\"https://example.com\">to</a></p>"),
+        numbered(103, GROUP, OTHER, "<p>hej, co tam?</p>"),
+        numbered(102, GROUP, ME, "<p>ok, lecę na obiad</p>"),
+    ];
+    teams.fake.on(move |s| (s.path == path).then(|| Reply::json(page("messages", messages.clone(), None))));
+    let result = teams.call("writing_context", json!({"conversation": GROUP, "purpose": "technical_status", "limit": 6})).await.unwrap();
+    let examples: Vec<&str> = result["examples"].as_array().unwrap().iter().map(|e| e["untrusted"]["text"].as_str().unwrap()).collect();
+    assert_eq!(examples, ["deploy na prod przeszedł", "ok, lecę na obiad"]);
+    assert_eq!(result["examples"][1]["sent_at"], "2027-01-15T08:10:00Z");
+}
+
+#[tokio::test]
+async fn get_attachment_fetches_ams_image() {
+    let teams = Teams::signed_in().await;
+    let object = "0-weu-d1-synthetic";
+    let html = format!(
+        "<p><img itemtype=\"http://schema.skype.com/AMSImage\" src=\"https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/{object}/views/imgo\"></p>"
+    );
+    let mut image = numbered(103, GROUP, OTHER, &html);
+    image["amsreferences"] = json!([object]);
+    let (one, list) = (format!("{}/103", messages_path(GROUP)), messages_path(GROUP));
+    let view = format!("/v1/objects/{object}/views/imgo");
+    teams.fake.on(move |s| {
+        if s.path == one {
+            Some(Reply::json(image.clone()))
+        } else if s.path == list {
+            Some(Reply::json(page("messages", vec![image.clone()], None)))
+        } else if s.path == view {
+            Some(Reply { body: b"\x89PNG synthetic".to_vec(), ..Reply::status(200) }.header("content-type", "image/png"))
+        } else {
+            None
+        }
+    });
+    // The message names its image, so an agent can ask for it.
+    let read = teams.call("read_messages", json!({"conversation": GROUP})).await.unwrap();
+    assert_eq!(read["items"][0]["untrusted"]["text"], format!("[image: {object}]"));
+    let attachment = teams.module.get_attachment(ME_OID, GROUP, "103", object).await.unwrap();
+    assert_eq!((attachment.file_name.as_str(), attachment.content_type.as_str()), ("0-weu-d1-synthetic.png", "image/png"));
+    assert_eq!(attachment.data, b"\x89PNG synthetic");
+    let fetch = &teams.fake.requests(&format!("/v1/objects/{object}"))[0];
+    assert_eq!(fetch.host, "eu-prod.asyncgw.teams.microsoft.com");
+    assert_eq!(fetch.audience().as_deref(), Some("https://ic3.teams.office.com"));
+    // Only what the message references.
+    let other = teams.module.get_attachment(ME_OID, GROUP, "103", "0-weu-d1-other").await;
+    assert!(matches!(module_error(other), ModuleError::InvalidArgs(_)));
+    assert_eq!(teams.fake.requests("/v1/objects/").len(), 1);
 }

@@ -1,23 +1,40 @@
 //! The shared tools (spec 8.5) on Teams: the core's arguments in, its result shapes out
 //! (`crates/open-mess/src/tools/shared.rs`). Other people's text goes under `untrusted` only.
+//! Nothing here writes read state: every request is a GET, except search's query POST.
 
 use serde_json::{Value, json};
 
 use crate::api::{self, Service};
-use crate::chat::{self, Conversation, ConversationKind};
-use crate::component::bindings::open_mess::module::types::ModuleError;
+use crate::chat::{self, Conversation, ConversationKind, Message};
+use crate::component::bindings::open_mess::module::types::{Attachment, ModuleError};
+use crate::http::HttpRequest;
 use crate::session::Session;
-use crate::time;
+use crate::text::html_to_markdown;
+use crate::unread::{self, UnreadState};
+use crate::writing::{self, Purpose};
+use crate::{search, time};
 
-/// Conversation pages a listing reads at most, newest first: 1000 conversations at the page size
+/// Pages a listing reads at most, newest first: 1000 conversations or messages at the page size
 /// of 50. ponytail: a "mark as unread" on a conversation past them is not seen; page further if
 /// that ever matters.
 const MAX_PAGES: usize = 20;
+const PAGE_SIZE: u16 = 50;
+/// `mentions` reads the messages of at most this many recently active conversations.
+const MENTION_CONVERSATIONS: usize = 20;
+/// `mentions` without `since` looks back this far.
+const MENTIONS_DEFAULT_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// The wrapper's `writing_context` looks at the last 100 messages.
+const WRITING_MESSAGES: usize = 100;
 
 pub fn call(account: &str, tool: &str, args_json: &str) -> Result<String, ModuleError> {
     let args: Value = serde_json::from_str(args_json).map_err(|_| ModuleError::InvalidArgs("the arguments are not JSON".to_string()))?;
     let run: fn(&mut Session, &Value) -> Result<Value, ModuleError> = match tool {
         "list_conversations" => list_conversations,
+        "unread" => unread,
+        "mentions" => mentions,
+        "read_messages" => read_messages,
+        "search" => search,
+        "writing_context" => writing_context,
         _ => return Err(ModuleError::NotSupported(tool.to_string())),
     };
     api::with_session(account, |session| run(session, &args)).map(|result| result.to_string())
@@ -27,8 +44,16 @@ fn text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str, ModuleError> {
+    text(args, key).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} is required")))
+}
+
 fn limit(args: &Value, default: usize) -> usize {
     args.get("limit").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(default)
+}
+
+fn since(args: &Value) -> Result<Option<i64>, ModuleError> {
+    text(args, "since").map(|t| time::rfc3339_ms(t).ok_or_else(|| ModuleError::InvalidArgs("since must be an RFC 3339 time".to_string()))).transpose()
 }
 
 fn kind_name(kind: ConversationKind) -> &'static str {
@@ -41,16 +66,16 @@ fn kind_name(kind: ConversationKind) -> &'static str {
     }
 }
 
-/// Walks the conversation list, newest first, while `keep` returns true, within `MAX_PAGES` and
-/// the call's time.
-fn conversations(session: &mut Session, mut keep: impl FnMut(&Session, Conversation) -> bool) -> Result<(), ModuleError> {
+/// Walks the conversations updated since `start_ms`, newest first, while `keep` returns true,
+/// within `MAX_PAGES` and the call's time.
+fn conversations(session: &mut Session, start_ms: i64, mut keep: impl FnMut(Conversation) -> bool) -> Result<(), ModuleError> {
     let mut link: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let request = chat::list_conversations(&session.directory, link.as_deref()).map_err(api::proto)?;
+        let request = chat::list_conversations(&session.directory, link.as_deref(), start_ms).map_err(api::proto)?;
         let page = chat::decode_conversations(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
         let empty = page.items.is_empty();
         for conversation in page.items {
-            if !keep(session, conversation) {
+            if !keep(conversation) {
                 return Ok(());
             }
         }
@@ -62,12 +87,44 @@ fn conversations(session: &mut Session, mut keep: impl FnMut(&Session, Conversat
     Ok(())
 }
 
+/// Walks a conversation's text messages, newest first, while `keep` returns true, within
+/// `MAX_PAGES` and the call's time.
+fn messages(session: &mut Session, conversation: &str, mut keep: impl FnMut(Message) -> bool) -> Result<(), ModuleError> {
+    let mut link: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let request = chat::read_messages(&session.directory, conversation, link.as_deref(), PAGE_SIZE).map_err(api::proto)?;
+        let page = chat::decode_messages(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+        let empty = page.items.is_empty() && page.skipped.is_empty();
+        for message in page.items {
+            if !keep(message) {
+                return Ok(());
+            }
+        }
+        match page.backward_link {
+            Some(next) if !empty && api::has_time() => link = Some(next),
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+fn message_item(m: &Message, me: &str) -> Value {
+    json!({
+        "id": m.id,
+        "conversation": m.conversation,
+        "sent_at": time::rfc3339(m.sent_ms),
+        "edited": m.edited,
+        "own": m.sender_id == me,
+        "untrusted": {"sender_name": m.sender_name, "text": html_to_markdown(&m.html)},
+    })
+}
+
 fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let kind = text(args, "kind");
     let query = text(args, "query").map(str::to_lowercase);
     let limit = limit(args, 50);
     let mut items = Vec::new();
-    conversations(session, |_, c| {
+    conversations(session, 1, |c| {
         let title_matches = query.as_deref().is_none_or(|q| c.title.as_deref().is_some_and(|t| t.to_lowercase().contains(q)));
         if kind.is_none_or(|k| k == kind_name(c.kind)) && title_matches {
             // Absent values go as null, which the core reads as left out.
@@ -77,4 +134,159 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
         items.len() < limit
     })?;
     Ok(json!({ "items": items }))
+}
+
+/// The official client's rule (docs/protocols/teams.md 3.4), reading horizons only. Where the
+/// account-wide "mark all as read" horizon comes from is not confirmed yet ("Live results" 4), so
+/// what looks unread is reported as unknown, never as read.
+fn unread(session: &mut Session, _args: &Value) -> Result<Value, ModuleError> {
+    let me = session.me();
+    let mut items = Vec::new();
+    conversations(session, 1, |c| {
+        // A conversation without a message has nothing to read.
+        if c.last_message_id.is_none() && c.horizons.last_message_ms.is_none() {
+            return true;
+        }
+        let state = match unread::state(&c, None, &me) {
+            UnreadState::Read => return true,
+            UnreadState::Unread => "unread",
+            UnreadState::Unknown => "unknown",
+        };
+        let last_activity = c.horizons.last_message_ms.map(time::rfc3339);
+        items.push(json!({"conversation": c.id, "kind": kind_name(c.kind), "unread": state, "last_activity": last_activity, "untrusted": {"title": c.title}}));
+        true
+    })?;
+    Ok(json!({ "items": items }))
+}
+
+/// Messages that mention the user, from the conversations active since `since`.
+fn mentions(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let since = since(args)?.unwrap_or_else(|| api::now_ms().saturating_sub(MENTIONS_DEFAULT_MS));
+    let me = session.me();
+    let mut active = Vec::new();
+    conversations(session, since, |c| {
+        if c.horizons.last_message_ms.is_some_and(|t| t > since) {
+            active.push(c.id);
+        }
+        active.len() < MENTION_CONVERSATIONS
+    })?;
+    let mut found: Vec<Message> = Vec::new();
+    for conversation in active {
+        if !api::has_time() {
+            break;
+        }
+        messages(session, &conversation, |m| {
+            if m.sent_ms <= since {
+                return false;
+            }
+            if m.sender_id != me && !m.deleted && m.mentions.iter().any(|mention| mention.mri == me) {
+                found.push(m);
+            }
+            true
+        })?;
+    }
+    found.sort_by_key(|c| std::cmp::Reverse(c.sent_ms));
+    Ok(json!({ "items": found.iter().map(|m| message_item(m, &me)).collect::<Vec<_>>() }))
+}
+
+fn read_messages(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let conversation = required(args, "conversation")?;
+    let (limit, before, since) = (limit(args, 30), text(args, "before"), since(args)?);
+    let me = session.me();
+    let mut found_before = before.is_none();
+    let mut items = Vec::new();
+    messages(session, conversation, |m| {
+        if !found_before {
+            found_before = Some(m.id.as_str()) == before;
+            return true;
+        }
+        if since.is_some_and(|s| m.sent_ms <= s) {
+            return false;
+        }
+        if !m.deleted {
+            items.push(message_item(&m, &me));
+        }
+        items.len() < limit
+    })?;
+    if !found_before {
+        return Err(ModuleError::InvalidArgs("the message in before is not among the conversation's recent messages".to_string()));
+    }
+    Ok(json!({ "items": items }))
+}
+
+fn search(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let query = required(args, "query")?;
+    let size = u32::try_from(limit(args, 30)).unwrap_or(30);
+    // `Oid:<oid>@<tenant>`, the format of the client's `addSubstrateIdHeaders` (to be confirmed live).
+    let anchor = format!("Oid:{}@{}", session.account, session.tenant.as_deref().unwrap_or_default());
+    let request = search::request(query, size, &anchor, &api::uuid());
+    let hits = search::decode(&api::read(session, Service::Search, &request)?).map_err(api::proto)?;
+    let me = session.upn.as_deref().map(str::to_lowercase);
+    let items: Vec<Value> = hits
+        .iter()
+        .map(|hit| {
+            let own = me.is_some() && hit.sender_address.as_deref().map(str::to_lowercase) == me;
+            json!({
+                "id": hit.id,
+                "conversation": hit.conversation,
+                "sent_at": time::rfc3339(hit.sent_ms),
+                "edited": false,
+                "own": own,
+                "untrusted": {"sender_name": hit.sender_name, "text": hit.text},
+            })
+        })
+        .collect();
+    Ok(json!({ "items": items }))
+}
+
+/// Examples of the user's own messages, filtered like teams-wrapper's (spec 8.5).
+fn writing_context(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let conversation = required(args, "conversation")?;
+    let purpose = match text(args, "purpose") {
+        None => Purpose::Casual,
+        Some(name) => Purpose::parse(name).ok_or_else(|| ModuleError::InvalidArgs(format!("unknown purpose {name:?}")))?,
+    };
+    let me = session.me();
+    let (mut seen, mut candidates) = (0, Vec::new());
+    messages(session, conversation, |m| {
+        seen += 1;
+        if m.sender_id == me && !m.deleted {
+            candidates.extend(writing::candidate(&m.html, m.sent_ms));
+        }
+        seen < WRITING_MESSAGES
+    })?;
+    let examples: Vec<Value> = writing::select(candidates, purpose, limit(args, 6))
+        .into_iter()
+        .map(|c| json!({"sent_at": time::rfc3339(c.sent_ms), "untrusted": {"text": c.text}}))
+        .collect();
+    Ok(json!({ "examples": examples }))
+}
+
+/// An AMS image of a message: only one the message references (docs 7).
+pub fn get_attachment(account: &str, conversation: &str, message: &str, attachment: &str) -> Result<Attachment, ModuleError> {
+    api::with_session(account, |session| {
+        let request = chat::one_message(&session.directory, conversation, message);
+        let m = chat::decode_message(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
+        if !m.attachments.iter().any(|id| id == attachment) {
+            return Err(ModuleError::InvalidArgs("the message has no such attachment".to_string()));
+        }
+        let mut url =
+            session.directory.ams.clone().ok_or_else(|| ModuleError::Platform("Teams named no media service for this account".to_string()))?;
+        url.path_segments_mut()
+            .map_err(|()| ModuleError::Incompatible("the media service address".to_string()))?
+            .pop_if_empty()
+            .extend(["v1", "objects", attachment, "views", "imgo"]);
+        let request = HttpRequest { method: "GET".to_string(), url: url.into(), headers: Vec::new(), body: Vec::new() };
+        let response = api::send(session, Service::Media, &request, false)?;
+        let content_type = api::header(&response.headers, "content-type").unwrap_or("application/octet-stream").to_string();
+        let extension = match content_type.split(';').next().unwrap_or_default().trim() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "bin",
+        };
+        let data = api::ok(response)?;
+        Ok(Attachment { file_name: format!("{attachment}.{extension}"), content_type, data })
+    })
 }

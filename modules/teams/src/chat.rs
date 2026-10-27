@@ -87,6 +87,8 @@ pub struct Message {
     pub mentions: Vec<Mention>,
     /// The root of the reply chain the message answers in (`rootMessageId`).
     pub reply_to: Option<String>,
+    /// AMS object ids of its images (`amsreferences`, docs 3.3).
+    pub attachments: Vec<String>,
 }
 
 pub struct Mention {
@@ -99,6 +101,15 @@ pub fn decode_conversations(body: &[u8]) -> Result<Page<Conversation>, ProtoErro
     let items =
         array(&v, "conversations")?.iter().enumerate().map(|(i, c)| conversation(c, &format!("conversations[{i}]"))).collect::<Result<_, _>>()?;
     page(&v, items, Vec::new())
+}
+
+/// One message (`GET .../messages/<id>`); only text messages are decoded.
+pub fn decode_message(body: &[u8]) -> Result<Message, ProtoError> {
+    let v = parse_json(body)?;
+    match req_str(&v, "", "messagetype")? {
+        kind @ ("RichText/Html" | "Text") => message(&v, "", kind == "Text"),
+        _ => Err(incompatible("messagetype")),
+    }
 }
 
 pub fn decode_messages(body: &[u8]) -> Result<Page<Message>, ProtoError> {
@@ -203,7 +214,17 @@ fn message(m: &Value, path: &str, plain: bool) -> Result<Message, ProtoError> {
         html: if plain { escape_html(content) } else { content.to_string() },
         mentions: mentions(props, &props_path)?,
         reply_to: opt_str(m, path, "rootMessageId")?.filter(|root| *root != id).map(str::to_string),
+        attachments: ams_references(m, path)?,
     })
+}
+
+fn ams_references(m: &Value, path: &str) -> Result<Vec<String>, ProtoError> {
+    let path = at(path, "amsreferences");
+    match m.get("amsreferences") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(ids)) => ids.iter().map(|id| id.as_str().map(str::to_string).ok_or_else(|| incompatible(&path))).collect(),
+        Some(_) => Err(incompatible(&path)),
+    }
 }
 
 fn mentions(props: &Value, path: &str) -> Result<Vec<Mention>, ProtoError> {
@@ -242,7 +263,7 @@ fn array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], ProtoError> {
 }
 
 /// `v.key` as an object; absent or null reads as an empty one (every lookup in it is `None`).
-fn obj<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a Value, ProtoError> {
+pub(crate) fn obj<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a Value, ProtoError> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(&NULL),
         Some(o @ Value::Object(_)) => Ok(o),
@@ -251,7 +272,7 @@ fn obj<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a Value, ProtoError>
 }
 
 /// `v.key` as text: `None` when absent or null, an error for any other type.
-fn opt_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<Option<&'a str>, ProtoError> {
+pub(crate) fn opt_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<Option<&'a str>, ProtoError> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
@@ -259,7 +280,7 @@ fn opt_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<Option<&'a str>, P
     }
 }
 
-fn req_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a str, ProtoError> {
+pub(crate) fn req_str<'a>(v: &'a Value, path: &str, key: &str) -> Result<&'a str, ProtoError> {
     opt_str(v, path, key)?.ok_or_else(|| incompatible(&at(path, key)))
 }
 
@@ -274,14 +295,21 @@ fn opt_time(v: &Value, path: &str, key: &str) -> Result<Option<i64>, ProtoError>
     ms.map(Some).ok_or_else(|| incompatible(&at(path, key)))
 }
 
-pub fn list_conversations(dir: &ServiceDirectory, page: Option<&str>) -> Result<HttpRequest, ProtoError> {
-    let first = format!("view={VIEW_CONVERSATIONS}&pageSize={CONVERSATION_PAGE_SIZE}&startTime=1");
-    Ok(request("GET", paged(endpoint(dir, &[]), page, &first)?, None))
+/// The conversations updated since `start_ms` (1 for all of them), newest first.
+pub fn list_conversations(dir: &ServiceDirectory, page: Option<&str>, start_ms: i64) -> Result<HttpRequest, ProtoError> {
+    let first = format!("view={VIEW_CONVERSATIONS}&pageSize={CONVERSATION_PAGE_SIZE}&startTime={start_ms}");
+    Ok(request("GET", paged(dir, endpoint(dir, &[]), page, &first)?, None))
 }
 
 pub fn read_messages(dir: &ServiceDirectory, conv: &str, page: Option<&str>, limit: u16) -> Result<HttpRequest, ProtoError> {
     let first = format!("view={VIEW_MESSAGES}&pageSize={limit}&startTime=1");
-    Ok(request("GET", paged(endpoint(dir, &[conv, "messages"]), page, &first)?, None))
+    Ok(request("GET", paged(dir, endpoint(dir, &[conv, "messages"]), page, &first)?, None))
+}
+
+pub fn one_message(dir: &ServiceDirectory, conv: &str, message_id: &str) -> HttpRequest {
+    let mut url = endpoint(dir, &[conv, "messages", message_id]);
+    url.set_query(Some(&format!("view={VIEW_MESSAGES}")));
+    request("GET", url, None)
 }
 
 /// The body follows the send accepted live ("Live results" 5), minus the sender's display name
@@ -324,15 +352,21 @@ fn endpoint(dir: &ServiceDirectory, segments: &[&str]) -> Url {
     url
 }
 
-/// The first page's query, or the paging query of a `backwardLink`. The link may name another
-/// (regional) host; only its query is used, so a link can't send the request and its token
-/// elsewhere.
-fn paged(mut url: Url, page: Option<&str>, first_page: &str) -> Result<Url, ProtoError> {
+/// The first page's query, or the paging query of a `backwardLink`. A link may name the chat
+/// service's regional host instead of the AFD one; a link to any other host is refused, and only
+/// the query of an accepted one is used, on our own host and path, so a link can't send the
+/// request and its token elsewhere.
+fn paged(dir: &ServiceDirectory, mut url: Url, page: Option<&str>, first_page: &str) -> Result<Url, ProtoError> {
     let query = match page {
         None => first_page.to_string(),
         Some(link) => {
-            let link = Url::parse(link).map_err(|_| incompatible("_metadata.backwardLink"))?;
-            link.query().ok_or_else(|| incompatible("_metadata.backwardLink"))?.to_string()
+            let refused = || incompatible("_metadata.backwardLink");
+            let link = Url::parse(link).map_err(|_| refused())?;
+            let same = |base: &Url| link.host_str() == base.host_str() && link.port() == base.port();
+            if link.scheme() != "https" || !(same(&url) || dir.chat_regional.as_ref().is_some_and(same)) {
+                return Err(refused());
+            }
+            link.query().ok_or_else(refused)?.to_string()
         }
     };
     url.set_query(Some(&query));
@@ -359,7 +393,8 @@ mod tests {
 
     fn dir() -> ServiceDirectory {
         let chat_service = Url::parse("https://teams.microsoft.com/api/chatsvc/emea").unwrap();
-        ServiceDirectory { chat_service, trouter: None, registrar: None, ams: None, middle_tier: None, search: None }
+        let chat_regional = Some(Url::parse("https://emea.ng.msg.teams.microsoft.com").unwrap());
+        ServiceDirectory { chat_service, chat_regional, trouter: None, registrar: None, ams: None, middle_tier: None, search: None }
     }
 
     fn conversations() -> Page<Conversation> {
@@ -490,7 +525,9 @@ mod tests {
 
     #[test]
     fn first_and_next_page_requests() {
-        let first = list_conversations(&dir(), None).unwrap();
+        let since = list_conversations(&dir(), None, 1_800_000_000_000).unwrap();
+        assert!(since.url.ends_with("&startTime=1800000000000"));
+        let first = list_conversations(&dir(), None, 1).unwrap();
         assert_eq!((first.method.as_str(), first.url.as_str()), ("GET", &*format!("{BASE}?view=msnp24Equivalent&pageSize=50&startTime=1")));
         let first = read_messages(&dir(), GROUP, None, 20).unwrap();
         assert_eq!(first.url, format!("{BASE}/{GROUP}/messages?view=msnp24Equivalent|supportsMessageProperties&pageSize=20&startTime=1"));
@@ -500,6 +537,33 @@ mod tests {
         assert!(next.url.starts_with(&format!("{BASE}/{GROUP}/messages?startTime=1&")), "{}", next.url);
         assert!(next.url.ends_with("syncState=b2xkZXI"));
         assert!(matches!(read_messages(&dir(), GROUP, Some("not a link"), 20), Err(ProtoError::Incompatible(_))));
+        let one = one_message(&dir(), GROUP, "1800000000300");
+        assert_eq!(one.url, format!("{BASE}/{GROUP}/messages/1800000000300?view=msnp24Equivalent|supportsMessageProperties"));
+    }
+
+    #[test]
+    fn backward_link_to_another_host_is_refused() {
+        for link in [
+            "https://evil.example/api/chatsvc/emea/v1/users/ME/conversations?syncState=x",
+            "http://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations?syncState=x",
+            "https://teams.microsoft.com:8443/api/chatsvc/emea/v1/users/ME/conversations?syncState=x",
+            "https://amer.ng.msg.teams.microsoft.com/v1/users/ME/conversations?syncState=x",
+        ] {
+            assert!(matches!(list_conversations(&dir(), Some(link), 1), Err(ProtoError::Incompatible(_))), "{link}");
+        }
+    }
+
+    #[test]
+    fn single_message_with_ams_references_unconfirmed_shape() {
+        let body = json!({"id": "1", "conversationid": GROUP, "from": ME, "messagetype": "RichText/Html", "content": "<p>x</p>",
+                          "originalarrivaltime": 1, "amsreferences": ["0-weu-d1-a", "0-weu-d1-b"]});
+        let m = decode_message(body.to_string().as_bytes()).unwrap();
+        assert_eq!(m.attachments, ["0-weu-d1-a", "0-weu-d1-b"]);
+        let event = json!({"id": "1", "messagetype": "ThreadActivity/AddMember", "content": ""});
+        assert!(matches!(decode_message(event.to_string().as_bytes()), Err(ProtoError::Incompatible(_))));
+        let bad = json!({"id": "1", "conversationid": GROUP, "from": ME, "messagetype": "Text", "content": "x", "originalarrivaltime": 1,
+                         "amsreferences": [1]});
+        assert!(matches!(decode_message(bad.to_string().as_bytes()), Err(ProtoError::Incompatible(p)) if p == "amsreferences"));
     }
 
     #[test]
