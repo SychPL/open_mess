@@ -32,8 +32,8 @@ pub const INSTRUCTIONS: &str = "open_mess connects the user's messengers. When a
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a notification may take to go out.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
-/// Pings in a row a session may leave unanswered before it is no longer notified (nor pinged, so
-/// rmcp lets it expire).
+/// Pings in a row a session may leave unanswered before it is no longer notified nor pinged (so
+/// rmcp lets a dead one expire) until it is heard from again.
 const MAX_MISSED_PINGS: u32 = 3;
 
 /// `experimental: {"claude/channel": {}}`.
@@ -56,8 +56,14 @@ struct Session {
     id: u64,
     peer: Peer<RoleServer>,
     active: Instant,
-    /// Pings left unanswered since the session last answered one or made a request.
+    /// Pings left unanswered since the session last answered one or was heard from.
     missed_pings: u32,
+}
+
+impl Session {
+    fn reachable(&self) -> bool {
+        self.missed_pings < MAX_MISSED_PINGS && !self.peer.is_transport_closed()
+    }
 }
 
 impl Sessions {
@@ -70,16 +76,24 @@ impl Sessions {
         id
     }
 
-    /// Notes a request of the session.
+    /// Notes a request of the session: it is active, and there.
     pub fn touch(&self, id: u64) {
         if let Some(session) = self.lock().iter_mut().find(|session| session.id == id) {
             (session.active, session.missed_pings) = (Instant::now(), 0);
         }
     }
 
-    /// Sessions still connected.
+    /// Notes a ping from the session (a bridge pings every few seconds): it is there, though not
+    /// active.
+    pub fn seen(&self, id: u64) {
+        if let Some(session) = self.lock().iter_mut().find(|session| session.id == id) {
+            session.missed_pings = 0;
+        }
+    }
+
+    /// Sessions that take notifications now: connected, and answering pings.
     pub fn len(&self) -> usize {
-        self.lock().iter().filter(|session| !session.peer.is_transport_closed()).count()
+        self.lock().iter().filter(|session| session.reachable()).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -98,8 +112,8 @@ impl Sessions {
             tried.push(id);
             // A client killed without closing its session (a bridge that died with its terminal)
             // leaves a session that takes notifications and drops them, until it expires; one
-            // that answers is there. One that doesn't is skipped, and after a few misses dropped,
-            // so pings stop keeping a dead session from expiring.
+            // that answers is there. One that doesn't is skipped, and after a few misses left
+            // alone until it is heard from again, so pings don't keep a dead session from expiring.
             let ping = peer.send_request(ServerRequest::PingRequest(PingRequest::default()));
             let answered = matches!(tokio::time::timeout(PING_TIMEOUT, ping).await, Ok(Ok(_)));
             self.pinged(id, answered);
@@ -118,18 +132,16 @@ impl Sessions {
     }
 
     fn pinged(&self, id: u64, answered: bool) {
-        let mut list = self.lock();
-        if let Some(session) = list.iter_mut().find(|session| session.id == id) {
+        if let Some(session) = self.lock().iter_mut().find(|session| session.id == id) {
             session.missed_pings = if answered { 0 } else { session.missed_pings.saturating_add(1) };
         }
-        list.retain(|session| session.missed_pings < MAX_MISSED_PINGS);
     }
 
-    /// The most recently active session not in `tried`; closed sessions are dropped.
+    /// The most recently active reachable session not in `tried`; closed sessions are dropped.
     fn most_recent(&self, tried: &[u64]) -> Option<(u64, Peer<RoleServer>)> {
         let mut list = self.lock();
         list.retain(|session| !session.peer.is_transport_closed());
-        let candidates = list.iter().filter(|session| !tried.contains(&session.id));
+        let candidates = list.iter().filter(|session| session.reachable() && !tried.contains(&session.id));
         candidates.max_by_key(|session| (session.active, session.id)).map(|session| (session.id, session.peer.clone()))
     }
 

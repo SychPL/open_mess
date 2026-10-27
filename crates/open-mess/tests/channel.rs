@@ -8,6 +8,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use common::info;
@@ -20,11 +21,12 @@ use open_mess::triggers::engine::{self, Batch, BatchedMessage, Delivery, Deliver
 use open_mess::triggers::rules::{self, Action, Condition, Rule, Spawn};
 use open_mess::triggers::spawn::{self, Runs};
 use open_mess::triggers::{Actions, Counters};
+use rmcp::ErrorData;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientConfig, ClientNotification, CustomNotification, Implementation, InitializedNotification,
-    ProtocolVersion,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, ClientNotification, ClientRequest, CustomNotification, Implementation,
+    InitializedNotification, PingRequest, ProtocolVersion,
 };
-use rmcp::service::{NotificationContext, RunningService};
+use rmcp::service::{NotificationContext, RequestContext, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient, ServiceExt};
@@ -322,6 +324,51 @@ async fn killed_bridge_is_skipped() {
     }
     assert_eq!(registry.channel_sessions().len(), 1);
     assert_eq!(received(&mut alive_got).await.len(), 2);
+}
+
+/// A channel session whose answers to pings stall while `stalled` is set.
+struct Stalling {
+    stalled: Arc<AtomicBool>,
+    got: mpsc::UnboundedSender<Value>,
+}
+
+impl ClientHandler for Stalling {
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::new(ClientCapabilities::builder().enable_experimental_with(channel::capability()).build(), Implementation::new("stalling", "0"))
+    }
+
+    async fn ping(&self, _context: RequestContext<RoleClient>) -> Result<(), ErrorData> {
+        if self.stalled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        Ok(())
+    }
+
+    async fn on_custom_notification(&self, notification: CustomNotification, _context: NotificationContext<RoleClient>) {
+        let _ = self.got.send(notification.params.unwrap_or_default());
+    }
+}
+
+#[tokio::test]
+async fn stalled_session_comes_back() {
+    let (port, registry, _stop) = daemon().await;
+    let (stalled, (got, mut notifications)) = (Arc::new(AtomicBool::new(true)), mpsc::unbounded_channel());
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")).auth_header(TOKEN),
+    );
+    let session = Stalling { stalled: Arc::clone(&stalled), got }.serve(transport).await.unwrap();
+    wait_for("the channel session", || registry.channel_sessions().len() == 1).await;
+    // Pings go unanswered for a while: the session is left alone after a few.
+    for _ in 0..3 {
+        assert!(!channel::deliver(registry.channel_sessions(), "r1", &batch(None)).await);
+    }
+    assert!(registry.channel_sessions().is_empty());
+    // Heard from again (a bridge pings the daemon every few seconds), it is notified again.
+    stalled.store(false, Ordering::SeqCst);
+    session.send_request(ClientRequest::PingRequest(PingRequest::default())).await.unwrap();
+    assert_eq!(registry.channel_sessions().len(), 1);
+    assert!(channel::deliver(registry.channel_sessions(), "r1", &batch(None)).await);
+    assert_eq!(received(&mut notifications).await.len(), 1);
 }
 
 #[tokio::test]

@@ -157,6 +157,15 @@ impl ServerHandler for McpServer {
         }
     }
 
+    /// `om mcp-stdio` pings every few seconds: a channel session that missed the daemon's pings
+    /// for a while is reachable again.
+    async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
+        if let Some(id) = self.channel.get() {
+            self.registry.channel_sessions().seen(*id);
+        }
+        Ok(())
+    }
+
     async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
         self.touch();
         let tools = self
