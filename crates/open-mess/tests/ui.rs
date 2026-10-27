@@ -483,6 +483,9 @@ async fn channel_setup_names_the_bridge() {
     let setup = commands::channel_setup(&state).unwrap();
     let config: Value = serde_json::from_str(&setup.json).unwrap();
     assert_eq!(config["mcpServers"]["open_mess_channel"]["args"], json!(["mcp-stdio"]));
+    // The bridge finds this daemon through its data folder, wherever the session starts.
+    let data_dir = state.accounts.data_dir().display().to_string();
+    assert_eq!(config["mcpServers"]["open_mess_channel"]["env"]["OPEN_MESS_DATA_DIR"], json!(data_dir));
     assert_eq!(std::fs::read_to_string(&setup.file).unwrap(), setup.json);
     assert_eq!(setup.command, format!(r#"claude --mcp-config "{}" --dangerously-load-development-channels server:open_mess_channel"#, setup.file));
     assert_eq!(setup.sessions, 0);

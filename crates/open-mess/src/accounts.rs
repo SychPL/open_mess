@@ -102,11 +102,16 @@ impl Accounts {
             display_name,
             state: state_name(SessionState::Online).into(),
         };
-        self.store().conn().execute(
+        // An account being removed stays so: its removal is not undone by a sign-in that ends
+        // meanwhile.
+        let changed = self.store().conn().execute(
             "INSERT INTO accounts (id, module, module_account, display_name, state) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, state = excluded.state",
-            [&account.id, &account.module, &account.module_account, &account.display_name, &account.state],
+             ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, state = excluded.state WHERE accounts.state <> ?6",
+            [&account.id, &account.module, &account.module_account, &account.display_name, &account.state, REMOVING],
         )?;
+        if changed == 0 {
+            return Err(Error::Account(format!("konto {} jest usuwane", account.id)));
+        }
         Ok(account)
     }
 
@@ -132,8 +137,15 @@ impl Accounts {
             if self.get(&format!("{module}:{}", info.id))?.is_none() {
                 let _ = handle.sign_out(&info.id).await;
                 let (credentials, data_dir, module, account) = (Arc::clone(&self.credentials), self.data_dir.clone(), module.to_owned(), info.id);
-                let _ =
-                    tokio::task::spawn_blocking(move || open_mess_host::delete_account_secrets(&*credentials, &data_dir, &module, &account)).await;
+                let deleted =
+                    tokio::task::spawn_blocking(move || open_mess_host::delete_account_secrets(&*credentials, &data_dir, &module, &account))
+                        .await
+                        .unwrap_or_else(|err| Err(err.to_string()));
+                // Said, so the user knows something of the other account stayed in Credential
+                // Manager (under open_mess/module/<module>).
+                if let Err(why) = deleted {
+                    return Err(Error::Account(format!("{OTHER_ACCOUNT} (sekretów tamtego konta nie udało się usunąć: {why})")));
+                }
             }
             return Err(Error::Account(OTHER_ACCOUNT.into()));
         }

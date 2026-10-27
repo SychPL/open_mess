@@ -178,9 +178,8 @@ impl SignIns {
         self.state().question.as_ref().map(|question| (question.id, question.host.clone()))
     }
 
-    /// The user's answer to prompt or question `id`. A prompt goes off the screen, and a cancel or
-    /// refusal cancels the rest of the sign-in too; a question is answered yes by anything but a
-    /// cancel.
+    /// The user's answer to prompt or question `id`. A prompt goes off the screen, and a cancel
+    /// cancels the rest of the sign-in too; a question is answered yes by anything but a cancel.
     pub fn answer(&self, id: u64, reply: SignInReply) -> Result<(), String> {
         let shown = {
             let mut state = self.state();
@@ -193,8 +192,7 @@ impl SignIns {
             if state.shown.as_ref().is_none_or(|shown| shown.id != id) {
                 return Err(GONE.into());
             }
-            // A cancel, or a refusal (a sign-in page host the user did not allow), ends the sign-in.
-            state.cancelled |= matches!(reply, SignInReply::Cancelled | SignInReply::Refused(_));
+            state.cancelled |= reply == SignInReply::Cancelled;
             match state.take_shown() {
                 Some(shown) => shown,
                 None => return Err(GONE.into()),
@@ -202,6 +200,15 @@ impl SignIns {
         };
         let _ = shown.reply.send(reply);
         self.changed();
+        Ok(())
+    }
+
+    /// The user refused what prompt `id` asked (a sign-in page's new host): the prompt ends refused,
+    /// and the rest of the sign-in with it (spec 8.3, R10). A refusal for a technical reason is an
+    /// ordinary [`SignIns::answer`], after which the module may try another way.
+    pub fn refuse(&self, id: u64, why: String) -> Result<(), String> {
+        self.answer(id, SignInReply::Refused(why))?;
+        self.state().cancelled = true;
         Ok(())
     }
 

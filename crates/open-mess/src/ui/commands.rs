@@ -653,9 +653,13 @@ pub struct ChannelSetupDto {
 /// The channel setup, with its MCP configuration saved in the data folder.
 pub fn channel_setup(state: &UiState) -> Result<ChannelSetupDto, String> {
     let om = std::env::current_exe().map_err(text)?;
-    let config = serde_json::json!({"mcpServers": {"open_mess_channel": {"command": om, "args": ["mcp-stdio"]}}});
+    // The bridge finds the daemon (its port, as stored) through the data folder: this daemon's.
+    let data_dir = state.accounts.data_dir();
+    let config = serde_json::json!({"mcpServers": {"open_mess_channel": {
+        "command": om, "args": ["mcp-stdio"], "env": {"OPEN_MESS_DATA_DIR": data_dir},
+    }}});
     let json = serde_json::to_string_pretty(&config).map_err(text)?;
-    let file = state.accounts.data_dir().join(CHANNEL_CONFIG);
+    let file = data_dir.join(CHANNEL_CONFIG);
     if std::fs::read_to_string(&file).ok().as_deref() != Some(json.as_str()) {
         std::fs::write(&file, &json).map_err(text)?;
     }

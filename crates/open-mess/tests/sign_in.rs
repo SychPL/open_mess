@@ -156,6 +156,27 @@ async fn cancelling_ends_the_whole_sign_in() {
 }
 
 #[tokio::test]
+async fn a_technical_refusal_lets_the_module_try_another_way() {
+    let d = daemon(&[]).await;
+    let state = state(&d);
+    let _active = state.sign_ins.begin("m").unwrap();
+    let offer = |request| {
+        let (reply, answer) = oneshot::channel();
+        state.sign_ins.offer(request, reply);
+        answer
+    };
+    let (url, redirect_prefix) = ("https://login.example.com/start".into(), "https://login.example.com/done".into());
+    let page = offer(SignInRequest::OpenPage { module: "m".into(), url, redirect_prefix });
+    // The sign-in window did not open: refused, but not by the user.
+    let id = state.sign_ins.shown().unwrap().0;
+    state.sign_ins.answer(id, SignInReply::Refused("okno logowania się nie otworzyło".into())).unwrap();
+    assert!(matches!(page.await, Ok(SignInReply::Refused(_))));
+    // The module falls back to a device code, which the window shows.
+    let _code = offer(SignInRequest::DeviceCode { module: "m".into(), code: "ABCD-1234".into(), url: "https://login.example.com/device".into() });
+    assert_eq!(commands::sign_in_request(&state).unwrap().kind, "device-code");
+}
+
+#[tokio::test]
 async fn windows_accounts_are_picked_in_the_window() {
     let d = daemon(&[]).await;
     let state = state(&d);

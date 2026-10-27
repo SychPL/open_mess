@@ -60,16 +60,17 @@ pub fn check_page(url: &str, redirect_prefix: &str, approved: &[String]) -> Resu
 /// Yes adds the host to the module's approved sign-in hosts and returns true; no (or the prompt
 /// ending meanwhile) ends the sign-in as refused.
 pub async fn unknown_host(sign_ins: &SignIns, accounts: &Accounts, page: u64, module: &str, host: &str) -> bool {
-    let refusal = if sign_ins.ask_host(page, host).await {
-        match modules::allow_sign_in_host(&accounts.store(), module, host) {
-            Ok(()) => return true,
-            Err(err) => err.to_string(),
+    if !sign_ins.ask_host(page, host).await {
+        let _ = sign_ins.refuse(page, format!("the sign-in page went on to {host}, which the user did not allow"));
+        return false;
+    }
+    match modules::allow_sign_in_host(&accounts.store(), module, host) {
+        Ok(()) => true,
+        Err(err) => {
+            let _ = sign_ins.answer(page, SignInReply::Refused(err.to_string()));
+            false
         }
-    } else {
-        format!("the sign-in page went on to {host}, which the user did not allow")
-    };
-    let _ = sign_ins.answer(page, SignInReply::Refused(refusal));
-    false
+    }
 }
 
 #[cfg(windows)]

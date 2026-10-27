@@ -120,7 +120,7 @@ async function renderAccounts() {
     const who = el("div", null, "grow");
     who.append(el("strong", account.display_name), el("div", (account.platform || account.module) + " - " + account.id, "muted"));
     card.append(who, stateDot(account.state));
-    if (!signingIn && modules.some((module) => module.name === account.module)) {
+    if (!signingIn && account.state !== "removing" && modules.some((module) => module.name === account.module)) {
       card.append(button("Zaloguj ponownie", () => signIn(account.module, account.id)));
     }
     card.append(
@@ -605,7 +605,10 @@ function spawnFields(spawn) {
   dir.placeholder = "pełna ścieżka, opcjonalnie";
   const node = el("div");
   const programRow = el("div", null, "row");
-  programRow.append(el("span", "Program:"), program, pick);
+  const clear = button("Bez programu", () => {
+    program.value = "";
+  });
+  programRow.append(el("span", "Program:"), program, pick, clear);
   node.append(programRow, field("Argumenty (stałe, po jednym w wierszu):", args), field("Folder roboczy:", dir));
   node.append(el("p", "Treść wiadomości nigdy nie trafia do argumentów: program dostaje ją na wejściu jako dane niezaufane.", "muted"));
   const read = () => {
@@ -680,6 +683,7 @@ function ruleForm(accounts, existing, done) {
   const row = el("div", null, "row");
   row.append(
     button("Zapisz", async () => {
+      if (quiet.checked && (!quietFrom.value || !quietTo.value)) throw "podaj obie godziny ciszy nocnej";
       const values = conditionValue.value.split(",").map((value) => value.trim()).filter((value) => value !== "");
       const conditionDto =
         condition.value === "conversation"
