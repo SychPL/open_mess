@@ -18,6 +18,15 @@ pub struct WamAccount {
     pub tenant: String,
 }
 
+/// What a module asks Windows for: the manifest's client id, scopes, and the claims of a CAE
+/// challenge (the JSON a 401 named), for a token that satisfies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TokenRequest {
+    pub(crate) client_id: String,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) claims: Option<String>,
+}
+
 /// Why a silent token request failed when only the WAM dialog can go on; the module may ask again
 /// with `interactive`.
 pub(crate) const INTERACTION_REQUIRED: &str = "interaction required";
@@ -40,7 +49,7 @@ mod platform {
 
     use std::time::{Duration, Instant};
 
-    use super::{INTERACTION_REQUIRED, MAX_ACCOUNTS, SignInError, WamAccount};
+    use super::{INTERACTION_REQUIRED, MAX_ACCOUNTS, SignInError, TokenRequest, WamAccount};
 
     /// The WAM provider of work and school accounts, as the live check found it.
     const PROVIDER: &str = "https://login.microsoft.com";
@@ -59,13 +68,17 @@ mod platform {
             .map_err(failed("provider lookup"))
     }
 
-    /// A token request for the client id and scopes, with the properties the live check needed.
-    fn request(provider: &WebAccountProvider, client_id: &str, scopes: &[String]) -> Result<WebTokenRequest, SignInError> {
+    /// WAM's request for the client id and scopes, with the properties the live check needed, and
+    /// the claims of a challenge.
+    fn request(provider: &WebAccountProvider, asked: &TokenRequest) -> Result<WebTokenRequest, SignInError> {
         let build = || {
-            let request = WebTokenRequest::Create(provider, &HSTRING::from(scopes.join(" ")), &HSTRING::from(client_id))?;
+            let request = WebTokenRequest::Create(provider, &HSTRING::from(asked.scopes.join(" ")), &HSTRING::from(&asked.client_id))?;
             let properties = request.Properties()?;
             properties.Insert(&HSTRING::from("wam_compat"), &HSTRING::from("2.0"))?;
             properties.Insert(&HSTRING::from("authority"), &HSTRING::from(AUTHORITY_URL))?;
+            if let Some(claims) = &asked.claims {
+                properties.Insert(&HSTRING::from("claims"), &HSTRING::from(claims))?;
+            }
             Ok(request)
         };
         build().map_err(failed("token request"))
@@ -113,12 +126,12 @@ mod platform {
     }
 
     /// A token for the account with WAM id `account_id`, without any dialog.
-    pub(crate) fn token_silent(client_id: &str, scopes: &[String], account_id: &str) -> Result<String, SignInError> {
+    pub(crate) fn token_silent(asked: &TokenRequest, account_id: &str) -> Result<String, SignInError> {
         let provider = provider()?;
         let account = WebAuthenticationCoreManager::FindAccountAsync(&provider, &HSTRING::from(account_id))
             .and_then(|operation| operation.join())
             .map_err(|_| SignInError::Refused("the Windows account is no longer there; sign in again".to_string()))?;
-        let request = request(&provider, client_id, scopes)?;
+        let request = request(&provider, asked)?;
         let result = WebAuthenticationCoreManager::GetTokenSilentlyWithWebAccountAsync(&request, &account)
             .and_then(|operation| operation.join())
             .map_err(failed("token request"))?;
@@ -127,14 +140,9 @@ mod platform {
 
     /// A token through the WAM dialog, owned by the configuration window `window`; the user picks
     /// or adds the account there. A dialog still open after `budget` is cancelled.
-    pub(crate) fn token_interactive(
-        window: isize,
-        client_id: &str,
-        scopes: &[String],
-        budget: Duration,
-    ) -> Result<(String, WamAccount), SignInError> {
+    pub(crate) fn token_interactive(window: isize, asked: &TokenRequest, budget: Duration) -> Result<(String, WamAccount), SignInError> {
         let provider = provider()?;
-        let request = request(&provider, client_id, scopes)?;
+        let request = request(&provider, asked)?;
         let operation = request_for_window(HWND(window as *mut core::ffi::c_void), &request).map_err(failed("dialog"))?;
         let until = Instant::now() + budget;
         while operation.Status().map_err(failed("dialog"))? == AsyncStatus::Started {
@@ -172,16 +180,11 @@ pub(crate) fn accounts(_client_id: &str) -> Result<Vec<WamAccount>, SignInError>
 }
 
 #[cfg(not(windows))]
-pub(crate) fn token_silent(_client_id: &str, _scopes: &[String], _account_id: &str) -> Result<String, SignInError> {
+pub(crate) fn token_silent(_asked: &TokenRequest, _account_id: &str) -> Result<String, SignInError> {
     Err(unsupported())
 }
 
 #[cfg(not(windows))]
-pub(crate) fn token_interactive(
-    _window: isize,
-    _client_id: &str,
-    _scopes: &[String],
-    _budget: std::time::Duration,
-) -> Result<(String, WamAccount), SignInError> {
+pub(crate) fn token_interactive(_window: isize, _asked: &TokenRequest, _budget: std::time::Duration) -> Result<(String, WamAccount), SignInError> {
     Err(unsupported())
 }

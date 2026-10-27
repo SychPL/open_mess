@@ -22,7 +22,7 @@ use crate::bindings::open_mess::module::sign_in::{Host, SignInError};
 use crate::bindings::open_mess::module::types;
 use crate::runtime::{HostState, WamIdentity};
 use crate::storage::Storage;
-use crate::wam::{self, WamAccount};
+use crate::wam::{self, TokenRequest, WamAccount};
 
 /// Test support: answers `wam-token` in place of Windows. It gets the scopes, whether the call is
 /// interactive and the claims asked for, and returns a token or the reason it refuses
@@ -175,8 +175,8 @@ type DialogResult = Result<(String, WamAccount), SignInError>;
 #[derive(Clone, Copy)]
 pub(crate) struct WamCalls {
     pub(crate) accounts: fn(&str) -> Result<Vec<WamAccount>, SignInError>,
-    pub(crate) silent: fn(&str, &[String], &str) -> Result<String, SignInError>,
-    pub(crate) interactive: fn(isize, &str, &[String], Duration) -> DialogResult,
+    pub(crate) silent: fn(&TokenRequest, &str) -> Result<String, SignInError>,
+    pub(crate) interactive: fn(isize, &TokenRequest, Duration) -> DialogResult,
 }
 
 const WINDOWS: WamCalls = WamCalls { accounts: wam::accounts, silent: wam::token_silent, interactive: wam::token_interactive };
@@ -210,10 +210,10 @@ pub(crate) struct Wam<'a> {
 }
 
 impl Wam<'_> {
-    /// A token for `scopes`. In a sign-in the user picks the account (once; `pick` keeps it for
-    /// the rest of the call), or the WAM dialog runs when `interactive`; any other call uses the
-    /// account's stored one, silently. `windows_accounts` are the module accounts with a stored
-    /// Windows account, which an event uses.
+    /// A token for `scopes` (and `claims`, a CAE challenge). In a sign-in the user picks the
+    /// account (once; `pick` keeps it for the rest of the call), or the WAM dialog runs when
+    /// `interactive`; any other call uses the account's stored one, silently. `windows_accounts`
+    /// are the module accounts with a stored Windows account, which an event uses.
     async fn token(
         &self,
         windows_accounts: &[String],
@@ -221,13 +221,15 @@ impl Wam<'_> {
         pick: &mut Option<WamAccount>,
         scopes: &[String],
         interactive: bool,
+        claims: Option<&str>,
     ) -> Result<String, SignInError> {
-        let client = allowed(self.identity, scopes)?.client_id.clone();
+        let client_id = allowed(self.identity, scopes)?.client_id.clone();
+        let asked = TokenRequest { client_id, scopes: scopes.to_vec(), claims: claims.map(str::to_owned) };
         let account = match caller {
             Caller::SignIn => match pick {
                 Some(account) if !interactive => account.id.clone(),
                 _ => {
-                    let (account, token) = self.choose(&client, scopes, interactive).await?;
+                    let (account, token) = self.choose(&asked, interactive).await?;
                     let id = account.id.clone();
                     *pick = Some(account);
                     if let Some(token) = token {
@@ -245,8 +247,8 @@ impl Wam<'_> {
                 _ => return Err(SignInError::Refused("several Windows accounts: ask for a token in a call for one of them".to_string())),
             },
         };
-        let (silent, scopes) = (self.calls.silent, scopes.to_vec());
-        blocking(move || silent(&client, &scopes, &account)).await
+        let silent = self.calls.silent;
+        blocking(move || silent(&asked, &account)).await
     }
 
     /// The WAM id stored for a module account.
@@ -257,10 +259,10 @@ impl Wam<'_> {
 
     /// The Windows account of a sign-in: one the user picks in the window from those Windows knows
     /// for the client id, or through the WAM dialog, which gives a token too.
-    async fn choose(&self, client: &str, scopes: &[String], interactive: bool) -> Result<(WamAccount, Option<String>), SignInError> {
+    async fn choose(&self, asked: &TokenRequest, interactive: bool) -> Result<(WamAccount, Option<String>), SignInError> {
         let module = self.module.to_string();
         if !interactive {
-            let (list, id) = (self.calls.accounts, client.to_string());
+            let (list, id) = (self.calls.accounts, asked.client_id.clone());
             let accounts = blocking(move || list(&id)).await?;
             let request = SignInRequest::WamPick { module: module.clone(), accounts: accounts.clone() };
             match wait_for_user(self.deadline, self.prompts.ask(request)).await? {
@@ -279,11 +281,11 @@ impl Wam<'_> {
             SignInReply::Refused(why) => return Err(SignInError::Refused(why)),
             _ => return Err(SignInError::Cancelled),
         };
-        let (dialog, client, scopes) = (self.calls.interactive, client.to_string(), scopes.to_vec());
+        let (dialog, asked) = (self.calls.interactive, asked.clone());
         // The dialog has the sign-in budget too: WAM cancels one left open past it, and the wait
         // here ends then too, whatever WAM does.
         let budget = self.prompts.budget;
-        let waiting = tokio::time::timeout(budget, blocking(move || dialog(window, &client, &scopes, budget)));
+        let waiting = tokio::time::timeout(budget, blocking(move || dialog(window, &asked, budget)));
         let (token, account) = wait_for_user(self.deadline, waiting).await.map_err(|_| SignInError::TimedOut)??;
         Ok((account, Some(token)))
     }
@@ -405,14 +407,14 @@ impl Host for HostState {
     /// A token from Windows for the manifest's identity; `interactive` opens the WAM dialog,
     /// which only a sign-in from the window may do. A silent request that needs the dialog fails
     /// with `refused("interaction required")`.
-    async fn wam_token(&mut self, scopes: Vec<String>, interactive: bool, _claims: Option<String>) -> Result<String, SignInError> {
+    async fn wam_token(&mut self, scopes: Vec<String>, interactive: bool, claims: Option<String>) -> Result<String, SignInError> {
         self.code_done();
         #[cfg(any(test, feature = "test-support"))]
         if let Some(wam) = &self.env.fake_wam {
-            return wam(&scopes, interactive, _claims.as_deref()).map_err(SignInError::Refused);
+            return wam(&scopes, interactive, claims.as_deref()).map_err(SignInError::Refused);
         }
-        if scopes.iter().map(String::len).sum::<usize>() > MAX_PROMPT_TEXT {
-            return Err(SignInError::Refused(format!("the scopes are over {MAX_PROMPT_TEXT} bytes")));
+        if scopes.iter().map(String::len).sum::<usize>() > MAX_PROMPT_TEXT || claims.as_ref().is_some_and(|claims| claims.len() > MAX_PROMPT_TEXT) {
+            return Err(SignInError::Refused(format!("the scopes or claims are over {MAX_PROMPT_TEXT} bytes")));
         }
         self.prompts()?;
         // Refused before anything touches Windows or the credential store.
@@ -426,7 +428,7 @@ impl Host for HostState {
         };
         let (env, deadline, caller, mut pick) = (std::sync::Arc::clone(&self.env), self.deadline.clone(), self.caller.clone(), self.pick.take());
         let wam = Wam { module: &env.name, identity: env.wam.as_ref(), prompts: &env.sign_in, deadline: &deadline, store: &*store, calls: WINDOWS };
-        let token = wam.token(&windows_accounts, &caller, &mut pick, &scopes, interactive).await;
+        let token = wam.token(&windows_accounts, &caller, &mut pick, &scopes, interactive, claims.as_deref()).await;
         self.pick = pick;
         token
     }
@@ -456,8 +458,11 @@ mod tests {
     /// Windows with accounts w1 and w2; a token names its client id, scopes and account.
     const FAKE: WamCalls = WamCalls {
         accounts: |_| Ok(vec![account("w1"), account("w2")]),
-        silent: |client, scopes, account| Ok(format!("token {client} {} {account}", scopes.join(" "))),
-        interactive: |window, client, _, _| Ok((format!("dialog {window} {client}"), account("w3"))),
+        silent: |asked, account| {
+            let claims = asked.claims.as_deref().map(|claims| format!(" claims {claims}")).unwrap_or_default();
+            Ok(format!("token {} {} {account}{claims}", asked.client_id, asked.scopes.join(" ")))
+        },
+        interactive: |window, asked, _| Ok((format!("dialog {window} {}", asked.client_id), account("w3"))),
     };
 
     struct Setup {
@@ -493,7 +498,7 @@ mod tests {
 
         async fn token(&self, caller: &Caller, pick: &mut Option<WamAccount>, interactive: bool) -> Result<String, SignInError> {
             let windows_accounts = self.storage.secret_accounts(WAM_ACCOUNT).unwrap();
-            self.wam(FAKE).token(&windows_accounts, caller, pick, &scopes(), interactive).await
+            self.wam(FAKE).token(&windows_accounts, caller, pick, &scopes(), interactive, None).await
         }
     }
 
@@ -507,18 +512,18 @@ mod tests {
     #[tokio::test]
     async fn wam_is_limited_to_the_manifest() {
         let mut t = setup();
-        let no_wam = WamCalls { accounts: |_| panic!("listed"), silent: |_, _, _| panic!("asked"), interactive: |_, _, _, _| panic!("dialog") };
+        let no_wam = WamCalls { accounts: |_| panic!("listed"), silent: |_, _| panic!("asked"), interactive: |_, _, _| panic!("dialog") };
         let mut pick = Some(account("w1"));
         // A scope the user did not approve never reaches Windows, nor does a module without a
         // WAM identity.
         for scopes in [vec!["https://graph.example.com/.default".to_string()], vec![SCOPE.into(), "openid".into()], Vec::new()] {
-            assert!(refused(t.wam(no_wam).token(&[], &Caller::SignIn, &mut pick, &scopes, false).await).contains("scope"));
+            assert!(refused(t.wam(no_wam).token(&[], &Caller::SignIn, &mut pick, &scopes, false, None).await).contains("scope"));
         }
         t.identity.scopes.clear();
-        assert!(t.wam(no_wam).token(&[], &Caller::SignIn, &mut pick, &scopes(), false).await.is_err());
+        assert!(t.wam(no_wam).token(&[], &Caller::SignIn, &mut pick, &scopes(), false, None).await.is_err());
         let mut wam = t.wam(no_wam);
         wam.identity = None;
-        assert!(refused(wam.token(&[], &Caller::SignIn, &mut pick, &scopes(), false).await).contains("no Windows account identity"));
+        assert!(refused(wam.token(&[], &Caller::SignIn, &mut pick, &scopes(), false, None).await).contains("no Windows account identity"));
         // The client id is always the manifest's: the module has no way to name another.
         let t = setup();
         assert_eq!(t.token(&Caller::SignIn, &mut pick, false).await.unwrap(), format!("token {CLIENT} {SCOPE} w1"));
@@ -574,6 +579,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claims_reach_windows() {
+        let mut t = setup();
+        remember(&*t.store, &mut t.storage, "m", "acct", &account("w2")).unwrap();
+        // A CAE challenge: the claims the 401 named go with the silent request for the account.
+        let claims = r#"{"access_token":{"nbf":{"essential":true,"value":"1"}}}"#;
+        let token = t.wam(FAKE).token(&[], &Caller::Account("acct".into()), &mut None, &scopes(), false, Some(claims)).await.unwrap();
+        assert_eq!(token, format!("token {CLIENT} {SCOPE} w2 claims {claims}"));
+    }
+
+    #[tokio::test]
     async fn dialog_has_the_budget() {
         let mut t = setup();
         let (sender, mut asked) = mpsc::channel::<Prompt>(8);
@@ -585,14 +600,14 @@ mod tests {
         });
         // The user leaves the WAM dialog open.
         let slow = WamCalls {
-            interactive: |_, _, _, _| {
+            interactive: |_, _, _| {
                 std::thread::sleep(Duration::from_secs(1));
                 Ok(("late".into(), account("w9")))
             },
             ..FAKE
         };
         let mut pick = None;
-        let result = t.wam(slow).token(&[], &Caller::SignIn, &mut pick, &scopes(), true).await;
+        let result = t.wam(slow).token(&[], &Caller::SignIn, &mut pick, &scopes(), true, None).await;
         assert!(matches!(result, Err(SignInError::TimedOut)), "{result:?}");
         assert_eq!(pick, None);
     }
