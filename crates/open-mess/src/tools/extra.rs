@@ -19,8 +19,8 @@ const MAX_PROPERTIES: usize = 32;
 pub(crate) struct Declared {
     pub module: String,
     pub state: ModuleState,
-    /// The name in the manifest, which the module gets in `call`.
-    pub tool: String,
+    /// As the manifest declares it; the module gets its name in `call`.
+    pub decl: open_mess_host::ToolDecl,
     /// What the front ends list, or why it is not listed.
     pub listed: Result<Listed, String>,
 }
@@ -45,7 +45,7 @@ pub(crate) fn declared(modules: &[ModuleInfo]) -> BTreeMap<String, Vec<Declared>
         for tool in info.manifest.iter().flat_map(|manifest| &manifest.extra_tools) {
             let name = full_name(&info.name, &tool.name);
             let listed = check(&name, tool);
-            all.entry(name).or_default().push(Declared { module: info.name.clone(), state: info.state.clone(), tool: tool.name.clone(), listed });
+            all.entry(name).or_default().push(Declared { module: info.name.clone(), state: info.state.clone(), decl: tool.clone(), listed });
         }
     }
     let core: Vec<String> = shared::tools().into_iter().map(|tool| tool.name).chain(["status".to_string()]).collect();
@@ -64,6 +64,15 @@ pub(crate) fn declared(modules: &[ModuleInfo]) -> BTreeMap<String, Vec<Declared>
         }
     }
     all
+}
+
+/// The declarations of a module tool named `name`; None for a core tool's name, which a module
+/// that declares it never shadows.
+pub(crate) fn find(modules: &[ModuleInfo], name: &str) -> Option<Vec<Declared>> {
+    if name == "status" || shared::tools().iter().any(|tool| tool.name == name) {
+        return None;
+    }
+    declared(modules).remove(name)
 }
 
 /// The tools of active modules the front ends list.
@@ -258,6 +267,9 @@ mod tests {
             module("a", ModuleState::Active, vec![tool("b_c", schema()), tool("d", schema())]),
         ];
         assert_eq!(listed(&modules).iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["a_d"]);
+        // A call of the shared tool never reaches the module; the others find their declarations.
+        assert!(find(&modules, "list_conversations").is_none());
+        assert_eq!(find(&modules, "a_b_c").map(|tools| tools.len()), Some(2));
         assert_eq!(reasons(&modules, "list").len(), 3);
         assert_eq!(reasons(&modules, "a-b"), [("a_b_c".to_string(), "its name is declared more than once".to_string())]);
     }

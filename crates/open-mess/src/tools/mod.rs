@@ -288,7 +288,7 @@ impl Registry {
             return self.status();
         }
         if let Some(accounts) = &self.accounts
-            && let Some(tool) = extra::declared(&accounts.modules().list()).remove(name)
+            && let Some(tool) = extra::find(&accounts.modules().list(), name)
         {
             return call_extra(accounts, name, tool, args).await;
         }
@@ -509,7 +509,12 @@ async fn call_extra(accounts: &Accounts, name: &str, mut tools: Vec<extra::Decla
     };
     let account = readable(accounts, &account.id, &module_args)?;
     let handle = module(accounts, &account)?;
-    let json = within(&account.module, handle.call(&account.module_account, &tool.tool, &module_args.to_string())).await?;
+    // The module may have been replaced since its tools were read: the one called must declare
+    // this very tool, never one that writes now.
+    if !handle.manifest().is_ok_and(|manifest| manifest.extra_tools.contains(&tool.decl)) {
+        return Err(ToolError::Module(format!("module {} changed meanwhile; try again", tool.module)));
+    }
+    let json = within(&account.module, handle.call(&account.module_account, &tool.decl.name, &module_args.to_string())).await?;
     if json.len() > extra::MAX_RESULT {
         return Err(ToolError::Module(format!("module returned a result over {} MiB", extra::MAX_RESULT / 1024 / 1024)));
     }
