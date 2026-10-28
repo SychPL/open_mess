@@ -54,7 +54,9 @@ impl Writer {
     /// Creates the file; an existing one is never overwritten.
     pub fn create(path: &Path) -> io::Result<Writer> {
         let mut file = BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path)?);
+        // On disk at once: a file shorter than its header cannot be fixed after a crash.
         file.write_all(&header(0))?;
+        file.flush()?;
         Ok(Writer { file, data: 0 })
     }
 

@@ -263,16 +263,24 @@ impl Recordings {
         failures
     }
 
+    /// Never leaves the recording in `recording`: a track that cannot be fixed (shorter than its
+    /// header: the daemon stopped as it was created) holds no audio and is deleted, and a
+    /// recording with no track left is `failed`.
     fn recover_recording(&self, id: &str, path: &Path, meta: Meta) -> io::Result<()> {
         let mut end_ms = meta.start_ms;
+        let mut tracks = 0;
         for track in TRACKS {
             let file = path.join(track);
-            if file.exists() {
-                wav::fix_header(&file)?;
-                end_ms = end_ms.max(fs::metadata(&file).and_then(|meta| meta.modified()).map(millis).unwrap_or(0));
+            // The last write, read before the fix writes the header: the retention counts from it.
+            let Ok(modified) = fs::metadata(&file).and_then(|meta| meta.modified()) else { continue };
+            end_ms = end_ms.max(millis(modified));
+            match wav::fix_header(&file) {
+                Ok(()) => tracks += 1,
+                Err(_) => fs::remove_file(&file)?,
             }
         }
-        self.set_meta(id, &Meta { state: State::Waiting, end_ms: Some(end_ms), reason: Some(Reason::Interrupted), ..meta })
+        let state = if tracks == 0 { State::Failed } else { State::Waiting };
+        self.set_meta(id, &Meta { state, end_ms: Some(end_ms), reason: Some(Reason::Interrupted), ..meta })
     }
 
     /// Deletes the audio of recordings not transcribed [`AUDIO_RETENTION`] after they ended
@@ -415,6 +423,36 @@ mod tests {
         let mut samples = Vec::new();
         reader.read(&mut samples, 10).unwrap();
         assert_eq!(samples, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_left_recording_ends_at_its_last_write_not_at_the_fix() {
+        let (_dir, recordings) = recordings();
+        let id = recordings.create(0).unwrap();
+        let file = recordings.path(&id).unwrap().join("others.wav");
+        drop(wav::Writer::create(&file).unwrap());
+        // Last written long ago: the daemon comes back days later.
+        File::options().write(true).open(&file).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1_000)).unwrap();
+        assert!(recordings.recover().is_empty());
+        assert_eq!(recordings.meta(&id).unwrap().end_ms, Some(1_000_000));
+    }
+
+    #[test]
+    fn a_track_shorter_than_its_header_is_dropped_not_left_recording() {
+        let (_dir, recordings) = recordings();
+        let both = recordings.create(0).unwrap();
+        let empty = recordings.create(0).unwrap();
+        // The daemon stopped as the tracks were created: nothing of them reached the disk.
+        fs::write(recordings.path(&both).unwrap().join("me.wav"), b"").unwrap();
+        with_track(&recordings, &both, &[1]);
+        fs::write(recordings.path(&empty).unwrap().join("others.wav"), b"RIFF").unwrap();
+        assert!(recordings.recover().is_empty());
+        let meta = recordings.meta(&both).unwrap();
+        assert_eq!((meta.state, meta.reason), (State::Waiting, Some(Reason::Interrupted)));
+        assert!(!recordings.path(&both).unwrap().join("me.wav").exists());
+        let meta = recordings.meta(&empty).unwrap();
+        assert_eq!((meta.state, meta.reason), (State::Failed, Some(Reason::Interrupted)));
+        assert!(!recordings.has_audio(&empty));
     }
 
     #[test]
