@@ -140,6 +140,15 @@ builds `om.exe` and the platform modules, signs `manifest.json` and publishes ev
 `gh release create`. It stops at the first failure and, once the commit exists, prints the commands
 that undo or finish the release.
 
+Run both commands in a normal terminal such as Windows Terminal. They read the password from the
+console, and a terminal embedded in another app may never pass it through.
+
+Merge commits, and the squash commits GitHub makes when it merges a pull request, never pass the
+local post-commit hook, so `release` lists them as unprocessed. Check that each one adds nothing
+unreviewed, then write its `.processed` file saying how you checked. For a merge commit,
+`git diff-tree --cc <sha>` must print no diff. For a squash commit, `git diff <sha>^ <sha>` must
+hold exactly the changes of the reviewed branch.
+
 ## Licence
 
 By contributing you agree that your work is dual-licensed under MIT or Apache-2.0, like the rest
