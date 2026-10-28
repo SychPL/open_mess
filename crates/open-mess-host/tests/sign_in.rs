@@ -162,3 +162,45 @@ async fn without_a_window_sign_in_is_refused() {
     let refused = "refused: sign-in UI not available";
     assert_eq!(echo.call("a", "sign-in", "{}").await.unwrap(), format!(r#"{{"open-page":"{refused}","wam-token":"{WAM}"}}"#));
 }
+
+#[tokio::test]
+async fn scope_patterns_cover_one_label_of_an_allowed_host() {
+    // The fake stands for Windows: whatever reaches it is recorded.
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let fake: open_mess_host::FakeWam = {
+        let asked = std::sync::Arc::clone(&asked);
+        std::sync::Arc::new(move |scopes, _, _| {
+            asked.lock().unwrap().extend(scopes.iter().cloned());
+            Ok("token".to_string())
+        })
+    };
+    let engine = Engine::with_limits(limits::for_tests()).unwrap().with_fake_wam(fake);
+    let echo = engine.load(&wasm("open_mess_test_echo"), context()).await.unwrap();
+    let token = |scope: &str| {
+        let echo = echo.clone();
+        let args = serde_json::json!({ "scopes": [scope] }).to_string();
+        async move { echo.call("a", "wam-token", &args).await.unwrap() }
+    };
+    // Literal scopes as they are, and the manifest's `https://*.sharepoint.com/.default` for one
+    // tenant's site.
+    for good in ["https://ic3.teams.office.com/.default", "https://contoso-my.sharepoint.com/.default", "https://contoso.sharepoint.com/.default"] {
+        assert_eq!(token(good).await, r#"{"token":"token"}"#, "{good}");
+    }
+    for bad in [
+        "https://a.b.sharepoint.com/.default",
+        "https://sharepoint.com/.default",
+        "https://x.sharepoint.com.evil.example/.default",
+        "https://x.sharepoint.com/AllSites.Read",
+        "https://x.sharepoint.com:443/.default",
+        "https://u@x.sharepoint.com/.default",
+        "https://X.sharepoint.com/.default",
+        "https://x.sharepoint.com/.default?x=1",
+        "http://x.sharepoint.com/.default",
+        "https://*.sharepoint.com/.default",
+    ] {
+        let refused = format!(r#"{{"error":"refused: scope \"{bad}\" is not in the module's manifest"}}"#);
+        assert_eq!(token(bad).await, refused, "{bad}");
+    }
+    // None of the refused ones reached Windows.
+    assert_eq!(asked.lock().unwrap().len(), 3);
+}

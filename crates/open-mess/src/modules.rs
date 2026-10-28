@@ -19,7 +19,7 @@ use open_mess_host::{Engine, Manifest, ModuleContext, ModuleHandle, Net, SignInP
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::Error;
 use crate::store::Store;
@@ -111,6 +111,8 @@ pub struct Modules {
     dir: PathBuf,
     /// The context for loading a file, by file name.
     ctx: Box<dyn Fn(&str) -> ModuleContext + Send + Sync>,
+    /// Touched whenever what runs may have changed: a scan adopted, a module crashed or stopped.
+    changes: watch::Sender<()>,
 }
 
 /// A file that loaded as a module.
@@ -140,7 +142,17 @@ impl Modules {
     ) -> Result<Modules, Error> {
         let found = load(engine, dir, &ctx).await?;
         let entries = decide(store, found)?;
-        Ok(Modules { entries: RwLock::new(entries), engine: engine.clone(), dir: dir.to_path_buf(), ctx: Box::new(ctx) })
+        let changes = watch::Sender::new(());
+        for handle in entries.iter().filter_map(|entry| entry.handle.as_ref()) {
+            forward_state(handle, &changes);
+        }
+        Ok(Modules { entries: RwLock::new(entries), engine: engine.clone(), dir: dir.to_path_buf(), ctx: Box::new(ctx), changes })
+    }
+
+    /// Changes when what runs may have changed (spec 2026-10-28-meetings-transcripts, 5.1): after
+    /// [`Modules::adopt`], and when the host marks a module crashed or stopped.
+    pub fn changes(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Vec<Entry>> {
@@ -225,10 +237,25 @@ impl Modules {
         }
         for entry in fresh.iter().filter(|entry| entry.info.state == ModuleState::Active && !kept.contains(&entry.info.name)) {
             changed.insert(entry.info.name.clone());
+            if let Some(handle) = &entry.handle {
+                forward_state(handle, &self.changes);
+            }
         }
         *entries = fresh;
+        drop(entries);
+        self.changes.send_replace(());
         Ok(changed.into_iter().collect())
     }
+}
+
+/// Touches `changes` whenever the host changes the module's state, until the module is gone.
+fn forward_state(handle: &ModuleHandle, changes: &watch::Sender<()>) {
+    let (mut state, changes) = (handle.state_changes(), changes.clone());
+    tokio::spawn(async move {
+        while state.changed().await.is_ok() {
+            changes.send_replace(());
+        }
+    });
 }
 
 /// Loads every `.wasm` file in `dir`, reading each module's manifest.
