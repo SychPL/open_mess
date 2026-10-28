@@ -341,6 +341,7 @@ impl Engine {
         let hosts = HostList::parse(&manifest.hosts)?;
         // Not used until the sign-in window (milestone E), but a bad manifest is refused now.
         HostList::parse(&manifest.sign_in_hosts)?;
+        crate::sign_in::check_scopes(manifest.wam.as_ref())?;
         actor.reset(Arc::new(ModuleEnv {
             name: manifest.name.clone(),
             data_dir,
@@ -396,6 +397,12 @@ impl ModuleHandle {
 
     pub fn state(&self) -> ModuleState {
         self.state.borrow().clone()
+    }
+
+    /// The module's state as the host changes it (a crash, a stop after crashes in a row); closed
+    /// once the module is gone.
+    pub fn state_changes(&self) -> watch::Receiver<ModuleState> {
+        self.state.clone()
     }
 
     /// How many times the module crashed since it was loaded. A good call does not reset it (unlike

@@ -28,7 +28,14 @@
 //! forever without polling (a misbehaving module); and after `{"how": "microsoft"}` its
 //! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
-//! named after any other.
+//! named after any other. `wam-token` asks WAM for `{"scopes"}` and returns `{"token"}` or
+//! `{"error"}`.
+//!
+//! Extra tools (the manifest's, for the core's registry): `peek` reads; it returns two items, one in
+//! `{"conversation"}` (else "c1") and one in "c2", one item without a conversation and some
+//! untrusted text; `{"answer": "big"}` returns a result over 1 MiB, `{"answer": "list"}` a JSON
+//! array and `{"answer": "slow"}` the items after 1 s. Each call counts in the tool `peeks`. The others are never exposed: `poke` writes, `Bad-Name` breaks the name rule,
+//! `with_account` declares `account`, `loose` takes any property, and `twin` is declared twice.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -57,6 +64,8 @@ mod guest {
     /// (docs/protocols/teams.md, "Live results" item 1), for the manual check of WAM.
     const TEAMS_CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
     const CHAT_SCOPE: &str = "https://ic3.teams.office.com/.default";
+    /// A scope pattern, for the host's tests of WAM scope patterns; its hosts are in the manifest.
+    const SHAREPOINT_SCOPE: &str = "https://*.sharepoint.com/.default";
 
     fn http_error(e: &http::HttpError) -> &'static str {
         match e {
@@ -116,6 +125,34 @@ mod guest {
             "sign-in-with" => {
                 storage::set("sign-in-with", text("how").as_bytes()).map_err(|_| types::ModuleError::Platform("storage".to_string()))?;
                 json!({})
+            }
+            "wam-token" => {
+                let scopes: Vec<String> =
+                    args.get("scopes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                match sign_in::wam_token(&scopes, false, None) {
+                    Ok(token) => json!({ "token": token }),
+                    Err(e) => json!({ "error": sign_in_error(&e) }),
+                }
+            }
+            "peeks" => json!({ "count": stored("peeks").as_u64().unwrap_or_default() }),
+            "peek" => {
+                let count = stored("peeks").as_u64().unwrap_or_default() + 1;
+                storage::set("peeks", count.to_string().as_bytes()).map_err(|_| types::ModuleError::Platform("storage".to_string()))?;
+                if text("answer") == "slow" {
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_secs(1) {
+                        std::hint::spin_loop();
+                    }
+                }
+                let conversation = Some(text("conversation")).filter(|c| !c.is_empty()).unwrap_or_else(|| "c1".to_string());
+                match text("answer").as_str() {
+                    "big" => json!({ "items": [], "untrusted": { "text": "x".repeat(1024 * 1024 + 1) } }),
+                    "list" => json!([1, 2]),
+                    _ => json!({
+                        "items": [{ "conversation": conversation }, { "conversation": "c2" }, { "note": "no conversation" }],
+                        "untrusted": { "text": format!("peeked at {account}") },
+                    }),
+                }
             }
             "trap" => std::process::abort(),
             // Opens a socket, stays busy while the server's frames pile up, then sends 40 frames.
@@ -212,6 +249,28 @@ mod guest {
         }
     }
 
+    /// The manifest's own tools: `peek`, and the ones the core never exposes.
+    fn extra_tools() -> Vec<types::ToolDecl> {
+        let string = json!({"type": "string"});
+        let schema = |properties: Value| json!({"type": "object", "properties": properties, "additionalProperties": false}).to_string();
+        let tool = |name: &str, input_schema: String, writes: bool| types::ToolDecl {
+            name: name.to_string(),
+            description: format!("test-echo's {name}"),
+            input_schema,
+            writes,
+        };
+        let peek = schema(json!({"conversation": string, "answer": string}));
+        vec![
+            tool("peek", peek.clone(), false),
+            tool("poke", peek.clone(), true),
+            tool("Bad-Name", peek.clone(), false),
+            tool("with_account", schema(json!({"account": string})), false),
+            tool("loose", json!({"type": "object", "properties": {}, "additionalProperties": true}).to_string(), false),
+            tool("twin", peek.clone(), false),
+            tool("twin", peek, false),
+        ]
+    }
+
     /// A JSON value the module stored under `key`, else null.
     fn stored(key: &str) -> Value {
         storage::get(key).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
@@ -229,10 +288,13 @@ mod guest {
                 version: std::hint::black_box(VERSION).trim_end().to_string(),
                 platform: "test".to_string(),
                 // black_box: the padded string stays in the file as written.
-                hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),
+                hosts: std::hint::black_box(HOSTS).split_whitespace().chain(["*.sharepoint.com"]).map(str::to_string).collect(),
                 sign_in_hosts: vec!["login.example.com".to_string(), "login.microsoftonline.com".to_string()],
-                wam: Some(types::WamIdentity { client_id: TEAMS_CLIENT.to_string(), scopes: vec![CHAT_SCOPE.to_string()] }),
-                extra_tools: Vec::new(),
+                wam: Some(types::WamIdentity {
+                    client_id: TEAMS_CLIENT.to_string(),
+                    scopes: vec![CHAT_SCOPE.to_string(), SHAREPOINT_SCOPE.to_string()],
+                }),
+                extra_tools: extra_tools(),
             }
         }
 

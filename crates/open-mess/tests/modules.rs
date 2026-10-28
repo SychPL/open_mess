@@ -45,10 +45,10 @@ async fn changed_manifest_waits_for_approval() {
     let modules = scan(&store, &engine, dir.path()).await;
     assert_eq!(modules.state("test-echo"), Some(ModuleState::AwaitingApproval { reason: ApprovalReason::ManifestChanged }));
     assert!(modules.handle("test-echo").is_none());
-    assert_eq!(modules.list()[0].hosts, ["localhost", "extra.example.com"]);
+    assert_eq!(modules.list()[0].hosts, ["localhost", "extra.example.com", "*.sharepoint.com"]);
     // The version that was approved and loaded keeps serving calls, with its own host list.
     assert_eq!(old.call("a", "echo", "{}").await.unwrap(), "{}");
-    assert_eq!(old.manifest().unwrap().hosts, ["localhost"]);
+    assert_eq!(old.manifest().unwrap().hosts, ["localhost", "*.sharepoint.com"]);
 }
 
 #[tokio::test]
@@ -88,7 +88,7 @@ async fn duplicate_name_is_a_replacement() {
     let modules = scan(&store, &engine, dir.path()).await;
     let states: Vec<_> = modules.list().into_iter().map(|info| (info.file, info.state)).collect();
     assert_eq!(states, [("a.wasm".to_string(), ModuleState::PendingReplacement), ("b.wasm".to_string(), ModuleState::Active)]);
-    assert_eq!(modules.handle("test-echo").unwrap().manifest().unwrap().hosts, ["localhost", "extra.example.com"]);
+    assert_eq!(modules.handle("test-echo").unwrap().manifest().unwrap().hosts, ["localhost", "extra.example.com", "*.sharepoint.com"]);
 
     // Two new files: exactly one waits for approval, the other is its replacement.
     let fresh = tempfile::tempdir().unwrap();
@@ -124,10 +124,12 @@ async fn status_lists_modules() {
 
     let status = registry.call("status", json!({})).await.unwrap();
     let modules = status["modules"].as_array().unwrap();
-    let echo = modules.iter().find(|module| module["name"] == "test-echo").unwrap();
+    let mut echo = modules.iter().find(|module| module["name"] == "test-echo").unwrap().clone();
+    // Its own tools the core does not list, with why (tools::extra's tests go through them).
+    assert_eq!(echo.as_object_mut().unwrap().remove("tools_not_listed").unwrap().as_array().unwrap().len(), 6);
     assert_eq!(
-        *echo,
-        json!({"name": "test-echo", "file": "echo.wasm", "version": env!("CARGO_PKG_VERSION"), "platform": "test", "state": "active", "hosts": ["localhost"], "crashes_since_load": 0})
+        echo,
+        json!({"name": "test-echo", "file": "echo.wasm", "version": env!("CARGO_PKG_VERSION"), "platform": "test", "state": "active", "hosts": ["localhost", "*.sharepoint.com"], "crashes_since_load": 0})
     );
     let broken = modules.iter().find(|module| module["file"] == "broken.wasm").unwrap();
     assert!(broken["state"].as_str().unwrap().starts_with("not a valid module"), "{broken}");

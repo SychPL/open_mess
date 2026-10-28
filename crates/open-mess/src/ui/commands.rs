@@ -187,7 +187,7 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
             detail: describe(&info.state, i18n::current()),
             hosts,
             sign_in_hosts,
-            wam: wam.map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes }),
+            wam: wam.map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes.iter().map(|scope| scope_text(scope)).collect() }),
             tools: extra_tools.into_iter().map(|tool| ToolDto { name: tool.name, writes: tool.writes }).collect(),
             file_sha256: info.file_sha256.clone(),
             manifest_sha256: info.manifest_sha256.clone(),
@@ -196,6 +196,18 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
         });
     }
     Ok(dtos)
+}
+
+/// A WAM scope as the approval shows it: a pattern says what it hands over (spec
+/// 2026-10-28-meetings-transcripts, 5.2; spec 15 asks to name the trust given).
+fn scope_text(scope: &str) -> String {
+    match scope {
+        "https://*.sharepoint.com/.default" => format!(
+            "{scope} - token do dowolnej witryny SharePoint/OneDrive Twojej organizacji, z pełnymi uprawnieniami (także zapis i usuwanie plików, Sites.FullControl.All)"
+        ),
+        _ if scope.contains('*') => format!("{scope} - token do dowolnej usługi pasującej do wzorca"),
+        _ => scope.to_string(),
+    }
 }
 
 fn empty_manifest(info: &ModuleInfo) -> Manifest {
