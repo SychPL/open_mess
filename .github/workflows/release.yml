@@ -1,0 +1,72 @@
+# Releases open_mess from main: `cargo xtask release <version> --pipeline` with the signing key from
+# the "release" environment, which only main may use and the owner approves for every run
+# (spec 2026-10-28-release-pipeline). This job sees the key, so every action is pinned to a commit.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, like 1.2.3"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release:
+    name: Release
+    runs-on: windows-latest
+    environment: release
+    # Explicit, so cancelling the run always cancels the job.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      # xtask checks the branch name and pushes main, whether or not checkout left HEAD detached.
+      - run: git checkout -B main "$env:GITHUB_SHA"
+      # No rust-cache: a release takes nothing from a cache other runs could have written.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
+      - name: Git identity for the Release commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898094+github-actions[bot]@users.noreply.github.com"
+      # Byte for byte (UTF-8 without BOM, no added newline): minisign refuses a reshaped key file.
+      - name: Write the release key
+        env:
+          RELEASE_KEY_FILE: ${{ secrets.RELEASE_KEY_FILE }}
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'release.key'
+          [IO.File]::WriteAllText($path, $env:RELEASE_KEY_FILE, [Text.UTF8Encoding]::new($false))
+          "OPEN_MESS_RELEASE_KEY=$path" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      # The version reaches the script only through the environment, never as script text.
+      - name: Release
+        timeout-minutes: 75
+        env:
+          VERSION: ${{ inputs.version }}
+          OPEN_MESS_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask release "$env:VERSION" --pipeline
+      # The built files outlive the runner, for the recovery commands xtask prints.
+      - if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dist-${{ inputs.version }}
+          path: target/release-dist
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Remove the release key
+        if: always()
+        run: Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'release.key') -Force -ErrorAction SilentlyContinue
