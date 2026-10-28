@@ -250,6 +250,38 @@ struct Decoding {
     avg_logprob: f64,
     no_speech_prob: f64,
     compression_ratio: f64,
+    /// The decoder hit Whisper's token limit before the end of the window's text.
+    cut: bool,
+}
+
+/// A window's pieces of speech from its sampled tokens: start and end in milliseconds from the
+/// window's start (the end of the last piece unknown, `u64::MAX`), and text. A decoding cut at the
+/// token limit marks its last piece.
+fn pieces(vocab: &Vocab, tokens: &[u32], cut: bool) -> Vec<(u64, u64, String)> {
+    let begin = vocab.timestamp_begin();
+    let mut pieces = Vec::new();
+    let (mut start, mut text) = (0u64, Vec::new());
+    for token in tokens {
+        if *token >= begin {
+            let at = u64::from(token - begin) * 20;
+            if !text.is_empty() {
+                pieces.push((start, at, vocab.decode(&text)));
+                text.clear();
+            }
+            start = at;
+        } else if *token < vocab.eot {
+            text.push(*token);
+        }
+    }
+    if !text.is_empty() {
+        pieces.push((start, u64::MAX, vocab.decode(&text)));
+    }
+    let mut pieces: Vec<_> =
+        pieces.into_iter().map(|(start, end, text)| (start, end, text.trim().to_string())).filter(|(_, _, text)| !text.is_empty()).collect();
+    if cut && let Some((_, _, text)) = pieces.last_mut() {
+        text.push_str(CUT);
+    }
+    pieces
 }
 
 /// A loaded model, ready to transcribe.
@@ -323,7 +355,9 @@ impl Model {
         let max = self.whisper.config.max_target_positions;
         let suppress = self.whisper.config.suppress_tokens.clone();
         let (mut sum_logprob, mut no_speech_prob) = (0.0, 0.0);
-        for step in 0..max / 2 {
+        // Up to Whisper's 448 positions of the decoder, prompt included.
+        let mut step = 0;
+        while tokens.len() < max {
             check(cancel)?;
             let hidden = self.forward(&tokens, features, step == 0)?;
             if step == 0 {
@@ -334,14 +368,16 @@ impl Model {
             timestamp_rules(&self.vocab, &suppress, &mut logits, tokens.get(prompt.len()..).unwrap_or_default());
             let next = if temperature > 0.0 { sample(&logits, temperature)? } else { argmax(&logits) };
             tokens.push(next);
-            if next == self.vocab.eot || tokens.len() > max {
+            step += 1;
+            if next == self.vocab.eot {
                 break;
             }
             sum_logprob += f64::from(log_softmax(&logits).get(next as usize).copied().unwrap_or(f32::NEG_INFINITY));
         }
         let sampled = tokens.split_off(prompt.len());
+        let cut = sampled.last() != Some(&self.vocab.eot);
         let compression_ratio = compression_ratio(&self.vocab.decode(&sampled));
-        Ok(Decoding { avg_logprob: sum_logprob / sampled.len().max(1) as f64, tokens: sampled, no_speech_prob, compression_ratio })
+        Ok(Decoding { avg_logprob: sum_logprob / sampled.len().max(1) as f64, tokens: sampled, no_speech_prob, compression_ratio, cut })
     }
 
     /// One window's pieces of speech: start and end in milliseconds from the window's start, and
@@ -361,25 +397,7 @@ impl Model {
         else {
             return Ok(Vec::new());
         };
-        let begin = self.vocab.timestamp_begin();
-        let mut pieces = Vec::new();
-        let (mut start, mut text) = (0u64, Vec::new());
-        for token in decoding.tokens {
-            if token >= begin {
-                let at = u64::from(token - begin) * 20;
-                if !text.is_empty() {
-                    pieces.push((start, at, self.vocab.decode(&text)));
-                    text.clear();
-                }
-                start = at;
-            } else if token < self.vocab.eot {
-                text.push(token);
-            }
-        }
-        if !text.is_empty() {
-            pieces.push((start, u64::MAX, self.vocab.decode(&text)));
-        }
-        Ok(pieces.into_iter().map(|(start, end, text)| (start, end, text.trim().to_string())).filter(|(_, _, text)| !text.is_empty()).collect())
+        Ok(pieces(&self.vocab, &decoding.tokens, decoding.cut))
     }
 
     /// Transcribes a recording's tracks (`others.wav` and `me.wav` in `folder`), with `language`
@@ -546,6 +564,16 @@ mod tests {
         for sampled in [&[][..], &[begin + 5], &[begin + 5, 3]] {
             assert!(allowed(sampled).iter().all(|t| *t <= vocab.eot || *t >= begin));
         }
+    }
+
+    #[test]
+    fn pieces_follow_the_timestamps_and_a_cut_is_marked() {
+        let vocab = small_vocab();
+        let begin = vocab.timestamp_begin();
+        let tokens = [begin, 0, 1, begin + 50, begin + 50, 2, vocab.eot];
+        assert_eq!(pieces(&vocab, &tokens, false), vec![(0, 1000, "ab".to_string()), (1000, u64::MAX, "c".to_string())]);
+        // At the token limit: the last piece says it was cut.
+        assert_eq!(pieces(&vocab, &tokens[..6], true).last().unwrap().2, format!("c{CUT}"));
     }
 
     #[test]
