@@ -292,11 +292,11 @@ mod toast {
     use crate::update::service::UpdateService;
 
     /// `HKCU\Software\Classes\AppUserModelId\open_mess.daemon` and `...\open_mess.update` with the
-    /// name toasts show.
+    /// names toasts and the notification settings show.
     pub(super) fn register() -> std::io::Result<()> {
-        for id in [APP_ID, UPDATE_APP_ID] {
+        for (id, name) in [(APP_ID, "open_mess"), (UPDATE_APP_ID, "open_mess - aktualizacje")] {
             let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(format!(r"Software\Classes\AppUserModelId\{id}"))?;
-            key.set_value("DisplayName", &"open_mess")?;
+            key.set_value("DisplayName", &name)?;
         }
         Ok(())
     }

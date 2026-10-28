@@ -304,15 +304,89 @@ async fn not_installable_from_a_dev_build() {
 async fn nothing_installs_while_a_new_version_is_checked() {
     let h = harness(Ok(()), true).await;
     h.service.set_auto_install(true).unwrap();
-    h.d.registry.pending().unwrap().probation().set(true);
-    h.check().await;
-    assert!(h.service.view().probation);
+    let probation = h.d.registry.pending().unwrap().probation().clone();
+    probation.set(true);
+    // The check waits for the probation's end: a release found now could not be installed, and its
+    // toast's Zainstaluj would be refused.
+    h.service.check_now();
     sleep(10 * MINUTE).await;
-    assert!(h.consents().is_empty());
+    assert!(h.service.view().probation);
+    assert_eq!(h.release.checks.load(Ordering::SeqCst), 0, "no check during the probation");
+    assert!(h.toasts().is_empty());
     assert_eq!(h.service.install(), Err("aktualizacja w toku".to_string()));
     assert_eq!(h.service.set_auto_install(false), Err("aktualizacja w toku".to_string()));
     assert!(h.consents().is_empty());
     assert!(h.launched().is_empty());
+
+    // Once it ends, the check runs within a minute, and the release installs on its own.
+    probation.set(false);
+    tokio::time::advance(MINUTE).await;
+    until("the release is installed on its own", || !h.consents().is_empty()).await;
+    assert_eq!(h.release.checks.load(Ordering::SeqCst), 1);
+    assert_eq!(h.service.view().state, UpdateState::Phase(Phase::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn turning_auto_install_on_installs_a_ready_release() {
+    let h = harness(Ok(()), true).await;
+    h.check().await;
+    assert_eq!(h.service.view().state, UpdateState::Ready);
+    h.service.set_auto_install(true).unwrap();
+    // At once: the clock stands still while this waits, so no timer is needed.
+    until("the release is installed on its own", || !h.consents().is_empty()).await;
+    assert_eq!(h.service.view().state, UpdateState::Phase(Phase::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_install_is_not_followed_by_one_on_its_own() {
+    let h = harness(Ok(()), true).await;
+    h.service.set_auto_install(true).unwrap();
+    h.triggers.open_batches.store(1, Ordering::SeqCst);
+    h.check().await;
+    // Installed by hand, then cancelled while phase A waits for the batch.
+    h.service.install().unwrap();
+    sleep(MINUTE).await;
+    h.service.cancel();
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(h.service.view().state, UpdateState::Ready);
+    // Quiet now: still nothing starts on its own.
+    h.triggers.open_batches.store(0, Ordering::SeqCst);
+    sleep(10 * MINUTE).await;
+    assert_eq!(h.service.view().state, UpdateState::Ready);
+    assert!(h.launched().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_shows_no_local_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths { data: dir.path().join("data"), local: dir.path().join("local") };
+    let reason = service::installable(&paths, &dir.path().join("target").join("debug").join("om.exe"), &paths.data).unwrap_err();
+    let mut h = harness(Err(reason.clone()), true).await;
+    h.d.registry.set_update(h.service.clone());
+    // A failed rollback names its backup; a version folder holding one refuses the download.
+    let backup = h.paths.updates().join("9.9.9").join("backup");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(h.paths.last_result(), format!("wycofanie nieudane: x; kopia zapasowa: {}\n", backup.display())).unwrap();
+    h.check().await;
+
+    // The window gets every text.
+    let view = h.service.view();
+    assert!(matches!(&view.state, UpdateState::Error(why) if why.contains(&h.paths.updates().display().to_string())), "{:?}", view.state);
+    assert!(view.last_result.unwrap().contains(&backup.display().to_string()));
+    assert_eq!(view.installable, Err(reason));
+
+    // Agents get none of them.
+    let status = h.d.registry.call("status", json!({})).await.unwrap();
+    assert_eq!(
+        status["update"],
+        json!({"current": env!("CARGO_PKG_VERSION"), "found": null, "state": "error", "installable": false, "probation": false, "auto_install": false})
+    );
+    let text = status["update"].to_string();
+    for folder in [&h.paths.data, &h.paths.local, dir.path()] {
+        let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!text.contains(&name), "{text} names {name}");
+    }
+    assert!(!text.contains('\\') && !text.contains('/'), "{text}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -359,7 +433,7 @@ async fn no_tool_or_cli_command_writes_consent() {
     h.check().await;
     let after = h.d.registry.call("status", json!({})).await.unwrap();
     assert_eq!(after["update"]["found"], json!({"version": "9.9.9", "rolled_back": false}));
-    assert_eq!(after["update"]["state"], json!({"kind": "ready"}));
+    assert_eq!(after["update"]["state"], json!("ready"));
     // status takes no arguments, and there is no tool to install.
     assert!(matches!(h.d.registry.call("status", json!({"auto_install": true})).await, Err(ToolError::InvalidArgs(_))));
     assert!(matches!(h.d.registry.call("install_update", json!({})).await, Err(ToolError::UnknownTool(_))));

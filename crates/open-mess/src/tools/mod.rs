@@ -299,7 +299,7 @@ impl Registry {
             "triggers": {"channel_sessions": self.sessions.len(), "counters": self.triggers.to_json()},
             "ui_ready": self.ui_ready.load(Ordering::SeqCst),
             "accounts_restored": self.accounts_restored.load(Ordering::SeqCst),
-            "update": self.update.as_ref().map(UpdateService::view),
+            "update": self.update.as_ref().map(UpdateService::status),
         }))
     }
 }

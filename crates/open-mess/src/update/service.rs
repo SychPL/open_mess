@@ -106,6 +106,32 @@ fn why_not<S: Serializer>(installable: &Result<(), String>, serializer: S) -> Re
     installable.as_ref().err().serialize(serializer)
 }
 
+/// What `status` shows agents: [`UpdateView`] without its texts, which can name local folders and so
+/// the user's name (an error, the reason it does not install, a failed rollback's backup).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StatusView {
+    pub current: String,
+    pub found: Option<Found>,
+    /// `idle`, `checking`, `downloading`, `ready`, `error` or `phase`.
+    pub state: &'static str,
+    pub installable: bool,
+    pub probation: bool,
+    pub auto_install: bool,
+}
+
+impl UpdateState {
+    fn kind(&self) -> &'static str {
+        match self {
+            UpdateState::Idle => "idle",
+            UpdateState::Checking => "checking",
+            UpdateState::Downloading => "downloading",
+            UpdateState::Ready => "ready",
+            UpdateState::Error(_) => "error",
+            UpdateState::Phase(_) => "phase",
+        }
+    }
+}
+
 /// Checks, downloads and installs releases; clones share it.
 #[derive(Clone)]
 pub struct UpdateService(Arc<Inner>);
@@ -115,6 +141,9 @@ struct Inner {
     /// Where an installation runs: the toast calls [`UpdateService::install`] on a thread of its own.
     runtime: Handle,
     check_now: Notify,
+    /// Looks again whether to install on its own: the option was turned on, or an installation went
+    /// back to ready.
+    wake: Notify,
     cancel: watch::Sender<bool>,
     shared: Mutex<Shared>,
 }
@@ -123,8 +152,9 @@ struct Inner {
 struct Shared {
     state: UpdateState,
     ready: Option<Ready>,
-    /// The release (its manifest SHA-256) announced, and the one installed on its own: each once,
-    /// so that a cancel or a helper that did not start is not followed by the same again.
+    /// The release (its manifest SHA-256) announced, and the one started while installing on its own
+    /// was on: each once, so that a cancel or a helper that did not start is not followed by the
+    /// same again.
     announced: Option<String>,
     auto_started: Option<String>,
 }
@@ -146,6 +176,7 @@ impl UpdateService {
             setup,
             runtime: Handle::current(),
             check_now: Notify::new(),
+            wake: Notify::new(),
             cancel: watch::channel(false).0,
             shared: Mutex::default(),
         }));
@@ -170,7 +201,8 @@ impl UpdateService {
     /// "Anuluj": ends phase A or B; the daemon goes back to work. The helper's launch is not
     /// cancelled.
     pub fn cancel(&self) {
-        if matches!(self.shared().state, UpdateState::Phase(Phase::A | Phase::B)) {
+        let shared = self.shared();
+        if matches!(shared.state, UpdateState::Phase(Phase::A | Phase::B)) {
             self.0.cancel.send_replace(true);
         }
     }
@@ -178,15 +210,14 @@ impl UpdateService {
     /// "Instaluj aktualizacje automatycznie"; only the window sets it.
     pub fn set_auto_install(&self, on: bool) -> Result<(), String> {
         self.not_held()?;
-        consent::set_auto_install(self.0.setup.accounts.store().conn(), on).map_err(text)
+        consent::set_auto_install(self.0.setup.accounts.store().conn(), on).map_err(text)?;
+        self.0.wake.notify_one();
+        Ok(())
     }
 
+    /// Everything, for the window.
     pub fn view(&self) -> UpdateView {
-        let (state, found) = {
-            let shared = self.shared();
-            let found = shared.ready.as_ref().map(|ready| Found { version: ready.downloaded.version.to_string(), rolled_back: ready.rolled_back });
-            (shared.state.clone(), found)
-        };
+        let (state, found) = self.state_and_found();
         UpdateView {
             current: Version::current().to_string(),
             found,
@@ -196,6 +227,25 @@ impl UpdateService {
             auto_install: self.auto_install(),
             last_result: last_result(&self.0.setup.paths),
         }
+    }
+
+    /// For `status`, which agents read.
+    pub fn status(&self) -> StatusView {
+        let (state, found) = self.state_and_found();
+        StatusView {
+            current: Version::current().to_string(),
+            found,
+            state: state.kind(),
+            installable: self.0.setup.installable.is_ok(),
+            probation: self.held(),
+            auto_install: self.auto_install(),
+        }
+    }
+
+    fn state_and_found(&self) -> (UpdateState, Option<Found>) {
+        let shared = self.shared();
+        let found = shared.ready.as_ref().map(|ready| Found { version: ready.downloaded.version.to_string(), rolled_back: ready.rolled_back });
+        (shared.state.clone(), found)
     }
 
     fn shared(&self) -> MutexGuard<'_, Shared> {
@@ -221,12 +271,20 @@ impl UpdateService {
     async fn run(self, first: Instant) {
         let mut checks = interval_at(first, EVERY);
         checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // A check due while a new version is checked waits for the probation's end: nothing found
+        // then could be installed.
+        let mut check_due = false;
         loop {
-            let waits = self.auto_install_due();
+            let retry = check_due || self.auto_install_due();
             tokio::select! {
-                _ = checks.tick() => self.check().await,
-                () = self.0.check_now.notified() => self.check().await,
-                () = sleep(QUIET_RETRY), if waits => {}
+                _ = checks.tick() => check_due = true,
+                () = self.0.check_now.notified() => check_due = true,
+                () = self.0.wake.notified() => {}
+                () = sleep(QUIET_RETRY), if retry => {}
+            }
+            if check_due && !self.held() {
+                check_due = false;
+                self.check().await;
             }
             if !self.try_auto_install() {
                 self.announce();
@@ -273,9 +331,12 @@ impl UpdateService {
         Ok(Some(Ready { downloaded, rolled_back }))
     }
 
-    /// Shows the toast for a release that is ready, once, unless the user cannot install it or it
-    /// was rolled back.
+    /// Shows the toast for a release that is ready, once, unless the user cannot install it, it was
+    /// rolled back, or a new version is being checked (Zainstaluj would be refused).
     fn announce(&self) {
+        if self.held() {
+            return;
+        }
         let ready = {
             let mut shared = self.shared();
             let Some(ready) = shared.ready.clone().filter(|ready| shared.state == UpdateState::Ready && !ready.rolled_back) else {
@@ -324,6 +385,7 @@ impl UpdateService {
         let setup = &self.0.setup;
         setup.installable.clone()?;
         self.not_held()?;
+        let auto = auto || self.auto_install();
         let ready = {
             let mut shared = self.shared();
             let ready = match (&shared.state, &shared.ready) {
@@ -335,6 +397,8 @@ impl UpdateService {
             if auto {
                 shared.auto_started = Some(ready.downloaded.manifest_sha256.clone());
             }
+            // With the phase reserved, so that a cancel right away is not lost.
+            self.0.cancel.send_replace(false);
             shared.state = UpdateState::Phase(Phase::A);
             ready
         };
@@ -344,8 +408,6 @@ impl UpdateService {
             self.set_state(UpdateState::Ready);
             return Err(err.to_string());
         }
-        // Before the phases start, so that a cancel right away is not lost.
-        self.0.cancel.send_replace(false);
         self.0.runtime.spawn(self.clone().run_install(downloaded));
         Ok(())
     }
@@ -358,11 +420,11 @@ impl UpdateService {
         let cancel = self.0.cancel.subscribe();
         // Both phases resume everything themselves when cancelled.
         if finish_work(&activity, &cancel).await.is_err() {
-            return self.set_state(UpdateState::Ready);
+            return self.back_to_ready();
         }
         self.set_state(UpdateState::Phase(Phase::B));
         if switch(&activity, &cancel).await.is_err() {
-            return self.set_state(UpdateState::Ready);
+            return self.back_to_ready();
         }
         self.set_state(UpdateState::Phase(Phase::Launching));
         let active = setup.accounts.modules().list().into_iter().filter(|info| info.state == ModuleState::Active).map(|info| info.name).collect();
@@ -379,9 +441,15 @@ impl UpdateService {
             Err(err) => {
                 resume(&activity).await;
                 state::record_result(&setup.paths, &format!("przerwano: {err}"));
-                self.set_state(UpdateState::Ready);
+                self.back_to_ready();
             }
         }
+    }
+
+    /// The installation stopped and the release is ready again; installing on its own may now be due.
+    fn back_to_ready(&self) {
+        self.set_state(UpdateState::Ready);
+        self.0.wake.notify_one();
     }
 }
 
