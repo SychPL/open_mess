@@ -283,6 +283,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_star_entry_allows_the_hosts_under_a_domain_only() {
+        let source = Source {
+            latest: Url::parse("https://huggingface.co/").unwrap(),
+            allowed_hosts: vec!["huggingface.co".into(), "*.hf.co".into()],
+            https_only: true,
+        };
+        let allows = |url: &str| source.allows(&Url::parse(url).unwrap());
+        assert!(allows("https://huggingface.co/x") && allows("https://us.aws.cdn.hf.co/x") && allows("https://cdn-lfs.hf.co/x"));
+        for refused in
+            ["https://hf.co/x", "https://evilhf.co/x", "https://hf.co.evil.example/x", "http://us.aws.cdn.hf.co/x", "https://huggingface.co.evil/x"]
+        {
+            assert!(!allows(refused), "{refused}");
+        }
+    }
+
+    #[test]
     fn a_file_gets_a_second_per_256_kib_and_at_most_30_minutes() {
         assert_eq!(asset_deadline(0), Duration::from_secs(30));
         assert_eq!(asset_deadline(20 * 1024 * 1024), Duration::from_secs(30 + 80));

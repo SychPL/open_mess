@@ -59,7 +59,31 @@ pub fn folder(local: &Path, revision: &Revision) -> PathBuf {
 
 /// The newest allowed revision with all its files on disk; their sums are checked as they are read.
 pub fn installed(local: &Path) -> Option<&'static Revision> {
-    REVISIONS.iter().find(|revision| revision.files.iter().all(|file| folder(local, revision).join(file.name).is_file()))
+    installed_of(REVISIONS, local)
+}
+
+fn installed_of(revisions: &'static [Revision], local: &Path) -> Option<&'static Revision> {
+    revisions.iter().find(|revision| revision.files.iter().all(|file| folder(local, revision).join(file.name).is_file()))
+}
+
+/// The state of `revisions` on disk: the one installed, and whether a newer one is listed.
+fn installed_and_newer(revisions: &'static [Revision], local: &Path) -> (Option<&'static Revision>, bool) {
+    let installed = installed_of(revisions, local);
+    let newer = installed.is_some_and(|found| revisions.first().is_some_and(|newest| newest.commit != found.commit));
+    (installed, newer)
+}
+
+/// Deletes what a download the daemon did not finish left (it stopped meanwhile): a listed
+/// revision's folder without all its files, or with a `.part` file. Unlisted folders are left.
+fn remove_unfinished(revisions: &[Revision], local: &Path) {
+    for revision in revisions {
+        let dir = folder(local, revision);
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let partial = entries.flatten().any(|entry| entry.file_name().to_string_lossy().ends_with(".part"));
+        if partial || !revision.files.iter().all(|file| dir.join(file.name).is_file()) {
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
 }
 
 /// Reads a model file whole. One of another size, or whose SHA-256 differs, is `InvalidData`
@@ -159,18 +183,19 @@ fn locked(download: &Mutex<Download>) -> MutexGuard<'_, Download> {
 }
 
 impl Models {
-    /// Downloads run on `runtime`, from `base` ([`BASE`], but in tests).
+    /// Downloads run on `runtime`, from `base` ([`BASE`], but in tests). Made at daemon start, when
+    /// no download runs: what an earlier daemon left of one goes.
     pub fn new(local: &Path, base: Url, runtime: Handle) -> Models {
+        remove_unfinished(REVISIONS, local);
         Models { local: local.to_path_buf(), base, runtime, download: Arc::new(Mutex::new(Download::Idle)) }
     }
 
     pub fn view(&self) -> ModelView {
-        let installed = installed(&self.local);
-        let newest = REVISIONS.first();
+        let (installed, newer) = installed_and_newer(REVISIONS, &self.local);
         ModelView {
             installed: installed.map(|revision| revision.commit),
-            newer: installed.is_some_and(|found| newest.is_some_and(|newest| newest.commit != found.commit)),
-            size: newest.map_or(0, |revision| revision.files.iter().map(|file| file.size).sum()),
+            newer,
+            size: REVISIONS.first().map_or(0, |revision| revision.files.iter().map(|file| file.size).sum()),
             download: locked(&self.download).clone(),
         }
     }
@@ -244,6 +269,64 @@ mod tests {
             let other = ModelFile { name: "abc", sha256: sum, size };
             assert_eq!(read_verified(dir.path(), &other).unwrap_err().kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    /// Two revisions, newest first, for what the window shows; files of one byte, never downloaded.
+    static TWO: [Revision; 2] = [
+        Revision {
+            commit: "2222222222222222222222222222222222222222",
+            files: [
+                ModelFile { name: "config.json", sha256: "", size: 1 },
+                ModelFile { name: "tokenizer.json", sha256: "", size: 1 },
+                ModelFile { name: "model.safetensors", sha256: "", size: 1 },
+            ],
+        },
+        Revision {
+            commit: "1111111111111111111111111111111111111111",
+            files: [
+                ModelFile { name: "config.json", sha256: "", size: 1 },
+                ModelFile { name: "tokenizer.json", sha256: "", size: 1 },
+                ModelFile { name: "model.safetensors", sha256: "", size: 1 },
+            ],
+        },
+    ];
+
+    fn put(local: &Path, revision: &Revision, names: &[&str]) -> PathBuf {
+        let dir = folder(local, revision);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn an_older_model_on_disk_is_used_and_a_newer_one_offered() {
+        let local = tempfile::tempdir().unwrap();
+        assert!(matches!(installed_and_newer(&TWO, local.path()), (None, false)));
+        put(local.path(), &TWO[1], &["config.json", "tokenizer.json", "model.safetensors"]);
+        let (installed, newer) = installed_and_newer(&TWO, local.path());
+        assert_eq!((installed.map(|found| found.commit), newer), (Some(TWO[1].commit), true));
+        put(local.path(), &TWO[0], &["config.json", "tokenizer.json", "model.safetensors"]);
+        let (installed, newer) = installed_and_newer(&TWO, local.path());
+        assert_eq!((installed.map(|found| found.commit), newer), (Some(TWO[0].commit), false));
+    }
+
+    #[test]
+    fn what_a_stopped_download_left_goes_at_start() {
+        let local = tempfile::tempdir().unwrap();
+        let whole = put(local.path(), &TWO[1], &["config.json", "tokenizer.json", "model.safetensors"]);
+        let missing = put(local.path(), &TWO[0], &["config.json"]);
+        remove_unfinished(&TWO, local.path());
+        assert!(whole.exists() && !missing.exists());
+        let partial = put(local.path(), &TWO[0], &["config.json", "tokenizer.json", "model.safetensors", "model.safetensors.part"]);
+        remove_unfinished(&TWO, local.path());
+        assert!(!partial.exists());
+        // A folder of no listed revision is left alone.
+        let unlisted = local.path().join("models").join("something-else");
+        std::fs::create_dir_all(&unlisted).unwrap();
+        remove_unfinished(&TWO, local.path());
+        assert!(unlisted.exists() && whole.exists());
     }
 
     #[test]
