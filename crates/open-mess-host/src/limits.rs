@@ -60,10 +60,12 @@ impl Default for Limits {
     }
 }
 
-/// Short limits that keep tests fast.
+/// Short limits that keep tests fast. The call limit still leaves room for an ordinary call of a
+/// debug-built module on a loaded CI runner, where committing module storage alone can take
+/// seconds; only tests that run into it on purpose wait for it.
 #[cfg(any(test, feature = "test-support"))]
 pub fn for_tests() -> Limits {
-    Limits { call_timeout: Duration::from_secs(2), connect_timeout: Duration::from_secs(1), read_timeout: Duration::from_secs(1) }
+    Limits { call_timeout: Duration::from_secs(10), connect_timeout: Duration::from_secs(1), read_timeout: Duration::from_secs(1) }
 }
 
 /// Caps a module instance's memories and tables in total, so a component with many memories gets
