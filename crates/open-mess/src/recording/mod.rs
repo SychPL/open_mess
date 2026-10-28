@@ -240,12 +240,18 @@ impl Recordings {
         fs::remove_dir_all(self.path(id).ok_or_else(not_found)?)
     }
 
-    /// At daemon start (4.4): a recording the daemon left gets valid tracks and waits for its
-    /// transcription, marked interrupted; a transcription that wrote its transcript is done; a
-    /// done recording loses leftover audio. Returns what could not be put right.
-    pub fn recover(&self) -> Vec<(String, io::Error)> {
+    /// At daemon start and in the daily pass with [`Recordings::expire`] (4.4): a recording the
+    /// daemon left gets valid tracks and waits for its transcription, marked interrupted; a
+    /// transcription that wrote its transcript is done; a done recording loses leftover audio.
+    /// `busy` are the recording and the transcription running now, which are left alone. What
+    /// could not be put right (a track another program holds) is returned and tried again in the
+    /// next pass.
+    pub fn recover(&self, busy: &[&str]) -> Vec<(String, io::Error)> {
         let mut failures = Vec::new();
         for Entry { id, meta } in self.list() {
+            if busy.contains(&id.as_str()) {
+                continue;
+            }
             let Some(path) = self.path(&id) else { continue };
             let result = match meta.state {
                 State::Recording => self.recover_recording(&id, &path, meta),
@@ -265,7 +271,7 @@ impl Recordings {
 
     /// A track shorter than its header (the daemon stopped as it was created) holds no audio and
     /// is deleted, and a recording with no track left is `failed`. Any other error (a file another
-    /// program holds) deletes nothing: the recording stays as it is and the next start tries again.
+    /// program holds) deletes nothing: the recording stays as it is for the next pass.
     fn recover_recording(&self, id: &str, path: &Path, meta: Meta) -> io::Result<()> {
         let mut end_ms = meta.start_ms;
         let mut tracks = 0;
@@ -416,7 +422,7 @@ mod tests {
         let mut writer = wav::Writer::create(&recordings.path(&id).unwrap().join("me.wav")).unwrap();
         writer.write(&[1, 2, 3]).unwrap();
         drop(writer);
-        assert!(recordings.recover().is_empty());
+        assert!(recordings.recover(&[]).is_empty());
         let meta = recordings.meta(&id).unwrap();
         assert_eq!((meta.state, meta.reason), (State::Waiting, Some(Reason::Interrupted)));
         assert!(meta.end_ms.is_some());
@@ -435,7 +441,7 @@ mod tests {
         drop(wav::Writer::create(&file).unwrap());
         // Last written long ago: the daemon comes back days later.
         File::options().write(true).open(&file).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1_000)).unwrap();
-        assert!(recordings.recover().is_empty());
+        assert!(recordings.recover(&[]).is_empty());
         assert_eq!(recordings.meta(&id).unwrap().end_ms, Some(1_000_000));
     }
 
@@ -448,7 +454,7 @@ mod tests {
         fs::write(recordings.path(&both).unwrap().join("me.wav"), b"").unwrap();
         with_track(&recordings, &both, &[1]);
         fs::write(recordings.path(&empty).unwrap().join("others.wav"), b"RIFF").unwrap();
-        assert!(recordings.recover().is_empty());
+        assert!(recordings.recover(&[]).is_empty());
         let meta = recordings.meta(&both).unwrap();
         assert_eq!((meta.state, meta.reason), (State::Waiting, Some(Reason::Interrupted)));
         assert!(!recordings.path(&both).unwrap().join("me.wav").exists());
@@ -458,7 +464,19 @@ mod tests {
     }
 
     #[test]
-    fn a_track_that_cannot_be_fixed_now_is_kept_for_the_next_start() {
+    fn the_daily_pass_leaves_the_running_recording_and_transcription_alone() {
+        let (_dir, recordings) = recordings();
+        let recording = recordings.create(0).unwrap();
+        let transcribing = recordings.create(0).unwrap();
+        with_track(&recordings, &transcribing, &[1]);
+        recordings.set_meta(&transcribing, &Meta { state: State::Transcribing, ..recordings.meta(&transcribing).unwrap() }).unwrap();
+        assert!(recordings.recover(&[recording.as_str(), transcribing.as_str()]).is_empty());
+        assert_eq!(recordings.meta(&recording).unwrap().state, State::Recording);
+        assert_eq!(recordings.meta(&transcribing).unwrap().state, State::Transcribing);
+    }
+
+    #[test]
+    fn a_track_that_cannot_be_fixed_now_is_kept_for_the_next_pass() {
         let (_dir, recordings) = recordings();
         let id = recordings.create(0).unwrap();
         let file = recordings.path(&id).unwrap().join("others.wav");
@@ -469,13 +487,13 @@ mod tests {
         let mut permissions = fs::metadata(&file).unwrap().permissions();
         permissions.set_readonly(true);
         fs::set_permissions(&file, permissions.clone()).unwrap();
-        assert_eq!(recordings.recover().len(), 1);
+        assert_eq!(recordings.recover(&[]).len(), 1);
         assert!(file.exists());
         assert_eq!(recordings.meta(&id).unwrap().state, State::Recording);
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         fs::set_permissions(&file, permissions).unwrap();
-        assert!(recordings.recover().is_empty());
+        assert!(recordings.recover(&[]).is_empty());
         assert_eq!(recordings.meta(&id).unwrap().state, State::Waiting);
         assert!(recordings.has_audio(&id));
     }
@@ -490,20 +508,20 @@ mod tests {
         recordings.set_meta(&id, &transcribing).unwrap();
 
         // Stopped before the transcript was written: back to waiting, audio kept.
-        assert!(recordings.recover().is_empty());
+        assert!(recordings.recover(&[]).is_empty());
         assert_eq!(recordings.meta(&id).unwrap().state, State::Waiting);
         assert!(recordings.has_audio(&id));
 
         // Stopped after the transcript, before the state: done, audio gone.
         recordings.set_meta(&id, &transcribing).unwrap();
         write_atomic(&path.join(TRANSCRIPT), &serde_json::to_vec(&transcript()).unwrap()).unwrap();
-        assert!(recordings.recover().is_empty());
+        assert!(recordings.recover(&[]).is_empty());
         assert_eq!(recordings.meta(&id).unwrap().state, State::Done);
         assert!(!recordings.has_audio(&id));
 
         // Stopped after the state, before the audio was deleted: the audio goes at start.
         with_track(&recordings, &id, &[1]);
-        assert!(recordings.recover().is_empty());
+        assert!(recordings.recover(&[]).is_empty());
         assert!(!recordings.has_audio(&id));
         assert_eq!(recordings.transcript(&id).unwrap(), transcript());
     }
