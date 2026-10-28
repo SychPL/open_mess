@@ -16,7 +16,7 @@ use crate::session::Session;
 use crate::text::{html_to_markdown, markdown_to_html};
 use crate::unread::{self, UnreadState};
 use crate::writing::{self, Purpose};
-use crate::{search, time};
+use crate::{meetings, search, time};
 
 /// Pages a listing reads at most, newest first: 1000 conversations or messages at the page size
 /// of 50. ponytail: a "mark as unread" on a conversation past them is not seen; page further if
@@ -42,6 +42,7 @@ pub fn call(account: &str, tool: &str, args_json: &str) -> Result<String, Module
         "send" => send,
         "edit_message" => edit_message,
         "react" => react,
+        "list_meetings" => list_meetings,
         _ => return Err(ModuleError::NotSupported(tool.to_string())),
     };
     api::with_session(account, |session| run(session, &args)).map(|result| result.to_string())
@@ -343,6 +344,40 @@ fn writing_context(session: &mut Session, args: &Value) -> Result<Value, ModuleE
         .map(|c| json!({"sent_at": time::rfc3339(c.sent_ms), "untrusted": {"text": c.text}}))
         .collect();
     Ok(json!({ "examples": examples }))
+}
+
+/// The longest window of `list_meetings`, and its default: from a week back to a day ahead.
+const MAX_MEETINGS_WINDOW_MS: i64 = 31 * DAY_MS;
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// The largest `list_meetings` result, as JSON: below the core's 1 MiB for the module's own tools.
+const MAX_MEETINGS_RESULT: usize = 900 * 1024;
+
+/// The Teams meetings of the user's calendar between `from` and `to` (spec 4.1). Not cut to a
+/// count: the core leaves out the meetings the agent may not read only after this.
+fn list_meetings(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let at = |key: &str, default: i64| match text(args, key) {
+        None => Ok(default),
+        Some(t) => time::rfc3339_ms(t).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} must be an RFC 3339 time"))),
+    };
+    let now = api::now_ms();
+    let (from, to) = (at("from", now.saturating_sub(7 * DAY_MS))?, at("to", now.saturating_add(DAY_MS))?);
+    if to <= from || to - from > MAX_MEETINGS_WINDOW_MS {
+        return Err(ModuleError::InvalidArgs("to must be after from, at most 31 days".to_string()));
+    }
+    let middle_tier =
+        session.directory.middle_tier.clone().ok_or_else(|| ModuleError::NotSupported("no calendar service for this account".to_string()))?;
+    let body = api::middle_tier(session, &meetings::calendar(&middle_tier, from, to))?;
+    let items = meetings::decode_calendar(&body)
+        .map_err(api::proto)?
+        .iter()
+        .map(meetings::meeting_item)
+        .collect::<Option<Vec<Value>>>()
+        .ok_or_else(|| ModuleError::Incompatible("a calendar id too long".to_string()))?;
+    let result = json!({ "items": items });
+    if result.to_string().len() > MAX_MEETINGS_RESULT {
+        return Err(ModuleError::Platform("too many events, narrow from/to".to_string()));
+    }
+    Ok(result)
 }
 
 /// An AMS image of a message: only one the message references (docs 7).

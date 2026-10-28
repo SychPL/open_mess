@@ -12,7 +12,7 @@ pub const CHAT_SCOPE: &str = "https://ic3.teams.office.com/.default";
 pub const SEARCH_SCOPE: &str = "https://outlook.office.com/.default";
 
 /// A token is renewed this long before it expires.
-const RENEW_BEFORE_MS: i64 = 5 * 60 * 1000;
+pub(crate) const RENEW_BEFORE_MS: i64 = 5 * 60 * 1000;
 
 /// What the module reads from a token. The token came from WAM, not from the network, so its
 /// signature is not checked; the claims only name the account it belongs to.
@@ -84,12 +84,15 @@ pub struct Session {
     pub directory: ServiceDirectory,
     /// Scope, token and when it expires.
     tokens: Vec<(&'static str, SecretString, Option<i64>)>,
+    /// The skype token of the last authsvc exchange, and when it expires; the middle tier takes it
+    /// (docs 9.1).
+    skype: Option<(SecretString, Option<i64>)>,
 }
 
 impl Session {
     pub fn new(claims: Claims, directory: ServiceDirectory) -> Session {
         let name = claims.name.or_else(|| claims.upn.clone()).unwrap_or_else(|| claims.oid.clone());
-        Session { account: claims.oid, name, upn: claims.upn, tenant: claims.tenant, directory, tokens: Vec::new() }
+        Session { account: claims.oid, name, upn: claims.upn, tenant: claims.tenant, directory, tokens: Vec::new(), skype: None }
     }
 
     /// The user's MRI, as the chat service names senders and mentions.
@@ -107,6 +110,17 @@ impl Session {
     pub fn keep(&mut self, scope: &'static str, token: String, expires_ms: Option<i64>) {
         self.tokens.retain(|(s, ..)| *s != scope);
         self.tokens.push((scope, SecretString::new(token), expires_ms));
+    }
+
+    /// The skype token, unless it is about to expire; with `fresh` false, also one that is (one
+    /// just given that lives less than the renewal margin).
+    pub fn skype(&self, now_ms: i64, fresh: bool) -> Option<&str> {
+        let (token, expires) = self.skype.as_ref()?;
+        (!fresh || expires.is_none_or(|at| at.saturating_sub(RENEW_BEFORE_MS) > now_ms)).then(|| token.expose())
+    }
+
+    pub fn keep_skype(&mut self, token: Option<SecretString>, expires_ms: Option<i64>) {
+        self.skype = token.map(|token| (token, expires_ms));
     }
 }
 
@@ -178,5 +192,11 @@ mod tests {
         assert_eq!(s.token(SEARCH_SCOPE, 0), None);
         s.keep(CHAT_SCOPE, "t2".to_string(), None);
         assert_eq!(s.token(CHAT_SCOPE, i64::MAX), Some("t2"));
+        // The skype token the same way.
+        assert_eq!(s.skype(0, true), None);
+        s.keep_skype(Some(SecretString::new("sk".to_string())), Some(1_000_000));
+        assert_eq!(s.skype(1_000_000 - RENEW_BEFORE_MS - 1, true), Some("sk"));
+        assert_eq!(s.skype(1_000_000 - RENEW_BEFORE_MS, true), None);
+        assert_eq!(s.skype(1_000_000 - RENEW_BEFORE_MS, false), Some("sk"));
     }
 }
