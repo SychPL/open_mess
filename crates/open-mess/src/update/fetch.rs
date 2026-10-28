@@ -25,15 +25,14 @@ pub struct Source {
 }
 
 impl Source {
-    #[allow(clippy::expect_used, reason = "a literal URL that is valid")]
-    pub fn github() -> Source {
-        Source {
-            latest: Url::parse("https://api.github.com/repos/SychPL/open_mess/releases/latest").expect("literal URL"),
+    pub fn github() -> Result<Source, url::ParseError> {
+        Ok(Source {
+            latest: Url::parse("https://api.github.com/repos/SychPL/open_mess/releases/latest")?,
             allowed_hosts: ["api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]
                 .map(String::from)
                 .to_vec(),
             https_only: true,
-        }
+        })
     }
 
     fn allows(&self, url: &Url) -> bool {
@@ -63,7 +62,16 @@ const MAX_MANIFEST: usize = 64 * 1024;
 const MAX_API: usize = 1024 * 1024;
 const MAX_ASSETS: usize = 200;
 const MAX_REDIRECTS: usize = 5;
+/// Connecting, and a whole small request: the release answer, the manifest, its signature (spec 5).
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// A file of the release gets [`TIMEOUT`] and a second for every 256 KiB it declares, at most this.
+const MAX_ASSET_TIME: Duration = Duration::from_secs(30 * 60);
+
+/// How long the download of a file of `size` bytes may take in all: a server that sends a byte now
+/// and then never ends it otherwise.
+fn asset_deadline(size: u64) -> Duration {
+    TIMEOUT.saturating_add(Duration::from_secs(size / (256 * 1024))).min(MAX_ASSET_TIME)
+}
 
 fn network(err: reqwest::Error) -> UpdateError {
     if err.is_redirect() { UpdateError::Rejected(format!("redirect refused: {err}")) } else { UpdateError::Network(err.to_string()) }
@@ -96,8 +104,9 @@ pub fn client(source: &Source) -> Result<reqwest::Client, UpdateError> {
     builder.build().map_err(network)
 }
 
-async fn get(client: &reqwest::Client, url: &Url) -> Result<reqwest::Response, UpdateError> {
-    let response = client.get(url.clone()).send().await.map_err(network)?;
+/// `url`, the answer read to its end within `timeout`.
+async fn get(client: &reqwest::Client, url: &Url, timeout: Duration) -> Result<reqwest::Response, UpdateError> {
+    let response = client.get(url.clone()).timeout(timeout).send().await.map_err(network)?;
     if !response.status().is_success() {
         return Err(UpdateError::Network(format!("HTTP {}", response.status())));
     }
@@ -135,7 +144,8 @@ struct AssetJson {
 
 /// The latest published release, if it is newer than `current`.
 pub async fn latest(client: &reqwest::Client, source: &Source, current: Version) -> Result<Option<Candidate>, UpdateError> {
-    let response = client.get(source.latest.clone()).header("Accept", "application/vnd.github+json").send().await.map_err(network)?;
+    let response =
+        client.get(source.latest.clone()).header("Accept", "application/vnd.github+json").timeout(TIMEOUT).send().await.map_err(network)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None); // no release yet
     }
@@ -207,15 +217,15 @@ fn holds_backup(dir: &Path) -> std::io::Result<bool> {
 
 async fn download_into(client: &reqwest::Client, candidate: &Candidate, public_key: &str, dir: &Path) -> Result<Downloaded, UpdateError> {
     std::fs::create_dir_all(dir)?;
-    let manifest_bytes = read_capped(get(client, asset_url(candidate, "manifest.json")?).await?, MAX_MANIFEST).await?;
-    let signature = read_capped(get(client, asset_url(candidate, "manifest.json.minisig")?).await?, MAX_MANIFEST).await?;
+    let manifest_bytes = read_capped(get(client, asset_url(candidate, "manifest.json")?, TIMEOUT).await?, MAX_MANIFEST).await?;
+    let signature = read_capped(get(client, asset_url(candidate, "manifest.json.minisig")?, TIMEOUT).await?, MAX_MANIFEST).await?;
     let signature = String::from_utf8(signature).map_err(|_| UpdateError::Rejected("signature is not text".into()))?;
     let manifest = verify(&manifest_bytes, &signature, public_key)?;
     if Version::parse(&manifest.version)? != candidate.version {
         return Err(UpdateError::Rejected(format!("manifest is for {}, the release tag for {}", manifest.version, candidate.version)));
     }
     for file in &manifest.files {
-        let mut response = get(client, asset_url(candidate, &file.name)?).await?;
+        let mut response = get(client, asset_url(candidate, &file.name)?, asset_deadline(file.size)).await?;
         let part = dir.join(format!("{}.part", file.name));
         let mut out = std::fs::File::create(&part)?;
         let (mut hasher, mut size) = (Sha256::new(), 0u64);
@@ -238,4 +248,16 @@ async fn download_into(client: &reqwest::Client, candidate: &Candidate, public_k
     std::fs::write(dir.join("manifest.json"), &manifest_bytes)?;
     std::fs::write(dir.join("manifest.json.minisig"), signature)?;
     Ok(Downloaded { version: candidate.version, manifest_sha256: manifest_sha256(&manifest_bytes), dir: dir.to_path_buf() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_gets_a_second_per_256_kib_and_at_most_30_minutes() {
+        assert_eq!(asset_deadline(0), Duration::from_secs(30));
+        assert_eq!(asset_deadline(20 * 1024 * 1024), Duration::from_secs(30 + 80));
+        assert_eq!(asset_deadline(u64::MAX), Duration::from_secs(30 * 60));
+    }
 }

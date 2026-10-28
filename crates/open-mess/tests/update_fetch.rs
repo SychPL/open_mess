@@ -259,3 +259,52 @@ async fn asset_not_in_manifest_is_not_downloaded() {
     assert!(!log.lock().expect("log").contains(&"extra.wasm".to_string()));
     assert!(!done.dir.join("extra.wasm").exists());
 }
+
+/// A server that answers one byte every 20 s: never quiet long enough for the read timeout, and
+/// never done.
+async fn drip() -> Source {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let body = r#"{"tag_name":"v9.9.9","draft":false,"prerelease":false,"assets":[]}"#;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len());
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                for byte in body.bytes() {
+                    if stream.write_all(&[byte]).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                }
+            });
+        }
+    });
+    Source { latest: format!("http://{addr}/latest").parse().expect("url"), allowed_hosts: vec!["127.0.0.1".into()], https_only: false }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dripping_answer_is_given_up_after_30_seconds() {
+    use std::time::Duration;
+    let source = drip().await;
+    let client = client(&source).expect("client");
+    let started = tokio::time::Instant::now();
+    let check = tokio::spawn(async move { latest(&client, &source, current()).await });
+    // The clock moves only here, a second at a time, with real time in between for the loopback:
+    // spinning on yield_now keeps the paused clock still.
+    while !check.is_finished() {
+        assert!(started.elapsed() <= Duration::from_secs(31), "still waiting after {:?}", started.elapsed());
+        let real = std::time::Instant::now();
+        while real.elapsed() < Duration::from_millis(20) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    let result = check.await.expect("task");
+    assert!(matches!(result, Err(UpdateError::Network(_))), "{result:?}");
+}

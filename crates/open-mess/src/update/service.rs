@@ -32,11 +32,15 @@ const FIRST_CHECK: Duration = Duration::from_secs(5 * 60);
 const EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often an installation on its own looks again for a quiet moment.
 const QUIET_RETRY: Duration = Duration::from_secs(60);
+/// A whole check, downloads included. Each request has a limit of its own (fetch.rs); this one
+/// makes sure the service never waits for ever.
+const CHECK_LIMIT: Duration = Duration::from_secs(60 * 60);
 /// `last-update.txt` holds one line; what is longer is not read.
 const MAX_RESULT: u64 = 4096;
 
-/// Shows that a release is ready (a toast on Windows); its button calls [`UpdateService::install`].
-pub type Announce = Arc<dyn Fn(&UpdateService, &Version) + Send + Sync>;
+/// Shows that a release is ready (a toast on Windows), with its manifest SHA-256; its button calls
+/// [`UpdateService::install_announced`].
+pub type Announce = Arc<dyn Fn(&UpdateService, &Version, &str) + Send + Sync>;
 
 /// What the service works with.
 pub struct Setup {
@@ -195,7 +199,18 @@ impl UpdateService {
     /// the background (spec 6, 7.1). Refused, with the reason, when this daemon cannot install,
     /// while a new version is checked, and when nothing is ready.
     pub fn install(&self) -> Result<(), String> {
-        self.start_install(false)
+        self.start_install(false, None)
+    }
+
+    /// "Zainstaluj" in the toast that announced the release with `manifest_sha256`: the user agreed
+    /// to that release only, so it is refused when another one is ready now (spec 6).
+    pub fn install_announced(&self, manifest_sha256: &str) -> Result<(), String> {
+        self.start_install(false, Some(manifest_sha256))
+    }
+
+    /// Whether an installation stops the daemon now (phase A, B or the helper's launch).
+    pub fn installing(&self) -> bool {
+        matches!(self.shared().state, UpdateState::Phase(_))
     }
 
     /// "Anuluj": ends phase A or B; the daemon goes back to work. The helper's launch is not
@@ -302,7 +317,9 @@ impl UpdateService {
             shared.state = UpdateState::Checking;
             shared.ready.clone()
         };
-        let result = self.fetch(earlier.as_ref()).await;
+        let result = tokio::time::timeout(CHECK_LIMIT, self.fetch(earlier.as_ref()))
+            .await
+            .unwrap_or_else(|_| Err(text(UpdateError::Network("the check did not end within an hour".into()))));
         let mut shared = self.shared();
         match result {
             Ok(Some(ready)) => (shared.state, shared.ready) = (UpdateState::Ready, Some(ready)),
@@ -348,7 +365,7 @@ impl UpdateService {
             shared.announced = Some(ready.downloaded.manifest_sha256.clone());
             ready
         };
-        (self.0.setup.announce)(self, &ready.downloaded.version);
+        (self.0.setup.announce)(self, &ready.downloaded.version, &ready.downloaded.manifest_sha256);
     }
 
     /// Whether an installation on its own waits for a quiet moment: the option is on, and a release
@@ -378,10 +395,11 @@ impl UpdateService {
                 && activity.triggers.open_batches.load(Ordering::SeqCst) == 0
                 && activity.triggers.delivering.load(Ordering::SeqCst) == 0
         };
-        self.auto_install_due() && quiet() && self.start_install(true).is_ok()
+        self.auto_install_due() && quiet() && self.start_install(true, None).is_ok()
     }
 
-    fn start_install(&self, auto: bool) -> Result<(), String> {
+    /// Installs the release that is ready; with `announced`, only if it is that one.
+    fn start_install(&self, auto: bool, announced: Option<&str>) -> Result<(), String> {
         let setup = &self.0.setup;
         setup.installable.clone()?;
         self.not_held()?;
@@ -394,6 +412,9 @@ impl UpdateService {
                 (UpdateState::Checking | UpdateState::Downloading, _) => return Err("trwa sprawdzanie aktualizacji, spróbuj za chwilę".into()),
                 _ => return Err("nie ma pobranej wersji do zainstalowania".into()),
             };
+            if announced.is_some_and(|announced| announced != ready.downloaded.manifest_sha256) {
+                return Err("gotowa jest inna wersja niż ta z powiadomienia".into());
+            }
             if auto {
                 shared.auto_started = Some(ready.downloaded.manifest_sha256.clone());
             }
@@ -426,7 +447,19 @@ impl UpdateService {
         if switch(&activity, &cancel).await.is_err() {
             return self.back_to_ready();
         }
-        self.set_state(UpdateState::Phase(Phase::Launching));
+        // Under the lock a cancel takes: one that came after phase B looked is not lost.
+        let launching = {
+            let mut shared = self.shared();
+            let go = !*cancel.borrow();
+            if go {
+                shared.state = UpdateState::Phase(Phase::Launching);
+            }
+            go
+        };
+        if !launching {
+            resume(&activity).await;
+            return self.back_to_ready();
+        }
         let active = setup.accounts.modules().list().into_iter().filter(|info| info.state == ModuleState::Active).map(|info| info.name).collect();
         // The consent's 10 minutes start now, not at the click (spec 6).
         let launched = consent::mark_launched(setup.accounts.store().conn(), &downloaded.version.to_string(), &downloaded.manifest_sha256, now_ms());

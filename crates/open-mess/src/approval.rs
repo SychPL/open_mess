@@ -264,16 +264,16 @@ pub fn start(_runtime: &Runtime, _pending: Arc<Pending>, _window: Opener) {}
 /// "open_mess <wersja> jest gotowy" with Zainstaluj and Później (spec 2026-10-27-self-update, 6);
 /// Zainstaluj is the user's consent, as in the window.
 #[cfg(windows)]
-pub fn update_ready(service: &UpdateService, version: &Version) {
-    let (service, version) = (service.clone(), version.to_string());
+pub fn update_ready(service: &UpdateService, version: &Version, manifest_sha256: &str) {
+    let (service, version, manifest_sha256) = (service.clone(), version.to_string(), manifest_sha256.to_owned());
     // Showing waits for Windows: not on the runtime. ponytail: without the thread no toast shows; the
     // window still offers the release.
-    let _ = std::thread::Builder::new().name("open-mess-update-toast".into()).spawn(move || toast::update(service, &version));
+    let _ = std::thread::Builder::new().name("open-mess-update-toast".into()).spawn(move || toast::update(service, &version, manifest_sha256));
 }
 
 /// No notifications here; there is no installation either.
 #[cfg(not(windows))]
-pub fn update_ready(_service: &UpdateService, _version: &Version) {}
+pub fn update_ready(_service: &UpdateService, _version: &Version, _manifest_sha256: &str) {}
 
 #[cfg(windows)]
 mod toast {
@@ -301,8 +301,9 @@ mod toast {
         Ok(())
     }
 
-    /// Shows that `version` is ready, in place of an earlier notice of a release.
-    pub(super) fn update(service: UpdateService, version: &str) {
+    /// Shows that `version` is ready, in place of an earlier notice of a release. Zainstaluj installs
+    /// that release, the one with `manifest_sha256`, and nothing else.
+    pub(super) fn update(service: UpdateService, version: &str, manifest_sha256: String) {
         let _ = ToastNotificationManager::History().and_then(|history| history.ClearWithId(&HSTRING::from(UPDATE_APP_ID)));
         let toast = Toast::new(UPDATE_APP_ID)
             .title(&format!("open_mess {version} jest gotowy"))
@@ -311,8 +312,8 @@ mod toast {
             .on_activated(move |argument| {
                 if argument.as_deref() == Some("install") {
                     // ponytail: a refusal (a check or an installation running, a new version being
-                    // checked) is shown by the window only.
-                    let _ = service.install();
+                    // checked, another release ready by now) is shown by the window only.
+                    let _ = service.install_announced(&manifest_sha256);
                 }
                 Ok(())
             });

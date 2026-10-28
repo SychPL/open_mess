@@ -220,13 +220,14 @@ fn start(
     runtime.spawn(Arc::clone(&pending).sweep());
     approval::start(&runtime, Arc::clone(&pending), window.clone());
     let exit = Arc::new(Notify::new());
-    let update = update.map(|(paths, launcher)| {
+    // The built-in URL always parses; were it not to, there would be no updates, never no daemon.
+    let update = update.zip(Source::github().ok()).map(|((paths, launcher), source)| {
         // Inside the runtime: the service spawns its checks there.
         let _entered = runtime.enter();
         UpdateService::spawn(Setup {
             installable: service::installable_here(&paths),
             paths,
-            source: Source::github(),
+            source,
             public_key: RELEASE_KEY.to_owned(),
             accounts: Arc::clone(&accounts),
             activity: Activity {

@@ -21,6 +21,7 @@ use open_mess::store::Store;
 use open_mess::tools::ToolError;
 use open_mess::triggers::spawn::Runs;
 use open_mess::triggers::{self, Counters};
+use open_mess::ui::{UiState, commands};
 use open_mess::update::UpdateError;
 use open_mess::update::consent;
 use open_mess::update::fetch::Source;
@@ -115,8 +116,8 @@ struct Harness {
     helper: Arc<Helper>,
     triggers: Arc<triggers::Activity>,
     exit: Arc<Notify>,
-    /// The versions announced in a toast.
-    toasts: Arc<Mutex<Vec<String>>>,
+    /// The releases announced in a toast: version and manifest SHA-256.
+    toasts: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 async fn harness(installable: Result<(), String>, helper_starts: bool) -> Harness {
@@ -129,7 +130,9 @@ async fn harness(installable: Result<(), String>, helper_starts: bool) -> Harnes
     let (exit, toasts) = (Arc::new(Notify::new()), Arc::new(Mutex::new(Vec::new())));
     let announce: Announce = {
         let toasts = Arc::clone(&toasts);
-        Arc::new(move |_: &UpdateService, version: &open_mess::update::release::Version| toasts.lock().unwrap().push(version.to_string()))
+        Arc::new(move |_: &UpdateService, version: &open_mess::update::release::Version, manifest_sha256: &str| {
+            toasts.lock().unwrap().push((version.to_string(), manifest_sha256.to_owned()));
+        })
     };
     let service = UpdateService::spawn(Setup {
         paths: paths.clone(),
@@ -170,7 +173,30 @@ impl Harness {
     }
 
     fn toasts(&self) -> Vec<String> {
-        self.toasts.lock().unwrap().clone()
+        self.toasts.lock().unwrap().iter().map(|(version, _)| version.clone()).collect()
+    }
+
+    /// The window, over this daemon and its update service.
+    fn ui(&self) -> UiState {
+        let pending = Arc::clone(self.d.registry.pending().unwrap());
+        UiState {
+            accounts: Arc::clone(&self.d.accounts),
+            probation: pending.probation().clone(),
+            pending,
+            started: std::time::Instant::now(),
+            port: 7341,
+            token: "t0ken".into(),
+            sign_ins: self.d.sign_ins.clone(),
+            counters: self.d.registry.trigger_counters().clone(),
+            sessions: self.d.registry.channel_sessions().clone(),
+            gate: self.d.registry.gate().clone(),
+            activity: Arc::clone(&self.triggers),
+            runs: Runs::new(self.d.dir.path().join("runs"), Duration::from_secs(60 * 60), Counters::default()),
+            host_events: mpsc::channel(1).0,
+            ui_ready: Arc::default(),
+            exit: Arc::clone(&self.exit),
+            update: Some(self.service.clone()),
+        }
     }
 
     /// Asks for a check and waits for its end.
@@ -446,4 +472,41 @@ async fn no_tool_or_cli_command_writes_consent() {
     for word in ["update", "install", "consent"] {
         assert!(!help.to_lowercase().contains(word), "om --help offers {word}: {help}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_toast_installs_only_the_release_it_announced() {
+    let h = harness(Ok(()), true).await;
+    h.triggers.open_batches.store(1, Ordering::SeqCst);
+    h.check().await;
+    let announced = h.toasts.lock().unwrap()[0].1.clone();
+    assert_eq!(announced, h.release.manifest_sha256);
+    // A toast left in Action Center for an earlier release: what is ready now is another one.
+    assert!(h.service.install_announced("the manifest of an earlier release").is_err());
+    assert!(h.consents().is_empty());
+    assert_eq!(h.service.view().state, UpdateState::Ready);
+    h.service.install_announced(&announced).unwrap();
+    assert_eq!(h.consents(), [("9.9.9".to_string(), announced, false)]);
+    assert_eq!(h.service.view().state, UpdateState::Phase(Phase::A));
+}
+
+/// A module loaded while the phases run is not among those phase A paused: it would go on polling
+/// through phase B and the launch (spec 7.1).
+#[tokio::test(start_paused = true)]
+async fn modules_are_not_changed_while_an_installation_stops_the_daemon() {
+    let h = harness(Ok(()), true).await;
+    h.triggers.open_batches.store(1, Ordering::SeqCst);
+    h.check().await;
+    let ui = h.ui();
+    h.service.install().unwrap();
+    assert_eq!(h.service.view().state, UpdateState::Phase(Phase::A));
+    let refused = Err(commands::UPDATE_IN_PROGRESS.to_string());
+    assert_eq!(commands::rescan_modules(&ui).await, refused);
+    assert_eq!(commands::set_module_enabled(&ui, "test-echo", true).await, refused);
+    assert_eq!(commands::approve_module(&ui, "test-echo", "file", "manifest").await, refused);
+
+    h.service.cancel();
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(h.service.view().state, UpdateState::Ready);
+    commands::rescan_modules(&ui).await.unwrap();
 }

@@ -36,6 +36,13 @@ fn changes_allowed(state: &UiState) -> Result<(), String> {
     if state.probation.get() { Err(UPDATE_IN_PROGRESS.into()) } else { Ok(()) }
 }
 
+/// Refuses a change to the modules also while an installation stops the daemon: a module loaded
+/// then is not among those phase A paused (spec 2026-10-27-self-update, 7.1).
+fn module_changes_allowed(state: &UiState) -> Result<(), String> {
+    changes_allowed(state)?;
+    if state.update.as_ref().is_some_and(UpdateService::installing) { Err(UPDATE_IN_PROGRESS.into()) } else { Ok(()) }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StatusDto {
     pub version: &'static str,
@@ -284,7 +291,7 @@ fn list_changes(changes: &mut Vec<String>, what: &str, new: &Value, old: &Value)
 /// file it replaced is deleted, so that the module has one file (spec 2026-10-27-self-update, 7.4);
 /// a file added by hand deletes nothing.
 pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, manifest_sha256: &str) -> Result<(), String> {
-    changes_allowed(state)?;
+    module_changes_allowed(state)?;
     let list = state.accounts.modules().list();
     let shown = list.iter().find(|info| info.name == name && info.file_sha256 == file_sha256 && info.manifest_sha256 == manifest_sha256);
     let Some((file, Some(manifest))) = shown.map(|info| (info.file.clone(), info.manifest.clone())) else {
@@ -336,7 +343,7 @@ fn placed_beside(file: &str) -> bool {
 
 /// Turns a module on or off, at once; turning it on also restarts it after repeated crashes.
 pub async fn set_module_enabled(state: &UiState, name: &str, enabled: bool) -> Result<(), String> {
-    changes_allowed(state)?;
+    module_changes_allowed(state)?;
     if !state.accounts.modules().list().iter().any(|info| info.name == name && info.manifest.is_some()) {
         return Err(format!("nie ma modułu {name}"));
     }
@@ -346,7 +353,7 @@ pub async fn set_module_enabled(state: &UiState, name: &str, enabled: bool) -> R
 
 /// Reads the modules folder again (spec 8.3).
 pub async fn rescan_modules(state: &UiState) -> Result<(), String> {
-    changes_allowed(state)?;
+    module_changes_allowed(state)?;
     rescan(state, None).await
 }
 
