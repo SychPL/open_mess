@@ -121,10 +121,11 @@ Write-Host "scheduled task '$taskName' starts the daemon at logon and every 5 mi
 
 # The update helper task (same shape as the one the daemon registers itself, update/system.rs): runs
 # om.update.exe apply-update at logon and every 5 minutes; with nothing to install it exits at once.
-# No RestartCount: the 5-minute trigger is the retry.
+# No RestartCount: the 5-minute trigger is the retry. A trailing backslash on the data folder would
+# escape the closing quote, so it goes.
 $updateTask = 'open_mess-update'
 $updateAction = New-ScheduledTaskAction -Execute 'conhost.exe' `
-    -Argument "--headless `"$helper`" apply-update --data-dir `"$dataDir`"" -WorkingDirectory $bin
+    -Argument "--headless `"$helper`" apply-update --data-dir `"$($dataDir.TrimEnd('\'))`"" -WorkingDirectory $bin
 $updateSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName $updateTask -Action $updateAction -Trigger $trigger -Settings $updateSettings -Principal $principal `

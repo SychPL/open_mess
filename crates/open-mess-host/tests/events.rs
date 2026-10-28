@@ -219,7 +219,8 @@ async fn resume_delivers_queued_events() {
 async fn pause_waits_for_a_running_event_handler() {
     let module = echo().await;
     module.call("a", "timer-at", r#"{"id":8}"#).await.unwrap();
-    // The handler for timer 8 is busy for 400 ms; pausing must not answer before it is done.
+    // The handler for timer 8 is busy for 1 s, under the tests' 2 s call limit; pausing must not
+    // answer before it is done.
     assert!(wait_for_log("timer 8").await, "{}", logs());
     assert!(!logs().contains("timer 8 done"), "{}", logs());
     module.pause_events().await.unwrap();
