@@ -7,7 +7,8 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub const SAMPLE_RATE: u32 = 16_000;
-const HEADER: u64 = 44;
+/// The header's size; a shorter file holds no samples.
+pub const HEADER: u64 = 44;
 /// Six hours of one track: the longest recording (4.2), and the most the reader takes.
 pub const MAX_DATA: u64 = 6 * 60 * 60 * SAMPLE_RATE as u64 * 2;
 

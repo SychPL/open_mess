@@ -263,20 +263,22 @@ impl Recordings {
         failures
     }
 
-    /// Never leaves the recording in `recording`: a track that cannot be fixed (shorter than its
-    /// header: the daemon stopped as it was created) holds no audio and is deleted, and a
-    /// recording with no track left is `failed`.
+    /// A track shorter than its header (the daemon stopped as it was created) holds no audio and
+    /// is deleted, and a recording with no track left is `failed`. Any other error (a file another
+    /// program holds) deletes nothing: the recording stays as it is and the next start tries again.
     fn recover_recording(&self, id: &str, path: &Path, meta: Meta) -> io::Result<()> {
         let mut end_ms = meta.start_ms;
         let mut tracks = 0;
         for track in TRACKS {
             let file = path.join(track);
             // The last write, read before the fix writes the header: the retention counts from it.
-            let Ok(modified) = fs::metadata(&file).and_then(|meta| meta.modified()) else { continue };
-            end_ms = end_ms.max(millis(modified));
-            match wav::fix_header(&file) {
-                Ok(()) => tracks += 1,
-                Err(_) => fs::remove_file(&file)?,
+            let Ok(found) = fs::metadata(&file) else { continue };
+            end_ms = end_ms.max(found.modified().map(millis).unwrap_or(0));
+            if found.len() < wav::HEADER {
+                fs::remove_file(&file)?;
+            } else {
+                wav::fix_header(&file)?;
+                tracks += 1;
             }
         }
         let state = if tracks == 0 { State::Failed } else { State::Waiting };
@@ -453,6 +455,29 @@ mod tests {
         let meta = recordings.meta(&empty).unwrap();
         assert_eq!((meta.state, meta.reason), (State::Failed, Some(Reason::Interrupted)));
         assert!(!recordings.has_audio(&empty));
+    }
+
+    #[test]
+    fn a_track_that_cannot_be_fixed_now_is_kept_for_the_next_start() {
+        let (_dir, recordings) = recordings();
+        let id = recordings.create(0).unwrap();
+        let file = recordings.path(&id).unwrap().join("others.wav");
+        let mut writer = wav::Writer::create(&file).unwrap();
+        writer.write(&[1, 2]).unwrap();
+        drop(writer);
+        // Not writable now, as when another program holds it.
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file, permissions.clone()).unwrap();
+        assert_eq!(recordings.recover().len(), 1);
+        assert!(file.exists());
+        assert_eq!(recordings.meta(&id).unwrap().state, State::Recording);
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&file, permissions).unwrap();
+        assert!(recordings.recover().is_empty());
+        assert_eq!(recordings.meta(&id).unwrap().state, State::Waiting);
+        assert!(recordings.has_audio(&id));
     }
 
     #[test]
