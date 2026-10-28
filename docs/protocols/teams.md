@@ -1,6 +1,6 @@
 # Microsoft Teams client protocol
 
-Status: sections 1-8 come from static analysis (2026-10-26): no account was signed in for them, no
+Status: sections 1-8 (2026-10-26) and 9 (2026-10-27) come from static analysis: no account was signed in for them, no
 request was sent to a Microsoft service, and nothing from the official client's user data
 (`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\`) or any browser profile was read. Facts later
 checked on the wire, with the user present, are in "Live results" at the end and override the
@@ -384,6 +384,130 @@ All **CONFIRMED** in `cmd-trouter-3959f9e7ca693a2a.js` (REA `ev_825293a6...`, cl
   `x-ms-continuation`. Exact values the services validate (client version format, client type) are
   **UNCONFIRMED**.
 
+## 9. Meetings and transcripts (stage 2)
+
+Added 2026-10-27 for `.specs/2026-10-28-meetings-transcripts.md`. Same package and decompressed
+copy as above. The REA MCP server did not start in that session (connection timeout), so REA ran
+through its CLI (`rea analyze-javascript-application`, rea-agents 6.4.0, the same analyzer): Evidence
+`ev_85abb977...` over `services-MeetingRecapSwaservice-d88c1b10...`,
+`services-meeting-recap-working-set-files-5f7539a1...`, `r_data-resolvers-meeting-intelligence-7c644bf1...`,
+`services-sharepoint-share-f3f02827...`, `services-meeting-recap-21224203...` and
+`services-meeting-artifacts-bb416b88...`. Literals in the shared worker
+(`precompiled-shared-worker-6249620d...`, 18 MB, too large for the analyzer, see above) and in the
+calendar chunks were found with ripgrep and read in place. Checks on the wire are in "Live results",
+item 9.
+
+### 9.1 Calendar
+
+- **CONFIRMED** the calendar app reads through the middle tier (`regionGtms.middleTier`,
+  `services-io-calendar` with the constants in `async-apps-calendar`): V1
+  `beta/me/calendarEvents?StartDate=<iso>&EndDate=<iso>`, V2
+  `v2.0/me/calendars/default/calendarView?StartDate=<iso>&EndDate=<iso>&shouldDecryptData=<bool>` and a
+  paged V2.1 `v2.1/me/calendars/calendarView?startDate=&endDate=&$top=&$count=true&$skip=&$orderby=`.
+  `config-prod` sets `enableCalendarV2ApiServiceEnterprise: true` and `enableCalendarV2ApiService:
+  false`. Auth is the middle-tier token (`mtResource` `https://api.spaces.skype.com`) plus
+  `x-skypetoken` (`requireSkypetokenForMT: true`), with `x-ms-client-type` and
+  `x-ms-client-version` (`<platformId>/<buildVersion>`).
+- **CONFIRMED** other calendar paths in the same constants: Outlook REST `/v2.0/me/calendarview`
+  (`outlookRequestHandler`, desktop calendar sync, audience from `autodiscoverSettings`) and Graph
+  `/v1.0/me/calendarView` behind `enableMsGraphForDesktopCalendarSync` (absent from `config-prod`). The
+  meeting recap code reads Graph events by iCalendar id: `/v1.0/me/events?$filter=iCalUId+eq+'<ID>'`
+  and `/v1.0/me/events/<id>/instances?startDateTime=&endDateTime=&$select=iCalUId,start,end`
+  (`r_data-resolvers-meeting-intelligence`, builders `k`, `re`).
+- **CONFIRMED** the meeting chat is the thread `19:meeting_<...>@thread.v2`; it is URL-encoded in the
+  join link `https://teams.microsoft.com/l/meetup-join/<thread>/0?context=...`. Middle-tier events
+  carry the link as `skypeTeamsMeetingUrl` and the meeting data as `skypeTeamsData` /
+  `skypeTeamsDataObject` (live, item 9).
+- A recurring meeting has one chat thread for all its occurrences; artifacts tell occurrences apart
+  by `iCalUid` / `instanceICalUid`, `callId` and start and end times (9.3).
+
+### 9.2 Where transcripts live
+
+- **CONFIRMED** artifact types (`MeetingArtifactType` in the shared worker's GraphQL schema):
+  `Transcript`, `TranscriptV2`, `Recording`, `Notes`, `MeetingRecap`, `RecapCrux`, `CallCrux`,
+  `AttendanceReport`, `MeetingChat` and others. `TranscriptV2` is a transcript stored in OneDrive or
+  SharePoint (ODSP) next to the meeting's recording (the recap code names it `ODSPTranscript`);
+  `Transcript` is the older kind kept by the Meeting Artifacts service (9.6).
+- **CONFIRMED** the meeting chat announces both: `RichText/Media_CallRecording` (an `URIObject` XML
+  document; the client reads `RecordingStatus` `status`/`code`, `ExportResult` `type`, `Id` with
+  `type="callId"`, `item` with `type="onedriveForBusinessVideo"` and `RecordingContent`
+  `contentTypes`) and `RichText/Media_CallTranscript` (the client reads its `callId`). The recap
+  merges four sources: MCPS (9.3), the Substrate working set (9.4), these chat messages and the older
+  service (9.6).
+
+### 9.3 A meeting's artifacts: MCPS
+
+- **CONFIRMED** (`services-io-collab-object` in the shared worker, model `listContents`, URL builder
+  `Bmr`): `GET <mcps>/contents?threadId=<thread>` with optional `&isSeriesMeeting=`, `&iCalUid=`,
+  `&organizerId=`, `&recapCallId=`, `&messageId=`, `&includeTypes=`, `&includePermissionStatus=true`.
+  The base is `regionGtms.mcpService` plus the path `contents` (`regionalMCPSEndpointPath`); a base
+  containing `artifacts` is rewritten to `mcps`. A list across meetings exists too
+  (`listArtifactsByUser`): `<mcps>/user/meetings/contents?top=&userUpn=&startDateTime=&endDateTime=&includeTypes=&skiptoken=&syncstate=`.
+- **CONFIRMED** token audience `cmdMeetingArtifactsServiceResource`
+  `6bc3b958-689b-49f5-9006-36d165f30e00` (an application id used as the resource, `_cmdMtAuthorize`);
+  headers `content-type: application/json;charset=UTF-8`, `x-ms-correlation-id` and, with
+  `enableMCPSTelemetryHeadersOverride`, `x-ms-caller-name`, `x-ringoverride`, `x-ms-meeting-type`,
+  `x-ms-user-meeting-role`.
+- **CONFIRMED** the response is a collection: `resources` of a union type whose `TranscriptV2`
+  member has `callId, organizerId, startTime, endTime, threadId, webUrl, driveId, driveItemId, iCalUid,
+  transcriptId` (GraphQL type `MeetingArtifactV2TranscriptV2`). Live shape: item 9.
+
+### 9.4 Recordings: Substrate working set
+
+- **CONFIRMED** (`services-meeting-recap-working-set-files`): `GET
+  https://substrate.office.com/api/beta/me/WorkingSetFiles?$filter=ItemProperties/Default/MeetingThreadId eq '<thread>'`
+  (or `MeetingICalUId` / `MeetingCallId`) `&$orderby=FileCreatedTime desc&$select=SharePointItem,Visualization,ItemProperties/Default/MeetingCallId,ItemProperties/Default/DriveId,ItemProperties/Default/RecordingStartDateTime,ItemProperties/Default/RecordingEndDateTime,ItemProperties/Default/TranscriptJson,ItemProperties/Default/DocumentLink`.
+  Headers `Prefer: substrate.flexibleschema,outlook.data-source="Substrate",exchange.behavior="SubstrateFiles"`,
+  `scenariotag: Teams_recap_recording`, `client-request-id`. Audience `https://substrate.office.com`
+  (`meetingWorkingSetFilesServiceResource`). Only items with `Visualization.Type == "Video"` are used;
+  `TranscriptJson` marks a recording with a transcript. It finds recordings, not standalone
+  transcripts.
+
+### 9.5 Downloading a transcript from ODSP
+
+- **CONFIRMED** list: `GET <site origin>/_api/v2.1/drives/<driveId>/items/<driveItemId>/media/transcripts`
+  (`fetchOdspVideoTranscript` uses `_api/v2.0`); items carry `id, displayName, cTag, languageTag,
+  transcriptType (subtitle|caption), isVisible, isAutoGenerated, isDefault, temporaryDownloadUrl,
+  source, createdDateTime, lastModifiedDateTime` (zod schema in `928576-*`; the recap transform reads
+  `media.transcripts[]` of the item).
+- **CONFIRMED** content: `GET .../media/transcripts/<id>/streamContent` returns WebVTT; `?is=1` adds
+  voice tags `<v Speaker>` (behind `isTextTrackVttVoiceTagEnabled`); `?format=json` returns the
+  player's structured transcript with `entries` and `events` (`pluginOT`); `applymediaedits=true`
+  applies recording trims. `temporaryDownloadUrl` is a pre-authorised URL the player uses for text
+  tracks. The recap's download menu offers `Vtt`, `Docx` and `Pdf` (`TranscriptDownloadFormat`).
+- **CONFIRMED** token audience: the site origin, from the first three URL segments
+  (`fetchAuthToken` / `M` in `services-MeetingRecapSwaservice`), e.g. `https://<tenant>-my.sharepoint.com`.
+  The origin comes from the artifact's `location` / `webUrl` (9.3).
+- **UNCONFIRMED** a download in the user's own organization (item 9: the only transcript found
+  belonged to another organization and was refused).
+
+### 9.6 Older transcripts: Meeting Artifacts service
+
+- **CONFIRMED** (`transcriptService` in the shared worker, URL builder `et`): base
+  `transcriptServiceEndpoint` `https://api.cortana.ai/MeetingArtifacts/API/v2`, audience
+  `transcriptServiceResource` `https://msai.meetingintelligence.ai`, auth source `CMDStable` (CAE in
+  `skypeTokenMigrationServiceInfo`). List
+  `me/organizer(<oid>)/thread(<thread>)/message(<msgId>)?artifacttypes=Transcript`; content
+  `.../call(<callId>)?artifacttypes=Transcript,CallEvents` (JSON `artifacts[].artifactEntries[].jsonContent`);
+  download `me/enrichment/organizer(<oid>)/thread(<thread>)/message(<msgId>)/call(<callId>)/artifacttype(Transcript)/format(<Vtt|Docx|Pdf>)?transcriptSource=Ai`
+  (file name in `Content-Disposition`). Headers `accept: json`, `x-ms-correlation-id`,
+  `x-ms-session-id`, optional `groupId`. Not checked on the wire.
+
+### 9.7 Graph online meetings
+
+- **CONFIRMED** the client never calls Graph `onlineMeetings`: the word occurs, in any letter case,
+  in none of the 7033 files of `desktop-assets`. Graph's meeting transcript API is not the client's
+  path.
+- **CONFIRMED LIVE** the Graph token WAM gives the Teams client id has no `OnlineMeeting*`,
+  `OnlineMeetingTranscript*` or `OnlineMeetingArtifact*` scope (item 9), so that API is closed to
+  open_mess anyway.
+
+### 9.8 Copilot recap
+
+MCPS also returns `AISummary` and `callCrux` resources, and the recap reads AI notes from
+`meetingRecapServiceEndpoint` and `.../api/mcps/prod/meetingcatchup/...`. These are Copilot outputs,
+not transcripts; not analysed further (stage 2 leaves summaries to the agent).
+
 ## Proposed spec changes
 
 Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
@@ -453,6 +577,15 @@ the user present (spec 9.5):
 11. AMS image download: header token vs cookie, and which view names exist for received images.
 12. Whether the public `teams.microsoft.com/v2` build differs from the packaged build analysed here
     (fetching the CDN bundle without signing in and diffing it with REA `compare_bundles` is enough).
+13. A transcript download in the user's own organization: `media/transcripts` with a WAM token for
+    the site origin, then `streamContent` (WebVTT, `?is=1`) - status, cue count, voice tags, never the
+    text (section 9.5). Needs a meeting of the user's own organization with a transcript.
+14. MCPS `contents` for a recurring meeting (which `iCalUid` it expects: series or occurrence) and for
+    a meeting without a transcript; the `paginationInfo` shape.
+15. The `RichText/Media_CallTranscript` content: it starts with `{` but did not parse as JSON
+    (perhaps HTML-escaped); its key names.
+16. Whether opening a transcript through `streamContent` counts as a view in the recording's
+    analytics, visible to its owner.
 
 ## Live results
 
@@ -560,6 +693,57 @@ token, tenant id, user id or account name.
    self-chat page itself: one page of 43 messages, 52 KB, about 300 ms, no `backwardLink`; the
    item 6 timeout is still to be reproduced through the daemon.
 
-All checks in items 1-4, 7 and 8 were read-only: no endpoint registration, no property write, no Trouter
-connection. Values printed during the checks were limited to status codes, key names, counts and
-service URLs.
+9. **Meetings and transcripts** (read-only, 2026-10-27, the owner at the computer and agreeing in
+   chat; a scratch WAM probe as in item 1, five runs, about 40 GET requests plus one authsvc POST per
+   run):
+   - WAM gave silent tokens with the Teams client id for: Graph (35 delegated scopes, among them
+     `Calendars.Read`, `Calendars.ReadWrite`, `Files.ReadWrite.All`, `Sites.ReadWrite.All`,
+     `Mail.ReadWrite`, `Mail.Send`; no `OnlineMeeting*` scope); `https://substrate.office.com` (17
+     scopes); the MCPS resource `6bc3b958-689b-49f5-9006-36d165f30e00` (`User.Read
+     user_impersonation`); the SharePoint site origin `<origin>/.default` (audience the SharePoint
+     application id `00000003-0000-0ff1-ce00-000000000000`, scopes `Container.Selected MyFiles.Write
+     Sites.FullControl.All Sites.Manage.All User.ReadWrite.All`; with `claims` asking for `CP1` the
+     token carries `xms_cc`); `https://msai.meetingintelligence.ai` (a token the probe could not decode
+     as a JWT). `<origin>/AllSites.Read` and the bare origin as a scope failed with `0xCAA20002`.
+   - authsvc `regionGtms` has `mcpService` (`https://teams.microsoft.com/api/mcps/<geo>`, a geography
+     like `eu`, not the chat region) and `cmdArtifactsService`; no calendar key.
+   - Middle tier `GET <middleTier>/v2.0/me/calendars/default/calendarView?StartDate=&EndDate=&shouldDecryptData=false`
+     with the `https://api.spaces.skype.com` token and `x-skypetoken`: HTTP 200, a JSON object with
+     `type` and `value`, 130 events for 30 days in one response (290 KB, no paging). Event keys:
+     `appointmentSequenceNumber, bodyPreview, categories, cleanGlobalObjectId, conflictingMeetings,
+     doNotForward, endTime, eventTimeZone, eventType, iCalUID, inviteAllMembers, isOnlineMeeting,
+     isResponseRequested, lastModifiedTime, location, myResponseType, objectId, onlineMeetingConfLink,
+     organizerName, schedulingServiceUpdateUrl, seriesMasterId, showAs, skypeTeamsData,
+     skypeTeamsDataObject, skypeTeamsMeetingUrl, startTime, subject, utcOffset`.
+   - Graph `GET /v1.0/me/calendarView` (30 days, `$top=100`, `$select`): HTTP 200 with
+     `@odata.nextLink`; `onlineMeeting` keys `conferenceId, joinUrl, tollNumber`; every one of 94
+     Teams meetings had the `19:meeting_...` thread in `joinUrl`. Not used by the spec (no new
+     audience needed for the middle tier).
+   - Meeting chats through the chat service (section 3): `RichText/Media_CallRecording` content is an
+     `URIObject` with `RecordingStatus[status,code]`, `ExportResult[type]`, `MeetingOrganizerId`,
+     `MeetingOrganizerTenantId`, `ICalUid`, `MeetingICalUid`, `RecordingStorage`, `Identifiers/Id[type,value]`
+     and `item[type,uri,driveId,driveItemId]`; `RichText/Media_CallTranscript` content (618 bytes)
+     starts with `{` but did not parse as JSON; its `properties` hold only `s2spartnername`. Of the
+     10 latest meeting chats one had transcript messages.
+   - MCPS `GET <mcpService>/contents?threadId=<thread>&iCalUid=<id>` with the MCPS token: HTTP 200,
+     top keys `changeKey, countOfFilteredContentsByChatHistory, deletedResources, invalidResources,
+     paginationInfo, resources`; resource types `AISummary`, `TranscriptV2`, `callCrux`, `notes`.
+     A resource has `addedBy, additionDateTime, id, location, mcoResourceId, metadata, subType, type`;
+     a `TranscriptV2`'s `metadata` has `appTitle, callId, containerId, correlationId, driveId,
+     driveItemId, endTime, fileId, fileTitle, fileType, iCalUid, instanceICalUid, isMultilingual,
+     meetingJoinUrl, messageId, organizerId, organizerTenantId, ownerId, ownerTenantId,
+     sharePointOnlineId, sharingLinkPermissionId, startTime, threadId, thumbnailUrl, transcriptId,
+     userId, webUrl`; its `location` origin is the owner's SharePoint.
+   - Substrate `WorkingSetFiles` by thread: HTTP 200, 0 items for that meeting.
+   - That transcript belonged to a meeting organized by another organization (`ownerTenantId` not
+     the user's; the owner confirmed). Its SharePoint refused every token of the user's own tenant:
+     HTTP 401 `unauthenticated` for the item and for `media/transcripts`, with and without `CP1`;
+     Graph `drives/<id>/items/<id>`: 404 `itemNotFound`; WAM for the owner's tenant authority:
+     provider error `0xCAA20003`. A download in the user's own organization is still to be captured
+     ("Needs live capture" 13).
+   - In the first run a tag-name filter of the probe printed part of a recording's file name to the
+     terminal; the filter was fixed and nothing of it was written to a file or this repository.
+
+All checks in items 1-4 and 7-9 were read-only: no endpoint registration, no property write, no Trouter
+connection. Apart from the slip noted in item 9, values printed during the checks were limited to
+status codes, key names, counts, enum values, scope names and service URLs.
