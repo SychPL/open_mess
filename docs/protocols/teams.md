@@ -1,6 +1,6 @@
 # Microsoft Teams client protocol
 
-Status: sections 1-8 (2026-10-26) and 9 (2026-10-27) come from static analysis: no account was signed in for them, no
+Status: sections 1-8 (2026-10-26), 9 (2026-10-27) and 10 (2026-10-28) come from static analysis: no account was signed in for them, no
 request was sent to a Microsoft service, and nothing from the official client's user data
 (`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\`) or any browser profile was read. Facts later
 checked on the wire, with the user present, are in "Live results" at the end and override the
@@ -511,7 +511,7 @@ not transcripts; not analysed further (stage 2 leaves summaries to the agent).
 
 ## 10. Live captions (stage 3 question)
 
-**Static analysis, not verified live.** Added 2026-10-29 to answer whether open_mess could receive
+**Static analysis, not verified live.** Added 2026-10-28 to answer whether open_mess could receive
 live captions by joining a meeting itself, as the user's second endpoint without audio or video
 (captions exist only for call participants and are never stored; reading them from the official
 client is ruled out by AGENTS.md). Same package and decompressed copy as above; ripgrep over the
@@ -544,7 +544,8 @@ to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the brow
 - **CONFIRMED** the service calls the client back: every callback link (`/conversation/addModalitySuccess/`,
   `/conversation/contentSharingUpdate/`, ...) is built on `baseMessagingChannelUrl`, the Trouter URL
   (section 5), with the broker as fallback. The local participant is `participants.from: {id, displayName,
-  endpointId, participantId, languageId}`. **UNCLEAR** whether a registrar registration is required too.
+  endpointId, participantId, languageId}`. **UNCONFIRMED** whether a registrar registration is required
+  too ("Needs live capture" 17).
 
 ### 10.2 Transport of the captions
 
@@ -568,7 +569,7 @@ to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the brow
   `textTracks[]` (`Mt` translation, `Cart`, `Cea708`, `RTT`), `events[]` and others. The UI's
   `ClosedCaptionsEntry` has `id, text, isFinal, userId, userDisplayName, utteranceId, roomId,
   spokenLanguage, trackLanguage, source, timestamp, duration, speakerType`.
-- **NOT FOUND** any other path: no captions handler in the Trouter client (`cmd-trouter`), no HTTP or
+- **CONFIRMED** the shipped code has no other path: no captions handler in the Trouter client (`cmd-trouter`), no HTTP or
   WebSocket subscription for ordinary meetings. Town hall and live-stream attendees poll encrypted
   caption chunks over HTTP instead (`services-broadcast-captions`, `{cacheUrl, originUrl, aesKey}` from
   the stream metadata) - not ordinary meetings.
@@ -586,7 +587,8 @@ to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the brow
   `datachannelDirection` Bidirectional while `audioDirection` is Inactive and `videoDirection` Disabled
   (IP audio/video off, screen-share-only joins), so captions can reach an endpoint that sends and
   receives no audio or video - but only over a negotiated media session (SDP, ICE, DTLS, SCTP).
-- **UNCLEAR** whether `noMediaTimeoutMs` / `NoMediaFlow` ends a call whose only media is the data channel.
+- **UNCONFIRMED** whether `noMediaTimeoutMs` / `NoMediaFlow` ends a call whose only media is the data
+  channel ("Needs live capture" 17).
 
 ### 10.4 Language, policy, speakers, side effects
 
@@ -600,14 +602,14 @@ to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the brow
 - **CONFIRMED** policy: the user's tenant policy `liveCaptionsEnabledType` from the synced user policy
   settings (`meetingPolicySettings`), region gating, and the meeting's
   `meetingDetails.meetingCapability.allowTranscription` from the call's meeting details; bot failures in
-  its `endpointMetadata.runtimeErrors`; "Due to policy, you can't copy captions". **NOT FOUND** a separate
-  organizer option for captions only.
+  its `endpointMetadata.runtimeErrors`; "Due to policy, you can't copy captions". **UNCONFIRMED** whether
+  the organizer has an option for captions alone; none was found.
 - **CONFIRMED** speakers: each result carries `userId` (an MRI; anonymous ones end in `@local`) and
   `displayName`, `roomId` for room devices; no media-source mapping through the roster is needed.
 - **CONFIRMED** CART is the same data-channel stream, a text track with `source: "Cart"`.
 - **CONFIRMED** turning captions on adds the bot when it is absent (the client filters `28:` bots out of
   participant lists); the only captions alert is a local "start failed". Transcription, unlike captions,
-  announces itself (`TranscriptStartedByOthers`) and is stored. **UNCLEAR** whether the service keeps
+  announces itself (`TranscriptStartedByOthers`) and is stored. **UNCONFIRMED** whether the service keeps
   anything of captions alone.
 
 ### 10.5 Visibility of a second endpoint
@@ -616,7 +618,7 @@ to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the brow
   `activeCallOnDifferentEndpointExists` drives "You're in {{title}} on another device. Want to join on
   this one?", "How would you like to join on this device?", "Transfer to this device" and "Add this
   device".
-- **UNCLEAR** what other participants see: the call model keeps a participant's endpoints as a list
+- **UNCONFIRMED** what other participants see ("Needs live capture" 18): the call model keeps a participant's endpoints as a list
   (`userEndpointCount` = `endpoints.endpointDetails.length`, GraphQL `...endpointDetailsFields`), which
   suggests one roster row with two endpoints; the roster rendering, join toast and sound were not checked.
 - **CONFIRMED** blocks on an extra endpoint: end-to-end encrypted meetings take one device
@@ -724,6 +726,12 @@ the user present (spec 9.5):
     analytics, visible to its owner. First reading on someone else's recording in "Live results" 12
     (no change right after the download); the next-day reading and the check on the user's own
     recording are still to be done.
+17. Live captions (section 10), only if stage 3 goes ahead and with the owner's consent and a test
+    meeting: a join with `audioDirection` Inactive, `videoDirection` Disabled and a data channel -
+    accepted, kept alive with no audio flowing (`noMediaTimeoutMs`), and needing a registrar
+    registration or only a Trouter URL.
+18. What other participants and the user's own client show for that second endpoint (roster rows,
+    join notice or sound, the "on another device" banner).
 
 ## Live results
 
