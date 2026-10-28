@@ -4,15 +4,21 @@
 //! run it before every commit.
 //! `cargo xtask hooks` points git at `.githooks/`, which sends every commit to the Codex and GLM reviewers.
 //! `cargo xtask release-keygen` creates the release signing key once; `cargo xtask release <x.y.z>`
-//! tags, builds, signs and publishes a release (spec 2026-10-27-self-update, section 4).
+//! tags, builds, signs and publishes a release (spec 2026-10-27-self-update, section 4), and
+//! `--pipeline` does the same from the GitHub Actions "Release" workflow (spec 2026-10-28-release-pipeline).
 
 // A developer tool: printing here may panic, it never takes the daemon down.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+/// The repository whose pull requests `release --pipeline` checks.
+const REPO: &str = "SychPL/open_mess";
 
 fn run(program: &str, args: &[&str]) -> bool {
     println!("> {program} {}", args.join(" "));
@@ -79,6 +85,59 @@ fn valid_version(text: &str) -> bool {
     parts.len() == 3 && parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// True when `new` is a higher `x.y.z` than `previous`, compared number by number (`0.10.0` is above `0.9.9`).
+fn version_above(previous: &str, new: &str) -> bool {
+    let parse = |text: &str| valid_version(text).then(|| text.split('.').map(str::parse::<u64>).collect::<Result<Vec<u64>, _>>().ok()).flatten();
+    match (parse(previous), parse(new)) {
+        (Some(previous), Some(new)) => new > previous,
+        _ => false,
+    }
+}
+
+/// `release <x.y.z> [--pipeline]`: the version and whether it is the pipeline mode. That mode only runs
+/// inside GitHub Actions, so it cannot skip the local review check by accident, and needs the key password
+/// in `OPEN_MESS_RELEASE_KEY_PASSWORD`, as there is no console to ask.
+fn release_args(args: &[String], github_actions: Option<&str>, has_password: bool) -> Result<(String, bool), String> {
+    let (version, pipeline) = match args {
+        [version] => (version, false),
+        [version, flag] if flag == "--pipeline" => (version, true),
+        _ => return Err("usage: cargo xtask release <x.y.z> [--pipeline]".into()),
+    };
+    if pipeline && github_actions != Some("true") {
+        return Err("--pipeline only runs in GitHub Actions".into());
+    }
+    if pipeline && !has_password {
+        return Err("--pipeline needs the key password in OPEN_MESS_RELEASE_KEY_PASSWORD".into());
+    }
+    Ok((version.clone(), pipeline))
+}
+
+/// The number of the pull request that brought `sha` onto main, read from `gh api
+/// repos/<repo>/commits/<sha>/pulls`: merged, into `main`, with `sha` as its merge commit (squash merging
+/// makes every commit on main one). `None` for anything else, broken JSON included.
+fn merged_through_pr(sha: &str, json: &str) -> Option<u64> {
+    let pulls: Vec<Value> = serde_json::from_str(json).ok()?;
+    pulls
+        .iter()
+        .find(|pull| {
+            pull.pointer("/base/ref").and_then(Value::as_str) == Some("main")
+                && pull.get("merged_at").is_some_and(Value::is_string)
+                && pull.get("merge_commit_sha").and_then(Value::as_str) == Some(sha)
+        })
+        .and_then(|pull| pull.get("number").and_then(Value::as_u64))
+}
+
+/// The public key installs trust: `keys/release.pub` of the previous release (`previous`, its text), which
+/// the versions users update from compiled in, or the working tree's (`tree`) for the first release. So the
+/// release that brings a new keys/release.pub is still signed with the old key, and the next with the new one.
+fn trusted_key(previous: Option<&str>, tree: &str) -> Result<minisign::PublicKey, String> {
+    let (text, source) = match previous {
+        Some(text) => (text, "keys/release.pub of the previous release"),
+        None => (tree, "keys/release.pub"),
+    };
+    minisign::PublicKey::from_box(text.to_string().into()).map_err(|e| format!("{source} is not a release key: {e}"))
+}
+
 /// The commits (full shas) that have no `<first 7 chars>.processed` file in `reviews_dir`.
 fn unprocessed_commits(shas: &[String], reviews_dir: &Path) -> Vec<String> {
     shas.iter().filter(|sha| !reviews_dir.join(format!("{}.processed", sha.get(..7).unwrap_or(sha))).exists()).cloned().collect()
@@ -130,30 +189,198 @@ fn set_workspace_version(toml: &str, version: &str) -> Option<String> {
 
 /// What the owner must run to undo or finish a release that failed after `stage`.
 /// `files` are the names in `target/release-dist`, listed one by one: `gh release` takes file paths,
-/// not patterns, and PowerShell does not expand a `*`.
-fn recovery(stage: Stage, tag: &str, files: &[String]) -> String {
+/// not patterns, and PowerShell does not expand a `*`. `run` is the GitHub Actions run of a `--pipeline`
+/// release: there the stages before the push print nothing (they left nothing on origin, and the runner
+/// with the local commit is gone), and the files come back from the run's artifact.
+fn recovery(stage: Stage, version: &str, files: &[String], run: Option<&str>) -> String {
+    let tag = format!("v{version}");
     match stage {
+        _ if run.is_some() && stage != Stage::Pushed => String::new(),
         Stage::Clean => String::new(),
         Stage::Edited => "git checkout HEAD -- Cargo.toml Cargo.lock".to_string(),
         Stage::Committed => format!("git tag -d {tag}\ngit reset --hard HEAD~1"),
         Stage::Pushed => {
             let list: String = files.iter().map(|name| format!(" target/release-dist/{name}")).collect();
+            // A push that reported an error may still have landed, or not.
+            let (not_pushed, download) = match run {
+                Some(run) => (
+                    "# it lists nothing: nothing reached origin; run the workflow again instead.\n".to_string(),
+                    format!(
+                        "# in a clone of the repository at {tag}, get the files of the release:\ngh run download {run} -n release-dist-{version} -D target/release-dist\n"
+                    ),
+                ),
+                None => (format!("# it lists nothing: push first:\ngit push --atomic origin main {tag}\n"), String::new()),
+            };
+            // A published release is never uploaded to: only a draft is invisible to installs.
             format!(
-                "# no release {tag} on GitHub yet:\ngh release create {tag} --title {tag} --notes \"\"{list}\n\
-                 # the release is there, with some files missing (a failed create can leave a draft):\n\
-                 gh release upload {tag}{list} --clobber\ngh release edit {tag} --draft=false"
+                "# check that the tag reached origin:\ngit ls-remote origin refs/tags/{tag}\n{not_pushed}\
+                 {download}# see what GitHub holds:\ngh release view {tag} --json isDraft,assets\n\
+                 # published, with every file of target/release-dist at its size: nothing to do.\n\
+                 # a draft: upload the files again, check them with `gh release view` as above, then publish:\n\
+                 gh release upload {tag}{list} --clobber\ngh release edit {tag} --draft=false\n\
+                 # no release: create the draft, check it the same way, then publish:\n\
+                 gh release create {tag} --verify-tag --draft --title {tag} --notes \"\"{list}\ngh release edit {tag} --draft=false"
             )
         }
     }
 }
 
 /// Signs a test message with `secret` and verifies it with `public`: a secret key that is not the
-/// pair of keys/release.pub fails here, before any commit or tag.
+/// pair of the trusted keys/release.pub fails here, before any commit or tag.
 fn check_key_pair(public: &minisign::PublicKey, secret: &minisign::SecretKey) -> Result<(), String> {
     const MESSAGE: &[u8] = b"open_mess release key check";
     let signature = minisign::sign(None, secret, MESSAGE, None, None).map_err(|e| format!("cannot sign with the secret key: {e}"))?;
     minisign::verify(public, &signature, std::io::Cursor::new(MESSAGE), true, false, false)
-        .map_err(|e| format!("the secret key is not the pair of keys/release.pub: {e}"))
+        .map_err(|e| format!("the secret key is not the pair of the trusted keys/release.pub: {e}"))
+}
+
+fn is_draft(release_view: &str) -> bool {
+    serde_json::from_str::<Value>(release_view).ok().and_then(|release| release.get("isDraft")?.as_bool()) == Some(true)
+}
+
+/// Checks `gh release view <tag> --json isDraft,assets` output: the release is a draft (or published, as
+/// `draft` says) and holds exactly the `expected` files (name, size on disk), all uploaded.
+fn check_release(release_view: &str, draft: bool, expected: &[(String, u64)]) -> Result<(), String> {
+    let release: Value = serde_json::from_str(release_view).map_err(|e| format!("unreadable `gh release view` output: {e}"))?;
+    if release.get("isDraft").and_then(Value::as_bool) != Some(draft) {
+        return Err(if draft { "the release is not a draft" } else { "the release is still a draft" }.into());
+    }
+    let assets = release.get("assets").and_then(Value::as_array).ok_or("`gh release view` lists no assets")?;
+    // An asset whose upload did not finish counts as a different file.
+    let found: Vec<(&str, Option<u64>)> = assets
+        .iter()
+        .map(|asset| {
+            let uploaded = asset.get("state").and_then(Value::as_str).is_none_or(|state| state == "uploaded");
+            (asset.get("name").and_then(Value::as_str).unwrap_or_default(), asset.get("size").and_then(Value::as_u64).filter(|_| uploaded))
+        })
+        .collect();
+    let wanted: Vec<(&str, Option<u64>)> = expected.iter().map(|(name, size)| (name.as_str(), Some(*size))).collect();
+    let missing: Vec<&str> = wanted.iter().filter(|file| !found.contains(file)).map(|(name, _)| *name).collect();
+    let extra: Vec<&str> = found.iter().filter(|file| !wanted.contains(file)).map(|(name, _)| *name).collect();
+    if missing.is_empty() && extra.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the release does not hold exactly its files: missing or wrong size [{}], not of this release [{}]",
+            missing.join(", "),
+            extra.join(", ")
+        ))
+    }
+}
+
+/// The id of the one GitHub release of `tag`, from `gh api --paginate repos/<repo>/releases --jq '.[] |
+/// {id, tag_name}'` (one object per line). `None` only when the list was read and holds no release
+/// of `tag`; an unreadable list is an error, never "no release". Several releases of `tag` (GitHub lets
+/// drafts share a tag) are an error too, so no step can act on the wrong one.
+fn release_for_tag(list: &str, tag: &str) -> Result<Option<u64>, String> {
+    let mut ids = Vec::new();
+    for line in list.lines().filter(|line| !line.trim().is_empty()) {
+        let release: Value = serde_json::from_str(line).map_err(|e| format!("unreadable release list: {e}"))?;
+        if release.get("tag_name").and_then(Value::as_str) == Some(tag) {
+            ids.push(release.get("id").and_then(Value::as_u64).ok_or_else(|| format!("a release of {tag} has no id"))?);
+        }
+    }
+    match ids.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        _ => Err(format!("GitHub holds {} releases of {tag}; delete the extra drafts", ids.len())),
+    }
+}
+
+fn find_release(tag: &str) -> Result<Option<u64>, String> {
+    let list = capture("gh", &["api", "--paginate", &format!("repos/{REPO}/releases?per_page=100"), "--jq", ".[] | {id, tag_name}"])?;
+    release_for_tag(&list, tag)
+}
+
+/// The release `id` in the shape of `gh release view --json isDraft,assets`.
+fn view_release(id: u64) -> Result<String, String> {
+    capture("gh", &["api", &format!("repos/{REPO}/releases/{id}"), "--jq", "{isDraft: .draft, assets: [.assets[] | {name, size, state}]}"])
+}
+
+/// Publishes through a draft (spec 2026-10-28-release-pipeline, 4.2): creates the draft with every file,
+/// or uploads them again into the draft that is already there; checks it holds exactly `expected`; only
+/// then publishes it and checks again. A draft is invisible to installs, so a half-uploaded release never
+/// reaches one. Up to 3 attempts, 30 s apart; a release that is already published is only checked.
+fn publish(tag: &str, paths: &[String], expected: &[(String, u64)]) -> Result<(), String> {
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    // A draft this run created is never created again, even while the release list does not show it yet.
+    let mut created = false;
+    let mut error = String::new();
+    for attempt in 1..=3 {
+        if attempt > 1 {
+            eprintln!("{error}; attempt {attempt} of 3 in 30 s");
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        match publish_attempt(tag, &paths, expected, &mut created) {
+            Ok(()) => return Ok(()),
+            Err(e) => error = e,
+        }
+    }
+    Err(error)
+}
+
+/// One attempt of `publish`. The release is looked up by its tag once and then handled by its id.
+fn publish_attempt(tag: &str, paths: &[&str], expected: &[(String, u64)], created: &mut bool) -> Result<(), String> {
+    let id = match find_release(tag)? {
+        Some(id) => id,
+        None if *created => return Err("the draft created earlier is not listed yet".into()),
+        None => {
+            // `--verify-tag`: gh must never make the tag itself, on whatever main holds.
+            step("gh", &[&["release", "create", tag, "--verify-tag", "--draft", "--title", tag, "--notes", ""][..], paths].concat())?;
+            *created = true;
+            find_release(tag)?.ok_or("the new draft is not listed yet")?
+        }
+    };
+    let view = view_release(id)?;
+    if !is_draft(&view) {
+        return check_release(&view, false, expected);
+    }
+    if check_release(&view, true, expected).is_err() {
+        // The tag has exactly this one release (checked above), so `gh release upload` cannot pick another.
+        step("gh", &[&["release", "upload", tag][..], paths, &["--clobber"]].concat())?;
+        check_release(&view_release(id)?, true, expected)?;
+    }
+    step("gh", &["api", "--method", "PATCH", &format!("repos/{REPO}/releases/{id}"), "-F", "draft=false", "--silent"])?;
+    check_release(&view_release(id)?, false, expected)
+}
+
+/// Appends Markdown to the GitHub Actions run summary, when there is one.
+fn append_summary(text: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") else { return };
+    let written = std::fs::OpenOptions::new().append(true).create(true).open(&path).and_then(|mut file| file.write_all(text.as_bytes()));
+    if let Err(e) = written {
+        eprintln!("cannot write the run summary: {e}");
+    }
+}
+
+/// `--pipeline` instead of the local .reviews files, which a runner does not have: every commit since
+/// `previous` came through a merged pull request into main. The list goes to the run summary.
+fn check_pull_requests(shas: &[String], previous: &str) -> Result<(), String> {
+    const MAX_COMMITS: usize = 500;
+    const MAX_ANSWER: usize = 64 * 1024;
+    // Only the fields `merged_through_pr` reads, so the size cap is about them and not about pull request texts.
+    const FIELDS: &str = "[.[] | {number, merged_at, merge_commit_sha, base: {ref: .base.ref}}]";
+    if shas.len() > MAX_COMMITS {
+        return Err(format!("{} commits since {previous}; the pipeline checks at most {MAX_COMMITS}", shas.len()));
+    }
+    let mut summary = format!("Commits since {previous}:\n\n");
+    let mut refused = Vec::new();
+    for sha in shas {
+        let answer = capture("gh", &["api", &format!("repos/{REPO}/commits/{sha}/pulls"), "--jq", FIELDS])?;
+        if answer.len() > MAX_ANSWER {
+            return Err(format!("the pull requests of {sha} take more than 64 KiB"));
+        }
+        match merged_through_pr(sha, &answer) {
+            Some(number) => summary.push_str(&format!("- {sha} #{number}\n")),
+            None => refused.push(sha.as_str()),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(format!("commits that did not come through a merged pull request into main: {}", refused.join(", ")));
+    }
+    append_summary(&summary);
+    Ok(())
 }
 
 /// How far `release` got; decides which recovery commands are printed on failure.
@@ -164,7 +391,8 @@ enum Stage {
     Edited,
     /// The Release commit and the tag exist locally.
     Committed,
-    /// Commit and tag are on origin; the GitHub release is missing or lacks files.
+    /// Commit and tag are on origin, or the push failed in a way that leaves that unknown; the GitHub
+    /// release is missing, or still a draft.
     Pushed,
 }
 
@@ -242,17 +470,21 @@ fn release_keygen() -> Result<(), String> {
     Ok(())
 }
 
-/// `cargo xtask release <version>`: spec section 4, steps 1-6, stopping at the first failure.
-fn release(version: &str) -> Result<(), String> {
+/// `cargo xtask release <version> [--pipeline]`: spec 2026-10-27-self-update section 4, steps 1-6, with
+/// the changes of spec 2026-10-28-release-pipeline section 4, stopping at the first failure. `password`
+/// unlocks the secret key; without it the console asks.
+fn release(version: &str, pipeline: bool, password: Option<String>) -> Result<(), String> {
     if !valid_version(version) {
         return Err(format!("{version:?} is not a version like 1.2.3"));
     }
     let tag = format!("v{version}");
     let mut stage = Stage::Clean;
     let mut files = Vec::new();
-    let result = release_steps(version, &tag, &mut stage, &mut files);
+    let result = release_steps(version, &tag, pipeline, password, &mut stage, &mut files);
     if result.is_err() {
-        let commands = recovery(stage, &tag, &files);
+        let run = pipeline.then(|| std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "<run id>".to_string()));
+        let commands = recovery(stage, version, &files, run.as_deref());
+        // In the pipeline a later workflow step puts them in the run summary, also after a timeout.
         if !commands.is_empty() {
             eprintln!("the release stopped half way; run:\n{commands}");
         }
@@ -261,30 +493,54 @@ fn release(version: &str) -> Result<(), String> {
 }
 
 /// `assets` gets the names of the files in `target/release-dist`, for the recovery commands.
-fn release_steps(version: &str, tag: &str, stage: &mut Stage, assets: &mut Vec<String>) -> Result<(), String> {
+fn release_steps(
+    version: &str,
+    tag: &str,
+    pipeline: bool,
+    password: Option<String>,
+    stage: &mut Stage,
+    assets: &mut Vec<String>,
+) -> Result<(), String> {
     let tag = tag.to_string();
     let root = repo_root();
     std::env::set_current_dir(&root).map_err(|e| e.to_string())?;
 
-    // 1. Preconditions. The keys are checked first so a missing key cannot strand a tagged release.
+    // 1. Preconditions, all before any commit or tag. The previous release decides which key installs
+    // trust and which versions may follow, so it is looked up first, on fresh tags.
+    step("git", &["fetch", "origin", "main", "--tags"])?;
+    let previous = capture("git", &["describe", "--tags", "--abbrev=0", "--match", "v*"]).ok();
+    match &previous {
+        // A running open_mess ignores a release that is not above its own version.
+        Some(previous) if !version_above(previous.strip_prefix('v').unwrap_or_default(), version) => {
+            return Err(format!("{version} is not above {previous}"));
+        }
+        // The first release covers commits from before pull requests; only the local review check fits it.
+        None if pipeline => return Err("no earlier v* tag: the first release is local".into()),
+        _ => {}
+    }
+    let tree_key = std::fs::read_to_string(root.join("keys").join("release.pub")).map_err(|e| format!("keys/release.pub: {e}"))?;
+    let previous_key = previous.as_ref().map(|previous| capture("git", &["show", &format!("{previous}:keys/release.pub")])).transpose()?;
+    let trusted = trusted_key(previous_key.as_deref(), &tree_key)?;
     let key_path = secret_key_path()?;
     if !key_path.exists() {
         return Err(format!("no secret key at {}; run `cargo xtask release-keygen`", key_path.display()));
     }
-    let public =
-        minisign::PublicKey::from_file(root.join("keys").join("release.pub")).map_err(|e| format!("keys/release.pub is not a release key: {e}"))?;
-    // Unlock now (the password is asked here): a wrong password must not strand a commit and tag.
-    let secret = minisign::SecretKey::from_file(&key_path, None).map_err(|e| format!("cannot unlock the secret key: {e}"))?;
-    check_key_pair(&public, &secret)?;
+    // Unlock now (the console asks unless the password is set): a wrong password must not strand a commit and tag.
+    let secret = minisign::SecretKey::from_file(&key_path, password).map_err(|e| format!("cannot unlock the secret key: {e}"))?;
+    check_key_pair(&trusted, &secret)?;
     if !capture("git", &["status", "--porcelain"])?.is_empty() {
         return Err("the working tree is not clean".into());
     }
     if capture("git", &["rev-parse", "--abbrev-ref", "HEAD"])? != "main" {
         return Err("not on main".into());
     }
-    step("git", &["fetch", "origin", "main", "--tags"])?;
-    if capture("git", &["rev-parse", "HEAD"])? != capture("git", &["rev-parse", "origin/main"])? {
+    let head = capture("git", &["rev-parse", "HEAD"])?;
+    if head != capture("git", &["rev-parse", "origin/main"])? {
         return Err("main differs from origin/main".into());
+    }
+    // The release is of exactly the commit the run was started and approved for.
+    if pipeline && std::env::var("GITHUB_SHA").ok().as_deref() != Some(head.as_str()) {
+        return Err(format!("HEAD {head} is not GITHUB_SHA, the commit this run was started for"));
     }
     if !capture("git", &["tag", "--list", &tag])?.is_empty() {
         return Err(format!("tag {tag} already exists"));
@@ -292,14 +548,26 @@ fn release_steps(version: &str, tag: &str, stage: &mut Stage, assets: &mut Vec<S
     if !ci() {
         return Err("cargo xtask ci failed".into());
     }
-    let range = match capture("git", &["describe", "--tags", "--abbrev=0", "--match", "v*"]) {
-        Ok(previous) => format!("{previous}..HEAD"),
-        Err(_) => "HEAD".to_string(),
+    let range = match &previous {
+        Some(previous) => format!("{previous}..HEAD"),
+        None => "HEAD".to_string(),
     };
     let shas: Vec<String> = capture("git", &["rev-list", &range])?.lines().map(str::to_string).collect();
-    let open = unprocessed_commits(&shas, &root.join(".reviews"));
-    if !open.is_empty() {
-        return Err(format!("commits without a .reviews/<sha>.processed file: {}", open.join(", ")));
+    match &previous {
+        Some(previous) if pipeline => check_pull_requests(&shas, previous)?,
+        _ => {
+            let open = unprocessed_commits(&shas, &root.join(".reviews"));
+            if !open.is_empty() {
+                return Err(format!("commits without a .reviews/<sha>.processed file: {}", open.join(", ")));
+            }
+        }
+    }
+    // Files of an earlier release must neither be uploaded nor counted as this release's; a file that
+    // cannot go (an om.exe still running from there) stops the release here, before the commit.
+    let dist = root.join("target/release-dist");
+    match std::fs::remove_dir_all(&dist) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("cannot clear {}: {e}", dist.display())),
+        _ => {}
     }
 
     // 2. Version commit and tag; the diff must be only the version and the lockfile.
@@ -331,10 +599,9 @@ fn release_steps(version: &str, tag: &str, stage: &mut Stage, assets: &mut Vec<S
         files.push((name, std::fs::read(root.join("target/wasm32-wasip2/release").join(&output)).map_err(|e| format!("{output}: {e}"))?));
     }
 
-    // 4-5. Manifest and its minisign signature (the password is asked here).
+    // 4-5. Manifest and its minisign signature, checked against the trusted key.
     let manifest = build_manifest(version, &files);
-    let signature = minisign::sign(Some(&public), &secret, manifest.as_bytes(), None, None).map_err(|e| format!("signing failed: {e}"))?;
-    let dist = root.join("target/release-dist");
+    let signature = minisign::sign(Some(&trusted), &secret, manifest.as_bytes(), None, None).map_err(|e| format!("signing failed: {e}"))?;
     std::fs::create_dir_all(&dist).map_err(|e| e.to_string())?;
     for (name, bytes) in &files {
         std::fs::write(dist.join(name), bytes).map_err(|e| e.to_string())?;
@@ -343,14 +610,31 @@ fn release_steps(version: &str, tag: &str, stage: &mut Stage, assets: &mut Vec<S
     std::fs::write(dist.join("manifest.json"), &manifest).map_err(|e| e.to_string())?;
     std::fs::write(dist.join("manifest.json.minisig"), signature.to_string()).map_err(|e| e.to_string())?;
     assets.extend(["manifest.json".to_string(), "manifest.json.minisig".to_string()]);
+    let expected = assets
+        .iter()
+        .map(|name| std::fs::metadata(dist.join(name)).map(|meta| (name.clone(), meta.len())).map_err(|e| format!("{name}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
 
     // 6. Publish. Atomic: the commit and the tag land on origin together, or neither does.
-    step("git", &["push", "--atomic", "origin", "main", &tag])?;
+    if let Err(error) = step("git", &["push", "--atomic", "origin", "main", &tag]) {
+        // The push may have landed with only its acknowledgement lost: then origin has the tag as it is
+        // here (`ls-remote` prints what the tag ref points to, the commit or, if annotated, the tag object).
+        let local = capture("git", &["rev-parse", &format!("refs/tags/{tag}")])?;
+        match capture("git", &["ls-remote", "origin", &format!("refs/tags/{tag}")]) {
+            Ok(remote) if remote.split_whitespace().next() == Some(local.as_str()) => {
+                eprintln!("git push reported an error, but {tag} is on origin; going on");
+            }
+            Ok(_) => return Err(error),
+            // Unknown whether it landed: the commands for after the push start by looking.
+            Err(e) => {
+                *stage = Stage::Pushed;
+                return Err(format!("{error}; whether it reached origin is unknown: {e}"));
+            }
+        }
+    }
     *stage = Stage::Pushed;
     let paths: Vec<String> = assets.iter().map(|name| dist.join(name).to_string_lossy().into_owned()).collect();
-    let mut args = vec!["release", "create", &tag, "--title", &tag, "--notes", ""];
-    args.extend(paths.iter().map(String::as_str));
-    step("gh", &args)
+    publish(&tag, &paths, &expected)
 }
 
 fn report(result: Result<(), String>) -> bool {
@@ -362,13 +646,16 @@ fn main() -> ExitCode {
         Some("ci") => ci(),
         Some("hooks") => run("git", &["config", "core.hooksPath", ".githooks"]),
         Some("release-keygen") => report(release_keygen()),
-        Some("release") => match std::env::args().nth(2) {
-            Some(version) => report(release(&version)),
-            None => {
-                eprintln!("usage: cargo xtask release <x.y.z>");
-                false
-            }
-        },
+        Some("release") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            // Never printed; an empty variable counts as unset.
+            let password = std::env::var("OPEN_MESS_RELEASE_KEY_PASSWORD").ok().filter(|password| !password.is_empty());
+            let github_actions = std::env::var("GITHUB_ACTIONS").ok();
+            report(
+                release_args(&args, github_actions.as_deref(), password.is_some())
+                    .and_then(|(version, pipeline)| release(&version, pipeline, password)),
+            )
+        }
         _ => {
             eprintln!("usage: cargo xtask <ci|hooks|release-keygen|release>");
             false
@@ -434,18 +721,153 @@ mod tests {
 
     #[test]
     fn failed_release_prints_the_way_back() {
-        assert_eq!(recovery(Stage::Clean, "v1.0.0", &[]), "");
-        assert!(recovery(Stage::Edited, "v1.0.0", &[]).contains("git checkout HEAD -- Cargo.toml Cargo.lock"));
-        let committed = recovery(Stage::Committed, "v1.0.0", &[]);
+        assert_eq!(recovery(Stage::Clean, "1.0.0", &[], None), "");
+        assert!(recovery(Stage::Edited, "1.0.0", &[], None).contains("git checkout HEAD -- Cargo.toml Cargo.lock"));
+        let committed = recovery(Stage::Committed, "1.0.0", &[], None);
         assert!(committed.contains("git tag -d v1.0.0") && committed.contains("git reset --hard HEAD~1"));
-        // The release may be missing, or there with only some of its files.
+        // The release may be missing, a draft, or published: the commands start by looking.
         let files = ["om.exe".to_string(), "manifest.json".to_string()];
-        let pushed = recovery(Stage::Pushed, "v1.0.0", &files);
+        let pushed = recovery(Stage::Pushed, "1.0.0", &files, None);
         let list = " target/release-dist/om.exe target/release-dist/manifest.json";
-        assert!(pushed.contains(&format!("gh release create v1.0.0 --title v1.0.0 --notes \"\"{list}")), "{pushed}");
+        // A push that reported an error may not have landed: that is checked first, and pushed again.
+        let check = "# check that the tag reached origin:\ngit ls-remote origin refs/tags/v1.0.0\n# it lists nothing: push first:\n\
+                     git push --atomic origin main v1.0.0\n# see what GitHub holds:\ngh release view v1.0.0 --json isDraft,assets\n";
+        assert!(pushed.starts_with(check), "{pushed}");
+        assert!(pushed.contains(&format!("gh release create v1.0.0 --verify-tag --draft --title v1.0.0 --notes \"\"{list}")), "{pushed}");
         assert!(pushed.contains(&format!("gh release upload v1.0.0{list} --clobber")), "{pushed}");
         assert!(pushed.contains("gh release edit v1.0.0 --draft=false"), "{pushed}");
         assert!(!pushed.contains('*'), "{pushed}");
+        assert!(!pushed.contains("gh run download"), "{pushed}");
+        // A published release is left alone: only the draft gets files uploaded again.
+        let published = pushed.split("\n# ").find(|block| block.starts_with("published")).expect("published");
+        assert!(published.ends_with("nothing to do."), "{published}");
+        let draft = pushed.split("\n# ").find(|block| block.starts_with("a draft")).expect("draft");
+        assert_eq!(pushed.matches("--clobber").count(), draft.matches("--clobber").count(), "{pushed}");
+    }
+
+    #[test]
+    fn pipeline_recovery_starts_after_the_push_from_the_artifact() {
+        for stage in [Stage::Clean, Stage::Edited, Stage::Committed] {
+            assert_eq!(recovery(stage, "1.0.0", &["om.exe".to_string()], Some("42")), "", "{stage:?}");
+        }
+        let pushed = recovery(Stage::Pushed, "1.0.0", &["om.exe".to_string()], Some("42"));
+        let check = "# check that the tag reached origin:\ngit ls-remote origin refs/tags/v1.0.0\n\
+                     # it lists nothing: nothing reached origin; run the workflow again instead.\n\
+                     # in a clone of the repository at v1.0.0, get the files of the release:\n\
+                     gh run download 42 -n release-dist-1.0.0 -D target/release-dist\n\
+                     # see what GitHub holds:\ngh release view v1.0.0 --json isDraft,assets\n";
+        assert!(pushed.starts_with(check), "{pushed}");
+        // The runner with the local commit is gone, so there is nothing to push again.
+        assert!(!pushed.contains("git push"), "{pushed}");
+    }
+
+    #[test]
+    fn only_a_list_that_was_read_says_there_is_no_release() {
+        let list = "{\"draft\":false,\"id\":7,\"tag_name\":\"v1.0.0\"}\n{\"draft\":true,\"id\":9,\"tag_name\":\"v1.1.0\"}\n";
+        assert_eq!(release_for_tag(list, "v1.1.0"), Ok(Some(9)));
+        assert_eq!(release_for_tag(list, "v1.2.0"), Ok(None));
+        assert_eq!(release_for_tag("", "v1.2.0"), Ok(None));
+        // An unreadable answer is not "no release": creating then could make a second draft.
+        assert!(release_for_tag("Not Found", "v1.2.0").is_err());
+        assert!(release_for_tag("{\"id\":", "v1.2.0").is_err());
+        // Two drafts of one tag: no step may guess which one it acts on.
+        let two = format!("{list}{{\"draft\":true,\"id\":10,\"tag_name\":\"v1.1.0\"}}\n");
+        let error = release_for_tag(&two, "v1.1.0").expect_err("two releases");
+        assert!(error.contains("2 releases of v1.1.0"), "{error}");
+        assert!(release_for_tag("{\"tag_name\":\"v1.1.0\"}", "v1.1.0").is_err());
+    }
+
+    #[test]
+    fn only_a_squash_merged_pull_request_into_main_lets_a_commit_through() {
+        let sha = "ff4fa9fcadeb8f8133455b3e837c2efa8861a485";
+        let pull = |base: &str, merged_at: &str, merge_commit: &str| {
+            format!(r#"[{{"number":2,"base":{{"ref":"{base}"}},"merged_at":{merged_at},"merge_commit_sha":"{merge_commit}"}}]"#)
+        };
+        assert_eq!(merged_through_pr(sha, &pull("main", "\"2026-10-28T10:31:25Z\"", sha)), Some(2));
+        // Not merged, into another branch, merged as another commit (a merge commit's parent, a rebase).
+        assert_eq!(merged_through_pr(sha, &pull("main", "null", sha)), None);
+        assert_eq!(merged_through_pr(sha, &pull("release", "\"2026-10-28T10:31:25Z\"", sha)), None);
+        assert_eq!(merged_through_pr(sha, &pull("main", "\"2026-10-28T10:31:25Z\"", "0123456789abcdef0123456789abcdef01234567")), None);
+        assert_eq!(merged_through_pr(sha, "[]"), None);
+        assert_eq!(merged_through_pr(sha, "{\"message\":\"Not Found\"}"), None);
+        assert_eq!(merged_through_pr(sha, "[{\"number\":"), None);
+        // Another pull request in the list does not hide the one that merged the commit.
+        let two = format!(
+            "[{},{}]",
+            pull("main", "null", sha).trim_matches(['[', ']']),
+            pull("main", "\"2026-10-28T10:31:25Z\"", sha).trim_matches(['[', ']'])
+        );
+        assert_eq!(merged_through_pr(sha, &two), Some(2));
+    }
+
+    fn public_text(pair: &minisign::KeyPair) -> String {
+        String::from_utf8(pair.pk.to_box().expect("box").to_bytes()).expect("utf-8")
+    }
+
+    #[test]
+    fn the_previous_release_decides_the_trusted_key() {
+        let old = minisign::KeyPair::generate_unencrypted_keypair().expect("old pair");
+        let new = minisign::KeyPair::generate_unencrypted_keypair().expect("new pair");
+        // A rotation: the tree holds the new public key, the previous tag the old one.
+        let trusted = trusted_key(Some(&public_text(&old)), &public_text(&new)).expect("previous key");
+        check_key_pair(&trusted, &old.sk).expect("signed with the old key");
+        assert!(check_key_pair(&trusted, &new.sk).is_err(), "a key that only matches the new keys/release.pub");
+        // No previous release: the working tree's key.
+        let first = trusted_key(None, &public_text(&new)).expect("tree key");
+        check_key_pair(&first, &new.sk).expect("first release");
+        assert!(trusted_key(Some("no key here"), &public_text(&new)).is_err());
+    }
+
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(version_above("1.2.3", "1.2.4"));
+        assert!(version_above("0.9.9", "0.10.0"));
+        assert!(version_above("1.9.9", "2.0.0"));
+        assert!(!version_above("1.2.3", "1.2.3"));
+        assert!(!version_above("1.2.4", "1.2.3"));
+        assert!(!version_above("0.10.0", "0.9.9"));
+        assert!(!version_above("foo", "1.0.0"));
+        assert!(!version_above("1.0.0", "99999999999999999999.0.0"));
+    }
+
+    #[test]
+    fn pipeline_mode_only_runs_in_actions_with_the_password() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(release_args(&args(&["1.2.3"]), None, false), Ok(("1.2.3".to_string(), false)));
+        assert_eq!(release_args(&args(&["1.2.3", "--pipeline"]), Some("true"), true), Ok(("1.2.3".to_string(), true)));
+        let outside = release_args(&args(&["1.2.3", "--pipeline"]), None, true);
+        assert_eq!(outside, Err("--pipeline only runs in GitHub Actions".to_string()));
+        assert!(release_args(&args(&["1.2.3", "--pipeline"]), Some("false"), true).is_err());
+        let no_password = release_args(&args(&["1.2.3", "--pipeline"]), Some("true"), false).expect_err("no password");
+        assert!(no_password.contains("OPEN_MESS_RELEASE_KEY_PASSWORD"), "{no_password}");
+        assert!(release_args(&args(&[]), None, false).is_err());
+        assert!(release_args(&args(&["1.2.3", "--pipelin"]), Some("true"), true).is_err());
+        assert!(release_args(&args(&["1.2.3", "--pipeline", "x"]), Some("true"), true).is_err());
+    }
+
+    #[test]
+    fn a_release_is_published_only_with_exactly_its_files() {
+        let expected = [("om.exe".to_string(), 3), ("manifest.json".to_string(), 10)];
+        let view = |draft: bool, assets: &str| format!(r#"{{"isDraft":{draft},"assets":[{assets}]}}"#);
+        let om = r#"{"name":"om.exe","size":3,"state":"uploaded"}"#;
+        let manifest = r#"{"name":"manifest.json","size":10,"state":"uploaded"}"#;
+        let complete = format!("{om},{manifest}");
+        check_release(&view(true, &complete), true, &expected).expect("complete draft");
+        check_release(&view(false, &complete), false, &expected).expect("complete release");
+        // Draft or published, as expected.
+        assert!(check_release(&view(false, &complete), true, &expected).is_err());
+        assert!(check_release(&view(true, &complete), false, &expected).is_err());
+        assert!(is_draft(&view(true, "")) && !is_draft(&view(false, "")) && !is_draft("not json"));
+        // A missing file, a wrong size, an unfinished upload, a file of another release.
+        assert!(check_release(&view(true, om), true, &expected).is_err());
+        let short = complete.replace("\"size\":10", "\"size\":9");
+        let error = check_release(&view(true, &short), true, &expected).expect_err("wrong size");
+        assert!(error.contains("manifest.json"), "{error}");
+        assert!(check_release(&view(true, &complete.replace("\"uploaded\"}", "\"starter\"}")), true, &expected).is_err());
+        let extra = format!("{complete},{}", r#"{"name":"old.wasm","size":1,"state":"uploaded"}"#);
+        let error = check_release(&view(true, &extra), true, &expected).expect_err("extra file");
+        assert!(error.contains("old.wasm"), "{error}");
+        assert!(check_release("{", true, &expected).is_err());
     }
 
     #[test]

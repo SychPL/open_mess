@@ -132,13 +132,89 @@ signing key: the secret key goes to `OPEN_MESS_RELEASE_KEY` or `%USERPROFILE%\.o
 (never inside the repository), the public key to `keys/release.pub`, which you commit; `om`
 compiles it in and refuses any update signed with another key. The command never overwrites a key.
 
-`cargo xtask release 1.2.3` needs `git`, the GitHub CLI (`gh`, signed in) and the key password. It
-requires a clean `main` equal to `origin/main`, a green `cargo xtask ci` and a
-`.reviews/<sha>.processed` file for every commit since the last `v*` tag; then it unlocks the key,
-commits the version bump (`Release 1.2.3`, only the version and `Cargo.lock`), tags `v1.2.3`,
-builds `om.exe` and the platform modules, signs `manifest.json` and publishes everything with
-`gh release create`. It stops at the first failure and, once the commit exists, prints the commands
-that undo or finish the release.
+`cargo xtask release 1.2.3` needs `git`, the GitHub CLI (`gh`, signed in) and the key password,
+which it asks for on the console unless `OPEN_MESS_RELEASE_KEY_PASSWORD` holds it. It requires a
+clean `main` equal to `origin/main`, a version above the last `v*` tag, a green `cargo xtask ci` and
+a `.reviews/<sha>.processed` file for every commit since that tag. The secret key must be the pair
+of `keys/release.pub` as it was at that tag: that is the key the installed versions trust. Then it
+commits the version bump (`Release 1.2.3`, only the version and `Cargo.lock`), tags `v1.2.3`, builds
+`om.exe` and the platform modules, signs `manifest.json`, pushes, creates the GitHub release as a
+draft, checks that it holds exactly these files and only then publishes it. Installs never see a
+draft, so they never get a half-uploaded release. It stops at the first failure and, once the commit
+exists, prints the commands that undo or finish the release. After the push they first check with
+`git ls-remote` that the tag reached origin, then run `gh release view`, because what is left to do
+depends on whether the release is missing, still a draft or already published.
+
+Run both commands in a normal terminal such as Windows Terminal. They read the password from the
+console, and a terminal embedded in another app may never pass it through.
+
+Merge commits, and the squash commits GitHub makes when it merges a pull request, never pass the
+local post-commit hook, so `release` lists them as unprocessed. Check that each one adds nothing
+unreviewed, then write its `.processed` file saying how you checked. For a merge commit, its tree
+must be the one an automatic re-merge gives: `git merge-tree --write-tree <sha>^1 <sha>^2` must print
+the same tree id as `git rev-parse <sha>^{tree}`. For a squash commit, `git diff <sha>^ <sha>` must
+hold exactly the changes of the reviewed branch.
+
+### Releasing from GitHub
+
+From the second release on, the owner can release without building or typing the password locally:
+in the repository's Actions tab pick "Release", then "Run workflow" on `main`, enter the version and
+approve the run when GitHub asks for the `release` environment. The workflow runs
+`cargo xtask release <version> --pipeline` on a fresh Windows runner with the key from that
+environment. The pipeline mode does everything above, except that the `.reviews` check, which only
+exists on the owner's machine, becomes a check that every commit since the last tag is the squash
+commit of a pull request merged into `main`. It refuses to run outside GitHub Actions, without an
+earlier `v*` tag, or when `main` moved after the run was started. The run's summary lists the
+commits with their pull requests.
+
+The first release is local: it covers the commits from before pull requests, which only the
+`.reviews` check can vouch for.
+
+The setup, once:
+
+- The `release` environment, with the owner as its required reviewer and deployments from `main`
+  only. Leave "Prevent self-review" off: the owner both starts the run and approves it, and with it
+  on nobody could approve a release.
+- Its two secrets, set by the owner in a normal terminal and by nobody else (the second command asks
+  for the password):
+
+  ```powershell
+  Get-Content -Raw "$env:USERPROFILE\.open_mess\release.key" | gh secret set RELEASE_KEY_FILE --env release --repo SychPL/open_mess
+  gh secret set RELEASE_KEY_PASSWORD --env release --repo SychPL/open_mess
+  ```
+
+- Squash as the only way to merge pull requests, so every commit on `main` is the merge commit of
+  its pull request.
+
+The workflow pushes the `Release <version>` commit and its tag straight to `main` with the
+workflow's own token. Branch protection on `main` that requires pull requests must let GitHub
+Actions through, or releases go back to being local.
+
+When a run fails after the push, the commit and the tag are on `main` and the release is missing or
+still a draft. The run keeps `target/release-dist` for 14 days as the artifact
+`release-dist-<version>`. Its summary gives the commands that finish the release, also when the
+Release step was cancelled or timed out before `xtask` could print them: in a clone at the tag, check
+the tag with `git ls-remote`, then `gh run download <run id> -n release-dist-<version> -D target/release-dist`,
+then `gh release view` and the `gh release` commands for what it shows.
+
+### Rotating the release key
+
+When the key leaks or has to change, every install still trusts only the old public key, so the new
+one arrives in a release signed with the old one:
+
+1. Create the new pair next to the old one: delete `keys/release.pub`, point
+   `OPEN_MESS_RELEASE_KEY` at a new file outside the repository and run `cargo xtask release-keygen`.
+2. Commit the new `keys/release.pub` through a pull request.
+3. Release it with the old key, which is still in the `release` environment (or locally, with
+   `OPEN_MESS_RELEASE_KEY` back on the old file). `release` checks the key against the last tag's
+   `keys/release.pub`, so it refuses the new key here. Say in the release notes that the key
+   changed.
+4. Only then replace both secrets with the new key file and its password, and make the new key the
+   local default.
+
+Installs check only the newest release, so keep the transition release the newest one for as long as
+you can. An install that was off for its whole time never sees it and refuses every later release:
+its user reinstalls by hand with `scripts/install.ps1` from a build of the newest tag.
 
 ## Licence
 
