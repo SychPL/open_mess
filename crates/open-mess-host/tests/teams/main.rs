@@ -1221,3 +1221,123 @@ async fn sign_out_stops_polling() {
     tokio::time::sleep(Duration::from_millis(u64::from(POLL) * 4)).await;
     assert_eq!(teams.fake.requests(CHAT_PATH).len(), polled);
 }
+
+// Stage 2: meetings (spec 2026-10-28-meetings-transcripts, 4.1).
+
+const CALENDAR_PATH: &str = "/api/mt/emea/v2.0/me/calendars/default/calendarView";
+
+/// A middle-tier event of the meeting chat `MEETING`, synthetic values ("Live results" 10).
+fn calendar_event(start: &str) -> Value {
+    json!({
+        "objectId": "AAMkSyntheticEvent=",
+        "iCalUID": "040000008200E00074C5B7101A82E00800000000",
+        "startTime": start,
+        "endTime": "2027-01-15T10:00:00+01:00",
+        "eventType": "Occurrence",
+        "myResponseType": "Organizer",
+        "subject": "Synthetic planning",
+        "organizerName": ME_NAME,
+        "skypeTeamsMeetingUrl": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_c3ludGhldGlj%40thread.v2/0?context=%7b%7d",
+    })
+}
+
+fn calendar_answer(events: Vec<Value>) -> impl Fn(&fake::Seen) -> Option<Reply> {
+    move |s| (s.path == CALENDAR_PATH).then(|| Reply::json(json!({"type": "calendarView", "value": events.clone()})))
+}
+
+#[tokio::test]
+async fn list_meetings_reads_the_middle_tier_calendar() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(calendar_answer(vec![calendar_event("2027-01-15T09:00:00+01:00")]));
+    let result = teams.call("list_meetings", json!({"from": "2027-01-14T00:00:00Z", "to": "2027-01-16T00:00:00Z"})).await.unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    let item = &result["items"][0];
+    assert_eq!((&item["conversation"], &item["start"], &item["kind"]), (&json!(MEETING), &json!("2027-01-15T08:00:00Z"), &json!("Occurrence")));
+    assert_eq!(item["untrusted"]["subject"], "Synthetic planning");
+    // One GET, with the authsvc audience's token and the skype token of the exchange.
+    let calendar = teams.fake.requests(CALENDAR_PATH);
+    assert_eq!(calendar.len(), 1);
+    let request = &calendar[0];
+    assert_eq!((request.method.as_str(), request.host.as_str()), ("GET", "teams.microsoft.com"));
+    assert_eq!(request.audience().as_deref(), Some("https://api.spaces.skype.com"));
+    assert_eq!(request.header("x-skypetoken"), Some("synthetic-skype-token"));
+    assert_eq!(request.query, "StartDate=2027-01-14T00%3A00%3A00Z&EndDate=2027-01-16T00%3A00%3A00Z&shouldDecryptData=false");
+    assert_eq!(teams.fake.requests(AUTHZ_PATH).len(), 1);
+}
+
+#[tokio::test]
+async fn list_meetings_checks_its_window() {
+    let teams = Teams::signed_in().await;
+    for args in [
+        json!({"from": "2027-01-15T00:00:00Z", "to": "2027-01-15T00:00:00Z"}),
+        json!({"from": "2027-01-01T00:00:00Z", "to": "2027-02-02T00:00:00Z"}),
+        json!({"from": "yesterday"}),
+    ] {
+        assert!(matches!(module_error(teams.call("list_meetings", args.clone()).await), ModuleError::InvalidArgs(_)), "{args}");
+    }
+    assert!(teams.fake.requests(CALENDAR_PATH).is_empty());
+    // Left out, the window is a week back to a day ahead.
+    teams.fake.on(calendar_answer(Vec::new()));
+    teams.call("list_meetings", json!({})).await.unwrap();
+    let query = teams.fake.requests(CALENDAR_PATH)[0].query.clone();
+    assert!(query.starts_with("StartDate=") && query.contains("&EndDate="), "{query}");
+}
+
+#[tokio::test]
+async fn an_expiring_skype_token_is_renewed_by_authsvc() {
+    let teams = Teams::start().await;
+    // The skype token expires in a minute, inside the renewal margin.
+    let short = {
+        let mut authz = fake::authz();
+        authz["tokens"]["expiresIn"] = json!(60);
+        authz
+    };
+    let events = calendar_answer(Vec::new());
+    teams.fake.on(move |s| if s.path == AUTHZ_PATH { Some(Reply::json(short.clone())) } else { events(s) });
+    teams.module.sign_in().await.unwrap();
+    teams.call("list_meetings", json!({})).await.unwrap();
+    teams.call("list_meetings", json!({})).await.unwrap();
+    // Each call exchanged once more before it read the calendar.
+    assert_eq!(teams.fake.requests(AUTHZ_PATH).len(), 3);
+    assert_eq!(teams.fake.requests(CALENDAR_PATH).len(), 2);
+}
+
+#[tokio::test]
+async fn a_middle_tier_401_gets_one_more_exchange() {
+    let teams = Teams::signed_in().await;
+    let refused = Arc::new(AtomicUsize::new(1));
+    let (answer, limit) = (calendar_answer(Vec::new()), refused.clone());
+    teams.fake.on(move |s| {
+        let reply = answer(s)?;
+        Some(if limit.fetch_sub(1, Ordering::SeqCst) > 0 { Reply::status(401) } else { reply })
+    });
+    teams.call("list_meetings", json!({})).await.unwrap();
+    let calendar = teams.fake.requests(CALENDAR_PATH);
+    assert_eq!(calendar.len(), 2);
+    assert_ne!(calendar[0].header("authorization"), calendar[1].header("authorization"));
+    assert_eq!(teams.fake.requests(AUTHZ_PATH).len(), 2);
+    // Refused again after that: the account must sign in again.
+    refused.store(usize::MAX / 2, Ordering::SeqCst);
+    assert!(matches!(module_error(teams.call("list_meetings", json!({})).await), ModuleError::AuthRequired(_)));
+}
+
+#[tokio::test]
+async fn list_meetings_needs_the_calendar_service() {
+    let teams = Teams::start().await;
+    let mut authz = fake::authz();
+    authz["regionGtms"].as_object_mut().unwrap().remove("middleTier");
+    teams.fake.on(move |s| (s.path == AUTHZ_PATH).then(|| Reply::json(authz.clone())));
+    teams.module.sign_in().await.unwrap();
+    let error = module_error(teams.call("list_meetings", json!({})).await);
+    assert!(matches!(&error, ModuleError::NotSupported(why) if why.contains("calendar")), "{error:?}");
+}
+
+#[tokio::test]
+async fn too_many_meetings_ask_for_a_narrower_window() {
+    let teams = Teams::signed_in().await;
+    let mut event = calendar_event("2027-01-15T09:00:00+01:00");
+    event["subject"] = json!("s".repeat(200));
+    teams.fake.on(calendar_answer(vec![event; 4000]));
+    let error = module_error(teams.call("list_meetings", json!({})).await);
+    assert!(matches!(&error, ModuleError::Platform(why) if why.contains("narrow from/to")), "{error:?}");
+}

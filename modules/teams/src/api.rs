@@ -189,17 +189,59 @@ fn open(account: &str) -> Result<Session, ModuleError> {
 /// The authsvc exchange: Teams accepts the account and names its services (docs 2). Its 404 is
 /// an answer, not a regional redirect.
 fn establish(token: String, claims: Claims) -> Result<Session, ModuleError> {
-    let response = exchange(&authsvc::request(), &token, false, false)?;
+    let auth = authorize(&token)?;
+    let expires = claims.expires_ms;
+    let mut session = Session::new(claims, auth.directory);
+    session.keep(AUTHSVC_SCOPE, token, expires);
+    session.keep_skype(auth.skype_token, auth.expires_at_ms);
+    Ok(session)
+}
+
+fn authorize(token: &str) -> Result<authsvc::Session, ModuleError> {
+    let response = exchange(&authsvc::request(), token, false, false)?;
     match response.status {
         200..=299 => {}
         401 | 403 => return Err(ModuleError::AuthRequired(format!("Teams refused the account (HTTP {})", response.status))),
         status => return Err(ModuleError::Platform(format!("Teams sign-in failed (HTTP {status})"))),
     }
-    let auth = authsvc::decode(&response.body, now_ms()).map_err(proto)?;
-    let expires = claims.expires_ms;
-    let mut session = Session::new(claims, auth.directory);
-    session.keep(AUTHSVC_SCOPE, token, expires);
-    Ok(session)
+    authsvc::decode(&response.body, now_ms()).map_err(proto)
+}
+
+/// A new authsvc exchange for the session: a new skype token and service directory.
+fn reauthorize(session: &mut Session, token: &str) -> Result<(), ModuleError> {
+    let auth = authorize(token)?;
+    session.directory = auth.directory;
+    session.keep_skype(auth.skype_token, auth.expires_at_ms);
+    Ok(())
+}
+
+/// A read from the middle tier (docs 9.1): the authsvc audience's token and the skype token. A
+/// skype token about to expire is renewed by a new authsvc exchange first; a 401 gets a new token,
+/// one more exchange and one more try (spec 2026-10-28-meetings-transcripts, 5.3).
+pub fn middle_tier(session: &mut Session, req: &HttpRequest) -> Result<Vec<u8>, ModuleError> {
+    let token = token(session, AUTHSVC_SCOPE)?;
+    if session.skype(now_ms(), true).is_none() {
+        reauthorize(session, &token)?;
+    }
+    let first = exchange(&with_skype(session, req)?, &token, false, false)?;
+    if first.status != 401 {
+        return ok(first);
+    }
+    let claims = header(&first.headers, "www-authenticate").and_then(session::challenge_claims);
+    let token = renew(session, AUTHSVC_SCOPE, claims.as_deref())?;
+    reauthorize(session, &token)?;
+    let second = exchange(&with_skype(session, req)?, &token, false, false)?;
+    if second.status == 401 {
+        return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
+    }
+    ok(second)
+}
+
+fn with_skype(session: &Session, req: &HttpRequest) -> Result<HttpRequest, ModuleError> {
+    let skype = session.skype(now_ms(), false).ok_or_else(|| ModuleError::NotSupported("no calendar service for this account".to_string()))?;
+    let mut req = req.clone();
+    req.headers.push(("x-skypetoken".to_string(), skype.to_string()));
+    Ok(req)
 }
 
 /// Runs `f` with the account's session, opened silently if this instance has none yet (after a

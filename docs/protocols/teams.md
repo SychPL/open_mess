@@ -744,6 +744,42 @@ token, tenant id, user id or account name.
    - In the first run a tag-name filter of the probe printed part of a recording's file name to the
      terminal; the filter was fixed and nothing of it was written to a file or this repository.
 
-All checks in items 1-4 and 7-9 were read-only: no endpoint registration, no property write, no Trouter
+10. **Step 0 of the stage 2 spec, calendar part** (read-only, 2026-10-28, the owner at the computer;
+    a scratch WAM probe printing only status codes, key names, counts, enum values, character classes
+    and lengths):
+    - Middle tier `calendarView` for a dense window of 32 days (31 back, 1 ahead): HTTP 200 in about
+      0.9 s, 316 KB, top keys only `type` and `value`, 140 events in one response - **no paging** for
+      the window of `teams_list_meetings` (at most 31 days).
+    - Keys over all events, with how many events had them: `appointmentSequenceNumber` 106,
+      `bodyPreview`, `categories`, `cleanGlobalObjectId`, `conflictingMeetings`, `doNotForward`,
+      `endTime`, `eventTimeZone`, `iCalUID`, `inviteAllMembers`, `isOnlineMeeting`, `lastModifiedTime`,
+      `location`, `myResponseType`, `objectId`, `organizerName`, `showAs`, `startTime`, `subject` 140,
+      `eventType` 129, `seriesMasterId` 129, `isResponseRequested` 137, `utcOffset` 139,
+      `schedulingServiceUpdateUrl`, `skypeTeamsData`, `skypeTeamsDataObject`, `skypeTeamsMeetingUrl` 131,
+      `onlineMeetingConferenceId`, `onlineMeetingTollNumber` 107, `isOrganizer` 28,
+      `onlineMeetingConfLink` 24, `onlineMeetingTollFreeNumbers` 13, `isAppointment` 3,
+      `sensitivityLabelId` 2, and once each `clientOptimisticEventId`, `isAllDayEvent`,
+      `meetingAgenda`, `meetingTemplateId`, `shortOnlineMeetingJoinUrl`. Keys with a default value are
+      left out (`eventType` is missing on single events, `isOrganizer` on events the user does not
+      organize).
+    - `eventType`: `Occurrence` 61, `Exception` 68, missing 11 (single events). `myResponseType`:
+      `Organizer` 68, `NotResponded` 70, `Accepted` 2 (no declined invitation in the window).
+      `showAs`: `Tentative` 110, `Busy` 29, `Oof` 1.
+    - No `isCancelled`, `sensitivity` or `isPrivate` key in any event: no cancelled or private
+      meeting in the window, or the middle tier never sends them; `sensitivityLabelId` is a Purview
+      label, not the private flag. The module skips an event whose `isCancelled` is true or whose
+      `sensitivity` is `Private`, should they come.
+    - `startTime` and `endTime`: always `YYYY-MM-DDTHH:MM:SS+hh:mm`, with the offset (280 of 280).
+      `eventTimeZone` is a shortened Windows zone name (`CentralEuropeanSt` 139, `Utc` 1) and
+      `utcOffset` a number (null once); the offset in the time is enough to get UTC.
+    - `skypeTeamsMeetingUrl` on 131 events, all `.../l/meetup-join/<thread>/...` with a
+      `19:meeting_...@thread.v2` thread of 69 characters whose middle part is only `[A-Za-z0-9]`.
+      The longest `objectId` or `iCalUID` was 168 characters.
+    - `GET <chatServiceAfd>/v1/users/ME/properties`: `personalFileSite` is a JSON document in a
+      string, keys `availability` (number), `lastModifiedTime`, `personalRootFolderUrl` and
+      `personalSiteUrl`; `personalSiteUrl` is `https://<t>-my.sharepoint.com/personal/...` with a
+      lowercase `<t>` (letters only for this tenant), no port.
+
+All checks in items 1-4 and 7-10 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
 status codes, key names, counts, enum values, scope names and service URLs.

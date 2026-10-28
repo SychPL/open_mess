@@ -68,8 +68,30 @@ pub fn manifest() -> Manifest {
         hosts: strings(HOSTS),
         sign_in_hosts: strings(&["login.microsoftonline.com"]),
         wam: Some(WamIdentity { client_id: CLIENT_ID.to_string(), scopes: strings(SCOPES) }),
-        extra_tools: Vec::new(),
+        extra_tools: extra_tools(),
     }
+}
+
+/// The module's own tools, all reads (spec 2026-10-28-meetings-transcripts, 4); the core lists
+/// them as `teams_<name>`.
+fn extra_tools() -> Vec<ToolDecl> {
+    let time = |what: &str| serde_json::json!({"type": "string", "description": what});
+    let list_meetings = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "from": time("Start of the window, RFC 3339; a week ago when left out."),
+            "to": time("End of the window, RFC 3339, at most 31 days after from; a day from now when left out."),
+        },
+        "additionalProperties": false,
+    });
+    vec![ToolDecl {
+        name: "list_meetings".to_string(),
+        description: "Teams meetings of the user's calendar in a window of time, oldest first, each with its meeting chat (conversation), \
+                      which read_messages reads. Declined and cancelled meetings are left out. Reading never marks anything as read."
+            .to_string(),
+        input_schema: list_meetings.to_string(),
+        writes: false,
+    }]
 }
 
 #[cfg(test)]
@@ -82,6 +104,21 @@ mod tests {
         assert_eq!(m.name, "teams");
         assert_eq!(m.wam.as_ref().map(|w| w.client_id.as_str()), Some("1fec8e78-bce4-4aaf-ab1b-5451cc387264"));
         assert!(m.sign_in_hosts.iter().any(|h| h == "login.microsoftonline.com"));
+    }
+
+    #[test]
+    fn extra_tools_are_reads_with_object_schemas() {
+        for tool in manifest().extra_tools {
+            assert!(!tool.writes, "{}", tool.name);
+            let schema: serde_json::Value = serde_json::from_str(&tool.input_schema).unwrap();
+            assert_eq!(
+                (&schema["type"], &schema["additionalProperties"]),
+                (&serde_json::json!("object"), &serde_json::json!(false)),
+                "{}",
+                tool.name
+            );
+            assert!(schema["properties"].get("account").is_none(), "{}", tool.name);
+        }
     }
 
     #[test]
