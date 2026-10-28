@@ -85,6 +85,11 @@ impl System for WindowsSystem {
     }
 
     fn start_daemon(&self) -> Result<(), UpdateError> {
+        // A task run whose daemon already let go of its lock may still be ending (one that handed
+        // over, or launched the helper and exits): the task's IgnoreNew would swallow the start.
+        if self.wait_daemon_lock_free(Duration::ZERO) {
+            let _ = schtasks(&[OsStr::new("/End"), OsStr::new("/TN"), OsStr::new(DAEMON_TASK)]);
+        }
         schtasks(&[OsStr::new("/Run"), OsStr::new("/TN"), OsStr::new(DAEMON_TASK)])
     }
 
