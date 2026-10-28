@@ -67,6 +67,44 @@ jobs:
           path: target/release-dist
           retention-days: 14
           if-no-files-found: ignore
+      # Also after a timeout or a cancel, which stop xtask before it prints anything: when this run's tag
+      # reached origin (or that is unknown), the run summary says how to finish the release from the artifact.
+      - name: How to finish the release
+        if: failure() || cancelled()
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = "v$env:VERSION"
+          # This run's tag sits on HEAD, the Release commit; without it nothing was pushed.
+          $local = git rev-parse --verify --quiet "refs/tags/$tag"
+          if (-not $local -or (git rev-parse "$tag^{commit}") -ne (git rev-parse HEAD)) { exit 0 }
+          $remote = git ls-remote origin "refs/tags/$tag"
+          if ($LASTEXITCODE -eq 0 -and -not "$remote".StartsWith($local)) { exit 0 }
+          $files = @(Get-ChildItem -LiteralPath target/release-dist -File -Name -ErrorAction SilentlyContinue | ForEach-Object { " target/release-dist/$_" }) -join ''
+          $lines = @(
+            '### Finish release {0}' -f $tag
+            ''
+            'This run pushed the Release commit and {0} (or could not tell); the release is missing or still a draft. In a clone of the repository at {0}:' -f $tag
+            ''
+            '    # check that the tag reached origin:'
+            '    git ls-remote origin refs/tags/{0}' -f $tag
+            '    # it lists nothing: nothing reached origin; run the workflow again instead.'
+            '    # get the files of the release:'
+            '    gh run download {0} -n release-dist-{1} -D target/release-dist' -f $env:GITHUB_RUN_ID, $env:VERSION
+            '    # see what GitHub holds:'
+            '    gh release view {0} --json isDraft,assets' -f $tag
+            '    # published, with every file of target/release-dist at its size: nothing to do.'
+            '    # a draft: upload the files again, check them with gh release view as above, then publish:'
+            '    gh release upload {0}{1} --clobber' -f $tag, $files
+            '    gh release edit {0} --draft=false' -f $tag
+            '    # no release: create the draft, check it the same way, then publish:'
+            '    gh release create {0} --verify-tag --draft --title {0} --notes ""{1}' -f $tag, $files
+            '    gh release edit {0} --draft=false' -f $tag
+            ''
+          )
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          exit 0
       - name: Remove the release key
         if: always()
         run: Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'release.key') -Force -ErrorAction SilentlyContinue

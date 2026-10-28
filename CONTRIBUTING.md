@@ -141,9 +141,9 @@ commits the version bump (`Release 1.2.3`, only the version and `Cargo.lock`), t
 `om.exe` and the platform modules, signs `manifest.json`, pushes, creates the GitHub release as a
 draft, checks that it holds exactly these files and only then publishes it. Installs never see a
 draft, so they never get a half-uploaded release. It stops at the first failure and, once the commit
-exists, prints the commands that undo or finish the release. After the push they start with
-`gh release view`, because what is left to do depends on whether the release is missing, still a
-draft or already published.
+exists, prints the commands that undo or finish the release. After the push they first check with
+`git ls-remote` that the tag reached origin, then run `gh release view`, because what is left to do
+depends on whether the release is missing, still a draft or already published.
 
 Run both commands in a normal terminal such as Windows Terminal. They read the password from the
 console, and a terminal embedded in another app may never pass it through.
@@ -173,13 +173,14 @@ The first release is local: it covers the commits from before pull requests, whi
 The setup, once:
 
 - The `release` environment, with the owner as its required reviewer and deployments from `main`
-  only.
+  only. Leave "Prevent self-review" off: the owner both starts the run and approves it, and with it
+  on nobody could approve a release.
 - Its two secrets, set by the owner in a normal terminal and by nobody else (the second command asks
   for the password):
 
   ```powershell
-  Get-Content -Raw "$env:USERPROFILE\.open_mess\release.key" | gh secret set RELEASE_KEY_FILE --env release
-  gh secret set RELEASE_KEY_PASSWORD --env release
+  Get-Content -Raw "$env:USERPROFILE\.open_mess\release.key" | gh secret set RELEASE_KEY_FILE --env release --repo SychPL/open_mess
+  gh secret set RELEASE_KEY_PASSWORD --env release --repo SychPL/open_mess
   ```
 
 - Squash as the only way to merge pull requests, so every commit on `main` is the merge commit of
@@ -191,9 +192,10 @@ Actions through, or releases go back to being local.
 
 When a run fails after the push, the commit and the tag are on `main` and the release is missing or
 still a draft. The run keeps `target/release-dist` for 14 days as the artifact
-`release-dist-<version>`, and its log and summary print the commands that finish the release: in a
-clone at the tag, `gh run download <run id> -n release-dist-<version> -D target/release-dist`, then
-the `gh release` commands.
+`release-dist-<version>`. Its summary gives the commands that finish the release, also when the
+Release step was cancelled or timed out before `xtask` could print them: in a clone at the tag, check
+the tag with `git ls-remote`, then `gh run download <run id> -n release-dist-<version> -D target/release-dist`,
+then `gh release view` and the `gh release` commands for what it shows.
 
 ### Rotating the release key
 

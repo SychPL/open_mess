@@ -201,19 +201,25 @@ fn recovery(stage: Stage, version: &str, files: &[String], run: Option<&str>) ->
         Stage::Committed => format!("git tag -d {tag}\ngit reset --hard HEAD~1"),
         Stage::Pushed => {
             let list: String = files.iter().map(|name| format!(" target/release-dist/{name}")).collect();
-            let download = run
-                .map(|run| {
-                    format!("# in a clone of the repository at {tag}, get the files of the release:\ngh run download {run} -n release-dist-{version} -D target/release-dist\n")
-                })
-                .unwrap_or_default();
+            // A push that reported an error may still have landed, or not.
+            let (not_pushed, download) = match run {
+                Some(run) => (
+                    "# it lists nothing: nothing reached origin; run the workflow again instead.\n".to_string(),
+                    format!(
+                        "# in a clone of the repository at {tag}, get the files of the release:\ngh run download {run} -n release-dist-{version} -D target/release-dist\n"
+                    ),
+                ),
+                None => (format!("# it lists nothing: push first:\ngit push --atomic origin main {tag}\n"), String::new()),
+            };
             // A published release is never uploaded to: only a draft is invisible to installs.
             format!(
-                "{download}# see what GitHub holds:\ngh release view {tag} --json isDraft,assets\n\
+                "# check that the tag reached origin:\ngit ls-remote origin refs/tags/{tag}\n{not_pushed}\
+                 {download}# see what GitHub holds:\ngh release view {tag} --json isDraft,assets\n\
                  # published, with every file of target/release-dist at its size: nothing to do.\n\
                  # a draft: upload the files again, check them with `gh release view` as above, then publish:\n\
                  gh release upload {tag}{list} --clobber\ngh release edit {tag} --draft=false\n\
                  # no release: create the draft, check it the same way, then publish:\n\
-                 gh release create {tag} --draft --title {tag} --notes \"\"{list}\ngh release edit {tag} --draft=false"
+                 gh release create {tag} --verify-tag --draft --title {tag} --notes \"\"{list}\ngh release edit {tag} --draft=false"
             )
         }
     }
@@ -262,37 +268,80 @@ fn check_release(release_view: &str, draft: bool, expected: &[(String, u64)]) ->
     }
 }
 
-fn release_view(tag: &str) -> Result<String, String> {
-    capture("gh", &["release", "view", tag, "--json", "isDraft,assets"])
+/// The id of the one GitHub release of `tag`, from `gh api --paginate repos/<repo>/releases --jq '.[] |
+/// {id, tag_name}'` (one object per line). `None` only when the list was read and holds no release
+/// of `tag`; an unreadable list is an error, never "no release". Several releases of `tag` (GitHub lets
+/// drafts share a tag) are an error too, so no step can act on the wrong one.
+fn release_for_tag(list: &str, tag: &str) -> Result<Option<u64>, String> {
+    let mut ids = Vec::new();
+    for line in list.lines().filter(|line| !line.trim().is_empty()) {
+        let release: Value = serde_json::from_str(line).map_err(|e| format!("unreadable release list: {e}"))?;
+        if release.get("tag_name").and_then(Value::as_str) == Some(tag) {
+            ids.push(release.get("id").and_then(Value::as_u64).ok_or_else(|| format!("a release of {tag} has no id"))?);
+        }
+    }
+    match ids.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        _ => Err(format!("GitHub holds {} releases of {tag}; delete the extra drafts", ids.len())),
+    }
+}
+
+fn find_release(tag: &str) -> Result<Option<u64>, String> {
+    let list = capture("gh", &["api", "--paginate", &format!("repos/{REPO}/releases?per_page=100"), "--jq", ".[] | {id, tag_name}"])?;
+    release_for_tag(&list, tag)
+}
+
+/// The release `id` in the shape of `gh release view --json isDraft,assets`.
+fn view_release(id: u64) -> Result<String, String> {
+    capture("gh", &["api", &format!("repos/{REPO}/releases/{id}"), "--jq", "{isDraft: .draft, assets: [.assets[] | {name, size, state}]}"])
 }
 
 /// Publishes through a draft (spec 2026-10-28-release-pipeline, 4.2): creates the draft with every file,
-/// or uploads them again into a draft that is already there; checks it holds exactly `expected`; only then
-/// publishes it and checks again. A draft is invisible to installs, so a half-uploaded release never
+/// or uploads them again into the draft that is already there; checks it holds exactly `expected`; only
+/// then publishes it and checks again. A draft is invisible to installs, so a half-uploaded release never
 /// reaches one. Up to 3 attempts, 30 s apart; a release that is already published is only checked.
 fn publish(tag: &str, paths: &[String], expected: &[(String, u64)]) -> Result<(), String> {
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    // A draft this run created is never created again, even while the release list does not show it yet.
+    let mut created = false;
     let mut error = String::new();
     for attempt in 1..=3 {
         if attempt > 1 {
             eprintln!("{error}; attempt {attempt} of 3 in 30 s");
             std::thread::sleep(Duration::from_secs(30));
         }
-        let result = match release_view(tag) {
-            // No release yet, or GitHub did not answer: then `create` fails and the next attempt looks again.
-            Err(_) => step("gh", &[&["release", "create", tag, "--draft", "--title", tag, "--notes", ""][..], &paths].concat()),
-            Ok(view) if is_draft(&view) => step("gh", &[&["release", "upload", tag][..], &paths, &["--clobber"]].concat()),
-            Ok(view) => return check_release(&view, false, expected),
-        }
-        .and_then(|()| check_release(&release_view(tag)?, true, expected))
-        .and_then(|()| step("gh", &["release", "edit", tag, "--draft=false"]))
-        .and_then(|()| check_release(&release_view(tag)?, false, expected));
-        match result {
+        match publish_attempt(tag, &paths, expected, &mut created) {
             Ok(()) => return Ok(()),
             Err(e) => error = e,
         }
     }
     Err(error)
+}
+
+/// One attempt of `publish`. The release is looked up by its tag once and then handled by its id.
+fn publish_attempt(tag: &str, paths: &[&str], expected: &[(String, u64)], created: &mut bool) -> Result<(), String> {
+    let id = match find_release(tag)? {
+        Some(id) => id,
+        None if *created => return Err("the draft created earlier is not listed yet".into()),
+        None => {
+            // `--verify-tag`: gh must never make the tag itself, on whatever main holds.
+            step("gh", &[&["release", "create", tag, "--verify-tag", "--draft", "--title", tag, "--notes", ""][..], paths].concat())?;
+            *created = true;
+            find_release(tag)?.ok_or("the new draft is not listed yet")?
+        }
+    };
+    let view = view_release(id)?;
+    if !is_draft(&view) {
+        return check_release(&view, false, expected);
+    }
+    if check_release(&view, true, expected).is_err() {
+        // The tag has exactly this one release (checked above), so `gh release upload` cannot pick another.
+        step("gh", &[&["release", "upload", tag][..], paths, &["--clobber"]].concat())?;
+        check_release(&view_release(id)?, true, expected)?;
+    }
+    step("gh", &["api", "--method", "PATCH", &format!("repos/{REPO}/releases/{id}"), "-F", "draft=false", "--silent"])?;
+    check_release(&view_release(id)?, false, expected)
 }
 
 /// Appends Markdown to the GitHub Actions run summary, when there is one.
@@ -342,7 +391,8 @@ enum Stage {
     Edited,
     /// The Release commit and the tag exist locally.
     Committed,
-    /// Commit and tag are on origin; the GitHub release is missing, or still a draft.
+    /// Commit and tag are on origin, or the push failed in a way that leaves that unknown; the GitHub
+    /// release is missing, or still a draft.
     Pushed,
 }
 
@@ -434,9 +484,9 @@ fn release(version: &str, pipeline: bool, password: Option<String>) -> Result<()
     if result.is_err() {
         let run = pipeline.then(|| std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "<run id>".to_string()));
         let commands = recovery(stage, version, &files, run.as_deref());
+        // In the pipeline a later workflow step puts them in the run summary, also after a timeout.
         if !commands.is_empty() {
             eprintln!("the release stopped half way; run:\n{commands}");
-            append_summary(&format!("The release stopped after the push; finish it with:\n\n```\n{commands}\n```\n"));
         }
     }
     result
@@ -512,6 +562,13 @@ fn release_steps(
             }
         }
     }
+    // Files of an earlier release must neither be uploaded nor counted as this release's; a file that
+    // cannot go (an om.exe still running from there) stops the release here, before the commit.
+    let dist = root.join("target/release-dist");
+    match std::fs::remove_dir_all(&dist) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("cannot clear {}: {e}", dist.display())),
+        _ => {}
+    }
 
     // 2. Version commit and tag; the diff must be only the version and the lockfile.
     let manifest_path = root.join("Cargo.toml");
@@ -545,12 +602,6 @@ fn release_steps(
     // 4-5. Manifest and its minisign signature, checked against the trusted key.
     let manifest = build_manifest(version, &files);
     let signature = minisign::sign(Some(&trusted), &secret, manifest.as_bytes(), None, None).map_err(|e| format!("signing failed: {e}"))?;
-    let dist = root.join("target/release-dist");
-    // Files of an earlier release must neither be uploaded nor counted as this release's.
-    match std::fs::remove_dir_all(&dist) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("cannot clear {}: {e}", dist.display())),
-        _ => {}
-    }
     std::fs::create_dir_all(&dist).map_err(|e| e.to_string())?;
     for (name, bytes) in &files {
         std::fs::write(dist.join(name), bytes).map_err(|e| e.to_string())?;
@@ -566,13 +617,20 @@ fn release_steps(
 
     // 6. Publish. Atomic: the commit and the tag land on origin together, or neither does.
     if let Err(error) = step("git", &["push", "--atomic", "origin", "main", &tag]) {
-        // The push may have landed with only its acknowledgement lost: then the tag is on origin.
-        let remote = capture("git", &["ls-remote", "origin", &format!("refs/tags/{tag}")]).unwrap_or_default();
-        let release_commit = capture("git", &["rev-parse", "HEAD"])?;
-        if remote.split_whitespace().next() != Some(release_commit.as_str()) {
-            return Err(error);
+        // The push may have landed with only its acknowledgement lost: then origin has the tag as it is
+        // here (`ls-remote` prints what the tag ref points to, the commit or, if annotated, the tag object).
+        let local = capture("git", &["rev-parse", &format!("refs/tags/{tag}")])?;
+        match capture("git", &["ls-remote", "origin", &format!("refs/tags/{tag}")]) {
+            Ok(remote) if remote.split_whitespace().next() == Some(local.as_str()) => {
+                eprintln!("git push reported an error, but {tag} is on origin; going on");
+            }
+            Ok(_) => return Err(error),
+            // Unknown whether it landed: the commands for after the push start by looking.
+            Err(e) => {
+                *stage = Stage::Pushed;
+                return Err(format!("{error}; whether it reached origin is unknown: {e}"));
+            }
         }
-        eprintln!("git push reported an error, but {tag} is on origin at the release commit; going on");
     }
     *stage = Stage::Pushed;
     let paths: Vec<String> = assets.iter().map(|name| dist.join(name).to_string_lossy().into_owned()).collect();
@@ -671,8 +729,11 @@ mod tests {
         let files = ["om.exe".to_string(), "manifest.json".to_string()];
         let pushed = recovery(Stage::Pushed, "1.0.0", &files, None);
         let list = " target/release-dist/om.exe target/release-dist/manifest.json";
-        assert!(pushed.starts_with("# see what GitHub holds:\ngh release view v1.0.0 --json isDraft,assets\n"), "{pushed}");
-        assert!(pushed.contains(&format!("gh release create v1.0.0 --draft --title v1.0.0 --notes \"\"{list}")), "{pushed}");
+        // A push that reported an error may not have landed: that is checked first, and pushed again.
+        let check = "# check that the tag reached origin:\ngit ls-remote origin refs/tags/v1.0.0\n# it lists nothing: push first:\n\
+                     git push --atomic origin main v1.0.0\n# see what GitHub holds:\ngh release view v1.0.0 --json isDraft,assets\n";
+        assert!(pushed.starts_with(check), "{pushed}");
+        assert!(pushed.contains(&format!("gh release create v1.0.0 --verify-tag --draft --title v1.0.0 --notes \"\"{list}")), "{pushed}");
         assert!(pushed.contains(&format!("gh release upload v1.0.0{list} --clobber")), "{pushed}");
         assert!(pushed.contains("gh release edit v1.0.0 --draft=false"), "{pushed}");
         assert!(!pushed.contains('*'), "{pushed}");
@@ -690,8 +751,30 @@ mod tests {
             assert_eq!(recovery(stage, "1.0.0", &["om.exe".to_string()], Some("42")), "", "{stage:?}");
         }
         let pushed = recovery(Stage::Pushed, "1.0.0", &["om.exe".to_string()], Some("42"));
-        assert!(pushed.contains("gh run download 42 -n release-dist-1.0.0 -D target/release-dist\n"), "{pushed}");
-        assert!(pushed.contains("gh release view v1.0.0 --json isDraft,assets"), "{pushed}");
+        let check = "# check that the tag reached origin:\ngit ls-remote origin refs/tags/v1.0.0\n\
+                     # it lists nothing: nothing reached origin; run the workflow again instead.\n\
+                     # in a clone of the repository at v1.0.0, get the files of the release:\n\
+                     gh run download 42 -n release-dist-1.0.0 -D target/release-dist\n\
+                     # see what GitHub holds:\ngh release view v1.0.0 --json isDraft,assets\n";
+        assert!(pushed.starts_with(check), "{pushed}");
+        // The runner with the local commit is gone, so there is nothing to push again.
+        assert!(!pushed.contains("git push"), "{pushed}");
+    }
+
+    #[test]
+    fn only_a_list_that_was_read_says_there_is_no_release() {
+        let list = "{\"draft\":false,\"id\":7,\"tag_name\":\"v1.0.0\"}\n{\"draft\":true,\"id\":9,\"tag_name\":\"v1.1.0\"}\n";
+        assert_eq!(release_for_tag(list, "v1.1.0"), Ok(Some(9)));
+        assert_eq!(release_for_tag(list, "v1.2.0"), Ok(None));
+        assert_eq!(release_for_tag("", "v1.2.0"), Ok(None));
+        // An unreadable answer is not "no release": creating then could make a second draft.
+        assert!(release_for_tag("Not Found", "v1.2.0").is_err());
+        assert!(release_for_tag("{\"id\":", "v1.2.0").is_err());
+        // Two drafts of one tag: no step may guess which one it acts on.
+        let two = format!("{list}{{\"draft\":true,\"id\":10,\"tag_name\":\"v1.1.0\"}}\n");
+        let error = release_for_tag(&two, "v1.1.0").expect_err("two releases");
+        assert!(error.contains("2 releases of v1.1.0"), "{error}");
+        assert!(release_for_tag("{\"tag_name\":\"v1.1.0\"}", "v1.1.0").is_err());
     }
 
     #[test]
