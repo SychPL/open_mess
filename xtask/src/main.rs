@@ -132,10 +132,22 @@ fn set_workspace_version(toml: &str, version: &str) -> Option<String> {
 fn recovery(stage: Stage, tag: &str) -> String {
     match stage {
         Stage::Clean => String::new(),
-        Stage::Edited => "git checkout -- Cargo.toml Cargo.lock".to_string(),
+        Stage::Edited => "git checkout HEAD -- Cargo.toml Cargo.lock".to_string(),
         Stage::Committed => format!("git tag -d {tag}\ngit reset --hard HEAD~1"),
-        Stage::Pushed => format!("gh release create {tag} --title {tag} --notes \"\" target/release-dist/*"),
+        Stage::Pushed => format!(
+            "# no release {tag} on GitHub yet:\ngh release create {tag} --title {tag} --notes \"\" target/release-dist/*\n\
+             # the release is there, with some files missing:\ngh release upload {tag} target/release-dist/* --clobber"
+        ),
     }
+}
+
+/// Signs a test message with `secret` and verifies it with `public`: a secret key that is not the
+/// pair of keys/release.pub fails here, before any commit or tag.
+fn check_key_pair(public: &minisign::PublicKey, secret: &minisign::SecretKey) -> Result<(), String> {
+    const MESSAGE: &[u8] = b"open_mess release key check";
+    let signature = minisign::sign(None, secret, MESSAGE, None, None).map_err(|e| format!("cannot sign with the secret key: {e}"))?;
+    minisign::verify(public, &signature, std::io::Cursor::new(MESSAGE), true, false, false)
+        .map_err(|e| format!("the secret key is not the pair of keys/release.pub: {e}"))
 }
 
 /// How far `release` got; decides which recovery commands are printed on failure.
@@ -146,7 +158,7 @@ enum Stage {
     Edited,
     /// The Release commit and the tag exist locally.
     Committed,
-    /// Commit and tag are on origin; the GitHub release is missing.
+    /// Commit and tag are on origin; the GitHub release is missing or lacks files.
     Pushed,
 }
 
@@ -255,6 +267,7 @@ fn release_steps(version: &str, tag: &str, stage: &mut Stage) -> Result<(), Stri
         minisign::PublicKey::from_file(root.join("keys").join("release.pub")).map_err(|e| format!("keys/release.pub is not a release key: {e}"))?;
     // Unlock now (the password is asked here): a wrong password must not strand a commit and tag.
     let secret = minisign::SecretKey::from_file(&key_path, None).map_err(|e| format!("cannot unlock the secret key: {e}"))?;
+    check_key_pair(&public, &secret)?;
     if !capture("git", &["status", "--porcelain"])?.is_empty() {
         return Err("the working tree is not clean".into());
     }
@@ -324,8 +337,8 @@ fn release_steps(version: &str, tag: &str, stage: &mut Stage) -> Result<(), Stri
     std::fs::write(dist.join("manifest.json.minisig"), signature.to_string()).map_err(|e| e.to_string())?;
     assets.extend(["manifest.json".to_string(), "manifest.json.minisig".to_string()]);
 
-    // 6. Publish.
-    step("git", &["push", "origin", "main", &tag])?;
+    // 6. Publish. Atomic: the commit and the tag land on origin together, or neither does.
+    step("git", &["push", "--atomic", "origin", "main", &tag])?;
     *stage = Stage::Pushed;
     let paths: Vec<String> = assets.iter().map(|name| dist.join(name).to_string_lossy().into_owned()).collect();
     let mut args = vec!["release", "create", &tag, "--title", &tag, "--notes", ""];
@@ -415,10 +428,21 @@ mod tests {
     #[test]
     fn failed_release_prints_the_way_back() {
         assert_eq!(recovery(Stage::Clean, "v1.0.0"), "");
-        assert!(recovery(Stage::Edited, "v1.0.0").contains("git checkout -- Cargo.toml Cargo.lock"));
+        assert!(recovery(Stage::Edited, "v1.0.0").contains("git checkout HEAD -- Cargo.toml Cargo.lock"));
         let committed = recovery(Stage::Committed, "v1.0.0");
         assert!(committed.contains("git tag -d v1.0.0") && committed.contains("git reset --hard HEAD~1"));
-        assert!(recovery(Stage::Pushed, "v1.0.0").starts_with("gh release create v1.0.0"));
+        // The release may be missing, or there with only some of its files.
+        let pushed = recovery(Stage::Pushed, "v1.0.0");
+        assert!(pushed.contains("gh release create v1.0.0 --title v1.0.0"), "{pushed}");
+        assert!(pushed.contains("gh release upload v1.0.0 target/release-dist/* --clobber"), "{pushed}");
+    }
+
+    #[test]
+    fn a_secret_key_that_does_not_match_the_public_one_is_refused() {
+        let pair = minisign::KeyPair::generate_unencrypted_keypair().expect("pair");
+        let other = minisign::KeyPair::generate_unencrypted_keypair().expect("other pair");
+        check_key_pair(&pair.pk, &pair.sk).expect("a matching pair");
+        assert!(check_key_pair(&other.pk, &pair.sk).is_err());
     }
 
     #[test]
