@@ -40,6 +40,10 @@ pub struct Effective {
     pub write: Write,
 }
 
+/// The reserved account of the local recordings (spec 2026-10-28-local-transcription, 4.5): only
+/// its read permission counts. Real accounts are `<module>:<account>`, so none is called this.
+pub const LOCAL: &str = "local";
+
 /// What an account has until the user changes it: reading, and writing with confirmation.
 pub const DEFAULT: Effective = Effective { read: true, write: Write::Confirm };
 

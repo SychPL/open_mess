@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use keyring_core::api::CredentialStore;
 use open_mess::accounts::Accounts;
 use open_mess::modules::{self, Modules};
+use open_mess::recording::Recordings;
 use open_mess::store::Store;
 use open_mess::tools::Registry;
 use open_mess::ui::sign_in::SignIns;
@@ -143,7 +144,8 @@ pub async fn daemon(files: &[(&str, &str)]) -> Daemon {
     let modules = scan_prompting(&store, &engine, dir.path(), sender, SignInPrompts::with_budget(prompts, SIGN_IN_BUDGET)).await;
     let credentials: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
     let accounts = accounts(dir.path(), modules, Arc::clone(&credentials));
-    let registry = Registry::new(Instant::now(), Arc::clone(&accounts));
+    let mut registry = Registry::new(Instant::now(), Arc::clone(&accounts));
+    registry.set_recordings(Recordings::new(&dir.path().join("local")));
     Daemon { dir, accounts, registry, events, credentials, sign_ins }
 }
 

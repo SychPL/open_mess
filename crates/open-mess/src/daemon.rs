@@ -187,6 +187,11 @@ fn start(
     let bus = Bus::default();
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
     let mut registry = Registry::with_pending(started, Arc::clone(&accounts), Arc::clone(&pending));
+    // In %LOCALAPPDATA%, which only Windows has (spec 2026-10-28-local-transcription, 4.4); elsewhere
+    // the recording tools say they are not supported.
+    if let Some((paths, _)) = &update {
+        registry.set_recordings(crate::recording::Recordings::new(&paths.local));
+    }
     let activity = Arc::new(triggers::Activity::default());
     if probation {
         // Before the trigger engine, the approvals and the API run; the probation lets them go.

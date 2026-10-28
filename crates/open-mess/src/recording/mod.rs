@@ -40,6 +40,18 @@ pub enum State {
     Failed,
 }
 
+impl State {
+    pub fn name(self) -> &'static str {
+        match self {
+            State::Recording => "recording",
+            State::Waiting => "waiting",
+            State::Transcribing => "transcribing",
+            State::Done => "done",
+            State::Failed => "failed",
+        }
+    }
+}
+
 /// Why a recording was cut short, failed or lost its audio: a fixed set, so nothing from outside
 /// reaches an agent through it (4.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -245,6 +245,28 @@ async fn set_and_clear_override() {
 }
 
 #[tokio::test]
+async fn the_local_recordings_have_one_read_permission() {
+    let d = daemon(&[]).await;
+    let state = state(&d);
+    let list = || d.registry.call("list_recordings", json!({}));
+    // Shown with no account at all, readable until the window says otherwise.
+    let defaults = commands::permissions(&state, "local").unwrap();
+    assert!(defaults.read && defaults.overrides.is_empty());
+    assert_eq!(list().await.unwrap()["items"], json!([]));
+
+    commands::set_permissions(&state, "local", None, false, "autonomous").unwrap();
+    let set = commands::permissions(&state, "local").unwrap();
+    // Nothing to write there: whatever the window sends, writing stays never.
+    assert_eq!((set.read, set.write.as_str()), (false, "never"));
+    assert!(matches!(list().await, Err(ToolError::NotAllowed(_))));
+    assert!(matches!(d.registry.call("get_recording_transcript", json!({"recording": "0".repeat(32)})).await, Err(ToolError::NotAllowed(_))));
+    assert!(commands::set_permissions(&state, "local", Some("c1".into()), true, "never").is_err());
+
+    commands::set_permissions(&state, "local", None, true, "never").unwrap();
+    assert!(list().await.is_ok());
+}
+
+#[tokio::test]
 async fn decide_from_window_updates_state() {
     let d = daemon(&[ECHO]).await;
     d.accounts.add("test-echo", info("a")).unwrap();

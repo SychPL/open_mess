@@ -9,6 +9,7 @@
 //! (pending.rs), which run under the write permission. Every call passes the [`Gate`], which an
 //! update closes (spec 7.1).
 
+pub mod recordings;
 pub mod shared;
 
 use std::future::Future;
@@ -26,6 +27,7 @@ use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::{ModuleInfo, ModuleState};
 use crate::pending::{Kind, Pending, State};
 use crate::permissions;
+use crate::recording::Recordings;
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
 use crate::triggers::engine::now_ms;
@@ -146,6 +148,8 @@ pub struct Registry {
     accounts_restored: Arc<AtomicBool>,
     /// The updates, shown in `status` and changed by no tool (spec 2026-10-27-self-update, 6).
     update: Option<UpdateService>,
+    /// The local recordings; None where the daemon records nothing (not on Windows).
+    recordings: Option<Recordings>,
 }
 
 impl Registry {
@@ -162,6 +166,7 @@ impl Registry {
             ui_ready: Arc::default(),
             accounts_restored: Arc::default(),
             update: None,
+            recordings: None,
         }
     }
 
@@ -208,6 +213,11 @@ impl Registry {
         self.update = Some(update);
     }
 
+    /// The local recordings the recording tools read.
+    pub fn set_recordings(&mut self, recordings: Recordings) {
+        self.recordings = Some(recordings);
+    }
+
     pub fn list(&self) -> Vec<ToolInfo> {
         let mut tools = vec![ToolInfo {
             name: "status".into(),
@@ -215,6 +225,7 @@ impl Registry {
             input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         }];
         tools.extend(shared::tools());
+        tools.extend(recordings::tools());
         tools
     }
 
@@ -228,6 +239,9 @@ impl Registry {
         if name == "status" {
             no_params(&args)?;
             return self.status();
+        }
+        if [recordings::LIST, recordings::TRANSCRIPT].contains(&name) {
+            return self.recording_tool(name, args);
         }
         let args = shared::validate(name, args)?;
         let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending) else {
@@ -259,6 +273,16 @@ impl Registry {
                 Ok(shared::with_notice(call_account(accounts, &readable(accounts, &id, &args.module_args)?, name, &args.module_args).await?))
             }
         }
+    }
+
+    /// The recording tools, under the read permission of the reserved account `local` (spec
+    /// 2026-10-28-local-transcription, 4.5).
+    fn recording_tool(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+        let (Some(recordings), Some(accounts)) = (&self.recordings, &self.accounts) else {
+            return Err(ToolError::Module("not supported yet: local recording works on Windows only".into()));
+        };
+        let readable = || Ok(permissions::effective(&accounts.store(), permissions::LOCAL, None).map_err(failed)?.read);
+        recordings::call(recordings, readable, name, args)
     }
 
     /// What the `status` tool answers; the daemon's own check during an update's probation reads it

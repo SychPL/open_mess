@@ -520,6 +520,18 @@ async function renderPermissions() {
     card.append(add);
     root.append(card);
   }
+  // The local recordings: one read permission, apart from the accounts' (spec
+  // 2026-10-28-local-transcription, 4.5); only its read box is shown.
+  const local = await call("permissions", { account: "local" });
+  const card = el("div", null, "card");
+  card.append(
+    el("strong", "Nagrania lokalne"),
+    el("div", "Transkrypcje rozmów nagranych na tym komputerze. Niezależne od uprawnień kont: agent z tym prawem czyta każde nagranie.", "muted"),
+  );
+  const row = el("div", null, "row");
+  row.append(permissionControls("local", null, local)[0]);
+  card.append(row);
+  root.append(card);
 }
 
 const KINDS = { send: "Wysłanie", edit: "Edycja", react: "Reakcja" };

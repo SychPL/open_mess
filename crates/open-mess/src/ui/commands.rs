@@ -391,7 +391,9 @@ fn known_account(state: &UiState, account: &str) -> Result<(), String> {
 }
 
 pub fn permissions(state: &UiState, account: &str) -> Result<PermissionsDto, String> {
-    known_account(state, account)?;
+    if account != permissions::LOCAL {
+        known_account(state, account)?;
+    }
     let store = state.accounts.store();
     let own = permissions::effective(&store, account, None).map_err(text)?;
     let overrides = permissions::overrides(&store, account).map_err(text)?;
@@ -409,8 +411,15 @@ pub fn permissions(state: &UiState, account: &str) -> Result<PermissionsDto, Str
 /// Sets the permissions of an account (`conversation` None) or of one of its conversations.
 pub fn set_permissions(state: &UiState, account: &str, conversation: Option<String>, read: bool, write: &str) -> Result<(), String> {
     changes_allowed(state)?;
-    known_account(state, account)?;
     let write = permissions::Write::parse(write).map_err(text)?;
+    if account == permissions::LOCAL {
+        // The local recordings are only read: no writing, no conversations of their own.
+        if conversation.is_some() {
+            return Err("nagrania lokalne nie mają rozmów".into());
+        }
+        return permissions::set(&state.accounts.store(), account, None, read, permissions::Write::Never).map_err(text);
+    }
+    known_account(state, account)?;
     let conversation = conversation.map(|id| id.trim().to_owned());
     if let Some(id) = &conversation
         && (id.is_empty() || id.len() > MAX_CONVERSATION || id.chars().any(char::is_control))
