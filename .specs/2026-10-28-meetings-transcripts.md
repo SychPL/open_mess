@@ -1,7 +1,7 @@
 # open_mess - spotkania i transkrypcje Teams (etap 2)
 
 Data: 2026-10-28
-Status: zatwierdzony przez Codex i GLM w rundzie R10 (2026-10-28); poprawki z recenzji commitów po R10 w changelogu
+Status: zatwierdzony przez Codex i GLM w rundzie R10 (2026-10-28); poprawki z recenzji commitów po R10 w changelogu; decyzje właściciela D1-D3 (2026-10-28) od rundy R11
 Powiązane: `.specs/2026-10-26-open-mess-design.md` (8.3, 8.5, 8.6, 12, 15), `docs/protocols/teams.md` (sekcja 9, "Live results" 9, "Needs live capture" 13-16), `wit/module.wit`.
 
 ## 1. Cel
@@ -16,8 +16,7 @@ Podsumowanie robi agent; open_mess niczego nie streszcza, nie nagrywa i nie tran
 
 - Etap 2 = spotkania, na których użytkownik jest, i transkrypcje Teams; podsumowuje agent (spec 3, 12).
 - Live check tylko do odczytu, przy właścicielu, za zgodą w czacie - zrobiony 2026-10-27 (`docs/protocols/teams.md`, "Live results" 9).
-
-Otwarte decyzje właściciela - sekcja 10. Ten spec ich nie rozstrzyga.
+- Decyzje D1-D3 z 2026-10-28 - sekcja 10: lokalna transkrypcja w osobnym specu, transkrypcje dla agentów bez dodatkowej bramki, pobranie transkrypcji nigdy nie liczy się jako wyświetlenie nagrania.
 
 ## 3. Kontekst w kodzie i protokole
 
@@ -71,7 +70,7 @@ Moduł:
 3. Gdy `metadata.ownerTenantId` różni się od `tid` konta: błąd "not supported yet: the transcript is stored by another organization" (live: SharePoint innej organizacji odrzuca token, docs 9 "Live results" 9).
 4. Origin z `location` musi być jedną z dwóch witryn organizacji użytkownika: `https://<t>-my.sharepoint.com` (OneDrive) albo `https://<t>.sharepoint.com` (witryny zespołów), gdzie `<t>` pochodzi z własnej witryny OneDrive użytkownika - `personalFileSite` z `GET <chatService>/v1/users/ME/properties` (tylko odczyt, klucz potwierdzony live, "Live results" 4), pobierane raz na sesję. Inny origin = błąd "transcript stored outside your organization", bez prośby o token: odbiorca tokenu nigdy nie pochodzi wyłącznie z odpowiedzi MCPS, więc wroga albo błędna odpowiedź nie skieruje tokenu SharePoint do obcej organizacji (recenzja R7). Brak `personalFileSite` = "not supported yet: cannot tell your organization's SharePoint". Znane ograniczenie: w organizacji wielogeograficznej (authsvc zwraca `isMultiGeo`, "Live results" 2) witryny innych geografii mają inne etykiety i dostają ten sam błąd - obsługa to osobna zmiana, gdy będzie potrzebna. Dalej `driveId` i `driveItemId` tylko znaki `[A-Za-z0-9!_-]`, do 256 znaków; inaczej "niezgodny protokół".
 5. `media/transcripts`; pusta lista albo brak pozycji z `isVisible` = wynik z `reason: "transcript not ready"` (Teams jeszcze przetwarza nagranie), nie błąd (recenzja R3). Wybór wyłącznie spośród pozycji z `isVisible: true` (niewidocznych Teams nie pokazuje, open_mess też nie): ta z `id == metadata.transcriptId`, inaczej ta z `isDefault`, inaczej pierwsza (recenzja R4). Związek `transcriptId` z MCPS i `id` z ODSP to "Needs live capture" 13. `id` wybranej pozycji przechodzi tę samą kontrolę co `driveId` (krok 4: dozwolone znaki, długość) i trafia do ścieżki zakodowany procentowo; inaczej "niezgodny protokół" (recenzja R2).
-6. `language` = `languageTag` pozycji, tylko gdy pasuje do `^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8}){0,4}$`, inaczej `null` (recenzja R7). `streamContent?is=1` (WebVTT, do `MAX_BODY`). Parser: nagłówek `WEBVTT` wymagany; fragmenty = linia czasu `[HH:]MM:SS.mmm --> [HH:]MM:SS.mmm` (obie postaci znacznika z WebVTT; ustawienia po znacznikach ignorowane) + tekst; mówca z `<v Imię>`; pozostałe tagi usuwane; najwyżej 100 000 fragmentów, 4000 znaków tekstu i 200 znaków mówcy na fragment (nadmiar obcięty ze znacznikiem, recenzja R4); zły format = "niezgodny protokół", nigdy panika.
+6. `language` = `languageTag` pozycji, tylko gdy pasuje do `^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8}){0,4}$`, inaczej `null` (recenzja R7). `streamContent?is=1` (WebVTT, do `MAX_BODY`) - tylko jeśli krok 0 potwierdzi, że to pobranie nie liczy się jako wyświetlenie nagrania (D3); inaczej krok 0 wskazuje inną drogę i spec wraca do review, a bez takiej drogi `teams_get_transcript` nie powstaje. Parser: nagłówek `WEBVTT` wymagany; fragmenty = linia czasu `[HH:]MM:SS.mmm --> [HH:]MM:SS.mmm` (obie postaci znacznika z WebVTT; ustawienia po znacznikach ignorowane) + tekst; mówca z `<v Imię>`; pozostałe tagi usuwane; najwyżej 100 000 fragmentów, 4000 znaków tekstu i 200 znaków mówcy na fragment (nadmiar obcięty ze znacznikiem, recenzja R4); zły format = "niezgodny protokół", nigdy panika.
 7. Strona: fragmenty od `cursor`, dopóki suma długości fragmentów zserializowanych do JSON (w bajtach, z ucieczkami znaków) nie przekroczy `max_bytes`, najwyżej 2000 fragmentów (co najmniej jeden fragment; pojedynczy fragment ma najwyżej 4000 znaków, więc kilkadziesiąt KB); `next_cursor` albo `null`. Górna granica `max_bytes` zostawia zapas do limitu wyniku 1 MiB (5.1) na resztę wyniku (recenzje R1, R2). Każda strona pobiera VTT od nowa (ponytail: bez pamięci podręcznej; transkrypcja godzinnego spotkania to ok. 100 KB; pamięć podręczna, gdy pomiar pokaże potrzebę).
 
 Wynik:
@@ -119,17 +118,19 @@ Token SharePoint ma odbiorcę zależnego od organizacji (`https://<tenant>-my.sh
 
 - Oba narzędzia czytają: podlegają prawu czytania konta/rozmowy (5.1), nigdy nie piszą na platformę i nie zmieniają stanu "przeczytane" (tylko GET do kalendarza, MCPS i SharePoint).
 - Nic nie jest zapisywane lokalnie: brak pamięci podręcznej transkrypcji, brak plików, w logach tylko kody statusu i liczby (spec 8.4).
-- Treść transkrypcji, tematy i nazwiska trafiają tylko do agentów podłączonych przez użytkownika (i dalej do dostawców ich modeli), jak wiadomości (spec 5, AGENTS.md) - z zastrzeżeniem otwartej decyzji D2 (sekcja 10).
+- Treść transkrypcji, tematy i nazwiska trafiają tylko do agentów podłączonych przez użytkownika (i dalej do dostawców ich modeli), jak wiadomości (spec 5, AGENTS.md), bez dodatkowej bramki poza prawem czytania konta/rozmowy (D2, sekcja 10).
+- Pobranie transkrypcji nie zostawia śladu wyświetlenia w analityce nagrania u jego właściciela (D3, sekcja 10): moduł używa wyłącznie drogi, którą krok 0 potwierdził jako niewidoczną w analityce.
 - Brak wyzwalaczy w tym etapie ("transkrypcja gotowa" - poza zakresem).
 
 ## 7. Kroki
 
 0. **Live capture przy właścicielu** (docs "Needs live capture" 13-16), tylko odczyt, tylko kody, klucze i liczby: kształt `paginationInfo` MCPS i odpowiedź kalendarza dla gęstego okna 31 dni (czy pojawia się stronicowanie), pobranie transkrypcji we własnej organizacji (lista ODSP, `streamContent?is=1`, związek `transcriptId` z `id`), MCPS dla spotkania cyklicznego i bez transkrypcji, kształt `Media_CallTranscript`, czy pobranie transkrypcji liczy się jako wyświetlenie nagrania, alfabet i długość identyfikatorów `19:meeting_...` (tylko klasy znaków i długości, nie wartości), zbiór wartości `myResponseType` i `eventType`, obecność pola prywatności i znacznika odwołania spotkania, postać `startTime`/`endTime` i rola `eventTimeZone`/`utcOffset`, postać znaczników czasu w VTT, postać `personalFileSite` (tylko schemat i wzór hosta, bez nazwy organizacji) i czy `location` transkrypcji własnej organizacji leży na jednym z dwóch originów z 4.2 krok 4. Wyniki do `docs/protocols/teams.md`. Krok 0 zapisuje też klasy znaków i długości `driveId`, `driveItemId` i `id` transkrypcji ODSP (bez wartości). Jeśli pobranie wymaga innej drogi niż 4.2 kroki 4-6, kalendarz okaże się stronicowany albo identyfikatory wyjdą poza klasy z 4.2 krok 4, spec wraca do review.
+   **Bramka D3 (wyświetlenia)**, część kroku 0: (a) REA klienta desktopowego: jak klient i odtwarzacz nagrań rejestrują wyświetlenie (osobne wywołanie, np. zapis aktywności albo zdarzenie analityki, czy sam odczyt treści po stronie serwera) i jakie zapytania klient wysyła, pokazując transkrypcję w podsumowaniu spotkania; (b) na żywo, wyłącznie na nagraniu, którego właścicielem jest sam użytkownik (więc ewentualne wyświetlenie trafia tylko do jego własnej analityki): liczniki pozycji `GET <origin>/_api/v2.1/drives/<driveId>/items/<driveItemId>/analytics/allTime` i `.../lastSevenDays` (`access.actionCount`, `access.actorCount` - tylko liczby) oraz liczba wyświetleń, którą pokazuje odtwarzacz nagrania, przed jednym pobraniem transkrypcji i ponownie po opóźnieniu analityki (następnego dnia), bez innych otwarć nagrania w tym czasie; kontrola: te same liczniki po otwarciu nagrania w oficjalnym kliencie. Droga przechodzi bramkę tylko wtedy, gdy pobranie nie zmienia żadnego licznika, a kontrola zmienia. Pobranie zmienia licznik = droga odrzucona; wtedy krok 0 szuka w REA innej drogi do tej samej treści (np. `temporaryDownloadUrl`, `streamContent?format=json`, usługa z 9.6 w docs) i sprawdza ją tak samo. Kontrola nie zmienia licznika (wynik nierozstrzygnięty) albo żadna droga nie przechodzi = stop i raport dla właściciela; `teams_get_transcript` nie jest wtedy wydawany, `teams_list_meetings` może być.
 1. Host: wzorce zakresów WAM (5.2) z testami.
 2. Rdzeń: dodatkowe narzędzia w rejestrze (5.1); moduł testowy `modules/test-echo` deklaruje jedno narzędzie czytające do testów rejestru; poprawiony komentarz w `wit/module.wit`.
 3. Teams: `teams_list_meetings` z testami dekodera na oczyszczonych, syntetycznych odpowiedziach o kształcie z live check.
 4. Teams: `teams_get_transcript` z testami (MCPS, wybór, inna organizacja, 401/404, parser VTT).
-5. Test akceptacyjny na żywo przy właścicielu (sekcja 9), wydanie dopiero po decyzji D2.
+5. Test akceptacyjny na żywo przy właścicielu (sekcja 9).
 
 ## 8. Dotknięte pliki
 
@@ -155,12 +156,13 @@ Token SharePoint ma odbiorcę zależnego od organizacji (`https://<tenant>-my.sh
 - Parser VTT: zły nagłówek, ucięty plik, brak `-->`, ogromna liczba fragmentów, bardzo długa linia, nie-UTF-8 - błąd albo obcięcie, nigdy panika (testy regresji).
 - Żadne z narzędzi nie wysyła zapytania innego niż GET do kalendarza, MCPS i SharePoint (test na nagranych wywołaniach `http.fetch`).
 - Oficjalny klient Teams działa jak dotąd; stan "przeczytane" czatów spotkań bez zmian.
+- Pobranie transkrypcji nie zmienia liczników wyświetleń nagrania (bramka D3 w kroku 0, wynik w `docs/protocols/teams.md`).
 
-## 10. Otwarte decyzje właściciela
+## 10. Decyzje właściciela (2026-10-28)
 
-- **D1. Lokalna transkrypcja dźwięku (np. Whisper)** dla spotkań bez transkrypcji Teams i innych platform (spec 12). Nie wchodzi w ten spec. Do rozstrzygnięcia: czy w ogóle, a jeśli tak - nagrywanie tylko na wyraźne polecenie użytkownika dla danego spotkania czy automatycznie, informacja dla uczestników, model wyłącznie lokalny, gdzie i jak długo leży dźwięk. Wymaga osobnego specu (przechwyt dźwięku to nowy import hosta, spec 12).
-- **D2. Zgoda / informacja dla uczestników (RODO)** przy przekazywaniu transkrypcji - mowy innych osób - agentom i dalej dostawcom ich modeli. Możliwości: (a) bez dodatkowej bramki, jak wiadomości czatu (prawo czytania konta/rozmowy); (b) osobny przełącznik per konto "transkrypcje dla agentów", domyślnie wyłączony; (c) jak (b) i tylko spotkania organizowane przez użytkownika; (d) inna. Do decyzji kroki 0-4 można zbudować, ale wydanie z tymi narzędziami (`cargo xtask release`) czeka na decyzję; (b) i (c) to mała zmiana w 5.1 (dodatkowy warunek przed wywołaniem) i w oknie.
-- **D3. Wyświetlenie w analityce nagrania** - tylko jeśli krok 0 pokaże, że pobranie transkrypcji widać u właściciela nagrania jako wyświetlenie: czy to akceptowalne (oficjalny klient robi to samo, otwierając podsumowanie spotkania).
+- **D1. Lokalna transkrypcja dźwięku (np. Whisper)** dla spotkań bez transkrypcji Teams i innych platform (spec 12): **tak, ale w osobnym specu**, nie w tym. Tamten spec rozstrzyga nagrywanie na polecenie czy automatycznie, informację dla uczestników, model wyłącznie lokalny, gdzie i jak długo leży dźwięk (przechwyt dźwięku to nowy import hosta, spec 12).
+- **D2. Zgoda / informacja dla uczestników (RODO)** przy przekazywaniu transkrypcji agentom: **(a) bez dodatkowej bramki**, bo open_mess służy właścicielowi do własnego użytku. Transkrypcje trafiają do agentów na prawie czytania konta/rozmowy, jak wiadomości czatu (5.1, 6); wydanie nie czeka na nic więcej. Odrzucone: (b) przełącznik per konto, (c) tylko spotkania organizowane przez użytkownika.
+- **D3. Wyświetlenie w analityce nagrania**: **niedopuszczalne**. Pobranie transkrypcji nie może pojawić się u właściciela nagrania jako wyświetlenie. Jeśli krok 0 pokaże, że droga z 4.2 liczy się jako wyświetlenie, trzeba znaleźć (REA klienta desktopowego) drogę, która się nie liczy, albo zatrzymać się i zgłosić to właścicielowi; nigdy nie wydawać pobrania, które rejestruje wyświetlenie (bramka D3 w kroku 0).
 
 ## 11. Threat model
 
@@ -169,6 +171,7 @@ Token SharePoint ma odbiorcę zależnego od organizacji (`https://<tenant>-my.sh
 - **Niezaufane**: odpowiedzi middle tier, MCPS i SharePoint oraz pliki VTT - limity rozmiaru (16 MiB odpowiedź, 1 MiB wynik narzędzia, 100 000 fragmentów, 4000 znaków na fragment), ścisłe dekodowanie, sprawdzanie originu SharePoint i identyfikatorów przed użyciem w adresie (moduł nie zbuduje zapytania do hosta wskazanego przez odpowiedź serwera poza `*.sharepoint.com`, a rdzeń i tak egzekwuje listę hostów), brak paniki na złych danych.
 - **Moduł**: nowe tokeny (SharePoint z `Sites.FullControl.All`, MCPS) poszerzają to, co moduł może zrobić na koncie - w granicy zaufania z spec 15 (rebutal R4 dokumentu projektowego); okno pokazuje nowe zakresy przy ponownej zgodzie. Najmniejsze uprawnienia: kalendarz przez middle tier, którego token moduł już ma, zamiast Graph, którego token klienta Teams niesie m.in. `Mail.ReadWrite` i `Mail.Send` (live check).
 - **Wzorzec zakresu WAM**: obejmuje tylko jedną etykietę pod `sharepoint.com`; inne domeny i głębsze nazwy odrzucone, więc moduł nie wyłudzi tokenu dla obcych usług.
+- **Właściciel nagrania** (często inna osoba niż użytkownik): open_mess nie zostawia u niego śladu wyświetlenia (D3); droga pobrania przechodzi bramkę D3 z kroku 0, a jej zmiana wraca do review.
 - **Inne organizacje**: transkrypcje spotkań cudzych organizacji nie są pobierane (błąd). Token SharePoint jest proszony wyłącznie dla dwóch originów organizacji użytkownika wyprowadzonych z jego własnej witryny OneDrive (4.2 krok 4), więc ani `ownerTenantId`, ani `location` z odpowiedzi MCPS nie wskażą odbiorcy tokenu (recenzja R7).
 - **Granica twardnienia**: jak spec 15 (bez obrony przed złośliwym kodem na koncie Windows).
 
@@ -188,3 +191,4 @@ Token SharePoint ma odbiorcę zależnego od organizacji (`https://<tenant>-my.sh
 - R8 (Codex REJECT, GLM APPROVE): zasada dla wartości serwera poza `untrusted` - ustalony zbiór, przepisany format albo żeton base64url (Codex P2); czasy kalendarza sprowadzane do UTC z kontrolą w kroku 0, odwołane spotkania pomijane (GLM P3).
 - R9 (Codex REJECT, GLM APPROVE): spotkania prywatne bez znacznika w odpowiedzi - rebutal w sekcji 12 (Codex P2); pola elementu dla starszej transkrypcji `Transcript`, próg 900 KiB przed filtrem uprawnień opisany wprost (GLM P3).
 - R10 (Codex APPROVE, GLM APPROVE): koniec pętli recenzji. Po R10: drugi odczyt `cTag` po pobraniu VTT (Codex P2 w recenzji commita 4bf20c2); limit 200 transkrypcji w wyniku, duplikat nazwy narzędzia w jednym manifeście nie jest wystawiany (GLM P3). Uwaga GLM P3 o treści serwera poza `untrusted` w wynikach narzędzi dodatkowych bez ścisłego parsowania w rdzeniu - przyjęta bez zmian: moduł jest zaufany dla swojego konta (spec 15), a zasada z sekcji 4 wiąże moduł Teams.
+- R11 (Codex APPROVE, GLM APPROVE): decyzje właściciela z 2026-10-28 w sekcji 10 - D1 lokalna transkrypcja w osobnym specu, D2 (a) bez dodatkowej bramki (sekcje 2, 6, krok 5 bez czekania na decyzję), D3 pobranie nie może liczyć się jako wyświetlenie: bramka D3 w kroku 0 (REA, liczniki analityki tylko na nagraniu użytkownika, kontrola, droga zastępcza albo stop), warunek w 4.2 krok 6, kryterium akceptacji i wpis w threat model.
