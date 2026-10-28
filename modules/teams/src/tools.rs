@@ -355,9 +355,9 @@ const MAX_MEETINGS_RESULT: usize = 900 * 1024;
 /// The Teams meetings of the user's calendar between `from` and `to` (spec 4.1). Not cut to a
 /// count: the core leaves out the meetings the agent may not read only after this.
 fn list_meetings(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
-    let at = |key: &str, default: i64| match text(args, key) {
+    let at = |key: &str, default: i64| match args.get(key) {
         None => Ok(default),
-        Some(t) => time::rfc3339_ms(t).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} must be an RFC 3339 time"))),
+        Some(t) => t.as_str().and_then(time::rfc3339_ms).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} must be an RFC 3339 time"))),
     };
     let now = api::now_ms();
     let (from, to) = (at("from", now.saturating_sub(7 * DAY_MS))?, at("to", now.saturating_add(DAY_MS))?);
