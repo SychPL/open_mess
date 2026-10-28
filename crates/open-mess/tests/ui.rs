@@ -14,6 +14,7 @@ use common::{Daemon, ECHO, daemon, echo, echo_rebuilt, echo_with_another_host, i
 use open_mess::approval;
 use open_mess::events::{Bus, Event};
 use open_mess::pending::{Kind, Pending, Preview, State};
+use open_mess::recording::model::{Download, Models};
 use open_mess::tools::ToolError;
 use open_mess::triggers::Counters;
 use open_mess::triggers::channel::Sessions;
@@ -45,6 +46,7 @@ fn state(d: &Daemon) -> UiState {
         exit: Arc::default(),
         probation: d.registry.pending().unwrap().probation().clone(),
         update: None,
+        models: None,
     }
 }
 
@@ -83,6 +85,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         ui_ready: Arc::default(),
         exit: Arc::default(),
         update: None,
+        models: None,
     };
     (dir, state)
 }
@@ -563,4 +566,20 @@ fn window_commands_are_registered() {
     for command in &commands {
         assert!(window.contains(&format!("pub async fn {command}(")), "no handler fn {command}");
     }
+}
+
+#[tokio::test]
+async fn the_model_is_handled_only_where_recording_is() {
+    let d = daemon(&[]).await;
+    let mut state = state(&d);
+    assert!(commands::model_status(&state).is_err());
+    assert!(commands::download_model(&state).is_err());
+    let local = d.dir.path().join("local");
+    let base = url::Url::parse("http://127.0.0.1:9/").unwrap();
+    state.models = Some(Arc::new(Models::new(&local, base, tokio::runtime::Handle::current())));
+    let view = commands::model_status(&state).unwrap();
+    assert_eq!((view.installed, view.newer, view.download), (None, false, Download::Idle));
+    assert!(view.size > 1_000_000_000);
+    // Nothing to delete is no error.
+    commands::delete_model(&state).unwrap();
 }

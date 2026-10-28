@@ -196,6 +196,7 @@ impl Harness {
             ui_ready: Arc::default(),
             exit: Arc::clone(&self.exit),
             update: Some(self.service.clone()),
+            models: None,
         }
     }
 

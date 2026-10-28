@@ -29,6 +29,9 @@
     "allow-check-update",
     "allow-install-update",
     "allow-cancel-update",
-    "allow-set-auto-install"
+    "allow-set-auto-install",
+    "allow-model-status",
+    "allow-download-model",
+    "allow-delete-model"
   ]
 }

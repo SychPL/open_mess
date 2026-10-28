@@ -31,6 +31,9 @@ const COMMANDS: &[&str] = &[
     "install_update",
     "cancel_update",
     "set_auto_install",
+    "model_status",
+    "download_model",
+    "delete_model",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -56,7 +56,10 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::check_update,
             ipc::install_update,
             ipc::cancel_update,
-            ipc::set_auto_install
+            ipc::set_auto_install,
+            ipc::model_status,
+            ipc::download_model,
+            ipc::delete_model
         ])
         .build(tauri::generate_context!())
         .map_err(failed)?;
@@ -295,6 +298,21 @@ mod ipc {
     #[tauri::command(rename_all = "snake_case")]
     pub async fn cancel_update(state: State<'_, UiState>) -> Result<(), String> {
         commands::cancel_update(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn model_status(state: State<'_, UiState>) -> Result<crate::recording::model::ModelView, String> {
+        commands::model_status(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn download_model(state: State<'_, UiState>) -> Result<(), String> {
+        commands::download_model(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn delete_model(state: State<'_, UiState>) -> Result<(), String> {
+        commands::delete_model(&state)
     }
 
     #[tauri::command(rename_all = "snake_case")]

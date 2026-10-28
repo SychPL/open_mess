@@ -765,6 +765,28 @@ pub fn cancel_update(state: &UiState) -> Result<(), String> {
     Ok(())
 }
 
+/// The Whisper model, where the daemon records (spec 2026-10-28-local-transcription, 4.6). Its
+/// download and removal are only here: no tool or CLI command reaches them.
+fn models(state: &UiState) -> Result<&crate::recording::model::Models, String> {
+    state.models.as_deref().ok_or_else(|| "nagrywanie rozmów działa tylko w Windows".to_owned())
+}
+
+pub fn model_status(state: &UiState) -> Result<crate::recording::model::ModelView, String> {
+    Ok(models(state)?.view())
+}
+
+/// "Pobierz model"; the window follows it in [`model_status`]. Only files under
+/// `%LOCALAPPDATA%`, which an update's rollback does not touch, so allowed while one is checked.
+pub fn download_model(state: &UiState) -> Result<(), String> {
+    let source = crate::recording::model::source().map_err(text)?;
+    models(state)?.start_download(source)
+}
+
+/// "Usuń model".
+pub fn delete_model(state: &UiState) -> Result<(), String> {
+    models(state)?.delete()
+}
+
 /// "Instaluj aktualizacje automatycznie".
 pub fn set_auto_install(state: &UiState, on: bool) -> Result<(), String> {
     changes_allowed(state)?;

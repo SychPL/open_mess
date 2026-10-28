@@ -946,12 +946,63 @@ async function renderTriggers() {
   root.append(setup);
 }
 
+function megabytes(bytes) {
+  return Math.round(bytes / (1024 * 1024)).toLocaleString("pl-PL") + " MB";
+}
+
+// Nagrywanie rozmów (spec 2026-10-28-local-transcription, 4.6). The model for now; the recording
+// settings and the list of recordings come with the recording itself.
+async function renderRecording() {
+  const model = await call("model_status");
+  const root = content("recording");
+  root.replaceChildren();
+  root.append(
+    el(
+      "p",
+      "Rozmowy są zamieniane na tekst na tym komputerze, modelem Whisper (large-v3-turbo, licencja MIT). Model pobiera się raz, z Hugging Face; każdy plik jest sprawdzany sumą kontrolną.",
+      "muted",
+    ),
+  );
+  const download = model.download;
+  let state = model.installed ? "pobrany" : "nie pobrany";
+  if (model.newer) state += " - dostępny nowszy model";
+  if (download.state === "running") state = "pobieranie: " + megabytes(download.done) + " z " + megabytes(download.total);
+  if (download.state === "failed") state = "pobieranie nie udało się: " + download.reason;
+  root.append(details([["Model", state]]));
+  const buttons = el("div", null, "row");
+  if (download.state !== "running" && (!model.installed || model.newer)) {
+    buttons.append(
+      button("Pobierz model (" + megabytes(model.size) + ")", async () => {
+        await call("download_model");
+        await renderRecording();
+      }),
+    );
+  }
+  if (model.installed && download.state !== "running") {
+    buttons.append(
+      button("Usuń model", async () => {
+        if (!confirm("Usunąć model? Bez niego rozmowy nie będą zamieniane na tekst.")) return;
+        await call("delete_model");
+        await renderRecording();
+      }, "danger"),
+    );
+  }
+  root.append(buttons);
+  // Progress while the section is open.
+  if (download.state === "running") {
+    setTimeout(() => {
+      if (current === "recording") renderRecording().catch(showError);
+    }, 1000);
+  }
+}
+
 const RENDER = {
   accounts: renderAccounts,
   triggers: renderTriggers,
   permissions: renderPermissions,
   waiting: renderWaiting,
   modules: renderModules,
+  recording: renderRecording,
   integrations: renderIntegrations,
   daemon: renderDaemon,
 };

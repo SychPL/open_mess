@@ -192,6 +192,10 @@ fn start(
     if let Some((paths, _)) = &update {
         registry.set_recordings(crate::recording::Recordings::new(&paths.local));
     }
+    let models = update.as_ref().and_then(|(paths, _)| {
+        let base = url::Url::parse(crate::recording::model::BASE).ok()?;
+        Some(Arc::new(crate::recording::model::Models::new(&paths.local, base, runtime.handle().clone())))
+    });
     let activity = Arc::new(triggers::Activity::default());
     if probation {
         // Before the trigger engine, the approvals and the API run; the probation lets them go.
@@ -270,6 +274,7 @@ fn start(
         ui_ready,
         exit,
         update,
+        models,
     };
     Ok((runtime, listener, registry, ui))
 }
