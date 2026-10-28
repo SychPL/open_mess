@@ -436,8 +436,9 @@ fn rollback_waits_for_the_daemon_to_let_go() {
     s.crash(&Machine::crashing());
     // The new daemon holds its lock, and its files, through two stops.
     let machine = Machine { stop_fails: true, ..Machine::new(true, Health::Healthy) };
-    let Outcome::RollbackFailed(why) = s.run(&machine) else { panic!("rolled back under a running daemon") };
+    let Outcome::Postponed(why) = s.run(&machine) else { panic!("rolled back under a running daemon") };
     assert!(why.contains("tried again"), "{why}");
+    assert!(s.last_result().unwrap().starts_with("wycofanie odłożone: "));
     assert_eq!(machine.log(), ["stop", "wait", "stop", "wait"], "nothing restored, nothing started");
     assert_eq!(s.pending().stage, Stage::RollingBack);
     assert_eq!(s.om(), NEW_OM);
@@ -449,7 +450,7 @@ fn rollback_waits_for_the_daemon_to_let_go() {
     assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
 }
 
-/// A stage that cannot be written leaves everything as it is: at `installed`, a daemon started
+/// A stage that cannot be written at `installed` leaves everything as it is: a daemon started
 /// meanwhile would run in probation and open its files in the middle of the restore. The next run
 /// rolls back.
 #[test]
@@ -461,8 +462,9 @@ fn rollback_that_cannot_write_its_stage_touches_nothing() {
     let blocked = s.paths.data.join("update-pending.json.tmp");
     std::fs::create_dir(&blocked).unwrap();
     let machine = Machine::new(true, Health::Healthy);
-    let Outcome::RollbackFailed(why) = s.run(&machine) else { panic!("rolled back without writing its stage") };
+    let Outcome::Postponed(why) = s.run(&machine) else { panic!("rolled back without writing its stage") };
     assert!(why.contains("tried again"), "{why}");
+    assert!(s.last_result().unwrap().starts_with("wycofanie odłożone: "), "not a failed rollback");
     assert!(machine.log().is_empty(), "nothing stopped, nothing started: {:?}", machine.log());
     assert_eq!(s.pending().stage, Stage::Installed);
     assert_eq!(s.om(), NEW_OM);
@@ -473,6 +475,24 @@ fn rollback_that_cannot_write_its_stage_touches_nothing() {
     assert_eq!(s.run(&machine), Outcome::RolledBack("the update was interrupted".into()));
     assert_eq!(s.om(), OLD_OM);
     assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
+}
+
+/// At `backed-up` a daemon that starts meanwhile exits, since this helper holds `update.lock`: a
+/// stage that cannot be written does not hold the rollback back, or open_mess would stay off for as
+/// long as the disk is full.
+#[test]
+fn rollback_at_backed_up_goes_ahead_when_its_stage_cannot_be_written() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    s.crash(&Machine::crashing());
+    s.set_stage(Stage::BackedUp);
+    std::fs::create_dir(s.paths.data.join("update-pending.json.tmp")).unwrap();
+    let machine = Machine::new(true, Health::Healthy);
+    assert_eq!(s.run(&machine), Outcome::RolledBack("the update was interrupted".into()));
+    assert_eq!(machine.log(), ["stop", "wait", "start"]);
+    assert_eq!(s.om(), OLD_OM);
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
+    assert!(!s.paths.pending_file().exists());
+    assert!(!s.backup().exists());
 }
 
 #[test]
@@ -532,6 +552,48 @@ fn busy_om_exe_is_moved_aside() {
         std::fs::read(s.paths.bin().join(format!("om.failed-{NOW}.exe"))).unwrap(),
         std::fs::read(env!("CARGO_BIN_EXE_open-mess-record-run")).unwrap()
     );
+}
+
+/// A bridge or an `om` call reads the state database during the rollback: SQLite opens it without
+/// delete sharing, so it cannot be replaced until the reader lets go. The restore waits for it, and
+/// never deletes the journals of a database it has not put back yet.
+#[cfg(windows)]
+#[test]
+fn restore_waits_for_a_reader_of_the_state_database() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::rc::Rc;
+    use std::thread::JoinHandle;
+
+    const FILE_SHARE_READ_WRITE: u32 = 1 | 2;
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    let mut machine = Machine::new(false, Health::Failed("module test-echo crashed".into()));
+    let data = s.paths.data.clone();
+    let reader: Rc<RefCell<Option<JoinHandle<bool>>>> = Rc::default();
+    let started = Rc::clone(&reader);
+    machine.meanwhile = Box::new(move || {
+        common::store(&data).set_config("written_by", "the new daemon").unwrap();
+        for journal in ["state.sqlite3-wal", "state.sqlite3-shm"] {
+            std::fs::write(data.join(journal), b"new journal").unwrap();
+        }
+        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ_WRITE).open(data.join("state.sqlite3")).unwrap();
+        let wal = data.join("state.sqlite3-wal");
+        // Lets go after 500 ms, and says whether the journal was still there while it held the
+        // database.
+        *started.borrow_mut() = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let kept = wal.exists();
+            drop(held);
+            kept
+        }));
+    });
+    let outcome = s.run(&machine);
+    let kept = reader.borrow_mut().take().unwrap().join().unwrap();
+    assert_eq!(outcome, Outcome::RolledBack("module test-echo crashed".into()));
+    assert!(kept, "the journal was deleted while its database was not restored");
+    assert_eq!(s.store().get_config("written_by").unwrap(), None, "the database is restored");
+    for journal in ["state.sqlite3-wal", "state.sqlite3-shm"] {
+        assert!(!s.paths.data.join(journal).exists(), "{journal} is left");
+    }
 }
 
 #[test]
@@ -674,7 +736,7 @@ fn judge_waits_for_accounts_but_fails_on_a_crash() {
     // Another version answering is not the new daemon, however well it is.
     let mut old = status(true, true, back());
     old["version"] = json!("9.9.8");
-    assert_eq!(judge(&old, &active), Judgement::Pending { accounts_only: false });
+    assert_eq!(judge(&old, &active), Judgement::OtherVersion("9.9.8".into()), "named in the failure");
 
     // A crash fails at once, even while the accounts are restored.
     assert!(matches!(judge(&status(true, false, echo("active", json!(1))), &active), Judgement::Failed(_)));

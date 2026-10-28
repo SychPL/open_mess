@@ -129,7 +129,8 @@ pub async fn watch(paths: &Paths, activity: &Activity, launcher: &dyn Launcher, 
                 }
             }
             Judgement::Pending { accounts_only } if started.elapsed() < (if accounts_only { ACCOUNTS } else { READY }) => {}
-            Judgement::Pending { .. } | Judgement::Failed(_) => return make_way(paths, launcher, lock, exit),
+            Judgement::OtherVersion(_) if started.elapsed() < READY => {}
+            Judgement::Pending { .. } | Judgement::OtherVersion(_) | Judgement::Failed(_) => return make_way(paths, launcher, lock, exit),
         }
     }
     drop(lock);
@@ -160,15 +161,14 @@ fn hold(activity: &Activity, on: bool) {
 /// After a successful installation of `keep` (spec 7.5): the update folders of older versions, and
 /// the programs earlier installations and `scripts/install.ps1` left in `bin`. A file in use (an old
 /// `om.exe` a bridge still runs) stays until the next time. Kept: `keep`'s folder with its backup,
-/// `om.update.exe` for the recovery, and every folder with a `backup` in it: a failed rollback left
-/// the user's data there.
+/// `om.update.exe` for the recovery, and every folder with a `backup` in it, or a `backup-*-earlier`
+/// a later attempt set aside: a failed rollback left the user's data there. A `backup-<ms>` of a
+/// successful installation goes with its folder.
 pub fn cleanup(paths: &Paths, keep: &Version) {
     for entry in fs::read_dir(paths.updates()).into_iter().flatten().flatten() {
         let older = entry.file_name().to_str().and_then(|name| Version::parse(name).ok()).is_some_and(|version| version < *keep);
         let dir = entry.path();
-        // A folder that cannot be looked into counts as one with a backup.
-        let backup = dir.join("backup").try_exists().unwrap_or(true);
-        if older && entry.file_type().is_ok_and(|kind| kind.is_dir()) && !backup {
+        if older && entry.file_type().is_ok_and(|kind| kind.is_dir()) && !holds_users_data(&dir) {
             let _ = fs::remove_dir_all(dir);
         }
     }
@@ -181,4 +181,17 @@ pub fn cleanup(paths: &Paths, keep: &Version) {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// Whether an update folder holds a backup a failed rollback left. A folder, or an entry, that
+/// cannot be looked at counts as one.
+fn holds_users_data(dir: &std::path::Path) -> bool {
+    let Ok(mut entries) = fs::read_dir(dir) else { return true };
+    entries.any(|entry| {
+        entry.map_or(true, |entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == "backup" || (name.starts_with("backup-") && name.ends_with("-earlier"))
+        })
+    })
 }

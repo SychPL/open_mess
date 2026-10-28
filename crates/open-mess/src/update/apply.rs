@@ -69,6 +69,8 @@ pub enum Outcome {
     Aborted(String),
     /// The rollback failed too; the reason names the backup folder.
     RollbackFailed(String),
+    /// The rollback could not run now and is tried again at the next run; nothing was touched.
+    Postponed(String),
 }
 
 impl fmt::Display for Outcome {
@@ -79,6 +81,7 @@ impl fmt::Display for Outcome {
             Outcome::RolledBack(why) => write!(f, "przywrócono: {why}"),
             Outcome::Aborted(why) => write!(f, "przerwano: {why}"),
             Outcome::RollbackFailed(why) => write!(f, "wycofanie nieudane: {why}"),
+            Outcome::Postponed(why) => write!(f, "wycofanie odłożone: {why}"),
         }
     }
 }
@@ -91,6 +94,9 @@ pub enum Judgement {
     Pending {
         accounts_only: bool,
     },
+    /// Another version answers (an old daemon not quite gone, say): pending like the window and the
+    /// modules, and named when that fails.
+    OtherVersion(String),
     Failed(String),
 }
 
@@ -100,8 +106,11 @@ pub enum Judgement {
 /// daemon's own check during the probation uses it too.
 pub fn judge(status: &Value, version: &str, active_modules: &[String]) -> Judgement {
     // Another version answering is not the new daemon yet (an old one not quite gone, say).
-    if status.get("version").and_then(Value::as_str) != Some(version) {
-        return Judgement::Pending { accounts_only: false };
+    match status.get("version").and_then(Value::as_str) {
+        Some(seen) if seen == version => {}
+        // Named in the failure, so capped: the answer is the network's.
+        Some(seen) => return Judgement::OtherVersion(seen.chars().take(64).collect()),
+        None => return Judgement::Pending { accounts_only: false },
     }
     let listed = status.get("modules").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let [active, waiting, crashed, disabled] =
@@ -258,16 +267,28 @@ fn abort(paths: &Paths, system: &dyn System, why: String) -> Outcome {
 /// Deletes `update-pending.json`, 5 tries 100 ms apart: an antivirus may hold it for a moment, and
 /// a stage file left behind makes the next run roll back.
 fn remove_stage_file(paths: &Paths) -> io::Result<()> {
-    let mut tries = 5;
+    retry(5, Duration::from_millis(100), || remove_if_present(&paths.pending_file()))
+}
+
+/// `step`, tried up to `tries` times `pause` apart until it works.
+fn retry(tries: u32, pause: Duration, mut step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let mut left = tries;
     loop {
-        match remove_if_present(&paths.pending_file()) {
-            Err(_) if tries > 1 => {
-                tries -= 1;
-                std::thread::sleep(Duration::from_millis(100));
+        match step() {
+            Err(_) if left > 1 => {
+                left -= 1;
+                std::thread::sleep(pause);
             }
-            removed => return removed,
+            done => return done,
         }
     }
+}
+
+/// A step of the restore, 10 tries 200 ms apart: with the daemon stopped, a bridge or an `om` call
+/// still reads the state database, which SQLite opens without delete sharing, and an antivirus may
+/// hold any file for a moment.
+fn restore_step(step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    retry(10, Duration::from_millis(200), step)
 }
 
 /// Starts the daemon; a failure is added to `why`, there is nothing else to do about it.
@@ -282,22 +303,27 @@ fn start(system: &dyn System, why: String) -> String {
 /// run cut short starts over. Then the stage file goes and the daemon starts, whatever came of it.
 /// A daemon that does not let go of its lock after two stops would keep its files open: nothing is
 /// restored then, and the stage file stays for the next run. So too when the stage cannot be
-/// written: at `installed` a daemon started meanwhile would run in probation and open its files in
-/// the middle of the restore.
+/// written and the file on disk says `installed`: a daemon started meanwhile would run in probation
+/// and open its files in the middle of the restore. At any other stage, or a file it cannot read,
+/// such a daemon exits while this helper holds `update.lock`, and the restore goes ahead: a full
+/// disk must not leave open_mess off.
 fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: String, now: fn() -> i64) -> Outcome {
     pending.stage = Stage::RollingBack;
-    if let Err(err) = state::write(&paths.pending_file(), &pending) {
-        return Outcome::RollbackFailed(format!("{why}; the stage could not be written ({err}), the rollback is tried again at the next run"));
+    if let Err(err) = retry(5, Duration::from_millis(100), || state::write(&paths.pending_file(), &pending))
+        && matches!(state::read(&paths.pending_file()), Read::Found(PendingFile { stage: Stage::Installed, .. }))
+    {
+        return Outcome::Postponed(format!("{why}; the stage could not be written ({err}), the rollback is tried again at the next run"));
     }
     let stopped = (0..2).any(|_| {
         let _ = system.stop_daemon();
         system.wait_daemon_lock_free(STOP_WAIT)
     });
     if !stopped {
-        return Outcome::RollbackFailed(format!("{why}; the daemon did not stop, the rollback is tried again at the next run"));
+        return Outcome::Postponed(format!("{why}; the daemon did not stop, the rollback is tried again at the next run"));
     }
     let backup = pending.update_dir.join(BACKUP);
-    match restore(paths, &pending, &backup, now()) {
+    // A restore leaves the backup as it is: one more whole pass before it counts as failed.
+    match restore(paths, &pending, &backup, now()).or_else(|_| restore(paths, &pending, &backup, now())) {
         Ok(()) => {
             if !pending.manifest_sha256.is_empty() {
                 // Best effort: without it the release is only offered again.
@@ -319,24 +345,27 @@ fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: 
 
 /// Deletes what the update added, copies every backed-up file back, and deletes the journals of the
 /// restored databases that the backup does not have: SQLite would replay the new version's journal
-/// onto the old database. Goes on past a failure, so that as much as can be is restored, and
-/// returns the failures.
+/// onto the old database. A database that could not be put back keeps its journals, which belong
+/// to it. Goes on past a failure, so that as much as can be is restored, and returns the failures.
 fn restore(paths: &Paths, pending: &PendingFile, backup: &Path, ms: i64) -> Result<(), String> {
     if !backup.is_dir() {
         return Err(format!("no backup in {}", backup.display()));
     }
     let mut failures = Vec::new();
     let mut check = |path: &Path, result: io::Result<()>| {
+        let done = result.is_ok();
         if let Err(err) = result {
             failures.push(format!("{}: {err}", path.display()));
         }
+        done
     };
     // First, so that a backed-up file is always there at the end.
     for path in &pending.added {
-        check(path, remove_if_present(path));
+        check(path, restore_step(|| remove_if_present(path)));
     }
     let exe = paths.bin().join("om.exe");
-    check(&exe, put_back(&backup.join("bin").join("om.exe"), &exe, Some(&paths.bin().join(format!("om.failed-{ms}.exe")))));
+    let aside = paths.bin().join(format!("om.failed-{ms}.exe"));
+    check(&exe, restore_step(|| put_back(&backup.join("bin").join("om.exe"), &exe, Some(&aside))));
     let data = backup.join("data");
     for (from, to) in [(data.clone(), paths.data.clone()), (data.join("modules"), paths.data.join("modules"))] {
         let names = match backed_up(&from) {
@@ -347,15 +376,16 @@ fn restore(paths: &Paths, pending: &PendingFile, backup: &Path, ms: i64) -> Resu
             }
         };
         for name in &names {
-            check(&to.join(name), put_back(&from.join(name), &to.join(name), None));
-        }
-        for database in names.iter().filter(|name| has_suffix(name, ".sqlite3")) {
+            let put = check(&to.join(name), restore_step(|| put_back(&from.join(name), &to.join(name), None)));
+            if !put || !has_suffix(name, ".sqlite3") {
+                continue;
+            }
             for suffix in ["-journal", "-wal", "-shm"] {
-                let mut journal = database.clone();
+                let mut journal = name.clone();
                 journal.push(suffix);
                 if !names.contains(&journal) {
                     let path = to.join(&journal);
-                    check(&path, remove_if_present(&path));
+                    check(&path, restore_step(|| remove_if_present(&path)));
                 }
             }
         }

@@ -540,8 +540,9 @@ fn cleanup_keeps_current_version_and_files_in_use() {
     let older = folder("1.1.0", &[]);
     // Set aside after a successful install: it goes with its version.
     let set_aside = folder("1.0.5", &["backup-1700000000000"]);
-    // A failed rollback keeps the user's data there.
+    // A failed rollback keeps the user's data there, also once a later attempt set it aside.
     let failed_rollback = folder("1.0.0", &["backup"]);
+    let set_aside_earlier = folder("1.0.6", &["backup-1700000000000-earlier"]);
     let current = folder("1.2.0", &["backup"]);
     let newer = folder("1.3.0", &[]);
     let not_a_version = folder("notes", &[]);
@@ -560,6 +561,7 @@ fn cleanup_keeps_current_version_and_files_in_use() {
     probation::cleanup(&paths, &Version(1, 2, 0));
     assert!(!older.exists() && !set_aside.exists());
     assert!(failed_rollback.join("backup").is_dir() && current.join("backup").is_dir());
+    assert!(set_aside_earlier.join("backup-1700000000000-earlier").is_dir());
     assert!(newer.exists() && not_a_version.exists());
     let left = || -> Vec<&str> { programs.into_iter().filter(|program| bin.join(program).exists()).collect() };
     // Elsewhere a file in use can be deleted.

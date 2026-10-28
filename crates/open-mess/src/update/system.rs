@@ -107,6 +107,7 @@ impl WindowsSystem {
                     Judgement::Failed(why) => return Health::Failed(why),
                     Judgement::Pending { accounts_only: true } => (ACCOUNTS_WITHIN, "the accounts were not restored within 10 minutes".to_owned()),
                     Judgement::Pending { accounts_only: false } => (READY_WITHIN, "the window or a module was not ready within 60 s".to_owned()),
+                    Judgement::OtherVersion(seen) => (READY_WITHIN, format!("version {seen} answered instead of {version} for 60 s")),
                 },
                 Err(err) => (READY_WITHIN, format!("the new daemon did not answer within 60 s: {err}")),
             };
