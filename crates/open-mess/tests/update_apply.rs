@@ -642,6 +642,28 @@ fn restore_puts_back_journal_and_removes_new_ones() {
     assert!(s.rolled_back(), "the restored state database opens");
 }
 
+/// A database that cannot be put back keeps its current journals, and its backed-up journal is not
+/// put next to it: the hot journal would be replayed onto the wrong database.
+#[test]
+fn journal_is_not_put_back_without_its_database() {
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
+    std::fs::write(s.module("test-echo.sqlite3"), b"module database").unwrap();
+    std::fs::write(s.module("test-echo.sqlite3-journal"), b"hot journal").unwrap();
+    let mut machine = Machine::new(false, Health::Failed("module test-echo crashed".into()));
+    let modules = s.paths.data.join("modules");
+    machine.meanwhile = Box::new(move || {
+        // A folder in the database's place: renaming the backed-up copy over it fails.
+        std::fs::remove_file(modules.join("test-echo.sqlite3")).unwrap();
+        std::fs::create_dir(modules.join("test-echo.sqlite3")).unwrap();
+        std::fs::remove_file(modules.join("test-echo.sqlite3-journal")).unwrap();
+        std::fs::write(modules.join("test-echo.sqlite3-wal"), b"new wal").unwrap();
+    });
+    assert!(matches!(s.run(&machine), Outcome::RollbackFailed(_)));
+    assert!(s.module("test-echo.sqlite3").is_dir());
+    assert!(!s.module("test-echo.sqlite3-journal").exists(), "the hot journal was put next to the wrong database");
+    assert_eq!(std::fs::read(s.module("test-echo.sqlite3-wal")).unwrap(), b"new wal");
+}
+
 #[test]
 fn tampered_file_after_download_is_caught_by_reverify() {
     let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);

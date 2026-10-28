@@ -129,15 +129,21 @@ fn set_workspace_version(toml: &str, version: &str) -> Option<String> {
 }
 
 /// What the owner must run to undo or finish a release that failed after `stage`.
-fn recovery(stage: Stage, tag: &str) -> String {
+/// `files` are the names in `target/release-dist`, listed one by one: `gh release` takes file paths,
+/// not patterns, and PowerShell does not expand a `*`.
+fn recovery(stage: Stage, tag: &str, files: &[String]) -> String {
     match stage {
         Stage::Clean => String::new(),
         Stage::Edited => "git checkout HEAD -- Cargo.toml Cargo.lock".to_string(),
         Stage::Committed => format!("git tag -d {tag}\ngit reset --hard HEAD~1"),
-        Stage::Pushed => format!(
-            "# no release {tag} on GitHub yet:\ngh release create {tag} --title {tag} --notes \"\" target/release-dist/*\n\
-             # the release is there, with some files missing:\ngh release upload {tag} target/release-dist/* --clobber"
-        ),
+        Stage::Pushed => {
+            let list: String = files.iter().map(|name| format!(" target/release-dist/{name}")).collect();
+            format!(
+                "# no release {tag} on GitHub yet:\ngh release create {tag} --title {tag} --notes \"\"{list}\n\
+                 # the release is there, with some files missing (a failed create can leave a draft):\n\
+                 gh release upload {tag}{list} --clobber\ngh release edit {tag} --draft=false"
+            )
+        }
     }
 }
 
@@ -243,9 +249,10 @@ fn release(version: &str) -> Result<(), String> {
     }
     let tag = format!("v{version}");
     let mut stage = Stage::Clean;
-    let result = release_steps(version, &tag, &mut stage);
+    let mut files = Vec::new();
+    let result = release_steps(version, &tag, &mut stage, &mut files);
     if result.is_err() {
-        let commands = recovery(stage, &tag);
+        let commands = recovery(stage, &tag, &files);
         if !commands.is_empty() {
             eprintln!("the release stopped half way; run:\n{commands}");
         }
@@ -253,7 +260,8 @@ fn release(version: &str) -> Result<(), String> {
     result
 }
 
-fn release_steps(version: &str, tag: &str, stage: &mut Stage) -> Result<(), String> {
+/// `assets` gets the names of the files in `target/release-dist`, for the recovery commands.
+fn release_steps(version: &str, tag: &str, stage: &mut Stage, assets: &mut Vec<String>) -> Result<(), String> {
     let tag = tag.to_string();
     let root = repo_root();
     std::env::set_current_dir(&root).map_err(|e| e.to_string())?;
@@ -328,7 +336,6 @@ fn release_steps(version: &str, tag: &str, stage: &mut Stage) -> Result<(), Stri
     let signature = minisign::sign(Some(&public), &secret, manifest.as_bytes(), None, None).map_err(|e| format!("signing failed: {e}"))?;
     let dist = root.join("target/release-dist");
     std::fs::create_dir_all(&dist).map_err(|e| e.to_string())?;
-    let mut assets = vec![];
     for (name, bytes) in &files {
         std::fs::write(dist.join(name), bytes).map_err(|e| e.to_string())?;
         assets.push(name.clone());
@@ -427,14 +434,18 @@ mod tests {
 
     #[test]
     fn failed_release_prints_the_way_back() {
-        assert_eq!(recovery(Stage::Clean, "v1.0.0"), "");
-        assert!(recovery(Stage::Edited, "v1.0.0").contains("git checkout HEAD -- Cargo.toml Cargo.lock"));
-        let committed = recovery(Stage::Committed, "v1.0.0");
+        assert_eq!(recovery(Stage::Clean, "v1.0.0", &[]), "");
+        assert!(recovery(Stage::Edited, "v1.0.0", &[]).contains("git checkout HEAD -- Cargo.toml Cargo.lock"));
+        let committed = recovery(Stage::Committed, "v1.0.0", &[]);
         assert!(committed.contains("git tag -d v1.0.0") && committed.contains("git reset --hard HEAD~1"));
         // The release may be missing, or there with only some of its files.
-        let pushed = recovery(Stage::Pushed, "v1.0.0");
-        assert!(pushed.contains("gh release create v1.0.0 --title v1.0.0"), "{pushed}");
-        assert!(pushed.contains("gh release upload v1.0.0 target/release-dist/* --clobber"), "{pushed}");
+        let files = ["om.exe".to_string(), "manifest.json".to_string()];
+        let pushed = recovery(Stage::Pushed, "v1.0.0", &files);
+        let list = " target/release-dist/om.exe target/release-dist/manifest.json";
+        assert!(pushed.contains(&format!("gh release create v1.0.0 --title v1.0.0 --notes \"\"{list}")), "{pushed}");
+        assert!(pushed.contains(&format!("gh release upload v1.0.0{list} --clobber")), "{pushed}");
+        assert!(pushed.contains("gh release edit v1.0.0 --draft=false"), "{pushed}");
+        assert!(!pushed.contains('*'), "{pushed}");
     }
 
     #[test]

@@ -303,16 +303,22 @@ fn start(system: &dyn System, why: String) -> String {
 /// run cut short starts over. Then the stage file goes and the daemon starts, whatever came of it.
 /// A daemon that does not let go of its lock after two stops would keep its files open: nothing is
 /// restored then, and the stage file stays for the next run. So too when the stage cannot be
-/// written and the file on disk says `installed`: a daemon started meanwhile would run in probation
-/// and open its files in the middle of the restore. At any other stage, or a file it cannot read,
-/// such a daemon exits while this helper holds `update.lock`, and the restore goes ahead: a full
-/// disk must not leave open_mess off.
+/// written and the file on disk says `installed`, or cannot be read back: a daemon started meanwhile
+/// would run in probation and open its files in the middle of the restore. At `backed-up` or
+/// `rolling-back`, or a file that is not a stage file, such a daemon exits while this helper holds
+/// `update.lock`, and the restore goes ahead: a full disk must not leave open_mess off.
 fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: String, now: fn() -> i64) -> Outcome {
     pending.stage = Stage::RollingBack;
-    if let Err(err) = retry(5, Duration::from_millis(100), || state::write(&paths.pending_file(), &pending))
-        && matches!(state::read(&paths.pending_file()), Read::Found(PendingFile { stage: Stage::Installed, .. }))
-    {
-        return Outcome::Postponed(format!("{why}; the stage could not be written ({err}), the rollback is tried again at the next run"));
+    if let Err(err) = retry(5, Duration::from_millis(100), || state::write(&paths.pending_file(), &pending)) {
+        // What is on disk decides; a read that fails says nothing, as in `run`.
+        let restore_anyway = match state::read(&paths.pending_file()) {
+            Read::Found(on_disk) => matches!(on_disk.stage, Stage::BackedUp | Stage::RollingBack),
+            Read::Unreadable => true,
+            Read::Missing | Read::Error(_) => false,
+        };
+        if !restore_anyway {
+            return Outcome::Postponed(format!("{why}; the stage could not be written ({err}), the rollback is tried again at the next run"));
+        }
     }
     let stopped = (0..2).any(|_| {
         let _ = system.stop_daemon();
@@ -345,8 +351,9 @@ fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: 
 
 /// Deletes what the update added, copies every backed-up file back, and deletes the journals of the
 /// restored databases that the backup does not have: SQLite would replay the new version's journal
-/// onto the old database. A database that could not be put back keeps its journals, which belong
-/// to it. Goes on past a failure, so that as much as can be is restored, and returns the failures.
+/// onto the old database. Journals go only with their database: one that could not be put back
+/// keeps its current journals, and its backed-up ones stay in the backup. Goes on past a failure,
+/// so that as much as can be is restored, and returns the failures.
 fn restore(paths: &Paths, pending: &PendingFile, backup: &Path, ms: i64) -> Result<(), String> {
     if !backup.is_dir() {
         return Err(format!("no backup in {}", backup.display()));
@@ -376,6 +383,11 @@ fn restore(paths: &Paths, pending: &PendingFile, backup: &Path, ms: i64) -> Resu
             }
         };
         for name in &names {
+            // Journals travel with their database, below: one alone could be replayed onto the
+            // wrong database.
+            if has_suffix(name, ".sqlite3-journal") || has_suffix(name, ".sqlite3-wal") {
+                continue;
+            }
             let put = check(&to.join(name), restore_step(|| put_back(&from.join(name), &to.join(name), None)));
             if !put || !has_suffix(name, ".sqlite3") {
                 continue;
@@ -383,8 +395,10 @@ fn restore(paths: &Paths, pending: &PendingFile, backup: &Path, ms: i64) -> Resu
             for suffix in ["-journal", "-wal", "-shm"] {
                 let mut journal = name.clone();
                 journal.push(suffix);
-                if !names.contains(&journal) {
-                    let path = to.join(&journal);
+                let path = to.join(&journal);
+                if names.contains(&journal) {
+                    check(&path, restore_step(|| put_back(&from.join(&journal), &path, None)));
+                } else {
                     check(&path, restore_step(|| remove_if_present(&path)));
                 }
             }
@@ -645,5 +659,45 @@ mod tests {
         std::fs::write(dir.path().join("teams.wasm"), b"SIGNED").unwrap();
         let swapped = copy_checked(dir.path(), &entry(b"signed"), &dir.path().join("other.wasm"));
         assert!(matches!(swapped, Err(UpdateError::Rejected(_))), "{swapped:?}");
+    }
+    /// A `System` that must not be touched.
+    struct Untouched;
+
+    impl System for Untouched {
+        fn wait_daemon_lock_free(&self, _wait: Duration) -> bool {
+            panic!("waited for the daemon")
+        }
+        fn stop_daemon(&self) -> Result<(), UpdateError> {
+            panic!("stopped the daemon")
+        }
+        fn start_daemon(&self) -> Result<(), UpdateError> {
+            panic!("started the daemon")
+        }
+        fn health(&self, _version: &str, _active_modules: &[String]) -> Health {
+            panic!("asked for health")
+        }
+    }
+
+    /// A stage that cannot be written, and a file that cannot be read back either (a folder in its
+    /// place fails both): what is on disk is not known, so nothing is restored and the system is
+    /// not touched.
+    #[test]
+    fn rollback_that_cannot_read_its_stage_back_postpones() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths { data: root.path().join("data"), local: root.path().join("local") };
+        std::fs::create_dir_all(paths.pending_file()).unwrap();
+        let update_dir = root.path().join("update");
+        std::fs::create_dir_all(update_dir.join(BACKUP)).unwrap();
+        let pending = PendingFile {
+            version: "1.0.0".into(),
+            manifest_sha256: String::new(),
+            update_dir,
+            stage: Stage::Installed,
+            active_modules: Vec::new(),
+            added: Vec::new(),
+            replaced: Vec::new(),
+        };
+        let outcome = roll_back(&paths, &Untouched, pending, "interrupted".into(), || 0);
+        assert!(matches!(&outcome, Outcome::Postponed(why) if why.contains("tried again")), "{outcome:?}");
     }
 }
