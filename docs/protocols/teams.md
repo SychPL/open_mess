@@ -508,6 +508,138 @@ MCPS also returns `AISummary` and `callCrux` resources, and the recap reads AI n
 `meetingRecapServiceEndpoint` and `.../api/mcps/prod/meetingcatchup/...`. These are Copilot outputs,
 not transcripts; not analysed further (stage 2 leaves summaries to the agent).
 
+## 10. Live captions (stage 3 question)
+
+**Static analysis, not verified live.** Added 2026-10-29 to answer whether open_mess could receive
+live captions by joining a meeting itself, as the user's second endpoint without audio or video
+(captions exist only for call participants and are never stored; reading them from the official
+client is ruled out by AGENTS.md). Same package and decompressed copy as above; ripgrep over the
+chunks, no REA Evidence id. Main chunks: `114419-5658b4e2d56443ff.js` (8.8 MB, the JS calling core:
+captions, calling bot and data channel services), `calling-electron-c8eaed3906901b6a.js` (the bridge
+to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the browser WebRTC stack),
+`523694-597666624a12ca08.js` (enums), `r_data-client-calling-cb8f40176e83d3b8.js` (GraphQL resolvers),
+`services-calling-service-adapters-6bbf4eb6997da139.js`, `calling-locale-en-us-52ee734f3e49b32e.js`.
+
+### 10.1 Calling stack and join
+
+- **CONFIRMED** on the desktop, signaling and media run in the native SlimCore stack outside the web
+  view (`services-calling-service-adapters`: `isSlimCoreRunningOutproc(){return!0}`; JS WebRTC only on
+  VDI / "pluginless"). The bridge is a global `window.SlimCore` that the host injects with
+  `scwv2_bundle.js` (not among the web assets).
+- **CONFIRMED** join (`calling-electron`, `SlimCoreElectronCall._joinOrStartSlimCoreCall`):
+  `joinSignalingSessionWithMeetingData(<meeting data>, shouldResurrect, {conversationUrl,
+  conversationId, conversationType}, mediaPeerType, options)`, options including `threadId`, `messageId`,
+  `meetingInfo`, `endpointMetadata`, `participantLegId`, `audioDirection` (default Bidirectional),
+  `videoDirection` (default ReceiveFromPeer), `screenshareDirection`, `datachannelDirection` (Disabled
+  unless ECS `SkypeCalling.enableDataChannelByDefault`), `muteFlags`, `clientEndpointCapabilities`.
+  Directions: 0 Disabled, 1 ReceiveFromPeer, 2 SendToPeer, 3 Inactive, 4 Bidirectional. With the call
+  already on another endpoint of the user, `mediaPeerType` becomes `EnterpriseMultiParty`.
+- **CONFIRMED** the protocol (seen in the pluginless stack, which speaks it in JS): `JoinConversation`
+  and `JoinConversationWithoutCallModality` to `signalingAgentConfig.conversationServiceUrl`, which ECS
+  gives at run time (the production host is not in the bundle; `config-prod` has only an override key
+  and an on-premises template `https://{appliance_fqdn}:8443/api/v1/conv`). A join with the call
+  modality carries an SDP offer; only a user the server marks as a streaming attendee skips it
+  (`skipOfferGenerationForStreamingUser`).
+- **CONFIRMED** the service calls the client back: every callback link (`/conversation/addModalitySuccess/`,
+  `/conversation/contentSharingUpdate/`, ...) is built on `baseMessagingChannelUrl`, the Trouter URL
+  (section 5), with the broker as fallback. The local participant is `participants.from: {id, displayName,
+  endpointId, participantId, languageId}`. **UNCLEAR** whether a registrar registration is required too.
+
+### 10.2 Transport of the captions
+
+- **CONFIRMED** captions come from a server-side bot in the call, not from a captions service the
+  client asks. Starting captions (GraphQL `startClosedCaptions(teamsCallId)`) adds the bot (a `28:` MRI,
+  shared with recording and transcription: `addParticipant(getBotDefaultMRI(), ...)` or
+  `addCombinedRecorderBot`) if it is not in the call, else sends it a start command. The command is an
+  HTTP POST to the bot's `commandUrl`, which the client reads from the bot's roster entry
+  (`commandUrl=t.endpointMetadata.commandUrl`), with a skype token and an AAD token: body
+  `{timestamp, participantMri, participantLegId, action: "start", mode: "transcription", processingModes:
+  [ClosedCaptions], actionParameters, participantSkypeToken}`; other actions `setLanguage`, `addLanguage`,
+  `stop`, `userSettingsUpdate`, `setUserToken`.
+- **CONFIRMED** the caption text arrives on the call's **data channel**, a media modality:
+  `initializeDataChannelForDynamicClosedCaptionsTrack` registers `callingBotService().registerDataCallback(call,
+  l, ClosedCaptionsMW, onDataReceived, SourceAndSink)` with `const l=3`, the data id `DATA_ID_TRANSCRIPT=3`
+  (`523694`; real-time text is `DATA_ID_RTT=24`). On the desktop the bytes come from a SlimCore data sink
+  (`calling-electron`: `_slimcoreInstance.createDataSink(dataId)`, `_dataChannel.registerDataSink(...)`,
+  `dataSink.on("data", ...)`, the channel from call property `CallDataChannelObjectId`); in the browser
+  stack from a WebRTC `createDataChannel("main-channel")` on the media peer connection.
+- **CONFIRMED** each message is JSON: `recognitionResults[]` (speech recognition, source `Ai`),
+  `textTracks[]` (`Mt` translation, `Cart`, `Cea708`, `RTT`), `events[]` and others. The UI's
+  `ClosedCaptionsEntry` has `id, text, isFinal, userId, userDisplayName, utteranceId, roomId,
+  spokenLanguage, trackLanguage, source, timestamp, duration, speakerType`.
+- **NOT FOUND** any other path: no captions handler in the Trouter client (`cmd-trouter`), no HTTP or
+  WebSocket subscription for ordinary meetings. Town hall and live-stream attendees poll encrypted
+  caption chunks over HTTP instead (`services-broadcast-captions`, `{cacheUrl, originUrl, aesKey}` from
+  the stream metadata) - not ordinary meetings.
+
+### 10.3 Joining without audio or video
+
+- **CONFIRMED** "Don't use audio" and "Add this device" (companion selection,
+  `adjustIntentForCompanionSelection`: outgoing video, outgoing and incoming audio off, the existing
+  call id) are a normal media call with mute flags; no mapping to `audioDirection` Disabled was found.
+- **CONFIRMED** a signaling-only join exists, "subscribe" (`joinCallWithoutCallModality`, telemetry
+  `JOIN_CONVERSATION_WITHOUT_CALL_MODALITY`, role `joinForRosterOnly`, states `CONNECTED_FOR_ROSTER_ONLY`;
+  SlimCore `subscribeToSignalingSessionWithMeetingData`): roster and events, no media session, so no
+  data channel and no captions.
+- **CONFIRMED** the data channel is its own modality: the client itself joins with
+  `datachannelDirection` Bidirectional while `audioDirection` is Inactive and `videoDirection` Disabled
+  (IP audio/video off, screen-share-only joins), so captions can reach an endpoint that sends and
+  receives no audio or video - but only over a negotiated media session (SDP, ICE, DTLS, SCTP).
+- **UNCLEAR** whether `noMediaTimeoutMs` / `NoMediaFlow` ends a call whose only media is the data channel.
+
+### 10.4 Language, policy, speakers, side effects
+
+- **CONFIRMED** spoken language: bot command `setLanguage` with `{spokenLanguage}` (per user
+  `{userSpokenLanguage}`, subtitles `{subtitleLanguages}`). Anyone may change it while transcription is
+  off; while it runs, only the organizer or whoever started transcription (`canChangeMeetingSpokenLanguage`,
+  flag `enableSpokenLanguageRestriction`). Every client sees the change through the bot's roster
+  `endpointMetadata.spokenLanguage` and shows "Meeting language was changed to ... This will change for
+  everyone in the meeting." (no name, no chat message). Default `en-us`, or the bot's `defaultLanguage`;
+  automatic detection exists.
+- **CONFIRMED** policy: the user's tenant policy `liveCaptionsEnabledType` from the synced user policy
+  settings (`meetingPolicySettings`), region gating, and the meeting's
+  `meetingDetails.meetingCapability.allowTranscription` from the call's meeting details; bot failures in
+  its `endpointMetadata.runtimeErrors`; "Due to policy, you can't copy captions". **NOT FOUND** a separate
+  organizer option for captions only.
+- **CONFIRMED** speakers: each result carries `userId` (an MRI; anonymous ones end in `@local`) and
+  `displayName`, `roomId` for room devices; no media-source mapping through the roster is needed.
+- **CONFIRMED** CART is the same data-channel stream, a text track with `source: "Cart"`.
+- **CONFIRMED** turning captions on adds the bot when it is absent (the client filters `28:` bots out of
+  participant lists); the only captions alert is a local "start failed". Transcription, unlike captions,
+  announces itself (`TranscriptStartedByOthers`) and is stored. **UNCLEAR** whether the service keeps
+  anything of captions alone.
+
+### 10.5 Visibility of a second endpoint
+
+- **CONFIRMED** the user's own official client notices: `checkForActiveCallOnDifferentEndpoints` ->
+  `activeCallOnDifferentEndpointExists` drives "You're in {{title}} on another device. Want to join on
+  this one?", "How would you like to join on this device?", "Transfer to this device" and "Add this
+  device".
+- **UNCLEAR** what other participants see: the call model keeps a participant's endpoints as a list
+  (`userEndpointCount` = `endpoints.endpointDetails.length`, GraphQL `...endpointDetailsFields`), which
+  suggests one roster row with two endpoints; the roster rendering, join toast and sound were not checked.
+- **CONFIRMED** blocks on an extra endpoint: end-to-end encrypted meetings take one device
+  (`calling_e2ee_meeting_single_device_limit`), immersive events, overflow streaming. Lobby is decided by
+  the server per identity (`CallJoinAsLobbyUser`, `autoAdmittedUsers`); no client logic sends a second
+  endpoint of an admitted user to the lobby.
+
+### 10.6 Verdict
+
+**Needs media.** Live captions reach a participant only on the data channel of a negotiated media
+session; signaling (and the Trouter push) carries the bot's roster entry and commands, not the text,
+and the signaling-only "subscribe" join gets no data channel. open_mess would have to do what SlimCore
+does: join the conversation service as an endpoint with callback links on its own Trouter connection,
+offer SDP with audio and video inactive or disabled and a data channel, run ICE, DTLS and SCTP to the
+Teams media relays, and parse the JSON messages of data id 3. That is a WebRTC-class transport, far
+beyond the HTTP and WebSocket host imports modules have today (a new host capability, its own spec).
+
+Main risks: the user's own official client shows "You're in this meeting on another device" while
+open_mess is in the call (it disturbs the official client, against AGENTS.md, unless the owner accepts
+it); others probably see one entry but that is unverified; starting captions when no one has them on
+adds the caption bot for everyone; E2EE meetings refuse the second device; a no-media timeout may end
+the call; the conversation-service host and media relay details come from ECS at run time and were not
+seen. A live check of 10.3 and 10.5 would need the owner's consent and a test meeting.
+
 ## Proposed spec changes
 
 Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
