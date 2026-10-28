@@ -161,4 +161,7 @@ Not code: the owner runs these at the computer.
 - [ ] Owner: `cargo xtask release 0.1.0`; check the GitHub release has `om.exe`, `teams.wasm`, `manifest.json`, `manifest.json.minisig`; install 0.1.0 with `scripts/install.ps1`.
 - [ ] Owner: `cargo xtask release 0.1.1` (any small change). The daemon finds it ("Sprawdź teraz"), the owner clicks Zainstaluj, the daemon comes back as 0.1.1 with Teams online and no module approval (spec 11, first criterion).
 - [ ] During that install a Claude Code session keeps `om mcp-stdio` open: `om.exe` is swapped, the bridge reconnects to 0.1.1 (spec 11).
+- [ ] Click Zainstaluj in the toast (not only in the window) for one of the installs; turn on auto-install for another and check it waits for quiet.
+- [ ] Kill `om.update.exe` in Task Manager right after the backup (stage `backed-up`): within 5 minutes the helper task rolls back and the old daemon runs.
+- [ ] With `OPEN_MESS_DATA_DIR` set to a path ending in `\`, run `scripts/install.ps1` and check the `open_mess-update` task action in Task Scheduler.
 - [ ] Rollback drill on 0.1.1 -> 0.1.2 built with a module that traps at load: "przywrócono", 0.1.1 running, `last-update.txt` explains, the release is marked "wycofane".
