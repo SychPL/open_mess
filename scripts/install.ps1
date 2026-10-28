@@ -44,8 +44,9 @@ function Stop-Daemon {
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     }
+    # `daemon` must be the first argument after the program: a bridge whose path has the word survives.
     Get-CimInstance Win32_Process -Filter "Name='om.exe'" |
-        Where-Object { $_.CommandLine -match '\bdaemon\b' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } |
+        Where-Object { $_.CommandLine -match '^\s*("[^"]*"|\S+)\s+daemon(\s|$)' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $env:USERNAME } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
 }
@@ -57,6 +58,15 @@ Stop-Daemon
 try {
     # 2. The binary. A running copy cannot be overwritten on Windows, so move it aside first.
     New-Item -ItemType Directory -Force $bin | Out-Null
+    # The update helper's own copy (the daemon replaces it itself during an update). Copied first:
+    # while a helper runs, the file is locked, and the install fails here before om.exe is touched.
+    $helper = Join-Path $bin 'om.update.exe'
+    try {
+        Copy-Item $exe $helper -Force
+    } catch {
+        throw "Cannot write $helper (an update may be running; try again in a minute): $($_.Exception.Message)"
+    }
+    Write-Host "om.exe -> $helper"
     $target = Join-Path $bin 'om.exe'
     $old = Join-Path $bin 'om.old.exe'
     if (Test-Path $target) {
@@ -108,6 +118,19 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
     -Description 'open_mess daemon (scripts/install.ps1)' -Force | Out-Null
 Write-Host "scheduled task '$taskName' starts the daemon at logon and every 5 minutes if it stopped"
+
+# The update helper task (same shape as the one the daemon registers itself, update/system.rs): runs
+# om.update.exe apply-update at logon and every 5 minutes; with nothing to install it exits at once.
+# No RestartCount: the 5-minute trigger is the retry. A trailing backslash on the data folder would
+# escape the closing quote, so it goes.
+$updateTask = 'open_mess-update'
+$updateAction = New-ScheduledTaskAction -Execute 'conhost.exe' `
+    -Argument "--headless `"$helper`" apply-update --data-dir `"$($dataDir.TrimEnd('\'))`"" -WorkingDirectory $bin
+$updateSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName $updateTask -Action $updateAction -Trigger $trigger -Settings $updateSettings -Principal $principal `
+    -Description 'open_mess update helper (scripts/install.ps1)' -Force | Out-Null
+Write-Host "scheduled task '$updateTask' installs accepted updates at logon and every 5 minutes"
 
 # The 5-minute trigger may have started the old daemon while files were replaced (it keeps running
 # from om.old.exe), and IgnoreNew would then keep it: stop it once more before starting.

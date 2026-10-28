@@ -47,7 +47,7 @@ commit.
 | `modules/teams/` | the Teams platform module, a WebAssembly component implementing `wit/module.wit` |
 | `modules/test-*/` | small guest modules the module host's tests load (`publish = false`) |
 | `wit/` | the contract between the core and platform modules |
-| `xtask/` | repository tasks (`cargo xtask ci`, `cargo xtask hooks`) |
+| `xtask/` | repository tasks (`cargo xtask ci`, `hooks`, `release`, `release-keygen`) |
 | `.specs/` | specs, one per non-trivial change; review output in `.specs/review/` is local |
 | `scripts/review/` | the Codex and GLM review scripts and their prompts |
 | `.githooks/` | the post-commit hook that sends each commit for review |
@@ -124,6 +124,21 @@ maintainer then reviews your commits before merge.
 4. Never force-push `main`. Rebase your own branch when it conflicts; don't merge `main` into it.
 
 Commit messages are plain English with an imperative subject and a body that says why.
+
+## Releases
+
+Only the owner releases. Once, `cargo xtask release-keygen` asks for a password and creates the
+signing key: the secret key goes to `OPEN_MESS_RELEASE_KEY` or `%USERPROFILE%\.open_mess\release.key`
+(never inside the repository), the public key to `keys/release.pub`, which you commit; `om`
+compiles it in and refuses any update signed with another key. The command never overwrites a key.
+
+`cargo xtask release 1.2.3` needs `git`, the GitHub CLI (`gh`, signed in) and the key password. It
+requires a clean `main` equal to `origin/main`, a green `cargo xtask ci` and a
+`.reviews/<sha>.processed` file for every commit since the last `v*` tag; then it unlocks the key,
+commits the version bump (`Release 1.2.3`, only the version and `Cargo.lock`), tags `v1.2.3`,
+builds `om.exe` and the platform modules, signs `manifest.json` and publishes everything with
+`gh release create`. It stops at the first failure and, once the commit exists, prints the commands
+that undo or finish the release.
 
 ## Licence
 

@@ -19,6 +19,7 @@ use open_mess::triggers::Counters;
 use open_mess::triggers::channel::Sessions;
 use open_mess::triggers::engine::{self, Batch, Delivery, DeliveryResult};
 use open_mess::triggers::rules::{Action, Condition, Rule, Spawn};
+use open_mess::triggers::spawn::{RUN_TIMEOUT, Runs};
 use open_mess::ui::UiState;
 use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto, RuleDto};
 use open_mess::ui::sign_in::SignIns;
@@ -36,6 +37,14 @@ fn state(d: &Daemon) -> UiState {
         sign_ins: d.sign_ins.clone(),
         counters: d.registry.trigger_counters().clone(),
         sessions: d.registry.channel_sessions().clone(),
+        gate: d.registry.gate().clone(),
+        activity: Arc::default(),
+        runs: Runs::new(d.dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
+        host_events: tokio::sync::mpsc::channel(1).0,
+        ui_ready: Arc::default(),
+        exit: Arc::default(),
+        probation: d.registry.pending().unwrap().probation().clone(),
+        update: None,
     }
 }
 
@@ -59,6 +68,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
     let state = UiState {
         accounts,
+        probation: pending.probation().clone(),
         pending,
         started: Instant::now(),
         port: 7341,
@@ -66,6 +76,13 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         sign_ins: SignIns::default(),
         counters: Counters::default(),
         sessions: Sessions::default(),
+        gate: Default::default(),
+        activity: Arc::default(),
+        runs: Runs::new(dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
+        host_events: tokio::sync::mpsc::channel(1).0,
+        ui_ready: Arc::default(),
+        exit: Arc::default(),
+        update: None,
     };
     (dir, state)
 }
@@ -466,7 +483,7 @@ async fn counters_are_listed() {
     commands::put_rule(&state, rule("r1", Condition::Direct, channel())).unwrap();
     let bus = Bus::default();
     let noon = || NaiveTime::from_hms_opt(12, 0, 0).unwrap();
-    let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(Delivered), state.counters.clone(), noon);
+    let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(Delivered), state.counters.clone(), Arc::default(), noon);
     let message = |id: &str| Event::Message {
         account: "test-echo:a".into(),
         conversation: "c1".into(),
@@ -494,4 +511,34 @@ async fn channel_setup_names_the_bridge() {
     assert_eq!(std::fs::read_to_string(&setup.file).unwrap(), setup.json);
     assert_eq!(setup.command, format!(r#"claude --mcp-config "{}" --dangerously-load-development-channels server:open_mess_channel"#, setup.file));
     assert_eq!(setup.sessions, 0);
+}
+
+/// Every window command in build.rs has its `allow-*` in the capability file and a handler in
+/// window.rs, and nothing more: a command left out of either is refused by the window, or never
+/// reached (spec 2026-10-27-self-update, 9).
+#[test]
+fn window_commands_are_registered() {
+    let read = |file: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+    let build = read("build.rs");
+    let listed = build.split("const COMMANDS: &[&str] = &[").nth(1).unwrap().split("];").next().unwrap();
+    let commands: Vec<&str> = listed.split(',').map(|item| item.trim().trim_matches('"')).filter(|item| !item.is_empty()).collect();
+    for command in ["update_status", "check_update", "install_update", "cancel_update", "set_auto_install"] {
+        assert!(commands.contains(&command), "{command} is not in build.rs");
+    }
+    let capability: Value = serde_json::from_str(&read("capabilities/main.json")).unwrap();
+    let mut allowed: Vec<String> = capability["permissions"].as_array().unwrap().iter().map(|item| item.as_str().unwrap().to_owned()).collect();
+    let mut expected: Vec<String> = commands.iter().map(|command| format!("allow-{}", command.replace('_', "-"))).collect();
+    allowed.sort();
+    expected.sort();
+    assert_eq!(allowed, expected, "capabilities/main.json grants exactly the commands of build.rs");
+    let window = read("src/ui/window.rs");
+    let handlers = window.split("generate_handler![").nth(1).unwrap().split(']').next().unwrap();
+    let mut handled: Vec<&str> = handlers.split(',').map(|item| item.trim().trim_start_matches("ipc::")).filter(|item| !item.is_empty()).collect();
+    let mut commands = commands.clone();
+    handled.sort_unstable();
+    commands.sort_unstable();
+    assert_eq!(handled, commands, "window.rs handles exactly the commands of build.rs");
+    for command in &commands {
+        assert!(window.contains(&format!("pub async fn {command}(")), "no handler fn {command}");
+    }
 }

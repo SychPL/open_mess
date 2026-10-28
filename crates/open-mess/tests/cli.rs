@@ -225,6 +225,20 @@ fn cli_without_daemon_shows_the_last_start_error() {
 }
 
 #[test]
+fn apply_update_is_hidden_and_does_nothing_without_a_stage_file() {
+    let dir = data_dir();
+    let output = om(dir.path(), free_port(), TOKEN, &["apply-update", "--data-dir", dir.path().to_str().unwrap()]);
+    if cfg!(windows) {
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(!dir.path().join("last-update.txt").exists());
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    }
+    let help = om(dir.path(), free_port(), TOKEN, &["--help"]);
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("apply-update"));
+}
+
+#[test]
 fn cli_takes_only_a_held_lock_as_a_running_daemon() {
     let dir = data_dir();
     std::fs::write(dir.path().join("last-start-error.txt"), "port 7341 is already in use\n").unwrap();
@@ -347,4 +361,21 @@ fn cli_version_and_bad_usage() {
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), format!("om {}", env!("CARGO_PKG_VERSION")));
     let output = om(dir.path(), free_port(), TOKEN, &["--no-such-flag"]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+}
+
+/// The port comes from the daemon's database even when a newer daemon migrated it further: the CLI
+/// reads it without migrating or refusing.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_reaches_daemon_with_newer_schema() {
+    let (port, _stop) = start().await;
+    let dir = running();
+    let conn = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+    conn.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+    conn.execute("INSERT INTO config (key, value) VALUES ('port', ?1)", [port.to_string()]).unwrap();
+    conn.pragma_update(None, "user_version", 99).unwrap();
+    drop(conn);
+    let output = om_command(dir.path(), 1, TOKEN, &["status", "--json"]).env_remove("OPEN_MESS_PORT").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 }

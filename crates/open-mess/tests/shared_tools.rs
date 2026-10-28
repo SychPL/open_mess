@@ -1,10 +1,16 @@
 //! The shared read tools: argument schemas, strict module results, untrusted marking and
-//! attachments written by the core.
+//! attachments written by the core. Also the gate an update closes, and what `status` tells it.
+
+// Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 mod common;
 
-use open_mess::tools::ToolError;
+use std::sync::atomic::Ordering;
+
+use open_mess::permissions::{self, Write};
 use open_mess::tools::shared::{self, UNTRUSTED_NOTICE, parse_module_result, validate};
+use open_mess::tools::{GateMode, ToolError};
 use open_mess_host::Engine;
 use open_mess_host::ip_policy::AddressPolicy;
 use serde_json::{Value, json};
@@ -150,4 +156,106 @@ async fn attachment_is_written_by_the_core() {
     assert_eq!(std::path::PathBuf::from(climbing["path"].as_str().unwrap()), attachments.join("x"));
     assert_eq!(climbing["untrusted"]["file_name"], "../x");
     assert!(!dir.path().join("x").exists());
+}
+
+/// test-echo with account "a", which the agent may read and write to on its own.
+async fn writable() -> common::Daemon {
+    let d = common::daemon(&[common::ECHO]).await;
+    d.accounts.add("test-echo", common::info("a")).unwrap();
+    permissions::set(&common::store(d.dir.path()), "test-echo:a", None, true, Write::Autonomous).unwrap();
+    d
+}
+
+fn send(text: &str) -> Value {
+    json!({"account": "test-echo:a", "conversation": "c1", "text": text})
+}
+
+fn is_update_in_progress(result: &Result<Value, ToolError>) -> bool {
+    matches!(result, Err(ToolError::Failed(why)) if why == "update in progress, try again shortly")
+}
+
+/// The actions stored, in any state.
+fn actions(d: &common::Daemon) -> i64 {
+    let db = rusqlite::Connection::open(d.dir.path().join("state.sqlite3")).unwrap();
+    db.query_row("SELECT COUNT(*) FROM pending", [], |row| row.get(0)).unwrap()
+}
+
+#[tokio::test]
+async fn closed_gate_rejects_every_call() {
+    let d = writable().await;
+    d.registry.gate().set(GateMode::Closed);
+    for (tool, args) in [
+        ("status", json!({})),
+        ("accounts", json!({})),
+        ("read_messages", json!({"account": "test-echo:a", "conversation": "c1"})),
+        ("send", send("hi")),
+    ] {
+        let result = d.registry.call(tool, args).await;
+        assert!(is_update_in_progress(&result), "{tool}: {result:?}");
+    }
+    assert_eq!((actions(&d), d.registry.gate().in_flight()), (0, 0));
+    d.registry.gate().set(GateMode::Open);
+    assert!(d.registry.call("accounts", json!({})).await.is_ok());
+}
+
+#[tokio::test]
+async fn blocked_writes_reject_write_tools_only() {
+    let d = writable().await;
+    d.registry.gate().set(GateMode::WritesBlocked);
+    for (tool, args) in [
+        ("send", send("hi")),
+        ("edit_message", json!({"account": "test-echo:a", "conversation": "c1", "message": "m1", "text": "fixed"})),
+        ("react", json!({"account": "test-echo:a", "conversation": "c1", "message": "m1", "reaction": "like"})),
+    ] {
+        let result = d.registry.call(tool, args).await;
+        assert!(is_update_in_progress(&result), "{tool}: {result:?}");
+    }
+    // Refused before an action was made of them.
+    assert_eq!(actions(&d), 0);
+    for (tool, args) in [
+        ("status", json!({})),
+        ("accounts", json!({})),
+        ("pending", json!({})),
+        ("read_messages", json!({"account": "test-echo:a", "conversation": "c1"})),
+    ] {
+        let result = d.registry.call(tool, args).await;
+        assert!(result.is_ok(), "{tool}: {result:?}");
+    }
+    d.registry.gate().set(GateMode::Open);
+    assert_eq!(d.registry.call("send", send("hi")).await.unwrap()["state"], "done");
+}
+
+#[tokio::test]
+async fn in_flight_counts_a_running_call() {
+    let d = writable().await;
+    let gate = d.registry.gate();
+    assert_eq!((gate.in_flight(), gate.last_end_ms()), (0, 0));
+    // test-echo answers this write only at its call limit; the check runs while it waits.
+    let running = async { assert_eq!(gate.in_flight(), 1) };
+    let (result, ()) = tokio::join!(d.registry.call("send", send("slow")), running);
+    assert_eq!(result.unwrap()["state"], "uncertain");
+    assert_eq!(gate.in_flight(), 0);
+    let ended = gate.last_end_ms();
+    assert!(ended > 0);
+    // A call that fails ends too.
+    assert!(d.registry.call("nope", json!({})).await.is_err());
+    assert_eq!(gate.in_flight(), 0);
+    assert!(gate.last_end_ms() >= ended);
+}
+
+#[tokio::test]
+async fn status_reports_restore_and_crashes() {
+    let d = common::daemon(&[common::ECHO]).await;
+    let status = d.registry.call("status", json!({})).await.unwrap();
+    assert_eq!((&status["ui_ready"], &status["accounts_restored"]), (&json!(false), &json!(false)));
+    assert_eq!(status["modules"][0]["crashes_since_load"], 0);
+    // test-echo traps once; it is loaded again and keeps working, the crash stays counted.
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    assert!(echo.call("a", "trap", "{}").await.is_err());
+    assert_eq!(echo.call("a", "echo", "{}").await.unwrap(), "{}");
+    d.registry.ui_ready().store(true, Ordering::SeqCst);
+    d.registry.accounts_restored().store(true, Ordering::SeqCst);
+    let status = d.registry.call("status", json!({})).await.unwrap();
+    assert_eq!((&status["modules"][0]["state"], &status["modules"][0]["crashes_since_load"]), (&json!("active"), &json!(1)));
+    assert_eq!((&status["ui_ready"], &status["accounts_restored"]), (&json!(true), &json!(true)));
 }

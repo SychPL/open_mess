@@ -187,3 +187,66 @@ async fn message_arrived_becomes_host_event() {
     assert!(matches!(events.recv().await, Some(HostEvent::Session { .. })));
     assert!(events.try_recv().is_err());
 }
+
+/// Whether the log has `needle` after waiting `ms` (for a thing that should not happen).
+async fn log_after(needle: &str, ms: u64) -> bool {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    logs().contains(needle)
+}
+
+#[tokio::test]
+async fn paused_module_gets_no_timer_events() {
+    let module = echo().await;
+    module.pause_events().await.unwrap();
+    assert_eq!(module.call("a", "timer-at", r#"{"id":21}"#).await.unwrap(), "{}");
+    assert!(!log_after("timer 21", 500).await, "{}", logs());
+    module.resume_events().await.unwrap();
+}
+
+#[tokio::test]
+async fn resume_delivers_queued_events() {
+    let module = echo().await;
+    module.pause_events().await.unwrap();
+    module.call("a", "timer-at", r#"{"id":22}"#).await.unwrap();
+    assert!(!log_after("timer 22", 400).await, "{}", logs());
+    module.resume_events().await.unwrap();
+    assert!(wait_for_log("timer 22").await, "{}", logs());
+    assert_eq!(logs().matches("timer 22").count(), 1, "{}", logs());
+}
+
+// Multi-threaded: the busy handler must not keep the test from looking at the log meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn pause_waits_for_a_running_event_handler() {
+    let module = echo().await;
+    module.call("a", "timer-at", r#"{"id":8}"#).await.unwrap();
+    // The handler for timer 8 is busy for 1 s, under the tests' 2 s call limit; pausing must not
+    // answer before it is done.
+    assert!(wait_for_log("timer 8").await, "{}", logs());
+    assert!(!logs().contains("timer 8 done"), "{}", logs());
+    module.pause_events().await.unwrap();
+    assert!(logs().contains("timer 8 done"), "{}", logs());
+    module.resume_events().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_calls_work_while_paused() {
+    let module = echo().await;
+    module.pause_events().await.unwrap();
+    assert_eq!(module.call("a", "echo", "{}").await.unwrap(), "{}");
+    module.resume_events().await.unwrap();
+    assert_eq!(module.call("a", "echo", "{}").await.unwrap(), "{}");
+}
+
+#[tokio::test]
+async fn crashes_since_load_survive_a_successful_call() {
+    let module = echo().await;
+    assert_eq!(module.crashes_since_load(), 0);
+    assert!(matches!(module.call("a", "trap", "{}").await, Err(HostError::Crashed(_))));
+    assert_eq!(module.crashes_since_load(), 1);
+    // A good call resets the crashes in a row, not the count since load.
+    assert_eq!(module.call("a", "echo", "{}").await.unwrap(), "{}");
+    assert_eq!(module.state(), open_mess_host::ModuleState::Running);
+    assert_eq!(module.crashes_since_load(), 1);
+    assert!(matches!(module.call("a", "trap", "{}").await, Err(HostError::Crashed(_))));
+    assert_eq!(module.crashes_since_load(), 2);
+}

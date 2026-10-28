@@ -23,6 +23,7 @@ use crate::Error;
 use crate::accounts::{Account, Accounts};
 use crate::permissions::{self, Write};
 use crate::tools::{ToolError, find, module, within};
+use crate::update::probation;
 
 /// How long an action waits for the user's approval.
 pub const APPROVAL_TTL: Duration = Duration::from_secs(10 * 60);
@@ -164,11 +165,13 @@ pub struct Pending {
     waiting: Mutex<Vec<Preview>>,
     /// Told whenever the waiting actions change, for the approval queue.
     changed: watch::Sender<()>,
+    /// On while an update's new version is checked: no decision is taken.
+    probation: probation::Flag,
 }
 
 impl Pending {
     pub fn new(accounts: Arc<Accounts>) -> Pending {
-        Pending { accounts, waiting: Mutex::new(Vec::new()), changed: watch::Sender::new(()) }
+        Pending { accounts, waiting: Mutex::new(Vec::new()), changed: watch::Sender::new(()), probation: probation::Flag::default() }
     }
 
     /// At daemon start: actions left waiting expire (their previews are gone), and actions that
@@ -188,6 +191,12 @@ impl Pending {
 
     fn previews(&self) -> MutexGuard<'_, Vec<Preview>> {
         self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// On while an update's new version is checked (spec 2026-10-27-self-update, 7.2); shared with
+    /// the configuration window.
+    pub fn probation(&self) -> &probation::Flag {
+        &self.probation
     }
 
     /// The waiting actions, oldest first, as their approvals show them.
@@ -224,6 +233,12 @@ impl Pending {
                 Ok(Outcome { action, state: State::Waiting, detail: None })
             }
         }
+    }
+
+    /// The actions in `state`, over all accounts.
+    pub fn count(&self, state: State) -> Result<usize, Error> {
+        let count: i64 = self.accounts.store().conn().query_row("SELECT COUNT(*) FROM pending WHERE state = ?1", [state.name()], |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or_default())
     }
 
     fn count_waiting(&self, account: &str) -> Result<i64, ToolError> {
@@ -282,8 +297,12 @@ impl Pending {
 
     /// The user's decision on a waiting action; an approved one runs before this returns. A
     /// decision on an action that is no longer waiting changes nothing and returns its state.
-    /// Only the approval UI, the configuration window (milestone E) and tests call this.
+    /// Only the approval UI, the configuration window (milestone E) and tests call this. Refused
+    /// while an update's new version is checked: the action keeps waiting.
     pub async fn decide(&self, action: &str, approve: bool) -> Result<State, Error> {
+        if self.probation.get() {
+            return Err(Error::UpdateInProgress);
+        }
         let decided = if approve { State::Approved } else { State::Rejected };
         let now = now_ms();
         // The text stays only while the action can still run.
@@ -465,7 +484,7 @@ pub(crate) fn time(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 

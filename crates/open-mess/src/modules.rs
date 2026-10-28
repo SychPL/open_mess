@@ -14,10 +14,12 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use open_mess_host::{Engine, Manifest, ModuleContext, ModuleHandle};
-use rusqlite::OptionalExtension;
+use open_mess_host::ip_policy::AddressPolicy;
+use open_mess_host::{Engine, Manifest, ModuleContext, ModuleHandle, Net, SignInPrompts};
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 
 use crate::Error;
 use crate::store::Store;
@@ -162,6 +164,11 @@ impl Modules {
             .and_then(|entry| entry.handle.clone())
     }
 
+    /// Every loaded module: the active ones.
+    pub fn handles(&self) -> Vec<ModuleHandle> {
+        self.read().iter().filter_map(|entry| entry.handle.clone()).collect()
+    }
+
     pub fn list(&self) -> Vec<ModuleInfo> {
         self.read().iter().map(|entry| ModuleInfo { state: entry.state(), ..entry.info.clone() }).collect()
     }
@@ -188,7 +195,7 @@ impl Modules {
         let mut kept = BTreeSet::new();
         for old in entries.drain(..).filter(|old| old.handle.is_some()) {
             let name = old.info.name.clone();
-            let enabled = Row::get(store, &name)?.is_some_and(|row| row.enabled);
+            let enabled = Row::get(store.conn(), &name)?.is_some_and(|row| row.enabled);
             let crashed = old.state() == ModuleState::Crashed;
             let at = fresh.iter().position(|entry| entry.is_current(&name) && entry.info.manifest.is_some());
             let keep = match at.and_then(|at| fresh.get(at)) {
@@ -227,39 +234,92 @@ impl Modules {
 /// Loads every `.wasm` file in `dir`, reading each module's manifest.
 async fn load(engine: &Engine, dir: &Path, ctx: &(dyn Fn(&str) -> ModuleContext + Send + Sync)) -> Result<Found, Error> {
     std::fs::create_dir_all(dir)?;
+    let paths = module_files(dir)?;
+
+    let mut invalid = Vec::new();
+    let mut by_name: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
+    for path in paths {
+        let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        match load_file(engine, &path, ctx(&file)).await {
+            (file_sha256, Ok((handle, manifest))) => {
+                let manifest_sha256 = manifest_sha256(&manifest);
+                by_name.entry(manifest.name.clone()).or_default().push(Candidate { file, file_sha256, manifest, manifest_sha256, handle });
+            }
+            (file_sha256, Err(why)) => invalid.push(invalid_entry(file, file_sha256, why)),
+        }
+    }
+    Ok(Found { invalid, by_name })
+}
+
+/// The `.wasm` files in `dir`, sorted.
+pub(crate) fn module_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("wasm")) && path.is_file())
         .collect();
     paths.sort();
+    Ok(paths)
+}
 
-    let mut invalid = Vec::new();
-    let mut by_name: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-    for path in paths {
-        let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-        // The bytes that are hashed are the bytes that are loaded: a file swapped in between
-        // never runs under the other file's approval.
-        let bytes = match read_capped(&path) {
-            Ok(bytes) => bytes,
-            Err(why) => {
-                invalid.push(invalid_entry(file, String::new(), why));
-                continue;
-            }
-        };
-        let file_sha256 = sha256_hex(&bytes);
-        match engine.load_bytes(bytes, ctx(&file)).await {
-            Ok(handle) => match handle.manifest() {
-                Ok(manifest) => {
-                    let manifest_sha256 = manifest_sha256(&manifest);
-                    by_name.entry(manifest.name.clone()).or_default().push(Candidate { file, file_sha256, manifest, manifest_sha256, handle });
-                }
-                Err(err) => invalid.push(invalid_entry(file, file_sha256, err.to_string())),
-            },
-            Err(err) => invalid.push(invalid_entry(file, file_sha256, err.to_string())),
+/// Loads one module file: its SHA-256 (empty when it cannot be read), and the module with its
+/// manifest or why it is not one.
+async fn load_file(engine: &Engine, path: &Path, ctx: ModuleContext) -> (String, Result<(ModuleHandle, Manifest), String>) {
+    // The bytes that are hashed are the bytes that are loaded: a file swapped in between never
+    // runs under the other file's approval.
+    let bytes = match read_capped(path) {
+        Ok(bytes) => bytes,
+        Err(why) => return (String::new(), Err(why)),
+    };
+    let file_sha256 = sha256_hex(&bytes);
+    let loaded = match engine.load_bytes(bytes, ctx).await {
+        Ok(handle) => handle.manifest().map(|manifest| (handle, manifest)).map_err(|err| err.to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    (file_sha256, loaded)
+}
+
+/// A module file as the approvals see it.
+pub(crate) struct Inspected {
+    pub(crate) file_sha256: String,
+    pub(crate) manifest: Manifest,
+    pub(crate) manifest_sha256: String,
+}
+
+/// Reads a module file's manifest and hashes, without running the module: it gets no network,
+/// storage or events, and is dropped at once. For the update helper (spec 2026-10-27-self-update,
+/// 7.2).
+pub(crate) async fn inspect(engine: &Engine, path: &Path) -> Result<Inspected, Error> {
+    let ctx = ModuleContext {
+        // Never opened: storage opens on a call, and no call reaches this module.
+        data_dir: PathBuf::new(),
+        events: mpsc::channel(1).0,
+        net: Net::new(AddressPolicy::Strict),
+        sign_in: SignInPrompts::new(mpsc::channel(1).0),
+    };
+    let (file_sha256, loaded) = load_file(engine, path, ctx).await;
+    let (_, manifest) = loaded.map_err(|why| Error::Io(std::io::Error::other(format!("{}: {why}", path.display()))))?;
+    Ok(Inspected { manifest_sha256: manifest_sha256(&manifest), file_sha256, manifest })
+}
+
+/// Whether two manifests differ at most in `version` (spec 2026-10-27-self-update, 7.4).
+pub(crate) fn version_only_change(a: &Manifest, b: &Manifest) -> bool {
+    let without_version = |manifest: &Manifest| {
+        let mut json = canonical(manifest);
+        if let Some(fields) = json.as_object_mut() {
+            fields.remove("version");
         }
-    }
-    Ok(Found { invalid, by_name })
+        json
+    };
+    without_version(a) == without_version(b)
+}
+
+/// Whether this is the file and manifest the user approved for its module.
+pub(crate) fn is_approved(conn: &Connection, inspected: &Inspected) -> Result<bool, Error> {
+    Ok(Row::get(conn, &inspected.manifest.name)?.is_some_and(|row| {
+        row.approved_file_sha256.as_deref() == Some(inspected.file_sha256.as_str())
+            && row.approved_manifest_sha256.as_deref() == Some(inspected.manifest_sha256.as_str())
+    }))
 }
 
 /// Which file is each module and what state it is in, by the approvals in `store`.
@@ -268,7 +328,7 @@ fn decide(store: &Store, found: Found) -> Result<Vec<Entry>, Error> {
     let mut entries = Vec::new();
     entries.append(&mut invalid);
     for (name, candidates) in by_name {
-        let row = Row::get(store, &name)?;
+        let row = Row::get(store.conn(), &name)?;
         let approved = |c: &Candidate| {
             row.as_ref().is_some_and(|row| {
                 row.approved_file_sha256.as_deref() == Some(c.file_sha256.as_str())
@@ -353,9 +413,8 @@ struct Row {
 }
 
 impl Row {
-    fn get(store: &Store, name: &str) -> Result<Option<Row>, Error> {
-        let row = store
-            .conn()
+    fn get(conn: &Connection, name: &str) -> Result<Option<Row>, Error> {
+        let row = conn
             .query_row("SELECT file, approved_file_sha256, approved_manifest_sha256, enabled FROM modules WHERE name = ?1", [name], |row| {
                 Ok(Row { file: row.get(0)?, approved_file_sha256: row.get(1)?, approved_manifest_sha256: row.get(2)?, enabled: row.get(3)? })
             })
@@ -375,9 +434,11 @@ fn record(store: &Store, name: &str, current: &Candidate) -> Result<(), Error> {
 }
 
 /// Approves a module file and manifest; the next scan runs the file with these hashes. Only the
-/// configuration window and tests call it: no MCP or CLI tool approves anything.
-pub fn approve(store: &Store, name: &str, file_sha256: &str, manifest_sha256: &str) -> Result<(), Error> {
-    store.conn().execute(
+/// configuration window, the update helper (a version-only change from a signed release, spec
+/// 2026-10-27-self-update 7.4) and tests call it: no MCP or CLI tool approves anything. Takes a plain
+/// connection: the helper never migrates the database.
+pub fn approve(conn: &Connection, name: &str, file_sha256: &str, manifest_sha256: &str) -> Result<(), Error> {
+    conn.execute(
         "INSERT INTO modules (name, file, file_sha256, manifest_sha256, approved_file_sha256, approved_manifest_sha256)
          VALUES (?1, '', ?2, ?3, ?2, ?3)
          ON CONFLICT (name) DO UPDATE SET approved_file_sha256 = excluded.approved_file_sha256,
@@ -430,8 +491,12 @@ fn approved_manifest_key(name: &str) -> String {
 
 /// Remembers the manifest the user approved for its module, so that the approval of a later file
 /// can show what changed even when no version of the module runs.
-pub fn remember_approved(store: &Store, manifest: &Manifest) -> Result<(), Error> {
-    store.set_config(&approved_manifest_key(&manifest.name), &canonical(manifest).to_string())
+pub fn remember_approved(conn: &Connection, manifest: &Manifest) -> Result<(), Error> {
+    conn.execute(
+        "INSERT INTO config (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        [approved_manifest_key(&manifest.name), canonical(manifest).to_string()],
+    )?;
+    Ok(())
 }
 
 fn sign_in_hosts_key(name: &str) -> String {

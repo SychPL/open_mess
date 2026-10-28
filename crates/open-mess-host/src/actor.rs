@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,9 @@ pub(crate) enum Request {
         message: Option<String>,
         reply: Reply<Target>,
     },
+    /// Stops pulling the instance's events; answered once no event handler is running.
+    PauseEvents(Reply<()>),
+    ResumeEvents(Reply<()>),
 }
 
 impl Request {
@@ -54,6 +58,7 @@ impl Request {
     fn caller(&self) -> Caller {
         match self {
             Request::SignIn(_) => Caller::SignIn,
+            Request::PauseEvents(_) | Request::ResumeEvents(_) => Caller::Event,
             Request::Restore(account, _) | Request::SignOut(account, _) | Request::Call { account, .. } => Caller::Account(account.clone()),
             Request::GetAttachment { ids: [account, ..], .. } | Request::DescribeTarget { ids: [account, ..], .. } => {
                 Caller::Account(account.clone())
@@ -227,6 +232,10 @@ pub(crate) struct Actor {
     /// leftovers never reach the next one.
     events: Option<mpsc::Receiver<GuestEvent>>,
     crashes: u32,
+    /// Every crash since the module was loaded; unlike `crashes`, a good call does not reset it.
+    pub(crate) crashes_since_load: Arc<AtomicU32>,
+    /// While true the actor leaves the instance's events queued (their senders wait on the full queue).
+    paused: bool,
     state: watch::Sender<ModuleState>,
     /// Whose call the next `run` makes.
     caller: Caller,
@@ -240,8 +249,20 @@ impl Actor {
         env: Arc<ModuleEnv>,
     ) -> (Actor, watch::Receiver<ModuleState>) {
         let (state, watch) = watch::channel(ModuleState::Running);
-        let actor =
-            Actor { env, engine, pre, limits, deadline: Deadline::default(), instance: None, events: None, crashes: 0, state, caller: Caller::Event };
+        let actor = Actor {
+            env,
+            engine,
+            pre,
+            limits,
+            deadline: Deadline::default(),
+            instance: None,
+            events: None,
+            crashes: 0,
+            crashes_since_load: Arc::default(),
+            paused: false,
+            state,
+            caller: Caller::Event,
+        };
         (actor, watch)
     }
 
@@ -314,6 +335,7 @@ impl Actor {
     fn crashed(&mut self, error: HostError) -> HostError {
         self.events = None;
         self.crashes = self.crashes.saturating_add(1);
+        self.crashes_since_load.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(module = %self.env.name, crashes = self.crashes, "module stopped: {error}");
         self.state.send_replace(if self.crashes >= limits::MAX_CRASHES {
             ModuleState::Disabled
@@ -332,7 +354,7 @@ impl Actor {
                     Some(request) => Ok(request),
                     None => break,
                 },
-                Some(event) = next_event(&mut self.events) => Err(event),
+                Some(event) = next_event(&mut self.events), if !self.paused => Err(event),
             };
             match work {
                 Ok(request) => self.answer(request).await,
@@ -377,6 +399,15 @@ impl Actor {
     async fn answer(&mut self, request: Request) {
         self.caller = request.caller();
         match request {
+            // The actor runs one request or event at a time, so answering proves no handler runs.
+            Request::PauseEvents(reply) => {
+                self.paused = true;
+                reply.send(Ok(())).ok();
+            }
+            Request::ResumeEvents(reply) => {
+                self.paused = false;
+                reply.send(Ok(())).ok();
+            }
             Request::SignIn(reply) => {
                 let result = self
                     .run(|m, s| {

@@ -84,7 +84,7 @@ async fn duplicate_name_is_a_replacement() {
 
     // Approving the replacement makes it the module, and the old file the one waiting.
     let replacement = modules.list().into_iter().find(|info| info.file == "b.wasm").unwrap();
-    modules::approve(&store, "test-echo", &replacement.file_sha256, &replacement.manifest_sha256).unwrap();
+    modules::approve(store.conn(), "test-echo", &replacement.file_sha256, &replacement.manifest_sha256).unwrap();
     let modules = scan(&store, &engine, dir.path()).await;
     let states: Vec<_> = modules.list().into_iter().map(|info| (info.file, info.state)).collect();
     assert_eq!(states, [("a.wasm".to_string(), ModuleState::PendingReplacement), ("b.wasm".to_string(), ModuleState::Active)]);
@@ -127,8 +127,10 @@ async fn status_lists_modules() {
     let echo = modules.iter().find(|module| module["name"] == "test-echo").unwrap();
     assert_eq!(
         *echo,
-        json!({"name": "test-echo", "file": "echo.wasm", "version": env!("CARGO_PKG_VERSION"), "platform": "test", "state": "active", "hosts": ["localhost"]})
+        json!({"name": "test-echo", "file": "echo.wasm", "version": env!("CARGO_PKG_VERSION"), "platform": "test", "state": "active", "hosts": ["localhost"], "crashes_since_load": 0})
     );
     let broken = modules.iter().find(|module| module["file"] == "broken.wasm").unwrap();
     assert!(broken["state"].as_str().unwrap().starts_with("not a valid module"), "{broken}");
+    // Nothing runs to have crashed.
+    assert!(broken["crashes_since_load"].is_null(), "{broken}");
 }

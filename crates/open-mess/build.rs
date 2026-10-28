@@ -26,6 +26,11 @@ const COMMANDS: &[&str] = &[
     "delete_rule",
     "pick_program",
     "channel_setup",
+    "update_status",
+    "check_update",
+    "install_update",
+    "cancel_update",
+    "set_auto_install",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

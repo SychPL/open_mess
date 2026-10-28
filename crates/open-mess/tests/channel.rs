@@ -197,7 +197,7 @@ async fn no_session_and_no_spawn_is_counted() {
         runs: Runs::new(d.dir.path().join("runs"), spawn::RUN_TIMEOUT, Counters::default()),
     };
     let (bus, counters) = (Bus::default(), Counters::default());
-    let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(actions), counters.clone(), || chrono::Local::now().time());
+    let _engine = engine::spawn(&bus, Arc::clone(&d.accounts), Arc::new(actions), counters.clone(), Arc::default(), || chrono::Local::now().time());
     bus.publish(Event::Message {
         account: "test-echo:a".into(),
         conversation: "c1".into(),

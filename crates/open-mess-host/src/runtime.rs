@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -354,8 +355,9 @@ impl Engine {
             wam: manifest.wam.clone(),
         }));
         let (requests, queue) = mpsc::channel(QUEUE);
+        let crashes_since_load = actor.crashes_since_load.clone();
         tokio::spawn(actor.serve(queue));
-        Ok(ModuleHandle { manifest, requests, state })
+        Ok(ModuleHandle { manifest, requests, state, crashes_since_load })
     }
 }
 
@@ -383,6 +385,7 @@ pub struct ModuleHandle {
     manifest: Manifest,
     requests: mpsc::Sender<Request>,
     state: watch::Receiver<ModuleState>,
+    crashes_since_load: Arc<AtomicU32>,
 }
 
 impl ModuleHandle {
@@ -393,6 +396,23 @@ impl ModuleHandle {
 
     pub fn state(&self) -> ModuleState {
         self.state.borrow().clone()
+    }
+
+    /// How many times the module crashed since it was loaded. A good call does not reset it (unlike
+    /// the crashes in a row that disable a module); only loading the module again does.
+    pub fn crashes_since_load(&self) -> u32 {
+        self.crashes_since_load.load(Ordering::Relaxed)
+    }
+
+    /// Stops the module's timers and sockets from running its event handlers; returns once none is
+    /// running. Tool calls still work. Events wait in their queue (a full one holds timers and
+    /// sockets back), and [`ModuleHandle::resume_events`] delivers them.
+    pub async fn pause_events(&self) -> Result<(), HostError> {
+        self.request(Request::PauseEvents).await
+    }
+
+    pub async fn resume_events(&self) -> Result<(), HostError> {
+        self.request(Request::ResumeEvents).await
     }
 
     /// Whether both handles are the same loaded module (clones of one handle), not two loads.

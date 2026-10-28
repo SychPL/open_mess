@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -25,6 +26,7 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     let profile = state.accounts.data_dir().join("webview");
     let pending = std::sync::Arc::clone(&state.pending);
     let sign_ins = state.sign_ins.clone();
+    let ui_ready = std::sync::Arc::clone(&state.ui_ready);
     let app = tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -49,7 +51,12 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::put_rule,
             ipc::delete_rule,
             ipc::pick_program,
-            ipc::channel_setup
+            ipc::channel_setup,
+            ipc::update_status,
+            ipc::check_update,
+            ipc::install_update,
+            ipc::cancel_update,
+            ipc::set_auto_install
         ])
         .build(tauri::generate_context!())
         .map_err(failed)?;
@@ -110,6 +117,8 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     });
 
     app.run_return(move |_, event| match event {
+        // Tauri has finished its setup; the tray was made before the loop started.
+        RunEvent::Ready => ui_ready.store(true, Ordering::SeqCst),
         // The last window closing asks to exit; only `Zakończ` and `quit` end the loop.
         RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
         // Nobody can answer what the closed window showed.
@@ -150,6 +159,7 @@ mod ipc {
         self, AccountDto, AnswerDto, ChannelSetupDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, RuleDto, RuleViewDto, SignInPromptDto,
         StatusDto,
     };
+    use crate::update::service::UpdateView;
 
     #[tauri::command(rename_all = "snake_case")]
     pub async fn status(state: State<'_, UiState>) -> Result<StatusDto, String> {
@@ -265,6 +275,31 @@ mod ipc {
     #[tauri::command(rename_all = "snake_case")]
     pub async fn channel_setup(state: State<'_, UiState>) -> Result<ChannelSetupDto, String> {
         commands::channel_setup(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn update_status(state: State<'_, UiState>) -> Result<UpdateView, String> {
+        commands::update_status(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn check_update(state: State<'_, UiState>) -> Result<(), String> {
+        commands::check_update(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn install_update(state: State<'_, UiState>) -> Result<(), String> {
+        commands::install_update(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn cancel_update(state: State<'_, UiState>) -> Result<(), String> {
+        commands::cancel_update(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn set_auto_install(state: State<'_, UiState>, on: bool) -> Result<(), String> {
+        commands::set_auto_install(&state, on)
     }
 }
 

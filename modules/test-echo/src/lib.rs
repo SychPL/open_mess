@@ -5,7 +5,7 @@
 //! or `{"error"}` (the `http-error` case name); `ws` opens a WebSocket to `{"url"}`, sends "ping"
 //! and returns `{"conn"}` or `{"error"}`; `store` sets key "k" to `{"size"}` bytes and returns the
 //! length read back (`{"len"}`, plus `{"error"}` when the set failed); `timer` sets timer 7 to
-//! fire after 100 ms; `message` reports account "a" online and a message `{"text"}` from "p1" in
+//! fire after 100 ms; `timer-at` the same for timer `{"id"}` (timer 8 is busy for 1 s and then logs "timer 8 done"); `message` reports account "a" online and a message `{"text"}` from "p1" in
 //! conversation "c" that mentions the user; `sign-in` shows a device code and reports what
 //! `open-page` and `wam-token` answered; `trap` crashes the module; `ws-burst` opens a socket to
 //! `{"url"}`, stays busy for 500 ms, then sends 40 frames and returns `{"sent"}`. The shared tools
@@ -51,6 +51,8 @@ mod guest {
     /// The manifest's hosts, padded so the core's tests can add one by patching the built file
     /// (a rebuild with another manifest under the same name).
     const HOSTS: &str = "localhost                               ";
+    /// The manifest's version, padded the same way so the update tests can change only the version.
+    const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "                ");
     /// The Windows account identity: the Teams desktop client id and the chat service's scope
     /// (docs/protocols/teams.md, "Live results" item 1), for the manual check of WAM.
     const TEAMS_CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
@@ -94,6 +96,10 @@ mod guest {
             }
             "timer" => {
                 host::set_timer(7, 100);
+                json!({})
+            }
+            "timer-at" => {
+                host::set_timer(args.get("id").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()).unwrap_or_default(), 100);
                 json!({})
             }
             "sign-in" => {
@@ -220,7 +226,7 @@ mod guest {
             host::session("a", host::SessionState::Online);
             types::Manifest {
                 name: "test-echo".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: std::hint::black_box(VERSION).trim_end().to_string(),
                 platform: "test".to_string(),
                 // black_box: the padded string stays in the file as written.
                 hosts: std::hint::black_box(HOSTS).split_whitespace().map(str::to_string).collect(),
@@ -323,6 +329,13 @@ mod guest {
 
         fn on_timer(id: u32) {
             host::log(2, &format!("timer {id}"));
+            if id == 8 {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(1) {
+                    std::hint::spin_loop();
+                }
+                host::log(2, "timer 8 done");
+            }
         }
     }
 }

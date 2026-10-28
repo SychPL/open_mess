@@ -277,8 +277,128 @@ async function renderDaemon() {
       ["Akcje do zatwierdzenia", status.waiting],
     ]),
   );
+  await renderUpdates(root);
   root.append(el("h2", "Ostatnie błędy"));
   root.append(list(status.problems, "Brak błędów modułów. (Dziennik demona pojawi się w następnej wersji.)"));
+}
+
+const UPDATE_STATES = {
+  idle: "nie ma nowszej wersji",
+  checking: "sprawdzanie...",
+  downloading: "pobieranie i sprawdzanie podpisu...",
+  ready: "gotowa do instalacji",
+};
+
+const UPDATE_PHASES = {
+  a: "instalacja, faza A: agenci i wyzwalacze kończą pracę (najdłużej 30 minut)",
+  b: "instalacja, faza B: kończą się trwające wywołania narzędzi, nowe czekają",
+  launching: "uruchamianie pomocnika aktualizacji",
+};
+
+function updateStateText(update) {
+  if (update.probation) return "aktualizacja w toku: nowa wersja jest sprawdzana";
+  const state = update.state;
+  if (state.kind === "error") return "błąd: " + state.detail;
+  if (state.kind === "phase") return UPDATE_PHASES[state.detail] || state.detail;
+  return UPDATE_STATES[state.kind] || state.kind;
+}
+
+/** The Aktualizacje block of Demon i logi (spec 2026-10-27-self-update, 6 and 7). */
+async function renderUpdates(root) {
+  const update = await call("update_status").catch(() => null);
+  if (!update) return;
+  root.append(el("h2", "Aktualizacje"));
+  let found = "brak";
+  if (update.found) {
+    found = update.found.version;
+    if (update.found.rolled_back) found += " (wycofane: jej instalacja została cofnięta, więc nie instaluje się sama)";
+  }
+  root.append(
+    details([
+      ["Bieżąca wersja", update.current],
+      ["Znaleziona wersja", found],
+      ["Stan", updateStateText(update)],
+      ["Ostatni wynik", update.last_result || "brak"],
+    ]),
+  );
+  const row = el("div", null, "row");
+  const phase = update.state.kind === "phase";
+  if (!phase) {
+    row.append(
+      button("Sprawdź teraz", async () => {
+        await call("check_update");
+        watchUpdate();
+      }),
+    );
+  }
+  if (update.state.kind === "ready" && !update.not_installable) {
+    const install = button("Zainstaluj", async () => {
+      const sure = confirm(
+        "Zainstalować open_mess " + update.found.version + "?\n\nDemon poczeka, aż agenci skończą pracę, i uruchomi się ponownie w nowej wersji.",
+      );
+      if (!sure) return;
+      await call("install_update");
+      await renderDaemon();
+    }, "primary saves");
+    row.append(install);
+  }
+  if (phase && update.state.detail !== "launching") {
+    row.append(
+      button("Anuluj", async () => {
+        await call("cancel_update");
+        await renderDaemon();
+      }, "danger"),
+    );
+  }
+  root.append(row);
+  const box = el("input", null, "saves");
+  box.type = "checkbox";
+  box.checked = update.auto_install;
+  box.addEventListener("change", async () => {
+    box.disabled = true;
+    try {
+      await call("set_auto_install", { on: box.checked });
+    } catch (err) {
+      box.checked = !box.checked;
+      showError(err);
+    } finally {
+      box.disabled = updateHeld;
+    }
+  });
+  const auto = el("label", null, "row");
+  auto.append(box, el("span", "Instaluj aktualizacje automatycznie"));
+  root.append(auto);
+  if (update.not_installable) {
+    root.append(el("p", update.not_installable, "muted"));
+  } else {
+    root.append(
+      el("p", "Sama instaluje się tylko wtedy, gdy nic nie czeka na zatwierdzenie, żaden agent nie pracuje i żadna reguła nie doręcza.", "muted"),
+    );
+  }
+  holdSaves(update.probation);
+}
+
+/** Whether saves are refused: an update's new version is being checked (spec 7.2). */
+let updateHeld = false;
+const SAVING_SECTIONS = ["accounts", "permissions", "triggers", "waiting", "modules"];
+
+/** Greys out what saves, and says why; the daemon refuses the saves anyway. */
+function holdSaves(held) {
+  updateHeld = held;
+  for (const section of SAVING_SECTIONS) content(section).inert = held;
+  for (const node of document.querySelectorAll("#daemon .saves")) node.disabled = held;
+  document.getElementById("update-held").hidden = !held;
+}
+
+let updateTimer = null;
+
+/** Looks at the update again in a moment: the daemon checks and installs in the background. */
+function watchUpdate() {
+  clearTimeout(updateTimer);
+  updateTimer = setTimeout(() => {
+    renderFooter().catch(showError);
+    if (current === "daemon") renderDaemon().catch(showError);
+  }, 1500);
 }
 
 async function renderFooter() {
@@ -288,6 +408,9 @@ async function renderFooter() {
   const badge = document.getElementById("waiting-count");
   badge.textContent = String(status.waiting);
   badge.hidden = status.waiting === 0;
+  const update = await call("update_status").catch(() => null);
+  holdSaves(Boolean(update && update.probation));
+  if (update && (update.probation || ["checking", "downloading", "phase"].includes(update.state.kind))) watchUpdate();
 }
 
 const WRITE_OPTIONS = [

@@ -6,12 +6,14 @@
 //! `mentions` ask every account at once. Read tools see only what the agent permissions allow
 //! (spec 8.6): an account or conversation the agent may not read is refused when named and left
 //! out of lists. The writes never reach a module from here: they become pending actions
-//! (pending.rs), which run under the write permission.
+//! (pending.rs), which run under the write permission. Every call passes the [`Gate`], which an
+//! update closes (spec 7.1).
 
 pub mod shared;
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use open_mess_host::limits::CALL_TIMEOUT;
@@ -21,11 +23,13 @@ use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
 use crate::accounts::{Account, Accounts, REMOVING};
-use crate::modules::ModuleState;
+use crate::modules::{ModuleInfo, ModuleState};
 use crate::pending::{Kind, Pending, State};
 use crate::permissions;
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
+use crate::triggers::engine::now_ms;
+use crate::update::service::UpdateService;
 
 /// A tool as both front ends describe it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,6 +61,73 @@ fn failed(err: impl std::fmt::Display) -> ToolError {
     ToolError::Failed(err.to_string())
 }
 
+/// Which tool calls the [`Gate`] lets in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GateMode {
+    #[default]
+    Open,
+    /// Reads only; the write tools fail.
+    WritesBlocked,
+    /// Every call fails.
+    Closed,
+}
+
+/// Lets tool calls in or refuses them, and counts those running, for an update that waits for
+/// them to end (spec 7.1).
+#[derive(Clone, Default)]
+pub struct Gate(Arc<GateState>);
+
+#[derive(Default)]
+struct GateState {
+    mode: Mutex<GateMode>,
+    in_flight: AtomicUsize,
+    /// When the last call ended, in milliseconds since 1970; 0 before the first.
+    last_end_ms: AtomicU64,
+}
+
+impl Gate {
+    pub fn set(&self, mode: GateMode) {
+        *self.0.mode.lock().unwrap_or_else(PoisonError::into_inner) = mode;
+    }
+
+    /// Calls running now, from when the registry took them until it answered.
+    pub fn in_flight(&self) -> usize {
+        self.0.in_flight.load(Ordering::SeqCst)
+    }
+
+    pub fn last_end_ms(&self) -> u64 {
+        self.0.last_end_ms.load(Ordering::SeqCst)
+    }
+
+    /// Takes a call of `tool`, counted while the guard lives, or refuses it.
+    fn enter(&self, tool: &str) -> Result<InFlight, ToolError> {
+        // Counted before the mode is read: whoever closes the gate and then sees no call running
+        // knows that every later call sees it closed.
+        self.0.in_flight.fetch_add(1, Ordering::SeqCst);
+        let call = InFlight(Arc::clone(&self.0));
+        match *self.0.mode.lock().unwrap_or_else(PoisonError::into_inner) {
+            GateMode::Closed => Err(update_in_progress()),
+            GateMode::WritesBlocked if Kind::for_tool(tool).is_some() => Err(update_in_progress()),
+            _ => Ok(call),
+        }
+    }
+}
+
+/// A call the [`Gate`] took.
+struct InFlight(Arc<GateState>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // Before the count drops: whoever sees no call running sees when the last one ended.
+        self.0.last_end_ms.store(now_ms(), Ordering::SeqCst);
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn update_in_progress() -> ToolError {
+    ToolError::Failed("update in progress, try again shortly".into())
+}
+
 /// The tools of this daemon.
 pub struct Registry {
     started: Instant,
@@ -68,13 +139,30 @@ pub struct Registry {
     triggers: Counters,
     /// The MCP sessions that take trigger notifications.
     sessions: Sessions,
+    gate: Gate,
+    /// Set by the daemon once the tray is up and once the accounts' sessions were restored, for
+    /// `status`: an update checks them (spec 7.2).
+    ui_ready: Arc<AtomicBool>,
+    accounts_restored: Arc<AtomicBool>,
+    /// The updates, shown in `status` and changed by no tool (spec 2026-10-27-self-update, 6).
+    update: Option<UpdateService>,
 }
 
 impl Registry {
     /// The tools with no modules and no accounts; `started` is when the daemon started, for
     /// `status`.
     pub fn with_builtin(started: Instant) -> Registry {
-        Registry { started, accounts: None, pending: None, triggers: Counters::default(), sessions: Sessions::default() }
+        Registry {
+            started,
+            accounts: None,
+            pending: None,
+            triggers: Counters::default(),
+            sessions: Sessions::default(),
+            gate: Gate::default(),
+            ui_ready: Arc::default(),
+            accounts_restored: Arc::default(),
+            update: None,
+        }
     }
 
     pub fn new(started: Instant, accounts: Arc<Accounts>) -> Registry {
@@ -85,7 +173,7 @@ impl Registry {
     /// [`Registry::new`] with the accounts' pending actions made by the caller, who shares them
     /// with the approval toasts and the configuration window.
     pub fn with_pending(started: Instant, accounts: Arc<Accounts>, pending: Arc<Pending>) -> Registry {
-        Registry { started, accounts: Some(accounts), pending: Some(pending), triggers: Counters::default(), sessions: Sessions::default() }
+        Registry { accounts: Some(accounts), pending: Some(pending), ..Registry::with_builtin(started) }
     }
 
     /// The trigger engine's counters, for the engine to count into.
@@ -103,6 +191,23 @@ impl Registry {
         self.pending.as_ref()
     }
 
+    pub fn gate(&self) -> &Gate {
+        &self.gate
+    }
+
+    pub fn ui_ready(&self) -> &Arc<AtomicBool> {
+        &self.ui_ready
+    }
+
+    pub fn accounts_restored(&self) -> &Arc<AtomicBool> {
+        &self.accounts_restored
+    }
+
+    /// The updates `status` shows.
+    pub fn set_update(&mut self, update: UpdateService) {
+        self.update = Some(update);
+    }
+
     pub fn list(&self) -> Vec<ToolInfo> {
         let mut tools = vec![ToolInfo {
             name: "status".into(),
@@ -115,6 +220,11 @@ impl Registry {
 
     /// Runs a tool. `args` is the arguments object.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+        let _call = self.gate.enter(name)?;
+        self.run(name, args).await
+    }
+
+    async fn run(&self, name: &str, args: Value) -> Result<Value, ToolError> {
         if name == "status" {
             no_params(&args)?;
             return self.status();
@@ -151,7 +261,9 @@ impl Registry {
         }
     }
 
-    fn status(&self) -> Result<Value, ToolError> {
+    /// What the `status` tool answers; the daemon's own check during an update's probation reads it
+    /// too (spec 2026-10-27-self-update, 7.2).
+    pub fn status(&self) -> Result<Value, ToolError> {
         let (modules, accounts) = match &self.accounts {
             None => (Vec::new(), Vec::new()),
             Some(accounts) => {
@@ -159,6 +271,11 @@ impl Registry {
                 let list = list.iter().map(|account| json!({"id": account.id, "module": account.module, "state": accounts.effective_state(account)}));
                 (accounts.modules().list(), list.collect())
             }
+        };
+        // Known only for an active module: a stopped one has no instance to ask.
+        let crashes = |module: &ModuleInfo| {
+            let accounts = self.accounts.as_ref().filter(|_| module.state == ModuleState::Active)?;
+            accounts.modules().handle(&module.name).map(|handle| handle.crashes_since_load())
         };
         let modules: Vec<Value> = modules
             .into_iter()
@@ -170,6 +287,7 @@ impl Registry {
                     "platform": module.platform,
                     "state": module.state.to_string(),
                     "hosts": module.hosts,
+                    "crashes_since_load": crashes(&module),
                 })
             })
             .collect();
@@ -179,6 +297,9 @@ impl Registry {
             "modules": modules,
             "accounts": accounts,
             "triggers": {"channel_sessions": self.sessions.len(), "counters": self.triggers.to_json()},
+            "ui_ready": self.ui_ready.load(Ordering::SeqCst),
+            "accounts_restored": self.accounts_restored.load(Ordering::SeqCst),
+            "update": self.update.as_ref().map(UpdateService::status),
         }))
     }
 }

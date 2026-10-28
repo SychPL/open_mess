@@ -14,14 +14,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use open_mess_host::HostEvent;
 use tokio::runtime::Runtime;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 use crate::Error;
 use crate::accounts::Accounts;
 use crate::pending::Pending;
-use crate::triggers::Counters;
+use crate::tools::Gate;
 use crate::triggers::channel::Sessions;
+use crate::triggers::spawn::Runs;
+use crate::triggers::{Activity, Counters};
+use crate::update::probation::Flag;
+use crate::update::service::UpdateService;
 use sign_in::SignIns;
 
 /// What the window's commands work on.
@@ -39,6 +44,21 @@ pub struct UiState {
     /// notifications, for the Wyzwalacze section.
     pub counters: Counters,
     pub sessions: Sessions,
+    /// What an update waits for before it stops the daemon (spec 7.1): the tool calls, the chain
+    /// from the modules' event queue to the rules' actions, and the programs those started.
+    pub gate: Gate,
+    pub activity: Arc<Activity>,
+    pub runs: Arc<Runs>,
+    pub host_events: mpsc::Sender<HostEvent>,
+    /// Set once the tray is up, for `status` (spec 7.2).
+    pub ui_ready: Arc<AtomicBool>,
+    /// Ends the daemon as Ctrl+C does: an update whose helper started (spec 7.1).
+    pub exit: Arc<Notify>,
+    /// On while an update's new version is checked: the window's saves are refused (spec 7.2). The
+    /// pending actions' own flag.
+    pub probation: Flag,
+    /// The Aktualizacje block of Demon i logi; None where updates do not install.
+    pub update: Option<UpdateService>,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.

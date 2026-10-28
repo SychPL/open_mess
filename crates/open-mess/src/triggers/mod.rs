@@ -13,10 +13,12 @@ pub mod rules;
 pub mod spawn;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use crate::accounts::Accounts;
 use crate::pending;
@@ -123,6 +125,26 @@ pub fn payload(rule: &str, batch: &Batch) -> Value {
         fields.remove("untrusted_notice");
     }
     shared::with_notice(payload)
+}
+
+/// What the chain from the modules' events to the rules' actions is doing, for an update waiting
+/// for it to finish (spec 7.1), and the hold that keeps batches from going out while a new version
+/// is checked (spec 7.2).
+#[derive(Default)]
+pub struct Activity {
+    /// Events the bus took from the modules' queue.
+    pub received: AtomicU64,
+    /// Events the engine took from the bus, those it missed by falling behind included.
+    pub consumed: AtomicU64,
+    /// Batches being collected.
+    pub open_batches: AtomicUsize,
+    /// Batches handed to their action that it has not finished with.
+    pub delivering: AtomicUsize,
+    /// When the last delivery ended, in milliseconds since 1970; 0 before the first.
+    pub last_delivery_ms: AtomicU64,
+    /// While true the engine collects batches but hands none over. Set it with `send_replace`:
+    /// `send` changes nothing while no engine listens.
+    pub hold: watch::Sender<bool>,
 }
 
 /// What happened to the batches of one rule since the daemon started, for `status`.

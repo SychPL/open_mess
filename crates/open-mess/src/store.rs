@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::Error;
 
@@ -38,6 +38,9 @@ const MIGRATIONS: &[&str] = &[
          batch INTEGER, PRIMARY KEY (rule, message));
      CREATE INDEX trigger_seen_at ON trigger_seen (at_ms);
      CREATE INDEX trigger_seen_batch ON trigger_seen (batch);",
+    // The user's one-time install consent (update/consent.rs): one row, replaced by each click.
+    "CREATE TABLE update_consent (version TEXT NOT NULL, manifest_sha256 TEXT NOT NULL, clicked_ms INTEGER NOT NULL,
+         launched_ms INTEGER, used_ms INTEGER);",
 ];
 
 /// Configuration and state in `state.sqlite3`.
@@ -57,8 +60,9 @@ impl Store {
         Ok(Store { conn })
     }
 
-    /// The connection, for the modules and accounts tables.
-    pub(crate) fn conn(&self) -> &Connection {
+    /// The connection, for the modules and accounts tables, and for what takes a plain connection
+    /// (update/consent.rs, the module approvals).
+    pub fn conn(&self) -> &Connection {
         &self.conn
     }
 
@@ -73,15 +77,36 @@ impl Store {
 
     /// The local API port: the stored `port`, or [`DEFAULT_PORT`].
     pub fn port(&self) -> Result<u16, Error> {
-        let Some(value) = self.get_config("port")? else {
-            return Ok(DEFAULT_PORT);
-        };
-        value
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port != 0)
-            .ok_or_else(|| Error::BadConfig(format!("port must be a number from 1 to 65535, found {value:?}")))
+        parse_port(self.get_config("port")?)
     }
+}
+
+fn parse_port(value: Option<String>) -> Result<u16, Error> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_PORT);
+    };
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| Error::BadConfig(format!("port must be a number from 1 to 65535, found {value:?}")))
+}
+
+/// The stored port, read without migrating: the CLI and `om mcp-stdio` must reach a daemon whose
+/// database a newer open_mess migrated further. A missing file or key gives [`DEFAULT_PORT`].
+pub fn read_port(db: &Path) -> Result<u16, Error> {
+    let conn = match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
+        Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::CannotOpen => return Ok(DEFAULT_PORT),
+        Err(err) => return Err(err.into()),
+    };
+    // No config table yet: a database that was never migrated.
+    let value = match conn.query_row("SELECT value FROM config WHERE key = 'port'", [], |row| row.get(0)).optional() {
+        Ok(value) => value,
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("no such table") => None,
+        Err(err) => return Err(err.into()),
+    };
+    parse_port(value)
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -126,6 +151,21 @@ mod tests {
         let path = dir.path().join("state.sqlite3");
         rusqlite::Connection::open(&path).unwrap().pragma_update(None, "user_version", 999).unwrap();
         assert!(matches!(Store::open(&path), Err(Error::SchemaTooNew { found: 999, .. })));
+    }
+
+    #[test]
+    fn port_is_read_from_a_newer_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        assert_eq!(read_port(&path).unwrap(), DEFAULT_PORT, "missing file");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(read_port(&path).unwrap(), DEFAULT_PORT, "missing key");
+        store.set_config("port", "7400").unwrap();
+        store.conn().pragma_update(None, "user_version", 99).unwrap();
+        drop(store);
+        assert!(matches!(Store::open(&path), Err(Error::SchemaTooNew { found: 99, .. })));
+        assert_eq!(read_port(&path).unwrap(), 7400);
+        assert_eq!(rusqlite::Connection::open(&path).unwrap().pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 99);
     }
 
     #[test]
