@@ -29,7 +29,7 @@ const WAM: &str = r#"refused: scope \"scope\" is not in the module's manifest"#;
 
 #[tokio::test]
 async fn device_code_reaches_the_window() {
-    let (call, mut prompts) = signing_in(Duration::from_secs(10)).await;
+    let (call, mut prompts) = signing_in(Duration::from_secs(30)).await;
     let (code, _) = prompts.recv().await.unwrap();
     let url = "https://login.example.com/device".into();
     assert_eq!(code, SignInRequest::DeviceCode { module: "test-echo".into(), code: "ABCD-1234".into(), url });

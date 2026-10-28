@@ -188,7 +188,7 @@ async fn phase_b_rejects_new_calls_and_waits_for_in_flight() {
     let d = writable().await;
     let activity = activity(&d, runs(&d), mpsc::channel(8).0);
     let (_cancel, cancelled) = watch::channel(false);
-    // test-echo answers this write only at its call limit (2 s in tests).
+    // test-echo answers this write only at its call limit (10 s in tests).
     let slow = async {
         let result = d.registry.call("send", send("slow")).await;
         (result, Instant::now())
