@@ -178,10 +178,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_is_rejected() {
+    fn foreign_signature_is_rejected_by_the_release_key() {
         let json = manifest_json(&[("om.exe", "exe", 10)]);
         let (_, secret) = key_pair();
         assert!(matches!(verify(&json, &sign(&secret, &json), RELEASE_KEY), Err(UpdateError::Rejected(_))));
+    }
+
+    #[test]
+    fn release_key_decodes() {
+        // A damaged keys/release.pub would reject every release in the field; CI catches it here.
+        minisign_verify::PublicKey::decode(RELEASE_KEY).expect("keys/release.pub is a minisign public key");
     }
 
     #[test]
