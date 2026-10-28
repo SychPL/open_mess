@@ -603,14 +603,14 @@ to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the brow
   settings (`meetingPolicySettings`), region gating, and the meeting's
   `meetingDetails.meetingCapability.allowTranscription` from the call's meeting details; bot failures in
   its `endpointMetadata.runtimeErrors`; "Due to policy, you can't copy captions". **UNCONFIRMED** whether
-  the organizer has an option for captions alone; none was found.
+  the organizer has an option for captions alone; none was found ("Needs live capture" 19).
 - **CONFIRMED** speakers: each result carries `userId` (an MRI; anonymous ones end in `@local`) and
   `displayName`, `roomId` for room devices; no media-source mapping through the roster is needed.
 - **CONFIRMED** CART is the same data-channel stream, a text track with `source: "Cart"`.
 - **CONFIRMED** turning captions on adds the bot when it is absent (the client filters `28:` bots out of
   participant lists); the only captions alert is a local "start failed". Transcription, unlike captions,
   announces itself (`TranscriptStartedByOthers`) and is stored. **UNCONFIRMED** whether the service keeps
-  anything of captions alone.
+  anything of captions alone ("Needs live capture" 19).
 
 ### 10.5 Visibility of a second endpoint
 
@@ -732,6 +732,8 @@ the user present (spec 9.5):
     registration or only a Trouter URL.
 18. What other participants and the user's own client show for that second endpoint (roster rows,
     join notice or sound, the "on another device" banner).
+19. Whether the organizer can turn captions alone off in the meeting options, and whether the
+    service keeps anything of captions that run without transcription (section 10.4).
 
 ## Live results
 
