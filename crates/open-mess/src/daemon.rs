@@ -24,8 +24,11 @@ use crate::triggers::spawn::{self, Runs};
 use crate::triggers::{self, Actions};
 use crate::ui::sign_in::SignIns;
 use crate::ui::{Opener, UiState};
+use crate::update::fetch::Source;
 use crate::update::probation::{self, Start};
 use crate::update::quiesce::{Activity, Launcher};
+use crate::update::release::RELEASE_KEY;
+use crate::update::service::{self, Setup, UpdateService};
 use crate::update::state::Paths;
 use crate::{Error, api, approval, paths, secrets, ui};
 
@@ -43,17 +46,18 @@ pub fn run() -> Result<(), Error> {
     let record = |why: &str| drop(std::fs::write(&error_file, format!("{}\n", why.replace(['\r', '\n'], " "))));
     // First of all: an update's helper may be changing the files, or waiting for this daemon to be
     // gone (spec 2026-10-27-self-update, 7.6).
-    let mut probation = None;
-    if let Some((paths, launcher)) = update()? {
-        match probation::on_start(&paths) {
+    let update = update()?;
+    let mut probation = false;
+    if let Some((paths, launcher)) = &update {
+        match probation::on_start(paths) {
             Start::Normal => {}
-            Start::Probation => probation = Some((paths, launcher)),
+            Start::Probation => probation = true,
             Start::Exit => {
                 record("an update of open_mess is being installed or rolled back; its helper starts the daemon when it is done");
                 return Ok(());
             }
             Start::LaunchHelperAndExit => {
-                let launched = probation::launch_helper(&paths, &*launcher);
+                let launched = probation::launch_helper(paths, &**launcher);
                 record(&match &launched {
                     Ok(()) => "an interrupted update of open_mess is being rolled back; its helper starts the daemon when it is done".to_owned(),
                     Err(err) => {
@@ -67,11 +71,11 @@ pub fn run() -> Result<(), Error> {
     // A second daemon fails here and leaves the running one's error file alone.
     let _lock = acquire_lock(&dir)?;
     let window = Opener::default();
-    let (runtime, listener, registry, ui) = start(&dir, started, &window, probation.is_some()).inspect_err(|err| record(&err.to_string()))?;
+    let (runtime, listener, registry, ui) = start(&dir, started, &window, probation, update.clone()).inspect_err(|err| record(&err.to_string()))?;
     let _ = std::fs::remove_file(&error_file);
     let exit = Arc::clone(&ui.exit);
     let registry = Arc::new(registry);
-    if let Some((paths, launcher)) = probation {
+    if let Some((paths, launcher)) = update.filter(|_| probation) {
         let activity = Activity {
             gate: ui.gate.clone(),
             triggers: Arc::clone(&ui.activity),
@@ -151,7 +155,14 @@ fn acquire_lock(dir: &Path) -> Result<InstanceLock, Error> {
 
 /// Everything the daemon runs. `probation`: a new version is being checked, and the daemon starts
 /// with writes, window saves and trigger deliveries held (spec 2026-10-27-self-update, 7.2).
-fn start(dir: &Path, started: Instant, window: &Opener, probation: bool) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
+/// `update`: where updates install, the service that checks for them.
+fn start(
+    dir: &Path,
+    started: Instant,
+    window: &Opener,
+    probation: bool,
+    update: Option<Update>,
+) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
     let store = Store::open(&dir.join("state.sqlite3"))?;
     let port = store.port()?;
     let token = secrets::local_api_token()?;
@@ -175,7 +186,7 @@ fn start(dir: &Path, started: Instant, window: &Opener, probation: bool) -> Resu
     let accounts = Arc::new(Accounts::new(store, modules, dir.to_path_buf(), credentials));
     let bus = Bus::default();
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
-    let registry = Registry::with_pending(started, Arc::clone(&accounts), Arc::clone(&pending));
+    let mut registry = Registry::with_pending(started, Arc::clone(&accounts), Arc::clone(&pending));
     let activity = Arc::new(triggers::Activity::default());
     if probation {
         // Before the trigger engine, the approvals and the API run; the probation lets them go.
@@ -208,6 +219,32 @@ fn start(dir: &Path, started: Instant, window: &Opener, probation: bool) -> Resu
     pending.recover()?;
     runtime.spawn(Arc::clone(&pending).sweep());
     approval::start(&runtime, Arc::clone(&pending), window.clone());
+    let exit = Arc::new(Notify::new());
+    let update = update.map(|(paths, launcher)| {
+        // Inside the runtime: the service spawns its checks there.
+        let _entered = runtime.enter();
+        UpdateService::spawn(Setup {
+            installable: service::installable_here(&paths),
+            paths,
+            source: Source::github(),
+            public_key: RELEASE_KEY.to_owned(),
+            accounts: Arc::clone(&accounts),
+            activity: Activity {
+                gate: registry.gate().clone(),
+                triggers: Arc::clone(&activity),
+                pending: Arc::clone(&pending),
+                runs: Arc::clone(&runs),
+                modules: Vec::new(),
+                host_events: event_queue.clone(),
+            },
+            launcher,
+            exit: Arc::clone(&exit),
+            announce: Arc::new(approval::update_ready),
+        })
+    });
+    if let Some(update) = &update {
+        registry.set_update(update.clone());
+    }
     let (counters, sessions) = (registry.trigger_counters().clone(), registry.channel_sessions().clone());
     let (gate, ui_ready) = (registry.gate().clone(), Arc::clone(registry.ui_ready()));
     let ui = UiState {
@@ -225,7 +262,8 @@ fn start(dir: &Path, started: Instant, window: &Opener, probation: bool) -> Resu
         runs,
         host_events: event_queue,
         ui_ready,
-        exit: Arc::default(),
+        exit,
+        update,
     };
     Ok((runtime, listener, registry, ui))
 }

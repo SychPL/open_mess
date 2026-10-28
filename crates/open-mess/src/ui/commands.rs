@@ -17,6 +17,7 @@ use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
 use crate::triggers::RuleCounters;
 use crate::triggers::rules::{self, Rule};
 use crate::update::release::Version;
+use crate::update::service::{UpdateService, UpdateView};
 use crate::{approval, cli, permissions};
 
 /// Why an approval is refused when the file on disk is not the one the window showed.
@@ -720,6 +721,39 @@ pub fn channel_setup(state: &UiState) -> Result<ChannelSetupDto, String> {
 
 /// The channel setup's MCP configuration, in the data folder.
 pub const CHANNEL_CONFIG: &str = "channel-mcp.json";
+
+/// The updates, where the daemon has them (spec 2026-10-27-self-update, 6). Consent and the option
+/// to install on its own are set only here and in the toast: no tool or CLI command reaches them.
+fn updates(state: &UiState) -> Result<&UpdateService, String> {
+    state.update.as_ref().ok_or_else(|| "ten demon nie aktualizuje się sam".to_owned())
+}
+
+pub fn update_status(state: &UiState) -> Result<UpdateView, String> {
+    Ok(updates(state)?.view())
+}
+
+/// "Sprawdź teraz"; the window looks at [`update_status`] for the outcome.
+pub fn check_update(state: &UiState) -> Result<(), String> {
+    updates(state)?.check_now();
+    Ok(())
+}
+
+/// "Zainstaluj": the user's consent; the installation goes on in the background.
+pub fn install_update(state: &UiState) -> Result<(), String> {
+    updates(state)?.install()
+}
+
+/// "Anuluj", during phase A or B.
+pub fn cancel_update(state: &UiState) -> Result<(), String> {
+    updates(state)?.cancel();
+    Ok(())
+}
+
+/// "Instaluj aktualizacje automatycznie".
+pub fn set_auto_install(state: &UiState, on: bool) -> Result<(), String> {
+    changes_allowed(state)?;
+    updates(state)?.set_auto_install(on)
+}
 
 #[cfg(test)]
 mod tests {

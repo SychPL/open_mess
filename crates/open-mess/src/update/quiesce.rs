@@ -40,6 +40,7 @@ const HELPER_START: Duration = Duration::from_secs(30);
 pub(crate) const HELPER: &str = "om.update.exe";
 
 /// What the phases wait for and stop.
+#[derive(Clone)]
 pub struct Activity {
     pub gate: Gate,
     pub triggers: Arc<triggers::Activity>,

@@ -14,9 +14,15 @@ use tokio::runtime::Runtime;
 
 use crate::pending::{Kind, Pending, Preview};
 use crate::ui::Opener;
+use crate::update::release::Version;
+use crate::update::service::UpdateService;
 
 /// The AppUserModelID the toasts show under, registered for the current user at daemon start.
 pub const APP_ID: &str = "open_mess.daemon";
+/// The AppUserModelID of the notice that an update is ready: its own, so that taking the approvals'
+/// toasts away (`ClearWithId(APP_ID)`) leaves it on screen. tauri-winrt-notification gives a toast a
+/// tag only with a progress bar, and a group never.
+pub const UPDATE_APP_ID: &str = "open_mess.update";
 /// Participants a toast names; the others are counted.
 const NAMED_PARTICIPANTS: usize = 5;
 /// Windows shows at most four lines of a toast's two text elements (the title has its own two).
@@ -255,6 +261,20 @@ pub fn start(runtime: &Runtime, pending: Arc<Pending>, window: Opener) {
 #[cfg(not(windows))]
 pub fn start(_runtime: &Runtime, _pending: Arc<Pending>, _window: Opener) {}
 
+/// "open_mess <wersja> jest gotowy" with Zainstaluj and Później (spec 2026-10-27-self-update, 6);
+/// Zainstaluj is the user's consent, as in the window.
+#[cfg(windows)]
+pub fn update_ready(service: &UpdateService, version: &Version) {
+    let (service, version) = (service.clone(), version.to_string());
+    // Showing waits for Windows: not on the runtime. ponytail: without the thread no toast shows; the
+    // window still offers the release.
+    let _ = std::thread::Builder::new().name("open-mess-update-toast".into()).spawn(move || toast::update(service, &version));
+}
+
+/// No notifications here; there is no installation either.
+#[cfg(not(windows))]
+pub fn update_ready(_service: &UpdateService, _version: &Version) {}
+
 #[cfg(windows)]
 mod toast {
     use std::sync::Arc;
@@ -266,14 +286,39 @@ mod toast {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
-    use super::{APP_ID, Prompt};
+    use super::{APP_ID, Prompt, UPDATE_APP_ID};
     use crate::pending::Pending;
     use crate::ui::Opener;
+    use crate::update::service::UpdateService;
 
-    /// `HKCU\Software\Classes\AppUserModelId\open_mess.daemon` with the name toasts show.
+    /// `HKCU\Software\Classes\AppUserModelId\open_mess.daemon` and `...\open_mess.update` with the
+    /// name toasts show.
     pub(super) fn register() -> std::io::Result<()> {
-        let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(format!(r"Software\Classes\AppUserModelId\{APP_ID}"))?;
-        key.set_value("DisplayName", &"open_mess")
+        for id in [APP_ID, UPDATE_APP_ID] {
+            let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(format!(r"Software\Classes\AppUserModelId\{id}"))?;
+            key.set_value("DisplayName", &"open_mess")?;
+        }
+        Ok(())
+    }
+
+    /// Shows that `version` is ready, in place of an earlier notice of a release.
+    pub(super) fn update(service: UpdateService, version: &str) {
+        let _ = ToastNotificationManager::History().and_then(|history| history.ClearWithId(&HSTRING::from(UPDATE_APP_ID)));
+        let toast = Toast::new(UPDATE_APP_ID)
+            .title(&format!("open_mess {version} jest gotowy"))
+            .add_button("Zainstaluj", "install")
+            .add_button("Później", "later")
+            .on_activated(move |argument| {
+                if argument.as_deref() == Some("install") {
+                    // ponytail: a refusal (a check or an installation running, a new version being
+                    // checked) is shown by the window only.
+                    let _ = service.install();
+                }
+                Ok(())
+            });
+        // ponytail: a toast Windows refuses leaves the release to the window; reported once a log
+        // sink exists.
+        let _ = toast.show();
     }
 
     /// Work for the toast thread.

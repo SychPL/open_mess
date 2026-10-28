@@ -29,6 +29,7 @@ use crate::permissions;
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
 use crate::triggers::engine::now_ms;
+use crate::update::service::UpdateService;
 
 /// A tool as both front ends describe it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,6 +144,8 @@ pub struct Registry {
     /// `status`: an update checks them (spec 7.2).
     ui_ready: Arc<AtomicBool>,
     accounts_restored: Arc<AtomicBool>,
+    /// The updates, shown in `status` and changed by no tool (spec 2026-10-27-self-update, 6).
+    update: Option<UpdateService>,
 }
 
 impl Registry {
@@ -158,6 +161,7 @@ impl Registry {
             gate: Gate::default(),
             ui_ready: Arc::default(),
             accounts_restored: Arc::default(),
+            update: None,
         }
     }
 
@@ -197,6 +201,11 @@ impl Registry {
 
     pub fn accounts_restored(&self) -> &Arc<AtomicBool> {
         &self.accounts_restored
+    }
+
+    /// The updates `status` shows.
+    pub fn set_update(&mut self, update: UpdateService) {
+        self.update = Some(update);
     }
 
     pub fn list(&self) -> Vec<ToolInfo> {
@@ -290,6 +299,7 @@ impl Registry {
             "triggers": {"channel_sessions": self.sessions.len(), "counters": self.triggers.to_json()},
             "ui_ready": self.ui_ready.load(Ordering::SeqCst),
             "accounts_restored": self.accounts_restored.load(Ordering::SeqCst),
+            "update": self.update.as_ref().map(UpdateService::view),
         }))
     }
 }

@@ -656,6 +656,7 @@ fn ui_state(d: &common::Daemon) -> UiState {
         host_events: mpsc::channel(1).0,
         ui_ready: Arc::default(),
         exit: Arc::default(),
+        update: None,
     }
 }
 

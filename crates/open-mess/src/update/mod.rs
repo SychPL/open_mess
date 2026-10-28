@@ -6,6 +6,7 @@ pub mod fetch;
 pub mod probation;
 pub mod quiesce;
 pub mod release;
+pub mod service;
 pub mod state;
 #[cfg(windows)]
 pub mod system;

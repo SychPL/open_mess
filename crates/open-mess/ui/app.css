@@ -77,6 +77,10 @@ h2 { font-size: 15px; margin: 24px 0 8px; }
 
 .muted { color: var(--muted); }
 .error { color: var(--danger); }
+.notice { color: var(--warn); }
+
+/* An update's new version is being checked: nothing in these sections saves. */
+.content[inert] :is(button, input, select, textarea) { opacity: 0.5; }
 
 .badge {
   display: inline-block;

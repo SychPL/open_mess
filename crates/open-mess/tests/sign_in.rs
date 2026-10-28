@@ -37,6 +37,7 @@ fn state(d: &Daemon) -> Arc<UiState> {
         ui_ready: Arc::default(),
         exit: Arc::default(),
         probation: d.registry.pending().unwrap().probation().clone(),
+        update: None,
     })
 }
 

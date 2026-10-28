@@ -24,6 +24,11 @@
     "allow-put-rule",
     "allow-delete-rule",
     "allow-pick-program",
-    "allow-channel-setup"
+    "allow-channel-setup",
+    "allow-update-status",
+    "allow-check-update",
+    "allow-install-update",
+    "allow-cancel-update",
+    "allow-set-auto-install"
   ]
 }

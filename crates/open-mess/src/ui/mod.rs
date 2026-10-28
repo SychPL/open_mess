@@ -26,6 +26,7 @@ use crate::triggers::channel::Sessions;
 use crate::triggers::spawn::Runs;
 use crate::triggers::{Activity, Counters};
 use crate::update::probation::Flag;
+use crate::update::service::UpdateService;
 use sign_in::SignIns;
 
 /// What the window's commands work on.
@@ -56,6 +57,8 @@ pub struct UiState {
     /// On while an update's new version is checked: the window's saves are refused (spec 7.2). The
     /// pending actions' own flag.
     pub probation: Flag,
+    /// The Aktualizacje block of Demon i logi; None where updates do not install.
+    pub update: Option<UpdateService>,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.
