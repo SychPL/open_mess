@@ -1272,6 +1272,7 @@ async fn list_meetings_checks_its_window() {
         json!({"from": "2027-01-15T00:00:00Z", "to": "2027-01-15T00:00:00Z"}),
         json!({"from": "2027-01-01T00:00:00Z", "to": "2027-02-02T00:00:00Z"}),
         json!({"from": "yesterday"}),
+        json!({"from": 1_800_000_000}),
     ] {
         assert!(matches!(module_error(teams.call("list_meetings", args.clone()).await), ModuleError::InvalidArgs(_)), "{args}");
     }

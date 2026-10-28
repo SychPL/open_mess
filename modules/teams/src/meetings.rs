@@ -222,8 +222,15 @@ pub fn parse_vtt(body: &[u8]) -> Result<Vec<Cue>, ProtoError> {
     let mut cues = Vec::new();
     for block in blocks {
         let lines: Vec<&str> = block.lines().collect();
-        // A cue's timing line is its first or, after an identifier, its second; NOTE, STYLE and
-        // REGION blocks have none.
+        // A cue's timing line is its first or, after an identifier, its second. NOTE, STYLE and
+        // REGION blocks are no cues, even with `-->` in their text.
+        let first = lines.first().copied().unwrap_or_default();
+        if ["NOTE", "STYLE", "REGION"]
+            .iter()
+            .any(|kind| first == *kind || first.starts_with(&format!("{kind} ")) || first.starts_with(&format!("{kind}\t")))
+        {
+            continue;
+        }
         let Some(at) = lines.iter().take(2).position(|line| line.contains("-->")) else { continue };
         if cues.len() == MAX_CUES {
             break;
@@ -518,8 +525,9 @@ mod tests {
         // Cut off in the middle of a cue's text, a tag or an entity: what is there is kept.
         let cues = parse_vtt(b"WEBVTT\n\n00:00.000 --> 00:01.000\n<v Ann>half a sente<i").unwrap();
         assert_eq!((cues[0].speaker.as_deref(), cues[0].text.as_str()), (Some("Ann"), "half a sente<i"));
-        // A block without a timing line is skipped, not an error.
+        // A block without a timing line is skipped, not an error; so is a comment with `-->`.
         assert!(parse_vtt(b"WEBVTT\n\nSTYLE\n::cue {}\n").unwrap().is_empty());
+        assert!(parse_vtt(b"WEBVTT\n\nNOTE a --> b\n\nNOTE\nc --> d\n").unwrap().is_empty());
     }
 
     #[test]
