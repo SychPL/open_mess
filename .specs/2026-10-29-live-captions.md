@@ -15,7 +15,9 @@ Poza zakresem: agent mówiący lub piszący na spotkaniu, nagrywanie, dźwięk i
 - 2026-10-29: "spróbujmy to" po werdykcie z docs 10.6 ("potrzebne media"), z wyborem "najpierw spec". Ten spec jest tym krokiem; kod powstaje po jego zatwierdzeniu i po krokach 0a i 0b (sekcja 7).
 - Napisy to mowa innych osób; trafiają do agentów na prawie czytania rozmowy spotkania, jak transkrypcje (D2 etapu 2: open_mess służy właścicielowi do własnego użytku).
 
-Otwarte decyzje - sekcja 10. Bez O1 (widoczność u właściciela) funkcja nie powstaje.
+- 2026-10-29, O1 = (a): właściciel akceptuje komunikat o drugim urządzeniu w swoim oficjalnym kliencie, tylko dla sesji napisów, które sam zatwierdza; wyjątek wpisany do AGENTS.md ("Never disturb the official clients").
+
+Otwarte decyzje - sekcja 10 (O2, O3).
 
 ## 3. Kontekst w kodzie i protokole
 
@@ -175,7 +177,7 @@ i w `events`: `on-rtc-data(conn: u32, messages: list<list<u8>>, dropped: u32)`, 
 
 ## 10. Otwarte decyzje właściciela
 
-- **O1. Widoczność u właściciela.** Póki open_mess jest na spotkaniu, oficjalny klient właściciela pokazuje "You're in this meeting on another device" i proponuje przeniesienie lub dodanie urządzenia (docs 10.5). To zakłóca oficjalnego klienta, czego AGENTS.md zabrania ("Never disturb the official clients"). Możliwości: (a) zgoda na ten wyjątek tylko dla sesji napisów, które właściciel sam zatwierdza (4.1) - wtedy wyjątek trafia do AGENTS.md; (b) bez zgody - spec porzucony. Bez decyzji nie ma kroku 0b.
+- **O1. Widoczność u właściciela - rozstrzygnięte 2026-10-29: (a).** Póki open_mess jest na spotkaniu, oficjalny klient właściciela pokazuje "You're in this meeting on another device" i proponuje przeniesienie lub dodanie urządzenia (docs 10.5). Właściciel zgodził się na ten wyjątek od "Never disturb the official clients" tylko dla sesji napisów, które sam zatwierdza (4.1); wyjątek jest w AGENTS.md. Nic innego w oficjalnym kliencie się nie zmienia.
 - **O2. Widoczność u innych** - tylko jeśli krok 0b pokaże, że inni uczestnicy widzą dodatkowe urządzenie, dźwięk albo powiadomienie: czy to akceptowalne.
 - **O3. Włączanie napisów.** Gdy nikt na spotkaniu nie ma włączonych napisów, bot napisów nie jest w połączeniu; włączenie go przez open_mess robi to samo co kliknięcie "Turn on live captions" w Teams (bot dołącza do spotkania). Możliwości: (a) open_mess włącza napisy, gdy ich nie ma; (b) open_mess czyta napisy tylko, gdy ktoś (np. właściciel w oficjalnym kliencie) już je włączył - inaczej błąd "turn on live captions in Teams first".
 
