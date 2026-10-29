@@ -450,7 +450,8 @@ item 9.
   `x-ms-user-meeting-role`.
 - **CONFIRMED** the response is a collection: `resources` of a union type whose `TranscriptV2`
   member has `callId, organizerId, startTime, endTime, threadId, webUrl, driveId, driveItemId, iCalUid,
-  transcriptId` (GraphQL type `MeetingArtifactV2TranscriptV2`). Live shape: item 9.
+  transcriptId` (GraphQL type `MeetingArtifactV2TranscriptV2`). Live shape: items 9 and 12 (there
+  `startTime` and `endTime` are .NET ticks, not ISO times).
 
 ### 9.4 Recordings: Substrate working set
 
@@ -478,8 +479,8 @@ item 9.
 - **CONFIRMED** token audience: the site origin, from the first three URL segments
   (`fetchAuthToken` / `M` in `services-MeetingRecapSwaservice`), e.g. `https://<tenant>-my.sharepoint.com`.
   The origin comes from the artifact's `location` / `webUrl` (9.3).
-- **UNCONFIRMED** a download in the user's own organization (item 9: the only transcript found
-  belonged to another organization and was refused).
+- **CONFIRMED** live: a download in the user's own organization ("Live results" 12, after item 9
+  where the only transcript found belonged to another organization and was refused).
 
 ### 9.6 Older transcripts: Meeting Artifacts service
 
@@ -579,13 +580,18 @@ the user present (spec 9.5):
     (fetching the CDN bundle without signing in and diffing it with REA `compare_bundles` is enough).
 13. A transcript download in the user's own organization: `media/transcripts` with a WAM token for
     the site origin, then `streamContent` (WebVTT, `?is=1`) - status, cue count, voice tags, never the
-    text (section 9.5). Needs a meeting of the user's own organization with a transcript.
+    text (section 9.5). Needs a meeting of the user's own organization with a transcript. Done, see
+    "Live results" 12.
 14. MCPS `contents` for a recurring meeting (which `iCalUid` it expects: series or occurrence) and for
-    a meeting without a transcript; the `paginationInfo` shape.
+    a meeting without a transcript; the `paginationInfo` shape. The recurring part and the shape with
+    `hasNextPage: false` are in "Live results" 12; a meeting without a transcript and a response with
+    `hasNextPage: true` are still to be captured.
 15. The `RichText/Media_CallTranscript` content: it starts with `{` but did not parse as JSON
     (perhaps HTML-escaped); its key names.
 16. Whether opening a transcript through `streamContent` counts as a view in the recording's
-    analytics, visible to its owner.
+    analytics, visible to its owner. First reading on someone else's recording in "Live results" 12
+    (no change right after the download); the next-day reading and the check on the user's own
+    recording are still to be done.
 
 ## Live results
 
@@ -780,6 +786,56 @@ token, tenant id, user id or account name.
       `personalSiteUrl`; `personalSiteUrl` is `https://<t>-my.sharepoint.com/personal/...` with a
       lowercase `<t>` (letters only for this tenant), no port.
 
-All checks in items 1-4 and 7-10 were read-only: no endpoint registration, no property write, no Trouter
+12. **Step 0 of the stage 2 spec, transcript part** (read-only, 2026-10-29, the owner at the computer
+    and approving in chat this one meeting, although the recording is not the owner's own; scratch WAM
+    probe, counts, key names, character classes and lengths only, no transcript text, names or ids).
+    The meeting: one occurrence (`eventType` `Exception`) of a recurring meeting of the owner's own
+    organization, organized by a colleague, transcribed, about an hour long. The probe made exactly the
+    requests of spec 4.2 steps 1-6, once:
+    - MCPS `contents`: HTTP 200 with `threadId` and the calendar event's `iCalUid`, and with
+      `threadId` alone. Top keys `changeKey`, `countOfFilteredContentsByChatHistory`,
+      `deletedResources`, `invalidResources`, `paginationInfo`, `resources`. `paginationInfo` is
+      `{"hasNextPage": false}` in both; no continuation field was seen, so `hasNextPage: true` has
+      no known shape yet. With `iCalUid` the resources were 1 `TranscriptV2`, 1 `AISummary`, 1
+      `notes`; with the thread alone 3, 3 and 2 (the whole series). So the calendar event's
+      `iCalUID` picks the occurrence, although the resource's `metadata.iCalUid` differs from it
+      and from `metadata.instanceICalUid` ("Needs live capture" 14, recurring part).
+    - The `TranscriptV2` resource: keys `addedBy`, `additionDateTime`, `id`, `location`,
+      `mcoResourceId`, `metadata`, `subType`, `type`; `metadata` keys `appTitle`, `callId`,
+      `containerId`, `correlationId`, `driveId`, `driveItemId`, `endTime`, `fileId`, `fileTitle`,
+      `fileType`, `iCalUid`, `instanceICalUid`, `isMultilingual`, `meetingJoinUrl`, `messageId`,
+      `organizerId`, `organizerTenantId`, `ownerId`, `ownerTenantId`, `sharePointOnlineId`,
+      `sharingLinkPermissionId`, `startTime`, `threadId`, `thumbnailUrl`, `transcriptId`, `userId`,
+      `webUrl`. **`metadata.startTime` and `endTime` are not ISO times but strings of 18 digits,
+      .NET ticks** (100 ns since 0001-01-01 UTC): read so, they were 0 and 64 minutes after the
+      calendar event's start. `ownerTenantId` was the account's tenant; `organizerTenantId` was an
+      empty string; `ownerId` was neither the owner nor the organizer (whoever started the
+      transcription). `id` 60 characters `[-0-9A-Za-z]`, `driveId` 66 `[!0-9A-Za-z]`, `driveItemId`
+      34 `[0-9A-Z]`, `transcriptId` 36 `[-0-9a-z]` - all inside the classes of spec 4.2 step 4.
+      `location` lay on the organization's OneDrive origin (`https://<t>-my.sharepoint.com`), and the
+      WAM token for that origin was granted.
+    - `GET <origin>/_api/v2.1/drives/<d>/items/<i>/media/transcripts`: HTTP 200, `value` with 1
+      entry, visible and default, keys `cTag`, `displayName`, `id`, `isAutoGenerated`, `isDefault`,
+      `isVisible`, `languageTag` (`pl-PL`), `size`, `source`, `temporaryDownloadUrl`,
+      `transcriptType` (`subtitle`). **Its `id` equals `metadata.transcriptId`** ("Needs live capture"
+      13). `cTag` 27 characters `[0-9:=A-Za-z]`, the same before and after the download.
+    - `.../media/transcripts/<id>/streamContent?is=1`: HTTP 200, `text/vtt`, about 157 KB for the
+      hour. The body starts with a byte order mark before `WEBVTT`. 1021 cues, every timing
+      `HH:MM:SS.mmm --> HH:MM:SS.mmm` with no cue settings, every cue one `<v Name>...</v>` and no
+      other tag. The module's own `parse_vtt` and `page` (copied verbatim into the probe) parsed it:
+      1021 cues, all with a speaker, 9 distinct speakers, no empty or cut text, at most 84 characters
+      per cue, starts in order; `page` with the default `max_bytes` 131072 gave 2 pages (131014 and
+      5445 bytes of JSON), with 4096 a first page of 34 cues.
+    - D3, view counters on someone else's recording, so only what any viewer's player reads:
+      `GET .../items/<i>/analytics/allTime` gave HTTP 200, keys `@odata.context`,
+      `@oneDrive.displayNamesOfFileViewers`, `access` (`actionCount`, `actorCount`,
+      `timeSpentInSeconds`), `aggregationInterval`, `citation`, `endDateTime`, `incompleteData`,
+      `isTrending`, `startDateTime`. `access.actionCount` and `actorCount` were 0 before the
+      download, right after it and about two minutes later. **Not a D3 result yet**: the counters may
+      lag, so they are read again a day later, and the check on the owner's own recording (spec step 0)
+      still stands. `@oneDrive.displayNamesOfFileViewers` shows that a counted view would carry the
+      viewer's name, which is why D3 matters.
+
+All checks in items 1-4, 7-10 and 12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
 status codes, key names, counts, enum values, scope names and service URLs.
