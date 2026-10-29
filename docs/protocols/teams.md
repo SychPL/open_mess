@@ -312,6 +312,9 @@ All **CONFIRMED** in `cmd-trouter-3959f9e7ca693a2a.js` (REA `ev_825293a6...`, cl
 3. Connect: Socket.IO 0.9 style over `wss://.../v4/c` (`X()` swaps `/v4/a` and `/v4/c`), query =
    `connectparams` + `v=v4`, `tc=<client info JSON>`, `timeout=40`, `auth=true`, `epid=<endpointId>`,
    optional `userActivity`. Ping 40 s, pong timeout 5 s, connect timeout 20 s.
+   **CONFIRMED** by later analysis (section 10.7): this allocate-then-connect flow is v4a, the
+   fallback; the default is v4c, one WebSocket to `/v4/c` with no allocate step. The frames and the
+   downstream request envelope are given there.
 4. Register: `POST https://teams.microsoft.com/registrar/prod/v2/registrations` (or
    `regionGtms.calling_registrarUrl`) body
    `{"clientDescription":{"appId":"TeamsCDLWebWorker","aesKey":"","languageId":"en-US","platform":"<browser>","templateKey":"TeamsCDLWebWorker_2.6","platformUIVersion":"<ver>","productContext":...},"registrationId":"<endpointId>","nodeId":"","transports":{"TROUTER":[{"context":"","path":"<surl>","ttl":<s>}]}}`.
@@ -726,11 +729,94 @@ desktop's SlimCore speaks it natively), the calling core `114419-5658b4e2d56443f
   `userId`, `displayName`, `spokenLanguage`, `source`, `roomId`, `timestampAudioSent`, `duration`.
   **UNCONFIRMED** the time units.
 
+**Trouter and call signaling, in detail** (added later on 2026-10-29, same method; mainly
+`cmd-trouter-3959f9e7ca693a2a.js` and `calling-pluginless-6f37e714be91fccf.js`; settles the static
+half of "Needs live capture" 7 and narrows 5 and 17)
+
+- **CONFIRMED** protocol choice (`tokenTypeProtocolSelector`): the default is **v4c**, a WebSocket
+  straight to `wss://.../v4/c` with no allocate step. The client falls back to the **v4a** flow of
+  section 5 only when `forceV4aProtocol` is set, when `forceV4aProtocolForSkypetoken` is set and the
+  token is a skype token (unless `scae` is `"1"`), or after a `v4c-websocket-failure`. The values of
+  those flags come from configuration at run time and were not seen.
+- **CONFIRMED** v4c query (`buildV4cUrlParams`): `tc=<client info JSON>`,
+  `timeout=<pingTimeoutMs / 1000>`, `epid=<endpoint id>`, `ccid`, `dom` (if set), `cor_id`,
+  `con_num=<client id>_<attempt>`; no `auth`, no `v`. The auth header goes on the upgrade request:
+  `X-Skypetoken` for a skype token, `Authorization: Bearer` for an AAD or CAE token. The server's
+  `trouter.connected` event then carries what allocate returns in v4a: `surl`, `connectparams`, `ttl`,
+  `ccid`, `id`, `reconnectUrl`, `curlb`.
+- **CONFIRMED** v4a details: allocate is a `POST` with an empty body and `Content-Type: text/plain`,
+  query `cor_id`, `con_num`, `epid`, `tc` (no `auth`, no `timeout`), and the response must be JSON with
+  `socketio` (base URL), `surl`, `ccid`, `id`, `ttl`, `connectparams` and optional `curlb`. The
+  WebSocket is then a standard Socket.IO 0.9 handshake: `GET <socketio>socket.io/1/?<query>&t=<ms>`
+  answers `sid:heartbeat:closeTimeout:transports`, then `wss://<host>/socket.io/1/websocket/<sid>?<query>`,
+  where the query is every `connectparams` key plus `v=v4`, `tc`, `timeout`, `auth=true`, `epid`,
+  `ccid`, `dom`, `cor_id`, `con_num`.
+- **CONFIRMED** frames (Socket.IO 0.9, `type:id[+]:endpoint[:data]`): `1::` connect, `2::` heartbeat
+  (echoed back), `3:::<json>` message, `5:<id>[+]::{"name", "args"}` event (`+` asks for an ack),
+  `6:::<id>` ack. A downstream request is a `3:::` message with `id` (number), `method`, `url`,
+  `headers` (`MS-CV` among them) and `body` (a string). The client answers with a `3:::` message
+  `{"id": <same id>, "status": 200, "headers": {...}, "body": "<string>"}`, the headers being
+  `MS-CV: <received CV>.<n>`, `trouter-client: {"cd": <ms taken>}` and `trouter-request` /
+  `trouter-is-broadcast` echoed when present; an app that does not answer within 5 s gets a 504 from
+  the client library itself. Ping is the event `5:<n>+::{"name":"ping"}`, acked by the server with
+  `6:::<n>`; `pingTimeoutMs` is 40 s. Events from the server: `trouter.connected`, `trouter.reconnect`,
+  `trouter.message_loss`, `audience.subscriptionresult`; from the client: `user.activity` (customary
+  after connecting, not required; open_mess never sends it, item 8 of "Proposed spec changes") and
+  `trouter.processed_message_loss`.
+- **CONFIRMED** compressed callbacks: a downstream request whose header
+  `X-Microsoft-Skype-Content-Encoding` (any case) is `gzip` has a base64 body that inflates (gzip or
+  zlib, auto-detected) to UTF-8 JSON; the client returns 400 when that fails. The server only
+  compresses for an endpoint that set capability bit 128.
+- **CONFIRMED** `endpointCapabilities` bits: 1 group video call joining, 2 cloud screen sharing,
+  4 hostless group calls, 16 broker incoming, 32 auto-join on conflict, 64 always (server mute),
+  128 compressed payload, 512 reinviteless media, 1024 always, 2048 watermark, 4096 audio-only
+  watermark, 8192 batched receive message, 16384 batched send message status, 65536 auto-promotion,
+  131072 prevent screen capture. The minimum is `64 | 1024` = 1088. `clientEndpointCapabilities` is a
+  separate number, 0 by default, sent as `null`.
+- **CONFIRMED** join body values for a meeting: `suppressDialout: true`, `scenario: null`
+  (`"409RedirectJoin"` after a 409), `conversationType: null`; the four `properties` are booleans from
+  configuration (`allowConversationWithoutHost` and the three event-message switches);
+  `groupChat.messageId` is the reply-chain id when known, else `"0"`; `capabilities: null`.
+  `callModalities` is a subset of `["Audio", "Video", "ScreenSharer", "ScreenViewer"]` - **there is no
+  data modality**. `mediaContent` is `{blob, contentType: "application/sdp-ngc-1.0"}`, optionally with
+  `requiredFeatures`, `skipIceReinvite` and `clientLocation`. **UNCONFIRMED** the keys of
+  `meetingInfo` (only `tenantId`, `organizerId` and `replyChainMessageId` are built explicitly; the rest
+  is passed through from the thread's meeting properties), the contents of `endpointMetadata`, the
+  `applicationType` value and whether the Trouter URL gets a path suffix before `callAgent/` (it must
+  end with `/`).
+- **CONFIRMED** the offer as sent: no trickle (sent after gathering), then `toOffer()`, which filters
+  candidates, sets port 9 on bundle-only sections and, unless `disableMsSdp` is set, applies the MS-SDP
+  transform `toMsSdp`: `msid-semantic: WMS *`, profile `RTP/SAVP`, `a=label` per section
+  (`main-audio`, ...), the data section cut down to type, port, protocol, payload `34`, mid and label,
+  `a=x-ssrc-range` (non-multistream), `|2^31` on crypto lines, the session fingerprint copied into each
+  section, candidate and extension rewrites and `rtcp` set to the m-line port. That `disableMsSdp`
+  exists suggests the service also takes plain SDP; **UNCONFIRMED**.
+- **CONFIRMED** callbacks: `/call/mediaAnswer/` body `{"mediaAnswer": {sender, mediaContent {blob,
+  contentType}, noRingBack}}` (provisional answers the service retries are ignored);
+  `/call/acceptance/` body `{"callAcceptance": {links {acknowledgement}, ...}}`, and the client **must**
+  `POST {payload: {callAcceptanceAcknowledgement: {links: {mediaRenegotiation, transfer, replacement,
+  balanceUpdate, retargetCompletion, ...}}}}` to `links.acknowledgement` (its own callback links). The
+  client answers a callback 200 with an empty body; 400 for a missing body, a bad path or a failed
+  decode, 404 for an unknown session.
+- **CONFIRMED** join response (any 2xx; 200 or 201 not settled): `conversationController` (the
+  conversation URL for later requests), `sequenceNumber`, `links` (`leave`, `addModality`,
+  `removeModality`, `mute`, `updateEndpointMetadata`, `getAllParticipants` and others),
+  `subscriptionDetails.selfParticipant`, `selfParticipant` (`enableCaptcha`, `enforceConsentToJoin`,
+  `preMeetingConsentInfo`) and `roster`. The SDP answer is not in it; it comes on `/call/mediaAnswer/`.
+
 **For the spec:** the steps of 5.2-5.3 hold. Presence can be checked before joining (4.1 takes that
 path); the offer should copy the official shape (inactive audio plus the data channel) unless step 0b
 shows a data-only offer works; the manifest needs `api.flightproxy.teams.microsoft.com`,
 `default.relay.teams.microsoft.com` and `tr.teams.microsoft.com`; `media.peers` has no source in the
 client and must come from step 0b (the candidates in the answer) and Microsoft's published ranges.
+The Trouter details above add four things for step 0b: the module needs `go.trouter.teams.microsoft.com`
+(v4c, one WebSocket) and must answer every downstream request within 5 s; a join needs a call
+modality, and since there is no data modality, a data-only join either sends `["Audio"]` with an
+inactive audio section or an empty list - which one the service accepts is step 0b; whether a plain
+(non-MS) SDP offer is accepted is step 0b; and the client must acknowledge `callAcceptance`. Offline
+note from the step 0b probe (two local `webrtc` 0.14 peers, no Teams involved): a data-only offer
+reached ICE `connected` and carried framed messages; an offer with an inactive audio transceiver
+stayed in ICE `checking`, so an inactive audio section may need work in the host's WebRTC stack.
 
 ## Proposed spec changes
 
@@ -790,7 +876,8 @@ the user present (spec 9.5):
    accept from a non-official client.
 7. Trouter allocate response fields, the downstream request envelope and the `/messaging` payload
    (compression, ack requirements), and which PNH app id/template the registrar accepts for a new
-   client.
+   client. The client side of the envelope, compression and acks is now in section 10.7; what the
+   server sends to a non-official client, and the registrar part, still need a capture.
 8. Whether `PUT v2/users/ME/endpoints/<id>` alone (without `activeendpoint`) is enough to get
    `/messaging` events, and whether an extra endpoint changes push delivery to the user's phone.
 9. Page size limits and `syncState` semantics for conversations and messages, and that the unread
