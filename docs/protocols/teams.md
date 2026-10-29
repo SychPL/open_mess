@@ -1017,6 +1017,19 @@ token, tenant id, user id or account name.
       `personalSiteUrl`; `personalSiteUrl` is `https://<t>-my.sharepoint.com/personal/...` with a
       lowercase `<t>` (letters only for this tenant), no port.
 
+11. **Call store and relay credentials** (read-only, 2026-10-29, the owner in a real meeting at the time
+    and agreeing in chat to reads only - no join, no Trouter; scratch probe, counts and key names only):
+    - `GET .../api.userstore.skype.com/api/v1/user/<MRI>/conversations` with `X-Skypetoken`: HTTP 200, a
+      JSON array. The first read, right after the owner joined, gave 0 items; the next ones gave 1, with
+      and without `?nocache=<ms>` and with or without `ms-teams-region` / `ms-teams-partition`. Item
+      keys `additionalData` (key `participantList`), `conversationController` (an https URL),
+      `correlationId`, `participants` (an array of 2 strings), `userJoinTime`. No field holds the
+      meeting's `19:meeting_...` thread, so the call store says that the user is in a call, not in
+      which meeting: the live captions spec can check "in a call" before joining, and "in this
+      meeting" only from the roster after joining (spec 4.1, second path). The store may lag a join.
+    - `GET https://teams.microsoft.com/trap/tokens` with `X-Skypetoken` and `api-version: 2`: HTTP 200,
+      top keys `expires` (a number) and `tokens` (one entry, its `realm` a quoted string as 10.7 says).
+
 12. **A transcript download in the owner's organization** (read-only, 2026-10-29, the owner at the
     computer; scratch WAM probe, counts, key names, character classes and lengths only, no transcript
     text, names or ids). This is **not the D3 gate of step 0**: the recording is a colleague's, and the
@@ -1072,6 +1085,6 @@ token, tenant id, user id or account name.
       still stands. `@oneDrive.displayNamesOfFileViewers` shows that a counted view would carry the
       viewer's name, which is why D3 matters.
 
-All checks in items 1-4, 7-10 and 12 were read-only: no endpoint registration, no property write, no Trouter
+All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
 status codes, key names, counts, enum values, scope names and service URLs.
