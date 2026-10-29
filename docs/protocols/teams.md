@@ -1063,8 +1063,8 @@ token, tenant id, user id or account name.
      the user's; the owner confirmed). Its SharePoint refused every token of the user's own tenant:
      HTTP 401 `unauthenticated` for the item and for `media/transcripts`, with and without `CP1`;
      Graph `drives/<id>/items/<id>`: 404 `itemNotFound`; WAM for the owner's tenant authority:
-     provider error `0xCAA20003`. A download in the user's own organization is still to be captured
-     ("Needs live capture" 13).
+     provider error `0xCAA20003`. A download in the user's own organization was captured later
+     (item 12).
    - In the first run a tag-name filter of the probe printed part of a recording's file name to the
      terminal; the filter was fixed and nothing of it was written to a file or this repository.
 
@@ -1117,9 +1117,13 @@ token, tenant id, user id or account name.
     - `GET https://teams.microsoft.com/trap/tokens` with `X-Skypetoken` and `api-version: 2`: HTTP 200,
       top keys `expires` (a number) and `tokens` (one entry, its `realm` a quoted string as 10.7 says).
 
-12. **Step 0 of the stage 2 spec, transcript part** (read-only, 2026-10-29, the owner at the computer
-    and approving in chat this one meeting, although the recording is not the owner's own; scratch WAM
-    probe, counts, key names, character classes and lengths only, no transcript text, names or ids).
+12. **A transcript download in the owner's organization** (read-only, 2026-10-29, the owner at the
+    computer; scratch WAM probe, counts, key names, character classes and lengths only, no transcript
+    text, names or ids). This is **not the D3 gate of step 0**: the recording is a colleague's, and the
+    owner decided explicitly in chat that this one meeting's transcript may be read before the D3
+    check, accepting that a view, if the download counts as one, lands in the colleague's analytics.
+    The decision covers only this meeting; the D3 gate (on the owner's own recording, both counters,
+    the player's count and a control) still has to pass before `teams_get_transcript` ships.
     The meeting: one occurrence (`eventType` `Exception`) of a recurring meeting of the owner's own
     organization, organized by a colleague, transcribed, about an hour long. The probe made exactly the
     requests of spec 4.2 steps 1-6, once:
