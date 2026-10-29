@@ -643,6 +643,95 @@ adds the caption bot for everyone; E2EE meetings refuse the second device; a no-
 the call; the conversation-service host and media relay details come from ECS at run time and were not
 seen. A live check of 10.3 and 10.5 would need the owner's consent and a test meeting.
 
+### 10.7 Join, relays and the data channel (step 0a of the live captions spec)
+
+**Static analysis, not verified live.** Added 2026-10-29 for step 0a of
+`.specs/2026-10-29-live-captions.md`: ripgrep over the same chunks, mainly the browser stack
+`calling-pluginless-6f37e714be91fccf.js` (which speaks the conversation-service protocol in JS; the
+desktop's SlimCore speaks it natively), the calling core `114419-5658b4e2d56443ff.js` and `config-prod`.
+
+**Conversation service and join**
+
+- **CONFIRMED** default service URL `https://api.flightproxy.teams.microsoft.com/api/v2/epconv/`
+  (`114419`, `kb.conversationServiceUrl`); ECS namespace `SkypeCalling`, key `conversationServiceUrl`,
+  may override it (ECS host `https://config.teams.microsoft.com/config/v1/Teams/`; its query
+  parameters are not in the bundle). A client can use the default.
+- **CONFIRMED** join = `POST` of JSON to that URL (`startOrJoinCall`, `sendPostRequest`, operation
+  `CallSetup`); a 409 re-joins at the `conversationUrl.Location` it returns. Auth: `X-Skypetoken` by
+  default; with `clientSupportsGenericTokenAPI` the server's `WWW-Authenticate` picks `skype`, `aad` or
+  `cae`, and the AAD forms send `Authorization: Bearer` with the token-migration header. Other headers:
+  `X-Microsoft-Skype-Chain-ID` (correlation), `X-Microsoft-Skype-Client`. **UNCONFIRMED** the AAD
+  audience (probably `callingTokenLogicalUrl`, default `https://calling.teams.microsoft.com`).
+- **CONFIRMED** body (`uw(...)` in the browser stack), keys only:
+  `payload.conversationRequest {conversationType, subject, roster {type: "Delta", rosterUpdate: <link>},
+  properties, links {conversationEnd, conversationUpdate, localParticipantUpdate, addParticipantSuccess,
+  addParticipantFailure, receiveMessage}}`, `groupChat {threadId, messageId}`, `participants.from {id,
+  displayName, endpointId, participantId, languageId, meetingRegistrationId, participantPin}`,
+  `endpointCapabilities`, `clientEndpointCapabilities`, `endpointMetadata`, `meetingInfo`, `meetingData`,
+  `endpointState`, and `callInvitation {links {progress, mediaAnswer, acceptance, redirection, end},
+  mediaContent, callModalities, ...}`. The SDP offer goes in `callInvitation.mediaContent` with content
+  type `application/sdp-ngc-1.0` (the SDP text in `blob`). The roster-only join (`subscribe`) is the same
+  body without `callInvitation`.
+- **CONFIRMED** callback links are `<Trouter URL>callAgent/<session id>/<uuid><path>` (`/callAgent/`
+  matched on the way in), paths `/call/progress/`, `/call/mediaAnswer/`, `/call/acceptance/`,
+  `/call/redirection/`, `/call/end/`, `/conversation/conversationEnd/`, `/conversation/conversationUpdate/`,
+  `/conversation/localParticipantUpdate/`, `/conversation/rosterUpdate/` and others; they arrive as
+  HTTP requests delivered over Trouter, answered `200`. **UNCONFIRMED** the Trouter envelope and whether
+  a registrar registration is needed besides a Trouter connection ("Needs live capture" 5, 7, 17);
+  the broker fallback's address was not found.
+- **CONFIRMED** answer and roster: `/call/mediaAnswer/` carries `mediaAnswer.mediaContent` (the client
+  acknowledges with a `POST` to `mediaAnswer.links.mediaAcknowledgement`); `/call/acceptance/` carries
+  `callAcceptance.mediaContent.blob` (final SDP), `acceptedCallModalities` and `links.callLeg`. The
+  roster comes as deltas on `/conversation/rosterUpdate/`, each participant with
+  `endpoints.endpointDetails[].endpointMetadata`; captions are on when
+  `endpointMetadata.processingModes.closedCaptions.state` is `Active` (other states `Inactive`,
+  `WaitingForMeetingLive`, `Paused`; `getProcessingModeState`).
+- **CONFIRMED** leave = `POST` to `links.leave` from the conversation response, body
+  `{participants: {from: {id, displayName, endpointId, participantId, languageId}}, callTransactionEnd:
+  {code, subCode, phrase}}`; on page close the client sends the same as a beacon. The meeting's end
+  arrives on `/conversation/conversationEnd/` (sub-code `CONVERSATION_END_RECEIVED_FROM_SERVICE` 4100),
+  the leg's on `/call/end/`.
+- **CONFIRMED** presence without joining: the "on another device" check reads the user's call store,
+  `GET https://api.flightproxy.teams.microsoft.com/api/v2/ep/api.userstore.skype.com/api/v1/user/<MRI>/conversations`
+  (`config-prod` `callStore.user.url`; `114419` builds `${url}/user/${mri}/conversations`), with
+  `X-Skypetoken` or an AAD bearer. **UNCONFIRMED** the item fields that name the meeting.
+
+**Relays**
+
+- **CONFIRMED** TURN hosts from configuration: `default.relay.teams.microsoft.com` (UDP 3478, TCP and
+  TLS 443), and `tr.teams.microsoft.com` (`TRAPRelayFqdn`); one configuration variant names the address
+  `52.113.193.5`. No wildcard host and no published address ranges of media servers are in the bundle.
+- **CONFIRMED** credentials: `GET https://teams.microsoft.com/trap/tokens` with `api-version: 2` and
+  `X-Skypetoken` (or a bearer under the newer token API); the answer is `{expires, tokens: [{realm,
+  username, password}]}` (realm `rtcmedia`); refreshed early from `earlyRefreshMinutes`. ICE servers are
+  built as `turn:<host>:3478?transport=udp`, `turn:<host>:443?transport=tcp`, `turns:<host>:443`.
+- **CONFIRMED** ICE: no trickle - the offer is sent after gathering finishes, remote candidates come in
+  the answer SDP (no `addIceCandidate`); `iceTransportPolicy` `all` by default, `bundlePolicy`
+  `max-bundle`, `rtcpMuxPolicy` `require`.
+- **CONFIRMED** offer shape: transceivers start `inactive`; the data channel is
+  `createDataChannel("main-channel")` (`m=application ... webrtc-datachannel`). The official client
+  keeps at least an inactive audio section; **UNCONFIRMED** whether an offer with only the data section
+  is accepted (step 0b).
+
+**Data channel**
+
+- **CONFIRMED** one channel `main-channel`, binary, every message with an 11-byte header, big-endian:
+  byte 0 = version 1 in the high nibble and the top 4 bits of the 12-bit header length, byte 1 = the
+  rest of the header length (11 + 4 per recipient), byte 2 = start-of-message flag `0x80` and data id
+  in bits 0-5, bytes 3-4 = sequence number per data id, byte 5 = fragments that follow, bytes 6-9 =
+  source id, byte 10 = recipient count, then 4 bytes per recipient; the payload follows the header,
+  fragments are reassembled by sequence number (`depacketize`). Captions (data id 3) are UTF-8 JSON.
+- **CONFIRMED** nothing has to be sent on the channel to receive captions: the handler only listens.
+- **CONFIRMED** caption entries (`recognitionResults[]`, `textTracks[]`) carry `id`, `text`, `isFinal`,
+  `userId`, `displayName`, `spokenLanguage`, `source`, `roomId`, `timestampAudioSent`, `duration`.
+  **UNCONFIRMED** the time units.
+
+**For the spec:** the steps of 5.2-5.3 hold. Presence can be checked before joining (4.1 takes that
+path); the offer should copy the official shape (inactive audio plus the data channel) unless step 0b
+shows a data-only offer works; the manifest needs `api.flightproxy.teams.microsoft.com`,
+`default.relay.teams.microsoft.com` and `tr.teams.microsoft.com`; `media.peers` has no source in the
+client and must come from step 0b (the candidates in the answer) and Microsoft's published ranges.
+
 ## Proposed spec changes
 
 Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
