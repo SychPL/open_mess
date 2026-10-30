@@ -1422,6 +1422,24 @@ token, tenant id, user id or account name.
       sections and adds the data section only with `subTypes` (`getMediaDescriptions`). In the
       client, data `subTypes` are set later (`setSubTypes`) and only for real-time text in PSTN
       calls, not for captions.
+    - **The data channel is started by a renegotiation in the client** (static, `calling-pluginless`
+      and `SlimCoreWebview2.dll`): `startDataChannel` enables modality 3 and calls
+      `updateMediaModalities`; the native code has `DataChannelStart` and "Data channel operation
+      offer" (the desktop joins with `datachannelDirection` Disabled by default). The renegotiation
+      is `POST <callAcceptance.links.mediaRenegotiation>` with `{"mediaNegotiation":
+      {"callModalities", "sender" {id, displayName, endpointId, participantId, languageId}, "links"
+      {"mediaAnswer", "rejection" (path /call/rejection/)}, "mediaContent"}}` (`qH`); the answer
+      comes on `/call/mediaAnswer/` and is acknowledged with an empty `POST` to
+      `mediaAnswer.links.mediaAcknowledgement`. Closed captions register a handler for data id 3 on
+      the calling bot's data channel (`registerDataCallback(call, 3, ClosedCaptionsMW, ...,
+      SourceAndSink)`); the handler decodes `recognitionResults` / `textTracks` JSON.
+    - Live, in a meeting of the owner's with ten other people (his explicit OK in chat for that
+      meeting; the probe only counts): join with audio `sendonly` only (no data section) - 200,
+      acceptance, ICE and DTLS connected; three seconds later the renegotiation adding `m=x-data`
+      - HTTP 202, `/call/mediaAnswer/` with audio `recvonly` and **`m=x-data 0` again**,
+      acknowledgement HTTP 202; the leg stayed up for 120 s, then left (204). That meeting's bot had
+      `closedCaptions` and `realTimeTranscript` `Active`. A run with the web client's build number
+      in `X-Microsoft-Skype-Client` was stopped by the session's permission classifier before it ran.
     - Still open: why the service rejects the probe's data section. What is left between the web
       client and the probe is that the web client offers audio `sendrecv` and video, which the
       live captions spec rules out (no audio or image sent or received). Offering a receive-only
