@@ -814,9 +814,11 @@ half of "Needs live capture" 7 and narrows 5 and 17)
   service URL above: `joinGivenConversation(conversationUrl, ...)` calls `startOrJoinCall` with
   `newCall: false` and `conversationServiceUrl` set to the call's own conversation URL, so the join
   goes to that URL, with the body of `uw(...)` (the keys listed above; `groupChat.messageId` is
-  `null` when the reply-chain id is unknown, not `"0"`; no `participants.to`; `endpointMetadata` is
+  the session's `teamsMessageId`, `null` only when there is none - the web client sent `"0"` for a
+  "Meet now" meeting, "Live results" 14; no `participants.to`; `endpointMetadata` is
   the session's, an empty object `{}` by default; `endpointState` only when muted or preheating).
-  Only a new call
+  The captured web join ("Live results" 14) shows the full sequence and supersedes this static
+  reading where they differ. Only a new call
   (`newCall: true`, body `EV(...)`, which adds `participants.to` and `addModalitySuccess` /
   `addModalityFailure` / `confirmUnmute` links) goes to the service URL. The conversation URL of a
   live call is in the chat's thread property `awareness_conversationLiveState:<n>` (a JSON string,
@@ -1261,13 +1263,90 @@ token, tenant id, user id or account name.
       <registrarUrl>/<registrationId>` afterwards: HTTP 202), `endpointMetadata: {}`, the
       `X-Microsoft-Skype-Client` value in the client's own format, the `MS-Teams-Region` and
       `MS-Teams-Partition` headers, a roster-only join (no `callInvitation`, so no SDP at all), and
-      even the body `{}`. So the refusal does not depend on the body, the offer or a registration:
-      a `POST` from this probe to the conversation URL fails before the body matters, while a `GET`
-      of the same URL with the same token works. **UNCONFIRMED** why. Relay candidates were also
-      missing from these offers (TURN allocation on `default.relay.teams.microsoft.com` gave none),
-      which matters only once a join is accepted.
+      even the body `{}`, while a `GET` of the same URL with the same token works. The 503 is an
+      `UnexpectedServerError`, which an empty body also produces, so it does not by itself show
+      whether the body matters. Relay candidates were also missing from these offers (TURN
+      allocation on `default.relay.teams.microsoft.com` gave none), which matters only once a join
+      is accepted. Item 14 has the captured web join and the probe runs that followed it.
     - Still open for step 0b: whether a data-only offer is accepted, data id 3 messages, and
       whether the call lives without audio.
+
+14. **A captured join of the Teams web client** (2026-10-30, the owner's choice and OK in chat). Method:
+    a separate Edge instance with an empty temporary profile and a loopback-only DevTools port (not
+    the official desktop client, whose data and process were not touched); the owner signed in there
+    himself before any recording began; then a small DevTools listener of ours recorded only the
+    call-signaling requests while he joined his own "Meet now" meeting from that window, and printed
+    methods, URL shapes, header names, the values of a few non-secret headers, JSON key trees,
+    enum-like values and the SDP structure (addresses, ports, keys, fingerprints and ids cut; a slip
+    that printed roster map keys was scrubbed from the scratch log at once). REA's own
+    `capture_browser_scenario` refused to attach to the existing tab (`target_not_allowed`), so REA
+    was used for the static half only. The web client runs at `https://teams.cloud.microsoft`.
+    Every request below carried `content-type: application/json`, `ms-teams-region`,
+    `ms-teams-partition`, `ms-teams-ring: general`, one `x-microsoft-skype-chain-id` for the whole
+    call, a fresh `x-microsoft-skype-message-id`, `x-ms-migration: True`, `x-skypetoken` and
+    `x-microsoft-skype-client:
+    SkypeSpaces/1415/<build>/os=windows; osVer=NT 10.0; deviceType=computer; browser=edgeChromium; browserVer=<v>/TsCallingVersion=<v>/Ovb=<hash>`,
+    over HTTP/2. The sequence:
+    1. Registrar registrations from the page and from a worker (`POST
+       https://teams.microsoft.com/registrar/prod/V2/registrations`).
+    2. `POST https://api-<region>.flightproxy.teams.microsoft.com/api/v2/epconv` - a regional host,
+       no trailing slash - with **no `callInvitation`**: `conversationRequest` (`subject: null`,
+       `roster`, `properties` with `enableGroupCallEventMessages: true`, `links` whose callbacks
+       point at `http://broker.invalid/callAgent/...` because Trouter was not ready yet),
+       `groupContext: null`, `groupChat: null`, `participants.from` (`languageId` `pl-pl`),
+       `capabilities: null`, `endpointCapabilities: 73463`, `clientEndpointCapabilities: 114259690`,
+       `endpointMetadata.holographicCapabilities`, `meetingInfo: null`, `meetingData` (`meetingCode`
+       16 digits, `passcode` - the `p` of the join link, `meetingUrl`), `meetingPreferences`
+       (`shouldResurrect: "Resurrect"`), `endpointState` (`endpointStateSequenceNumber: 0`,
+       `endpointProperties.additionalEndpointProperties`), `debugContent`. Answer: HTTP 200 with
+       `conversationController`, `links`, `meetingDetails`, `roster`, `state`
+       (`conversationType: "scheduledMeeting"` for a "Meet now" meeting) and a `location` header.
+       This is how a meeting join link (`/meet/<code>?p=<passcode>`, which holds no thread) leads to
+       the running call.
+    3. `POST <conversation URL>/notificationLinks` with `participants.from`, `roster` and the full
+       set of Trouter callback links (`https://<trouter host>/v4/f/<id>/callAgent/<session>/<tag>/conversation/...`):
+       HTTP 200. It moves the callbacks from the broker to Trouter.
+    4. `POST <conversation URL>` (the `conversationController` from step 2, which equals the live
+       call's URL) - the join: the body of `EV(...)` (`participants.to: []`, `contentSharing: null`,
+       `conversationRequest.links` with `addModalitySuccess` / `addModalityFailure` /
+       `confirmUnmute`), `groupChat` (`threadId`, `messageId: "0"`), `meetingInfo` (`organizerId`,
+       `tenantId`), `meetingData` (`meetingCode`, an 8-character `passcode` the service returned),
+       `meetingPreferences`, `endpointState` (also `preheatProperties`), `participantPropertyBag`, and
+       `callInvitation` with `callModalities: ["Audio", "ScreenViewer"]`, `replaces`, `transferor`,
+       `clientTransferContext`, `customContext` and `emergencyContent` all `null`, the five call
+       links, `clientContentForMediaController` (`controlVideoStreaming`, `csrcInfo` links),
+       `pstnContent` (`emergencyCallCountry`, `platformName`, `publicApiCall`), `locationContent`,
+       `networkContent`, `areaContent` `null`, and `mediaContent` with `contentType:
+       "application/sdp-ngc-1.0"`, `blob`, `clientLocation` (2 letters), `mediaDescriptions`
+       (`descriptions[]` of `mid` and `direction`, `requestId`), `applyChannelParameters` and
+       `mediaLegId` (32 characters). HTTP 200.
+    5. `POST https://api.flightproxy.teams.microsoft.com/api/v2/ep/<cc host>/cc/v1/active/...` with
+       `callParticipantUpdate.links` (the client's call callbacks) and
+       `clientContentForMediaController`: HTTP 202. Then `updateEndpointState` (POST) and
+       `updateEndpointMetadata` (PUT) on the conversation.
+    - **The offer** (`blob`): 13 sections in one BUNDLE, all `RTP/SAVP` with `a=x-signaling-fb`,
+      `a=x-ssrc-range`, `a=setup:actpass`, `a=ice-options:trickle`, `a=rtcp-mux` and `a=label`:
+      `main-audio` (sendrecv), ten `main-video` (sendrecv and recvonly), `applicationsharing-video`,
+      and **the data channel as `m=x-data <port> RTP/SAVP 127 126` with `a=x-data-protocol:sctp`,
+      `a=label:data` and `a=sctp-port:5000`** - not `m=application ... webrtc-datachannel` (that is
+      what `toMsSdp` makes of it; section 10.7 did not show it). The offer held a single host
+      candidate.
+    - A separate broker channel is long-polled throughout: `GET
+      .../api/v2/ep/<broker host>/api/v1/subscribe/<id>/0?i=<n>`, HTTP 202 with `message`,
+      `nextSubscribeUrl` and `expirationTimeInSec`.
+    - The probe after the capture (same meeting, the owner in it with captions on, his OK for each
+      run): step 2 copied from the web client returned HTTP 200 and the live call's URL - but only
+      with the web client's `endpointCapabilities` (without the broker and reinviteless bits:
+      72935); with 1088 the service answered **201 and created a new conversation** for the meeting,
+      which ended at once (`/conversation/conversationEnd/` arrived during the next request), and an
+      empty meeting gives 201 too. Step 4 with the web client's body keys, one chain id per call,
+      an `m=x-data` offer (data only, and with an inactive audio section), and a roster-only join
+      after step 2, all still gave 503 subCode 70051 in about 300 ms. What is left between the web
+      client and the probe is the transport and the browser headers (HTTP/2, `User-Agent`,
+      `Origin`), the remaining body values (`clientEndpointCapabilities`, `languageId`,
+      `endpointMetadata`, `pstnContent`, `mediaDescriptions`, `participantPropertyBag`) and the rest
+      of the SDP (13 sections, trickle). Not tested: a probe that copies a browser's `User-Agent` and
+      `Origin` was stopped before it ran - open_mess must not pass itself off as a browser.
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
