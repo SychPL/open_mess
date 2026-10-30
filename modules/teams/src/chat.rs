@@ -459,7 +459,16 @@ mod tests {
     fn dir() -> ServiceDirectory {
         let chat_service = Url::parse("https://teams.microsoft.com/api/chatsvc/emea").unwrap();
         let chat_regional = Some(Url::parse("https://emea.ng.msg.teams.microsoft.com").unwrap());
-        ServiceDirectory { chat_service, chat_regional, trouter: None, registrar: None, ams: None, middle_tier: None, search: None }
+        ServiceDirectory {
+            chat_service,
+            chat_regional,
+            trouter: None,
+            registrar: None,
+            ams: None,
+            middle_tier: None,
+            search: None,
+            mcp_service: None,
+        }
     }
 
     fn conversations() -> Page<Conversation> {

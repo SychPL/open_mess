@@ -35,6 +35,8 @@ pub struct ServiceDirectory {
     pub middle_tier: Option<Url>,
     /// `search` (the live response has no `searchService`).
     pub search: Option<Url>,
+    /// `mcpService`, a meeting's artifacts (docs 9.3).
+    pub mcp_service: Option<Url>,
 }
 
 /// The authz request with the headers the live check sent (docs/protocols/teams.md "Live
@@ -69,6 +71,7 @@ pub fn decode(body: &[u8], now_ms: i64) -> Result<Session, ProtoError> {
         },
         middle_tier: url("middleTier")?,
         search: url("search")?,
+        mcp_service: url("mcpService")?,
     };
 
     let (skype_token, expires_at_ms) = match v.get("tokens") {

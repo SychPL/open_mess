@@ -16,7 +16,7 @@ use crate::component::bindings::open_mess::module::{http, sign_in, storage};
 use crate::http::HttpRequest;
 use crate::poll;
 use crate::retry::{self, GiveUpReason, Retry};
-use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, SEARCH_SCOPE, Session};
+use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, MCPS_SCOPE, SEARCH_SCOPE, Session};
 
 /// The part of the host's call limit (30 s) the module plans with: no wait starts that would end
 /// past it, so a slow service ends a call with an error, not a timeout that unloads the module.
@@ -81,6 +81,8 @@ pub enum Service {
     /// AMS images, with the chat service's token (docs 7; which token AMS takes is to be
     /// confirmed live).
     Media,
+    /// A meeting's artifacts (docs 9.3).
+    Mcps,
 }
 
 impl Service {
@@ -88,6 +90,7 @@ impl Service {
         match self {
             Service::Chat | Service::Media => CHAT_SCOPE,
             Service::Search => SEARCH_SCOPE,
+            Service::Mcps => MCPS_SCOPE,
         }
     }
 }
@@ -267,7 +270,7 @@ pub fn with_session<T>(account: &str, f: impl FnOnce(&mut Session) -> Result<T, 
 }
 
 /// A token for `scope` that is not about to expire.
-fn token(session: &mut Session, scope: &'static str) -> Result<String, ModuleError> {
+fn token(session: &mut Session, scope: &str) -> Result<String, ModuleError> {
     match session.token(scope, now_ms()) {
         Some(token) => Ok(token.to_string()),
         None => renew(session, scope, None),
@@ -275,7 +278,7 @@ fn token(session: &mut Session, scope: &'static str) -> Result<String, ModuleErr
 }
 
 /// A new token from WAM, silently, for the session's own account only.
-fn renew(session: &mut Session, scope: &'static str, claims: Option<&str>) -> Result<String, ModuleError> {
+fn renew(session: &mut Session, scope: &str, claims: Option<&str>) -> Result<String, ModuleError> {
     let (token, c) = wam(scope, false, claims)?;
     if c.oid != session.account {
         return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
@@ -301,6 +304,25 @@ pub fn send(session: &mut Session, service: Service, req: &HttpRequest, write: b
         return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
     }
     Ok(second)
+}
+
+/// A read from the organization's SharePoint or OneDrive at `origin`, with a token for that
+/// origin. A 401 gets one silent refresh, as in [`send`]; a refusal after that, or a 403, is the
+/// platform's answer about this transcript, not a sign-in the account needs (spec
+/// 2026-10-28-meetings-transcripts, 4.2).
+pub fn sharepoint(session: &mut Session, origin: &str, req: &HttpRequest) -> Result<Vec<u8>, ModuleError> {
+    let scope = format!("{origin}/.default");
+    let mut response = exchange(req, &token(session, &scope)?, false, false)?;
+    if response.status == 401 {
+        let claims = header(&response.headers, "www-authenticate").and_then(session::challenge_claims);
+        let token = renew(session, &scope, claims.as_deref())?;
+        response = exchange(req, &token, false, false)?;
+    }
+    match response.status {
+        401 | 403 => Err(ModuleError::Platform("access to this transcript was refused".to_string())),
+        404 => Err(ModuleError::Platform("transcript not found".to_string())),
+        _ => ok(response),
+    }
 }
 
 /// [`send`] for a read: the body of a 2xx answer, any other status an error.

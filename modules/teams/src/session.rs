@@ -4,12 +4,15 @@
 
 use crate::authsvc::ServiceDirectory;
 use crate::http::SecretString;
+use crate::meetings::PersonalSite;
 
 /// Token audiences (docs/protocols/teams.md 1.4 and "Live results" 1-3): authsvc and the middle
 /// tier, the chat service (a plain AAD token is accepted, "Live results" 3), search.
 pub const AUTHSVC_SCOPE: &str = "https://api.spaces.skype.com/.default";
 pub const CHAT_SCOPE: &str = "https://ic3.teams.office.com/.default";
 pub const SEARCH_SCOPE: &str = "https://outlook.office.com/.default";
+/// MCPS, a meeting's artifacts: an application id as the resource (docs 9.3).
+pub const MCPS_SCOPE: &str = "6bc3b958-689b-49f5-9006-36d165f30e00/.default";
 
 /// A token is renewed this long before it expires.
 pub(crate) const RENEW_BEFORE_MS: i64 = 5 * 60 * 1000;
@@ -82,17 +85,21 @@ pub struct Session {
     pub upn: Option<String>,
     pub tenant: Option<String>,
     pub directory: ServiceDirectory,
-    /// Scope, token and when it expires.
-    tokens: Vec<(&'static str, SecretString, Option<i64>)>,
+    /// Scope, token and when it expires. SharePoint's scope is the organization's origin, so
+    /// scopes are not all constants.
+    tokens: Vec<(String, SecretString, Option<i64>)>,
     /// The skype token of the last authsvc exchange, and when it expires; the middle tier takes it
     /// (docs 9.1).
     skype: Option<(SecretString, Option<i64>)>,
+    /// The user's own OneDrive, read once a session from `personalFileSite` (spec
+    /// 2026-10-28-meetings-transcripts, 4.2 step 4).
+    pub personal_site: Option<PersonalSite>,
 }
 
 impl Session {
     pub fn new(claims: Claims, directory: ServiceDirectory) -> Session {
         let name = claims.name.or_else(|| claims.upn.clone()).unwrap_or_else(|| claims.oid.clone());
-        Session { account: claims.oid, name, upn: claims.upn, tenant: claims.tenant, directory, tokens: Vec::new(), skype: None }
+        Session { account: claims.oid, name, upn: claims.upn, tenant: claims.tenant, directory, tokens: Vec::new(), skype: None, personal_site: None }
     }
 
     /// The user's MRI, as the chat service names senders and mentions.
@@ -107,9 +114,9 @@ impl Session {
         fresh.then(|| token.expose())
     }
 
-    pub fn keep(&mut self, scope: &'static str, token: String, expires_ms: Option<i64>) {
-        self.tokens.retain(|(s, ..)| *s != scope);
-        self.tokens.push((scope, SecretString::new(token), expires_ms));
+    pub fn keep(&mut self, scope: &str, token: String, expires_ms: Option<i64>) {
+        self.tokens.retain(|(s, ..)| s != scope);
+        self.tokens.push((scope.to_string(), SecretString::new(token), expires_ms));
     }
 
     /// The skype token, unless it is about to expire; with `fresh` false, also one that is (one
@@ -141,6 +148,7 @@ mod tests {
             ams: None,
             middle_tier: None,
             search: None,
+            mcp_service: None,
         };
         Session::new(claims(TOKEN).unwrap(), directory)
     }

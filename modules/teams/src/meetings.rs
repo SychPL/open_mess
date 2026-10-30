@@ -161,8 +161,13 @@ pub fn meeting_thread(link: &str) -> Option<String> {
         return None;
     }
     let thread = percent_decode(segments.next()?)?;
+    is_meeting_thread(&thread).then_some(thread)
+}
+
+/// Whether `thread` is a meeting chat id as [`meeting_thread`] takes them.
+pub fn is_meeting_thread(thread: &str) -> bool {
     let plain = !thread.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#'));
-    (thread.starts_with("19:meeting_") && thread.ends_with("@thread.v2") && thread.chars().count() <= MAX_THREAD && plain).then_some(thread)
+    thread.starts_with("19:meeting_") && thread.ends_with("@thread.v2") && thread.chars().count() <= MAX_THREAD && plain
 }
 
 /// `%XX` escapes decoded; None for a broken escape or text that is not UTF-8.
@@ -195,6 +200,291 @@ pub fn meeting_item(m: &Meeting) -> Option<Value> {
         "conversation": m.conversation,
         "untrusted": {"subject": m.subject, "organizer": m.organizer},
     }))
+}
+
+/// .NET ticks at the Unix epoch, and per millisecond.
+const TICKS_AT_EPOCH: i64 = 621_355_968_000_000_000;
+const TICKS_PER_MS: i64 = 10_000;
+/// The longest drive, item or transcript id of ODSP.
+const MAX_ODSP_ID: usize = 256;
+
+/// MCPS times, .NET ticks of 18 digits (100 ns since 0001-01-01 UTC, "Live results" 12), as epoch
+/// milliseconds; None in any other form.
+pub fn ticks_ms(text: &str) -> Option<i64> {
+    if text.len() != 18 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((text.parse::<i64>().ok()? - TICKS_AT_EPOCH).div_euclid(TICKS_PER_MS))
+}
+
+/// A meeting's artifacts from MCPS (docs 9.3): `<mcpService>/contents?threadId=` and, for one
+/// occurrence, `&iCalUid=`. The caller adds the token.
+pub fn artifacts(mcps: &Url, thread: &str, ical_uid: Option<&str>, correlation: &str) -> HttpRequest {
+    let mut url = mcps.clone();
+    // Never fails for https URLs, the only ones `authsvc::decode` accepts.
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.pop_if_empty().push("contents");
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("threadId", thread);
+        if let Some(ical_uid) = ical_uid {
+            query.append_pair("iCalUid", ical_uid);
+        }
+    }
+    let headers = [("content-type", "application/json;charset=UTF-8"), ("x-ms-correlation-id", correlation)];
+    HttpRequest {
+        method: "GET".to_string(),
+        url: url.into(),
+        headers: headers.map(|(n, v)| (n.to_string(), v.to_string())).to_vec(),
+        body: Vec::new(),
+    }
+}
+
+/// The transcripts among a meeting's artifacts, and whether MCPS has more pages.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Artifacts {
+    pub more: bool,
+    pub transcripts: Vec<Artifact>,
+}
+
+/// A transcript artifact: a `TranscriptV2` the module reads, or an older `Transcript` it only lists.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Artifact {
+    pub id: String,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    pub v2: Option<TranscriptV2>,
+}
+
+/// Where a `TranscriptV2` lies in ODSP, and which organization it belongs to.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TranscriptV2 {
+    pub location: String,
+    pub drive_id: String,
+    pub drive_item_id: String,
+    pub transcript_id: Option<String>,
+    pub owner_tenant: String,
+}
+
+impl Artifact {
+    /// Whether the artifact's time overlaps `[from, to]`; one without times only when the window is
+    /// open.
+    pub fn overlaps(&self, from: Option<i64>, to: Option<i64>) -> bool {
+        match (self.start_ms, self.end_ms) {
+            (Some(start), Some(end)) => from.is_none_or(|from| end >= from) && to.is_none_or(|to| start <= to),
+            _ => from.is_none() && to.is_none(),
+        }
+    }
+}
+
+/// Decodes MCPS `contents` ("Live results" 12): `paginationInfo.hasNextPage` and the transcript
+/// resources; other resources are not looked at.
+pub fn decode_artifacts(body: &[u8]) -> Result<Artifacts, ProtoError> {
+    let v = parse_json(body)?;
+    let more = v.get("paginationInfo").and_then(|p| p.get("hasNextPage")).and_then(Value::as_bool);
+    let more = more.ok_or_else(|| incompatible("paginationInfo.hasNextPage"))?;
+    let resources = v.get("resources").and_then(Value::as_array).ok_or_else(|| incompatible("resources"))?;
+    let mut transcripts = Vec::new();
+    for resource in resources {
+        let kind = resource.get("type").and_then(Value::as_str);
+        if !matches!(kind, Some("TranscriptV2" | "Transcript")) {
+            continue;
+        }
+        let text = |at: &Value, key: &str, path: &str| {
+            at.get(key).and_then(Value::as_str).map(str::to_string).ok_or_else(|| ProtoError::Incompatible(format!("resources[].{path}{key}")))
+        };
+        let metadata = resource.get("metadata").cloned().unwrap_or(Value::Null);
+        let time = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|t| ticks_ms(t).ok_or_else(|| ProtoError::Incompatible(format!("resources[].metadata.{key}"))))
+        };
+        let id = text(resource, "id", "")?;
+        if kind == Some("Transcript") {
+            // Times only when the older kind has them in the checked form (spec 4.2 step 1, R9).
+            let (start_ms, end_ms) = (time("startTime").and_then(Result::ok), time("endTime").and_then(Result::ok));
+            transcripts.push(Artifact { id, start_ms, end_ms, v2: None });
+            continue;
+        }
+        let start_ms = time("startTime").unwrap_or_else(|| Err(incompatible("resources[].metadata.startTime")))?;
+        let end_ms = time("endTime").unwrap_or_else(|| Err(incompatible("resources[].metadata.endTime")))?;
+        if end_ms < start_ms {
+            return Err(incompatible("resources[].metadata.endTime"));
+        }
+        let v2 = TranscriptV2 {
+            location: text(resource, "location", "")?,
+            drive_id: text(&metadata, "driveId", "metadata.")?,
+            drive_item_id: text(&metadata, "driveItemId", "metadata.")?,
+            transcript_id: metadata.get("transcriptId").and_then(Value::as_str).map(str::to_string),
+            owner_tenant: text(&metadata, "ownerTenantId", "metadata.")?,
+        };
+        transcripts.push(Artifact { id, start_ms: Some(start_ms), end_ms: Some(end_ms), v2: Some(v2) });
+    }
+    Ok(Artifacts { more, transcripts })
+}
+
+/// The result's `items`: every transcript artifact, as a token, with its times and whether the
+/// module reads it and picked it. None when an id is too long for a token.
+pub fn transcript_items(conversation: &str, found: &[&Artifact], selected: Option<&str>) -> Option<Vec<Value>> {
+    found
+        .iter()
+        .map(|a| {
+            Some(json!({
+                "conversation": conversation,
+                "transcript": token(&a.id)?,
+                "start": a.start_ms.map(time::rfc3339),
+                "end": a.end_ms.map(time::rfc3339),
+                "supported": a.v2.is_some(),
+                "selected": selected == Some(a.id.as_str()),
+            }))
+        })
+        .collect()
+}
+
+/// The user's own properties on the chat service, which name their OneDrive ("Live results" 9).
+pub fn user_properties(chat_service: &Url) -> HttpRequest {
+    let mut url = chat_service.clone();
+    // Never fails for https URLs, the only ones `authsvc::decode` accepts.
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.pop_if_empty().extend(["v1", "users", "ME", "properties"]);
+    }
+    let headers = vec![("BehaviorOverride".to_string(), "redirectAs404".to_string())];
+    HttpRequest { method: "GET".to_string(), url: url.into(), headers, body: Vec::new() }
+}
+
+/// The user's own OneDrive: the label `<t>` of `https://<t>-my.sharepoint.com` and the site's path,
+/// `/personal/<...>`, lowercase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonalSite {
+    pub tenant: String,
+    pub path: String,
+}
+
+/// The user's OneDrive from the user's properties: `personalFileSite` is JSON in a string, its
+/// `personalSiteUrl` `https://<t>-my.sharepoint.com/personal/...` ("Live results" 9). None without
+/// `personalFileSite`.
+pub fn decode_personal_site(body: &[u8]) -> Result<Option<PersonalSite>, ProtoError> {
+    let v = parse_json(body)?;
+    let Some(site) = v.get("personalFileSite") else { return Ok(None) };
+    let bad = || incompatible("personalFileSite");
+    let site: Value = site.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(bad)?;
+    let url = site.get("personalSiteUrl").and_then(Value::as_str).and_then(|u| Url::parse(u).ok()).ok_or_else(bad)?;
+    let label = url.host_str().and_then(|host| host.strip_suffix("-my.sharepoint.com")).map(str::to_string);
+    let path = url.path().trim_end_matches('/').to_ascii_lowercase();
+    let plain = url.scheme() == "https" && url.port().is_none() && url.username().is_empty() && path.len() > "/personal/".len();
+    match label {
+        Some(tenant) if plain && path.starts_with("/personal/") && dns_label(&tenant) => Ok(Some(PersonalSite { tenant, path })),
+        _ => Err(bad()),
+    }
+}
+
+/// Whether a transcript's `location` lies in the user's own OneDrive, so that its analytics are the
+/// user's own (spec 4.2 step 3).
+pub fn in_own_onedrive(location: &str, site: &PersonalSite) -> bool {
+    let Ok(url) = Url::parse(location) else { return false };
+    let host = format!("{}-my.sharepoint.com", site.tenant);
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.host_str() == Some(host.as_str())
+        && url.path().to_ascii_lowercase().starts_with(&format!("{}/", site.path))
+}
+
+/// One lowercase DNS label, as the host's WAM scope pattern takes it.
+fn dns_label(label: &str) -> bool {
+    (1..=60).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The origin of a transcript's `location` when it is one of the two of the user's organization,
+/// `https://<t>-my.sharepoint.com` or `https://<t>.sharepoint.com` (spec 4.2 step 4); None for any
+/// other, so no SharePoint token is ever asked for a host an answer named.
+pub fn own_origin(location: &str, tenant: &str) -> Option<String> {
+    let url = Url::parse(location).ok()?;
+    if url.scheme() != "https" || url.port().is_some() || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let origin = format!("https://{}", url.host_str()?);
+    [format!("https://{tenant}-my.sharepoint.com"), format!("https://{tenant}.sharepoint.com")].contains(&origin).then_some(origin)
+}
+
+/// Whether an ODSP id may go into a path: `[A-Za-z0-9!_-]`, at most [`MAX_ODSP_ID`].
+pub fn odsp_id(id: &str) -> bool {
+    (1..=MAX_ODSP_ID).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'!' | b'_' | b'-'))
+}
+
+/// `<origin>/_api/v2.1/drives/<drive>/items/<item>/media/transcripts[/<id>/streamContent?is=1]`
+/// (docs 9.5); the ids are checked first.
+fn odsp(origin: &str, drive: &str, item: &str, transcript: Option<&str>) -> Result<HttpRequest, ProtoError> {
+    if !odsp_id(drive) || !odsp_id(item) || transcript.is_some_and(|id| !odsp_id(id)) {
+        return Err(incompatible("resources[].metadata.driveItemId"));
+    }
+    let mut url = Url::parse(origin).map_err(|_| incompatible("resources[].location"))?;
+    let mut headers = Vec::new();
+    {
+        let mut path = url.path_segments_mut().map_err(|()| incompatible("resources[].location"))?;
+        path.extend(["_api", "v2.1", "drives", drive, "items", item, "media", "transcripts"]);
+        if let Some(id) = transcript {
+            path.extend([id, "streamContent"]);
+        } else {
+            headers.push(("accept".to_string(), "application/json".to_string()));
+        }
+    }
+    if transcript.is_some() {
+        url.set_query(Some("is=1"));
+    }
+    Ok(HttpRequest { method: "GET".to_string(), url: url.into(), headers, body: Vec::new() })
+}
+
+/// The transcripts of a recording.
+pub fn transcript_list(origin: &str, drive: &str, item: &str) -> Result<HttpRequest, ProtoError> {
+    odsp(origin, drive, item, None)
+}
+
+/// One transcript's WebVTT.
+pub fn transcript_content(origin: &str, drive: &str, item: &str, id: &str) -> Result<HttpRequest, ProtoError> {
+    odsp(origin, drive, item, Some(id))
+}
+
+/// The transcript of a recording the module reads: its id, version (`cTag`) and language.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OdspTranscript {
+    pub id: String,
+    pub version: String,
+    pub language: Option<String>,
+}
+
+/// The transcript to read from a recording's list (spec 4.2 step 5): only visible ones, the one
+/// with `transcript_id` first, else the default, else the first. None when none is visible yet.
+pub fn decode_transcript_list(body: &[u8], transcript_id: Option<&str>) -> Result<Option<OdspTranscript>, ProtoError> {
+    let v = parse_json(body)?;
+    let list = v.get("value").and_then(Value::as_array).ok_or_else(|| incompatible("value"))?;
+    let visible: Vec<&Value> = list.iter().filter(|t| t.get("isVisible").and_then(Value::as_bool) == Some(true)).collect();
+    fn id(t: &Value) -> Option<&str> {
+        t.get("id").and_then(Value::as_str)
+    }
+    let chosen = visible
+        .iter()
+        .find(|t| transcript_id.is_some() && id(t) == transcript_id)
+        .or_else(|| visible.iter().find(|t| t.get("isDefault").and_then(Value::as_bool) == Some(true)))
+        .or(visible.first());
+    let Some(chosen) = chosen else { return Ok(None) };
+    let id = id(chosen).filter(|id| odsp_id(id)).ok_or_else(|| incompatible("value[].id"))?;
+    let version = chosen.get("cTag").and_then(Value::as_str).ok_or_else(|| incompatible("value[].cTag"))?;
+    let language = chosen.get("languageTag").and_then(Value::as_str).filter(|tag| language_tag(tag)).map(str::to_string);
+    Ok(Some(OdspTranscript { id: id.to_string(), version: version.to_string(), language }))
+}
+
+/// `^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8}){0,4}$` (spec 4.2 step 6).
+fn language_tag(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let first = parts.next().unwrap_or_default();
+    let rest: Vec<&str> = parts.collect();
+    (2..=8).contains(&first.len())
+        && first.bytes().all(|b| b.is_ascii_alphabetic())
+        && rest.len() <= 4
+        && rest.iter().all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// One cue of a transcript: start and end as `HH:MM:SS.mmm`, the speaker and the text.
@@ -542,6 +832,180 @@ mod tests {
             |n| -> String { std::iter::once("WEBVTT\n".to_string()).chain((0..n).map(|_| "\n00:00.000 --> 00:01.000\nx\n".to_string())).collect() };
         assert_eq!(parse_vtt(cues(MAX_CUES).as_bytes()).unwrap().len(), MAX_CUES);
         assert_eq!(parse_vtt(cues(MAX_CUES + 1).as_bytes()), Err(ProtoError::Incompatible("vtt.cues".to_string())));
+    }
+
+    const MCPS: &[u8] = include_bytes!("../tests/fixtures/mcps_contents.json");
+    const ODSP: &[u8] = include_bytes!("../tests/fixtures/odsp_transcripts.json");
+
+    #[test]
+    fn ticks_are_utc_milliseconds() {
+        // 2027-01-15T08:00:00Z and 64 minutes later, as in the fixture.
+        assert_eq!(ticks_ms("639355968000000000"), Some(1_800_000_000_000));
+        assert_eq!(ticks_ms("639356006400000000"), Some(1_800_000_000_000 + 64 * 60_000));
+        for bad in ["2027-01-15T08:00:00Z", "63935596800000000", "6393559680000000000", "63935596800000000x", "-39355968000000000", ""] {
+            assert_eq!(ticks_ms(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn mcps_gives_the_transcripts_of_the_live_shape() {
+        let a = decode_artifacts(MCPS).unwrap();
+        assert!(!a.more);
+        assert_eq!(a.transcripts.len(), 1);
+        let t = &a.transcripts[0];
+        assert_eq!((t.start_ms, t.end_ms), (Some(1_800_000_000_000), Some(1_800_000_000_000 + 64 * 60_000)));
+        let v2 = t.v2.as_ref().unwrap();
+        assert_eq!(v2.transcript_id.as_deref(), Some("00000000-0000-0000-0000-000000000001"));
+        assert!(odsp_id(&v2.drive_id) && odsp_id(&v2.drive_item_id));
+        let items = transcript_items(THREAD, &[t], Some(&t.id)).unwrap();
+        assert_eq!(items[0]["start"], "2027-01-15T08:00:00Z");
+        assert_eq!((&items[0]["supported"], &items[0]["selected"]), (&json!(true), &json!(true)));
+        assert_eq!(untoken(items[0]["transcript"].as_str().unwrap()).as_deref(), Some(t.id.as_str()));
+    }
+
+    #[test]
+    fn mcps_in_another_shape_is_incompatible() {
+        let live: Value = serde_json::from_slice(MCPS).unwrap();
+        let changed = |f: &dyn Fn(&mut Value)| {
+            let mut v = live.clone();
+            f(&mut v);
+            v.to_string().into_bytes()
+        };
+        let cases: [(Vec<u8>, &str); 7] = [
+            (changed(&|v| _ = v.as_object_mut().unwrap().remove("paginationInfo")), "paginationInfo.hasNextPage"),
+            (changed(&|v| v["paginationInfo"]["hasNextPage"] = json!("no")), "paginationInfo.hasNextPage"),
+            (changed(&|v| v["resources"][0]["metadata"]["startTime"] = json!("2027-01-15T08:00:00Z")), "resources[].metadata.startTime"),
+            (changed(&|v| v["resources"][0]["metadata"]["endTime"] = json!("639355967000000000")), "resources[].metadata.endTime"),
+            (changed(&|v| _ = v["resources"][0]["metadata"].as_object_mut().unwrap().remove("ownerTenantId")), "resources[].metadata.ownerTenantId"),
+            (changed(&|v| _ = v["resources"][0].as_object_mut().unwrap().remove("location")), "resources[].location"),
+            (changed(&|v| _ = v.as_object_mut().unwrap().remove("resources")), "resources"),
+        ];
+        for (body, path) in cases {
+            assert_eq!(decode_artifacts(&body), Err(ProtoError::Incompatible(path.to_string())), "{path}");
+        }
+        // More pages are reported, an older transcript is listed without times it lacks.
+        let more = changed(&|v| {
+            v["paginationInfo"]["hasNextPage"] = json!(true);
+            v["resources"].as_array_mut().unwrap().push(json!({"id": "old", "type": "Transcript", "metadata": {"startTime": "x"}}));
+        });
+        let a = decode_artifacts(&more).unwrap();
+        assert!(a.more);
+        assert_eq!(a.transcripts[1], Artifact { id: "old".into(), start_ms: None, end_ms: None, v2: None });
+        assert!(a.transcripts[1].overlaps(None, None) && !a.transcripts[1].overlaps(Some(0), None));
+    }
+
+    #[test]
+    fn mcps_request_names_the_thread_and_occurrence() {
+        let base = Url::parse("https://teams.microsoft.com/api/mcps/eu").unwrap();
+        let r = artifacts(&base, THREAD, Some("040000008200E0"), "c-1");
+        assert_eq!(r.method, "GET");
+        assert_eq!(
+            r.url,
+            "https://teams.microsoft.com/api/mcps/eu/contents?threadId=19%3Ameeting_c3ludGhldGljbWVldGluZzAx%40thread.v2&iCalUid=040000008200E0"
+        );
+        assert!(r.headers.contains(&("x-ms-correlation-id".to_string(), "c-1".to_string())));
+        assert!(!artifacts(&base, THREAD, None, "c-1").url.contains("iCalUid"));
+    }
+
+    #[test]
+    fn windows_overlap_inclusively() {
+        let a = Artifact { id: String::new(), start_ms: Some(100), end_ms: Some(200), v2: None };
+        assert!(a.overlaps(None, None) && a.overlaps(Some(200), None) && a.overlaps(None, Some(100)) && a.overlaps(Some(150), Some(160)));
+        assert!(!a.overlaps(Some(201), None) && !a.overlaps(None, Some(99)));
+    }
+
+    #[test]
+    fn personal_site_names_the_tenant_label() {
+        let body = include_bytes!("../tests/fixtures/user_properties.json");
+        let site = decode_personal_site(body).unwrap().unwrap();
+        assert_eq!(site, PersonalSite { tenant: "synthetic".into(), path: "/personal/person_one_synthetic_example".into() });
+        let own = "https://synthetic-my.sharepoint.com/personal/Person_One_Synthetic_Example/Documents/Recordings/r.mp4";
+        assert!(in_own_onedrive(own, &site));
+        for other in [
+            "https://synthetic-my.sharepoint.com/personal/person_two_synthetic_example/Documents/r.mp4",
+            "https://synthetic-my.sharepoint.com/personal/person_one_synthetic_example_x/Documents/r.mp4",
+            "https://synthetic-my.sharepoint.com/personal/person_one_synthetic_example",
+            "https://synthetic.sharepoint.com/personal/person_one_synthetic_example/r.mp4",
+            "https://synthetic.sharepoint.com/sites/team/r.mp4",
+            "http://synthetic-my.sharepoint.com/personal/person_one_synthetic_example/r.mp4",
+        ] {
+            assert!(!in_own_onedrive(other, &site), "{other}");
+        }
+        assert_eq!(decode_personal_site(br#"{"locale": "en-us"}"#).unwrap(), None);
+        let site = |url: &str| json!({"personalFileSite": json!({"personalSiteUrl": url}).to_string()}).to_string().into_bytes();
+        for bad in [
+            "http://synthetic-my.sharepoint.com/personal/x",
+            "https://synthetic-my.sharepoint.com:8443/personal/x",
+            "https://synthetic.sharepoint.com/personal/x",
+            "https://synthetic-my.sharepoint.com.evil.example/personal/x",
+            "https://a.b-my.sharepoint.com/personal/x",
+            "https://synthetic-my.sharepoint.com/sites/x",
+        ] {
+            assert_eq!(decode_personal_site(&site(bad)), Err(ProtoError::Incompatible("personalFileSite".to_string())), "{bad}");
+        }
+        assert!(decode_personal_site(br#"{"personalFileSite": "not json"}"#).is_err());
+    }
+
+    #[test]
+    fn only_the_organization_origins_get_a_token() {
+        let ok = "https://synthetic-my.sharepoint.com/personal/x/Documents/r.mp4";
+        assert_eq!(own_origin(ok, "synthetic").as_deref(), Some("https://synthetic-my.sharepoint.com"));
+        assert_eq!(own_origin("https://synthetic.sharepoint.com/sites/team/r.mp4", "synthetic").as_deref(), Some("https://synthetic.sharepoint.com"));
+        for bad in [
+            "https://other-my.sharepoint.com/personal/x",
+            "https://synthetic-my.sharepoint.com.evil.example/x",
+            "https://synthetic-my.sharepoint.com:443x/x",
+            "https://user@synthetic-my.sharepoint.com/x",
+            "http://synthetic-my.sharepoint.com/x",
+            "not a url",
+        ] {
+            assert_eq!(own_origin(bad, "synthetic"), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn odsp_requests_check_their_ids() {
+        let list = transcript_list("https://synthetic-my.sharepoint.com", "b!Drive_1-x", "01ITEM").unwrap();
+        assert_eq!(list.url, "https://synthetic-my.sharepoint.com/_api/v2.1/drives/b!Drive_1-x/items/01ITEM/media/transcripts");
+        let content = transcript_content("https://synthetic-my.sharepoint.com", "b!D", "01I", "0000-aa").unwrap();
+        assert_eq!(content.url, "https://synthetic-my.sharepoint.com/_api/v2.1/drives/b!D/items/01I/media/transcripts/0000-aa/streamContent?is=1");
+        assert_eq!((list.method.as_str(), content.method.as_str()), ("GET", "GET"));
+        for (drive, item, id) in [("a/b", "i", "t"), ("d", "..", "t"), ("d", "i", "t?x"), ("", "i", "t"), (&*"d".repeat(257), "i", "t")] {
+            assert!(transcript_content("https://synthetic-my.sharepoint.com", drive, item, id).is_err(), "{drive} {item} {id}");
+        }
+    }
+
+    #[test]
+    fn the_visible_transcript_is_chosen() {
+        let t = decode_transcript_list(ODSP, Some("00000000-0000-0000-0000-000000000001")).unwrap().unwrap();
+        assert_eq!((t.id.as_str(), t.language.as_deref()), ("00000000-0000-0000-0000-000000000001", Some("pl-PL")));
+        let list = |items: Value| json!({ "value": items }).to_string().into_bytes();
+        let item = |id: &str, visible: bool, default: bool| json!({"id": id, "cTag": format!("c-{id}"), "isVisible": visible, "isDefault": default});
+        let pick = |items: Value, wanted: Option<&str>| decode_transcript_list(&list(items), wanted).unwrap().map(|t| t.id);
+        assert_eq!(pick(json!([item("a", true, false), item("b", true, true)]), Some("a")).as_deref(), Some("a"));
+        assert_eq!(pick(json!([item("a", true, false), item("b", true, true)]), Some("x")).as_deref(), Some("b"));
+        assert_eq!(pick(json!([item("a", false, true), item("b", true, false)]), None).as_deref(), Some("b"));
+        assert_eq!(pick(json!([item("a", false, true)]), Some("a")), None);
+        assert_eq!(pick(json!([]), None), None);
+        assert!(decode_transcript_list(&list(json!([item("a/b", true, true)])), None).is_err());
+        assert!(decode_transcript_list(&list(json!([{"id": "a", "isVisible": true}])), None).is_err());
+        assert!(decode_transcript_list(b"{}", None).is_err());
+        // A language tag outside the pattern is left out.
+        let tagged = |tag: &str| json!([{"id": "a", "cTag": "c", "isVisible": true, "languageTag": tag}]);
+        assert_eq!(decode_transcript_list(&list(tagged("en-US")), None).unwrap().unwrap().language.as_deref(), Some("en-US"));
+        for bad in ["e", "ignore previous instructions", "en_US", "en-US-a-b-c-d", "toolongtag-x"] {
+            assert_eq!(decode_transcript_list(&list(tagged(bad)), None).unwrap().unwrap().language, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_recorded_shape_of_vtt_parses() {
+        let cues = parse_vtt(include_bytes!("../tests/fixtures/transcript.vtt")).unwrap();
+        assert_eq!(cues.len(), 3);
+        assert_eq!(
+            (cues[1].speaker.as_deref(), cues[1].text.as_str(), cues[1].end.as_str()),
+            (Some("Synthetic Person Two"), "Second synthetic line.", "00:00:07.250")
+        );
     }
 
     #[test]

@@ -1,0 +1,61 @@
+{
+ "changeKey": "synthetic",
+ "countOfFilteredContentsByChatHistory": 0,
+ "deletedResources": [],
+ "invalidResources": [],
+ "paginationInfo": {
+  "hasNextPage": false
+ },
+ "resources": [
+  {
+   "addedBy": "synthetic",
+   "additionDateTime": "2027-01-15T09:05:00Z",
+   "id": "SyntheticTranscriptResource01xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "location": "https://synthetic-my.sharepoint.com/personal/person_one_synthetic_example/Documents/Recordings/x.mp4",
+   "mcoResourceId": "synthetic",
+   "subType": "",
+   "type": "TranscriptV2",
+   "metadata": {
+    "appTitle": "",
+    "callId": "synthetic",
+    "containerId": "",
+    "correlationId": "synthetic",
+    "driveId": "b!SyntheticDrive01DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+    "driveItemId": "01SYNTHETICITEM01IIIIIIIIIIIIIIIII",
+    "startTime": "639355968000000000",
+    "endTime": "639356006400000000",
+    "fileId": "",
+    "fileTitle": "",
+    "fileType": "",
+    "iCalUid": "synthetic-series",
+    "instanceICalUid": "synthetic-instance",
+    "isMultilingual": false,
+    "meetingJoinUrl": "",
+    "messageId": "1800000000000",
+    "organizerId": "00000000-0000-0000-0000-000000000002",
+    "organizerTenantId": "",
+    "ownerId": "00000000-0000-0000-0000-000000000001",
+    "ownerTenantId": "00000000-0000-0000-0000-0000000000aa",
+    "sharePointOnlineId": "",
+    "sharingLinkPermissionId": "",
+    "threadId": "19:meeting_c3ludGhldGlj@thread.v2",
+    "thumbnailUrl": "",
+    "transcriptId": "00000000-0000-0000-0000-000000000001",
+    "userId": "00000000-0000-0000-0000-000000000001",
+    "webUrl": ""
+   }
+  },
+  {
+   "addedBy": "synthetic",
+   "id": "synthetic-summary",
+   "type": "AISummary",
+   "metadata": {}
+  },
+  {
+   "addedBy": "synthetic",
+   "id": "synthetic-notes",
+   "type": "notes",
+   "metadata": {}
+  }
+ ]
+}
