@@ -565,14 +565,12 @@ fn payload_text(payload: &str) -> (Option<String>, String) {
     (speaker, entities(text.trim()))
 }
 
-/// The character references WebVTT text uses.
+/// `text` with its character references decoded, named and numeric; unknown or malformed ones
+/// stay as they are.
 fn entities(text: &str) -> String {
-    if !text.contains('&') {
-        return text.to_string();
-    }
-    [("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " "), ("&lrm;", "\u{200e}"), ("&rlm;", "\u{200f}"), ("&quot;", "\""), ("&#39;", "'"), ("&amp;", "&")]
-        .iter()
-        .fold(text.to_string(), |text, (entity, character)| text.replace(entity, character))
+    let mut out = String::with_capacity(text.len());
+    crate::text::push_text(&mut out, text);
+    out
 }
 
 /// `text` cut to `max` characters, the last one the cut mark.
@@ -775,6 +773,17 @@ mod tests {
         assert_eq!((cues[2].speaker.as_deref(), cues[2].text.as_str()), (None, "no speaker"));
         // A byte order mark and a header line with text are fine.
         assert_eq!(parse_vtt(format!("\u{feff}WEBVTT - transcript\n\n{}", "00:00.000 --> 00:01.000\nx\n").as_bytes()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn vtt_numeric_entities_are_decoded() {
+        // The service escapes speakers and texts, non-ASCII letters as numeric references.
+        let vtt = "WEBVTT\n\n00:00.000 --> 00:01.000\n<v Zo&#243;fia Przyk&#x142;ad>a &amp; b &lt;c&gt; &quot;d&quot; &apos;e&#39;</v>\n\n\
+                   00:01.000 --> 00:02.000\n<v Ann>&#xD800; &#1114112; &#xFFFFFFFF; &#; &#x; &bogus; &amp &#65</v>\n";
+        let cues = parse_vtt(vtt.as_bytes()).unwrap();
+        assert_eq!((cues[0].speaker.as_deref(), cues[0].text.as_str()), (Some("Zoófia Przykład"), "a & b <c> \"d\" 'e'"));
+        // Out of range, surrogate, empty, unknown and unterminated references stay as text.
+        assert_eq!(cues[1].text, "&#xD800; &#1114112; &#xFFFFFFFF; &#; &#x; &bogus; &amp &#65");
     }
 
     #[test]
