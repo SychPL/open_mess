@@ -1481,7 +1481,8 @@ token, tenant id, user id or account name.
       audio `inactive` (item 15) were tried only before the three lines above were added, so
       whether either of them works now is still open (a retest, step 0c of the spec). The leg
       lives without audio flowing (two minutes, ended by the probe's own `leave`, HTTP 204), the
-      caption messages are on data id 3, and the other participants saw nothing (item 15). The
+      caption messages are on data id 3, and the other participants saw nothing (item 15 - asked
+      after runs whose data channel did not open; not asked again after these runs). The
       join that received captions went through the `epconv` request with `meetingData` from a
       meeting link; the join at the call store's `conversationController` (item 15, HTTP 200)
       has not yet carried the data section. The steps the module
@@ -1489,6 +1490,31 @@ token, tenant id, user id or account name.
       `user.authenticate`, the regional `epconv` request with `meetingData` (or the live call's
       URL), `notificationLinks`, the join without a `payload` envelope, the acceptance
       acknowledgement, MS-SDP both ways, and a DTLS stack that verifies P-384 with SHA-256.
+
+17. **What the roster shows for the probe's leg** (2026-10-30, the owner's own "Meet now" meeting with
+    an anonymous guest he joined himself as an observer and, in the second run, a colleague he
+    invited for the test; his OK in chat for both runs; the probe printed only key names, counts and
+    enum values of the owner's own roster entry):
+    - Run A, the owner in the meeting: the probe's join (HTTP 200) added a second endpoint to the
+      owner's entry (`endpoints` 1 to 2, `state: active`, `isMuted: true`, `role: admin`) - one
+      roster entry with two endpoints (what the observer saw at that moment was not asked). The
+      owner then hung up in the official client: his entry stayed
+      `active` with one endpoint (the probe's), and the observer still saw him in the meeting. The
+      entry went only when the probe left (`leave`, HTTP 204). Captions kept coming (36 messages, 7
+      final, all on data id 3).
+    - Run B, the owner not in the meeting (the probe's own presence check turned off for this run):
+      the `epconv` request with `meetingData` from the link and the join both gave HTTP 200, with no
+      lobby (the owner organizes the meeting); the owner's entry appeared `active` with one endpoint,
+      and the observer saw "Mateusz" join. The data channel opened and captions came (110
+      messages, 18 final; a result key `rawText` appeared next to those of item 16).
+    - So a leg is never hidden: whenever any endpoint of the account is in the call, the account is
+      in the roster as present. A leg without the user is not an invisible listener but a stand-in
+      that shows the user as present - which is why the live captions spec joins only while the user
+      is in the meeting and leaves when the user's last other endpoint goes. Anyone holding the
+      user's tokens could do the same; that is an account compromise, not a gap in the service.
+    - `timestampAudioSent` is a number that is not a Unix time (s, ms, us), .NET ticks or a
+      FILETIME within 10 minutes of the local clock, so probably relative to something;
+      `duration` was of the order 1e6-1e7 (in 100 ns units that would be 0.1-10 s; unconfirmed).
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
