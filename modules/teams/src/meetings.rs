@@ -364,7 +364,7 @@ pub fn decode_personal_site(body: &[u8]) -> Result<Option<String>, ProtoError> {
     let site: Value = site.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(bad)?;
     let url = site.get("personalSiteUrl").and_then(Value::as_str).and_then(|u| Url::parse(u).ok()).ok_or_else(bad)?;
     let label = url.host_str().and_then(|host| host.strip_suffix("-my.sharepoint.com")).map(str::to_string);
-    let path = url.path().trim_end_matches('/');
+    let path = url.path().trim_end_matches('/').to_ascii_lowercase();
     let plain = url.scheme() == "https" && url.port().is_none() && url.username().is_empty() && path.len() > "/personal/".len();
     match label {
         Some(tenant) if plain && path.starts_with("/personal/") && dns_label(&tenant) => Ok(Some(tenant)),
@@ -900,6 +900,8 @@ mod tests {
         assert_eq!(decode_personal_site(body).unwrap().as_deref(), Some("synthetic"));
         assert_eq!(decode_personal_site(br#"{"locale": "en-us"}"#).unwrap(), None);
         let site = |url: &str| json!({"personalFileSite": json!({"personalSiteUrl": url}).to_string()}).to_string().into_bytes();
+        // SharePoint paths ignore letter case.
+        assert_eq!(decode_personal_site(&site("https://synthetic-my.sharepoint.com/Personal/x/")).unwrap().as_deref(), Some("synthetic"));
         for bad in [
             "http://synthetic-my.sharepoint.com/personal/x",
             "https://synthetic-my.sharepoint.com:8443/personal/x",
