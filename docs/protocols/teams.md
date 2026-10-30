@@ -1364,11 +1364,53 @@ token, tenant id, user id or account name.
       audio `sendrecv`, ten video sections and `m=x-data`, and mutes afterwards. After the probe's
       registrar registration, chat notifications arrived on the Trouter path `/messaging` (keys only
       were looked at); the registration was deleted after each run (HTTP 202).
-    - **UNCONFIRMED** what the service still misses in step 4. Left: the remaining body values
+    - **Solved later the same day, see item 15** (the probe wrapped the join body in `payload`).
+      What the service missed in step 4 was first thought to be one of: the remaining body values
       (`languageId`, `endpointMetadata.holographicCapabilities`, `endpointState.endpointProperties`,
       `participantPropertyBag`, `applyChannelParameters`, the `confirmUnmute` link), the offer's
       other sections (audio `sendrecv` plus video, which open_mess may not use) and the browser
       request headers.
+
+15. **The probe joins the call** (2026-10-30, the owner alone in his own "Meet now" meeting with
+    live captions on, his OK in chat for each run; a file-only review by Codex pointed at the first
+    item below):
+    - **The wire body has no `payload` level.** The client's request builder `lw` sends
+      `JSON.stringify(data.payload)`, and the builders (`uw`, `EV`, `_V` for leave, the acceptance
+      acknowledgement) return `{payload: {...}}`, so what goes on the wire is the inner object - as
+      the capture of item 14 shows (`conversationRequest`, `participants`, `callInvitation` at the
+      root). Section 10.7 lists those keys under `payload.`; read them as root keys. The probe had
+      wrapped its join, leave and acknowledgement in `payload`, which is what the 503 70051 of items
+      13 and 14 answered (an empty `{}` too). Unwrapped: the join returned **HTTP 200** with the
+      conversation (about 40 KB), `leave` HTTP 204 and the acceptance acknowledgement HTTP 202.
+    - Offer with only `m=x-data` and `callModalities: []`: join 200, then `/call/end/` at once.
+    - Offer with an audio section `inactive` plus `m=x-data`, `callModalities: ["Audio"]`: join 200,
+      `/call/acceptance/` came with the answer: one BUNDLE (`0`), `m=audio 3478 RTP/SAVP 111 9 0 8`
+      `inactive`, `a=setup:passive`, `a=x-source-streamid`, four relay candidates on port 3478 in
+      52.112.0.0/16 (two UDP with an `MTURNID <id>` extension, two `tcp-pass`), and **`m=x-data 0
+      RTP/SAVP 127 126` - the data section rejected**; `acceptedCallModalities: []`; the acceptance
+      `mediaContent` keys `blob`, `contentType`, `escalationOccurring`, `fromMixer`, `mediaLegId`,
+      `newOffer`, `skipIceReinvite`. ICE never connected.
+    - The same with the audio transceiver **`sendonly` and no track** (nothing is sent; the probe
+      refuses any answer whose audio section would send audio to it, failing closed when no
+      direction is given) and `endpointState.state.isMuted: true`: the answer's audio was `recvonly`,
+      ICE **connected** to the relay candidates, and the data section was again `m=x-data 0`. Then
+      the service ended the leg about 2-3 s later: `/call/end/` with `callEnd` code 410, subCode
+      301067, phrase `DTLSHandshakeFailed`, reason `clientError`, result categories `JoinFailure`,
+      `Other`. webrtc-rs logged `Failed to start manager dtls: ring::error::Unspecified`.
+    - **The media processor's DTLS certificate is ECDSA P-384 and signs with SHA-256.** The `dtls`
+      crate 0.13 that webrtc-rs 0.14 uses verifies ECDSA with SHA-256 only on P-256, so the
+      handshake failed in `verify_signature`; `allow_insecure_verification_algorithm` does not cover
+      it. With a local patch to the probe's copy of the crate that picks the curve from the
+      certificate's key (`ECDSA_P384_SHA256_ASN1`), the peer connection reached **connected** and the
+      leg stayed up for the 90 s of the run, the service sending only RTCP; the probe then left
+      (HTTP 204). Step 1 of the live captions spec needs a WebRTC stack that verifies P-384 with
+      SHA-256 (the fix upstreamed or carried).
+    - Still open: the service answers the data section with port 0 in every run so far, so no data
+      channel opened and no caption message (data id 3) arrived. A capture of the web client's own
+      answer (over Trouter) would show whether the service accepts its `m=x-data`. Offering a
+      receive-only screen-sharing section (the web client's `ScreenViewer` modality) to give the
+      service a second accepted modality was not tried: it would let the service send images,
+      which the live captions spec (4.4) rules out without the owner's decision.
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
