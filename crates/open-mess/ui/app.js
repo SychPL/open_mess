@@ -624,7 +624,7 @@ function outcomes() {
     done: tr("Wykonano.", "Done."),
     rejected: tr("Odrzucono.", "Rejected."),
     expired: tr("Wygasło - nic nie wysłano.", "Expired - nothing was sent."),
-    voided: tr("Uczestnicy albo wiadomość zmienili się od pokazania - nic nie wysłano.", "The participants or the message changed since they were shown - nothing was sent."),
+    voided: tr("Uczestnicy, wiadomość albo prawo zapisu zmieniły się od pokazania - nic nie wysłano.", "The participants, the message or the write permission changed since it was shown - nothing was sent."),
     uncertain: tr("Mogło dotrzeć - sprawdź rozmowę, zanim spróbujesz ponownie.", "It may have arrived - check the conversation before you try again."),
     failed: tr("Nie udało się - nic nie wysłano.", "It failed - nothing was sent."),
   };
