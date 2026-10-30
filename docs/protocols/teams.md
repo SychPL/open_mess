@@ -1405,12 +1405,28 @@ token, tenant id, user id or account name.
       leg stayed up for the 90 s of the run, the service sending only RTCP; the probe then left
       (HTTP 204). Step 1 of the live captions spec needs a WebRTC stack that verifies P-384 with
       SHA-256 (the fix upstreamed or carried).
-    - Still open: the service answers the data section with port 0 in every run so far, so no data
-      channel opened and no caption message (data id 3) arrived. A capture of the web client's own
-      answer (over Trouter) would show whether the service accepts its `m=x-data`. Offering a
-      receive-only screen-sharing section (the web client's `ScreenViewer` modality) to give the
-      service a second accepted modality was not tried: it would let the service send images,
-      which the live captions spec (4.4) rules out without the owner's decision.
+    - **The web client's own answer accepts the data section.** A further capture (same method as
+      item 14) showed that the web join's HTTP 200 response itself carries `callAcceptance` (with
+      `acceptedCallModalities: []`, `links` for `acknowledgement`, `callLeg`, `mediaRenegotiation`,
+      `startOutgoingNegotiation`, `applyChannelParameters` and more, and `mediaContent` with
+      `skipIceReinvite: true`), and its answer SDP has `m=x-data <port> RTP/SAVP 127 126` with
+      `a=x-source-streamid`, `a=setup:passive`, `a=x-ssrc-range`, `a=x-data-protocol:sctp`,
+      `a=label:data`, `a=rtcp-mux` - accepted - next to audio and eleven video sections. The client
+      acknowledged it with `POST .../cc/v1/callAcceptance/.../acknowledge`.
+    - For the probe the data section stayed at port 0 with each of: a video section `sendonly` with
+      no track added (answered `recvonly`, the leg stayed up), the web client's
+      `clientEndpointCapabilities` 114259690, the reinviteless bit 512 without `mediaDescriptions`,
+      and `/TsCallingVersion=<v>` in the client string. Bit 512 with the probe's own
+      `mediaDescriptions` (one per section) ended the leg at once: `callEnd` 410, subCode 301999,
+      `InvalidFinalAnswerMediaDescriptions`; the client builds that list only from `sendrecv`
+      sections and adds the data section only with `subTypes` (`getMediaDescriptions`). In the
+      client, data `subTypes` are set later (`setSubTypes`) and only for real-time text in PSTN
+      calls, not for captions.
+    - Still open: why the service rejects the probe's data section. What is left between the web
+      client and the probe is that the web client offers audio `sendrecv` and video, which the
+      live captions spec rules out (no audio or image sent or received). Offering a receive-only
+      screen-sharing section (the web client's `ScreenViewer` modality) was not tried for the same
+      reason. No caption message (data id 3) has arrived yet.
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
