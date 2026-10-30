@@ -4,7 +4,6 @@
 
 use crate::authsvc::ServiceDirectory;
 use crate::http::SecretString;
-use crate::meetings::PersonalSite;
 
 /// Token audiences (docs/protocols/teams.md 1.4 and "Live results" 1-3): authsvc and the middle
 /// tier, the chat service (a plain AAD token is accepted, "Live results" 3), search.
@@ -91,15 +90,24 @@ pub struct Session {
     /// The skype token of the last authsvc exchange, and when it expires; the middle tier takes it
     /// (docs 9.1).
     skype: Option<(SecretString, Option<i64>)>,
-    /// The user's own OneDrive, read once a session from `personalFileSite` (spec
-    /// 2026-10-28-meetings-transcripts, 4.2 step 4).
-    pub personal_site: Option<PersonalSite>,
+    /// The label `<t>` of the organization's SharePoint, read once a session from the user's
+    /// `personalFileSite` (spec 2026-10-28-meetings-transcripts, 4.2 step 4).
+    pub sharepoint_tenant: Option<String>,
 }
 
 impl Session {
     pub fn new(claims: Claims, directory: ServiceDirectory) -> Session {
         let name = claims.name.or_else(|| claims.upn.clone()).unwrap_or_else(|| claims.oid.clone());
-        Session { account: claims.oid, name, upn: claims.upn, tenant: claims.tenant, directory, tokens: Vec::new(), skype: None, personal_site: None }
+        Session {
+            account: claims.oid,
+            name,
+            upn: claims.upn,
+            tenant: claims.tenant,
+            directory,
+            tokens: Vec::new(),
+            skype: None,
+            sharepoint_tenant: None,
+        }
     }
 
     /// The user's MRI, as the chat service names senders and mentions.

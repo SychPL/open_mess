@@ -112,7 +112,8 @@ fn extra_tools() -> Vec<ToolDecl> {
         ToolDecl {
             name: "get_transcript".to_string(),
             description: "The Teams transcript of a meeting, a page of cues (start, end, speaker, text) at a time; for the next page pass \
-                          next_cursor as cursor with transcript and version. For now only recordings the user owns. Reading never marks \
+                          next_cursor as cursor with transcript and version. Any meeting the user is in, of the user's own \
+                          organization. Reading never marks \
                           anything as read."
                 .to_string(),
             input_schema: get_transcript.to_string(),
