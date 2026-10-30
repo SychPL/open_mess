@@ -1440,8 +1440,10 @@ token, tenant id, user id or account name.
       acknowledgement HTTP 202; the leg stayed up for 120 s, then left (204). That meeting's bot had
       `closedCaptions` and `realTimeTranscript` `Active`. Asked afterwards, the other participants
       had seen nothing of the probe's endpoint (the owner's report) - a first answer to "Needs live
-      capture" 18 and decision O2 of the live captions spec. A run with the web client's build number
-      in `X-Microsoft-Skype-Client` was stopped by the session's permission classifier before it ran.
+      capture" 18 and decision O2 of the live captions spec. The owner then ran, himself, the same
+      probe with the web client's build number in `X-Microsoft-Skype-Client` (a run the session's
+      permission classifier had stopped): the same result, `m=x-data 0` in the renegotiation answer -
+      the client version is not what the service decides on.
     - Still open: why the service rejects the probe's data section. What is left between the web
       client and the probe is that the web client offers audio `sendrecv` and video, which the
       live captions spec rules out (no audio or image sent or received). Offering a receive-only
