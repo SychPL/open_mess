@@ -1136,14 +1136,10 @@ async function show(section) {
   }
 }
 
-for (const node of document.querySelectorAll("#menu button")) {
-  node.addEventListener("click", () => show(node.dataset.section));
-}
-
-// Asked for by the notice that several actions wait, on an open window.
-window.addEventListener("show-waiting", () => show("waiting"));
-
-/** The language first, then the first section: actions waiting for approval, otherwise the accounts. */
+/**
+ * The language first, then the sections: none is drawn before the language is known. The first is
+ * the actions waiting for approval, otherwise the accounts, unless the user picked one meanwhile.
+ */
 async function start() {
   let failed = null;
   try {
@@ -1156,7 +1152,11 @@ async function start() {
   }
   document.documentElement.lang = lang;
   if (lang === "en") translatePage();
-  // Not over a section the user picked meanwhile.
+  for (const node of document.querySelectorAll("#menu button")) {
+    node.addEventListener("click", () => show(node.dataset.section));
+  }
+  // Asked for by the notice that several actions wait, on an open window.
+  window.addEventListener("show-waiting", () => show("waiting"));
   const waiting = await call("waiting").catch(() => []);
   if (current === null) await show(waiting.length > 0 ? "waiting" : "accounts");
   renderSignIn().catch(showError);

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::{Daemon, ECHO, daemon};
 use open_mess::accounts::other_account;
+use open_mess::i18n::Lang;
 use open_mess::modules;
 use open_mess::ui::commands::{self, AccountDto, AnswerDto, SignInPromptDto};
 use open_mess::ui::sign_in::{NO_WINDOW, NOT_FROM_WINDOW, busy};
@@ -345,8 +346,8 @@ async fn re_sign_in_must_match_the_account() {
     sign_in_as(&state, None, "a").await.unwrap();
     d.accounts.set_state("test-echo", "a", SessionState::AuthRequired).unwrap();
     // Signed in again, the module returns another account: refused, nothing changes.
-    assert_eq!(sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err(), other_account());
-    assert!(other_account().starts_with("to jest inne konto"));
+    assert_eq!(sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err(), other_account(Lang::Pl));
+    assert!(other_account(Lang::Pl).starts_with("to jest inne konto"));
     assert_eq!(listed(&state), [("test-echo:a".to_string(), "auth-required".to_string())]);
     // Removed first, the other account can be added.
     commands::remove_account(&state, "test-echo:a").await.unwrap();
@@ -401,7 +402,7 @@ async fn what_changed_during_a_sign_in_is_respected() {
     sign_in_as(&state, None, "b").await.unwrap();
     d.accounts.set_state("test-echo", "b", SessionState::AuthRequired).unwrap();
     let refused = sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err();
-    assert!(refused.starts_with(other_account()), "{refused}");
+    assert!(refused.starts_with(other_account(Lang::Pl)), "{refused}");
     assert!(refused.ends_with("(zalogowano ponownie konto test-echo:b)"), "{refused}");
     assert_eq!(listed(&state), [("test-echo:a".to_string(), "online".to_string()), ("test-echo:b".to_string(), "online".to_string())]);
 }

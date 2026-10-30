@@ -196,6 +196,7 @@ async fn sign_in_errors_in_english() {
         other,
         "this is another account - sign in with the account you are signing in again, or remove the old account first and add the new one"
     );
+    assert_eq!(other, open_mess::accounts::other_account(Lang::En));
     // A sign-in page outside the approved sign-in hosts is refused, in the window's language.
     assert_eq!(
         sign_in_page::check_page("https://evil.example/", "https://login.example.com/done", &["login.example.com".into()]),

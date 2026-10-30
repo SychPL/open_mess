@@ -25,9 +25,9 @@ const MAX_DISPLAY_NAME: usize = 256;
 /// removal cut short (the daemon stopped) can be run again.
 pub const REMOVING: &str = "removing";
 /// Why signing in an account again with another one is refused. The texts of a sign-in go to the
-/// window only (spec 8.8): they are in its language.
-pub fn other_account() -> &'static str {
-    i18n::pick(
+/// window only (spec 8.8): they are in its language, the one it had when the sign-in started.
+pub fn other_account(lang: Lang) -> &'static str {
+    lang.pick(
         "to jest inne konto - zaloguj się kontem, które ponownie logujesz, albo najpierw usuń stare konto i dodaj nowe",
         "this is another account - sign in with the account you are signing in again, or remove the old account first and add the new one",
     )
@@ -162,7 +162,7 @@ impl Accounts {
             Lang::Pl => format!("konto {id} usunięto w trakcie logowania"),
             Lang::En => format!("account {id} was removed during the sign-in"),
         };
-        let other_account = other_account();
+        let other_account = other_account(lang);
         // The sign-in took a while: the module may have been turned off or replaced meanwhile, and
         // the account signed in again may have been removed.
         // An account signed in again is only updated, never inserted: one removed meanwhile does
