@@ -252,9 +252,12 @@ async fn updates_in_english() {
     );
     assert_eq!(NotInstallable::UnknownTaskDataDir.text(Lang::En), "it is not known which data folder the open_mess task gives");
 
-    // The last result, as the helper or the daemon wrote it.
-    std::fs::write(d.dir.path().join("last-update.txt"), "aborted: the update helper did not start\n").unwrap();
-    assert_eq!(service.view().last_result.as_deref(), Some("aborted: the update helper did not start"));
+    // The last result, as the helper or the daemon wrote it: as it is; one an earlier version wrote
+    // in Polish too.
+    for written in ["aborted: the update helper did not start", "rollback failed: x; backup: C:\\b", "przerwano: brak ważnej zgody"] {
+        std::fs::write(d.dir.path().join("last-update.txt"), format!("{written}\n")).unwrap();
+        assert_eq!(service.view().last_result.as_deref(), Some(written));
+    }
 
     let installable = updates(&d, Ok(()), local.path());
     assert_eq!(installable.install(), Err("no downloaded version to install".to_string()));

@@ -409,13 +409,13 @@ async fn status_shows_no_local_paths() {
     // A failed rollback names its backup; a version folder holding one refuses the download.
     let backup = h.paths.updates().join("9.9.9").join("backup");
     std::fs::create_dir_all(&backup).unwrap();
-    std::fs::write(h.paths.last_result(), format!("wycofanie nieudane: x; kopia zapasowa: {}\n", backup.display())).unwrap();
+    std::fs::write(h.paths.last_result(), format!("rollback failed: x; backup: {}\n", backup.display())).unwrap();
     h.check().await;
 
     // The window gets every text.
     let view = h.service.view();
     assert!(matches!(&view.state, UpdateState::Error(why) if why.contains(&h.paths.updates().display().to_string())), "{:?}", view.state);
-    assert!(view.last_result.unwrap().contains(&backup.display().to_string()));
+    assert_eq!(view.last_result, Some(format!("wycofanie nieudane: x; kopia zapasowa: {}", backup.display())));
     assert_eq!(view.installable, Err(reason.text(Lang::Pl)));
 
     // Agents get none of them.
@@ -453,6 +453,8 @@ async fn cancel_and_a_helper_that_did_not_start_go_back_to_work() {
     assert_eq!(h.launched().len(), 1);
     let view = h.service.view();
     assert_eq!(view.state, UpdateState::Ready);
+    // Written in English, as every result is; the window shows it in its language.
+    assert_eq!(std::fs::read_to_string(h.paths.last_result()).unwrap(), "aborted: the update helper did not start\n");
     assert_eq!(view.last_result.as_deref(), Some("przerwano: the update helper did not start"));
     assert!(matches!(state::read(&h.paths.pending_file()), Read::Missing));
     // Tool calls are taken again.

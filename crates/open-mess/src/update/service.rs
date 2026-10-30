@@ -17,6 +17,7 @@ use tokio::sync::{Notify, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 
 use super::UpdateError;
+use super::apply::{BACKUP_MARK, Outcome};
 use super::consent;
 use super::fetch::{Downloaded, Source, client, download, latest};
 use super::quiesce::{Activity, Launcher, finish_work, launch, resume, switch};
@@ -103,7 +104,7 @@ pub struct UpdateView {
     /// A new version is being checked: nothing is installed or saved meanwhile (spec 7.2).
     pub probation: bool,
     pub auto_install: bool,
-    /// The last installation's result, from `last-update.txt`.
+    /// The last installation's result, from `last-update.txt`, in the window's language.
     pub last_result: Option<String>,
 }
 
@@ -279,7 +280,7 @@ impl UpdateService {
             installable: self.installable(),
             probation: self.held(),
             auto_install: self.auto_install(),
-            last_result: last_result(&self.0.setup.paths),
+            last_result: last_result(&self.0.setup.paths).map(|raw| localize_result(&raw, i18n::current())),
         }
     }
 
@@ -523,7 +524,7 @@ impl UpdateService {
             Err(err @ UpdateError::StageFileLeft(_)) => self.set_state(UpdateState::Error(err.to_string())),
             Err(err) => {
                 resume(&activity).await;
-                state::record_result(&setup.paths, &format!("przerwano: {err}"));
+                state::record_result(&setup.paths, &Outcome::Aborted(err.to_string()));
                 self.back_to_ready();
             }
         }
@@ -542,6 +543,29 @@ fn last_result(paths: &Paths) -> Option<String> {
     std::fs::File::open(paths.last_result()).ok()?.take(MAX_RESULT).read_to_end(&mut bytes).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     text.lines().next().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned)
+}
+
+/// `last-update.txt` as the window shows it: the English form an [`Outcome`] is written in, put in
+/// `lang`. The reason inside stays as it is, but for the backup's folder of a failed rollback; a line
+/// that does not start as an outcome does (one an earlier version wrote) is shown as it is.
+pub fn localize_result(raw: &str, lang: Lang) -> String {
+    let outcomes = match lang {
+        Lang::En => return raw.to_owned(),
+        Lang::Pl => [
+            ("rolled back: ", "przywrócono: "),
+            ("rollback deferred: ", "wycofanie odłożone: "),
+            ("rollback failed: ", "wycofanie nieudane: "),
+            ("aborted: ", "przerwano: "),
+            ("installed", "zainstalowano"),
+        ],
+    };
+    let Some((outcome, rest)) = outcomes.iter().find_map(|(en, pl)| raw.strip_prefix(en).map(|rest| (pl, rest))) else {
+        return raw.to_owned();
+    };
+    match rest.rsplit_once(BACKUP_MARK) {
+        Some((why, backup)) => format!("{outcome}{why}; kopia zapasowa: {backup}"),
+        None => format!("{outcome}{rest}"),
+    }
 }
 
 /// Whether this daemon can install an update (spec 7): it runs as `<local>\bin\om.exe`, and its data
@@ -591,4 +615,36 @@ fn task_data_dir() -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn task_data_dir() -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_result_in_the_window_s_language() {
+        let backup = r"C:\Users\x\AppData\Local\open_mess\updates\9.9.9\backup";
+        let failed = format!("the update was interrupted; om.exe could not be restored{BACKUP_MARK}{backup}");
+        for (outcome, pl) in [
+            (Outcome::Installed, "zainstalowano".to_owned()),
+            (Outcome::RolledBack("module test-echo crashed".into()), "przywrócono: module test-echo crashed".to_owned()),
+            (Outcome::Aborted("no valid consent".into()), "przerwano: no valid consent".to_owned()),
+            (
+                Outcome::RollbackFailed(failed),
+                format!("wycofanie nieudane: the update was interrupted; om.exe could not be restored; kopia zapasowa: {backup}"),
+            ),
+            (Outcome::Postponed("the daemon did not stop".into()), "wycofanie odłożone: the daemon did not stop".to_owned()),
+        ] {
+            let raw = outcome.to_string();
+            assert_eq!(localize_result(&raw, Lang::En), raw);
+            assert_eq!(localize_result(&raw, Lang::Pl), pl, "{raw}");
+        }
+        // Only the last backup mark is the backup's: an earlier one belongs to the reason.
+        assert_eq!(localize_result("rollback failed: a; backup: b; backup: c", Lang::Pl), "wycofanie nieudane: a; backup: b; kopia zapasowa: c");
+        // Lines no outcome wrote, an earlier version's Polish ones among them, stay as they are.
+        for raw in ["something else; backup: x", "przerwano: brak ważnej zgody", "wycofanie nieudane: x; kopia zapasowa: C:\\b", "rolled back"] {
+            assert_eq!(localize_result(raw, Lang::Pl), raw);
+            assert_eq!(localize_result(raw, Lang::En), raw);
+        }
+    }
 }

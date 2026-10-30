@@ -36,7 +36,10 @@ const MAX_MANIFEST: u64 = 64 * 1024;
 const MAX_NUMBERED: u32 = 100;
 /// The backup's folder, in the update folder.
 const BACKUP: &str = "backup";
-const NO_CONSENT: &str = "brak ważnej zgody";
+/// Before the backup's folder in the reason of a failed rollback; the window finds it there to put
+/// it in its language (service.rs).
+pub const BACKUP_MARK: &str = "; backup: ";
+const NO_CONSENT: &str = "no valid consent";
 const UNREADABLE: &str = "update-pending.json is unreadable";
 
 /// What the helper needs from Windows; tests fake it.
@@ -57,7 +60,9 @@ pub enum Health {
     Failed(String),
 }
 
-/// How a run ended. All but `Nothing` go to `last-update.txt`, for the window.
+/// How a run ended. All but `Nothing` go to `last-update.txt`, for the window, in a fixed English
+/// form: the helper and a new daemon write it without knowing the window's language, which puts it
+/// in its own when it reads it (spec 2026-10-30-ui-languages, 6). The logs get the same text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// No update to install or to finish, or another helper's turn: nothing was touched.
@@ -77,11 +82,11 @@ impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Outcome::Nothing => Ok(()),
-            Outcome::Installed => f.write_str("zainstalowano"),
-            Outcome::RolledBack(why) => write!(f, "przywrócono: {why}"),
-            Outcome::Aborted(why) => write!(f, "przerwano: {why}"),
-            Outcome::RollbackFailed(why) => write!(f, "wycofanie nieudane: {why}"),
-            Outcome::Postponed(why) => write!(f, "wycofanie odłożone: {why}"),
+            Outcome::Installed => f.write_str("installed"),
+            Outcome::RolledBack(why) => write!(f, "rolled back: {why}"),
+            Outcome::Aborted(why) => write!(f, "aborted: {why}"),
+            Outcome::RollbackFailed(why) => write!(f, "rollback failed: {why}"),
+            Outcome::Postponed(why) => write!(f, "rollback deferred: {why}"),
         }
     }
 }
@@ -157,7 +162,7 @@ pub fn run(paths: &Paths, system: &dyn System, public_key: &str, now: fn() -> i6
         // Never finished forwards (spec 7.6).
         Read::Found(pending) => roll_back(paths, system, pending, "the update was interrupted".into(), now),
     };
-    state::record_result(paths, &outcome.to_string());
+    state::record_result(paths, &outcome);
     outcome
 }
 
@@ -344,7 +349,7 @@ fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: 
         }
         Err(failed) => {
             let _ = remove_stage_file(paths);
-            Outcome::RollbackFailed(start(system, format!("{why}; {failed}; kopia zapasowa: {}", backup.display())))
+            Outcome::RollbackFailed(start(system, format!("{why}; {failed}{BACKUP_MARK}{}", backup.display())))
         }
     }
 }

@@ -482,7 +482,7 @@ async fn daemon_finishes_check_when_helper_dies() {
     drop(helper);
     ended(watching, 2 * SECOND).await;
     assert_eq!(stage_file(&t.paths), None);
-    assert_eq!(std::fs::read_to_string(t.paths.last_result()).unwrap(), "zainstalowano\n");
+    assert_eq!(std::fs::read_to_string(t.paths.last_result()).unwrap(), "installed\n");
     assert!(!t.on() && !t.held() && !t.write_refused().await);
     assert!(!notified(&t.exit).await);
     assert!(t.task.launched().is_empty());
