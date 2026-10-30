@@ -1444,11 +1444,46 @@ token, tenant id, user id or account name.
       probe with the web client's build number in `X-Microsoft-Skype-Client` (a run the session's
       permission classifier had stopped): the same result, `m=x-data 0` in the renegotiation answer -
       the client version is not what the service decides on.
-    - Still open: why the service rejects the probe's data section. What is left between the web
-      client and the probe is that the web client offers audio `sendrecv` and video, which the
-      live captions spec rules out (no audio or image sent or received). Offering a receive-only
-      screen-sharing section (the web client's `ScreenViewer` modality) was not tried for the same
-      reason. No caption message (data id 3) has arrived yet.
+    - Two diagnostics the owner decided on also left the data section at port 0: audio `sendrecv`
+      with no track (the service then sends audio; webrtc-rs dropped it undecoded, as there was no
+      track handler) and the renegotiation above. The cause was elsewhere - item 16.
+
+16. **Live captions received** (2026-10-30, the owner's meeting with nine or ten other people,
+    captions on, his OK in chat for a series of runs; the probe counts, prints key names only and
+    never reads, prints or stores caption text, names or ids):
+    - **The cause of the rejected data section**: the client's MS-SDP converter (`Kz.modify` in
+      `calling-pluginless`) gives the `m=x-data ... 127 126` section the lines
+      `a=rtpmap:127 x-data/90000`, `a=rtpmap:126 rtx/90000` and `a=fmtp:126 apt=127`; the probe
+      did not, and the service answered the section with port 0. (The capture tool of item 14 left
+      `rtpmap` and `fmtp` lines out of its print, which hid them.) For the answer the client's
+      `Xz` turns the section back into `m=application <port> UDP/DTLS/SCTP webrtc-datachannel`,
+      drops its `rtpmap`, `fmtp`, `rtcp` and x- lines and adds `a=sctp-port` (the answer has none).
+    - **The working offer**: one BUNDLE of `m=audio` `sendonly` with no track (nothing is sent; the
+      service answers `recvonly`, so it sends no audio) and `m=x-data <port> RTP/SAVP 127 126`
+      with the three lines above, `a=x-data-protocol:sctp`, `a=x-ssrc-range:<n>-<n>`, `a=rtcp-mux`,
+      `a=setup:actpass`, `a=sendrecv`, `a=sctp-port:5000`, `a=max-message-size:262144`,
+      `a=label:data`, one host candidate and `a=ice-options:trickle`; `callModalities: ["Audio"]`,
+      one `mediaLegId` for the call. The data section goes in the first offer; no renegotiation is
+      needed.
+    - **The answer** (in `/call/acceptance/`): audio `recvonly` on port 3478 and **`m=x-data 3478
+      RTP/SAVP 127 126`** with `a=label:data` and `a=x-data-protocol:sctp`, four relay candidates
+      in 52.112.0.0/16; ICE and DTLS (P-384, item 15) connected and the SCTP data channel
+      `main-channel` opened once.
+    - **Captions arrived with nothing sent on the channel**: in 120 s 301 messages, all on data id
+      3, framed as section 10.7 says (0 broken frames); 299 recognition results, 24 of them
+      final. A second run of 30 s: 55 messages, 54 results, 11 final. Message top keys
+      `events`, `recognitionResults`, `version`; result keys `confidence`, `displayName`,
+      `duration`, `id`, `isFinal`, `model`, `source`, `speechRecognitionServiceLatency`,
+      `spokenLanguage`, `temporaryStorageOnly`, `text`, `timestampAudioSent`, `trackLanguage`,
+      `userId`. No `textTracks` in these runs.
+    - So step 0b of the live captions spec is answered: a data-only offer is not accepted, but an
+      offer with audio `sendonly` and no track plus the data section is, the leg lives without
+      audio flowing (two minutes, ended by the probe's own `leave`, HTTP 204), the caption messages
+      are on data id 3, and the other participants saw nothing (item 15). The steps the module
+      needs are those of items 14-16: registrar registration, Trouter v4c with
+      `user.authenticate`, the regional `epconv` request with `meetingData` (or the live call's
+      URL), `notificationLinks`, the join without a `payload` envelope, the acceptance
+      acknowledgement, MS-SDP both ways, and a DTLS stack that verifies P-384 with SHA-256.
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
