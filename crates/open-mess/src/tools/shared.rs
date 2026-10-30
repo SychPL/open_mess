@@ -155,8 +155,8 @@ pub fn tools() -> Vec<ToolInfo> {
         tool(
             "pending",
             "The writes (send, edit, react) of the last 7 days, newest first, and their states: waiting (for the user's approval), \
-             approved (running), done, rejected, expired, voided (the conversation or message changed after the approval; nothing \
-             was sent), uncertain (it may have reached the platform: check the conversation before trying again) or failed. Never \
+             approved (running), done, rejected, expired, voided (the conversation or message changed after the approval, or the user \
+             turned writing off; nothing was sent), uncertain (it may have reached the platform: check the conversation before trying again) or failed. Never \
              shows message text.",
             json!({
                 "account": optional_account,
