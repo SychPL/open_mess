@@ -389,8 +389,9 @@ const PAGE_BYTES: std::ops::RangeInclusive<u64> = 4096..=786_432;
 const MAX_TRANSCRIPTS: usize = 200;
 
 /// One page of a meeting's transcript (spec 2026-10-28-meetings-transcripts, 4.2): MCPS names the
-/// transcripts, the user's own OneDrive or team sites hold them. Only GETs; until the D3 gate has
-/// passed, only recordings the user owns, so a view, if reading counts as one, is the user's own.
+/// transcripts, OneDrives or team sites of the user's organization hold them. Only GETs; reading
+/// someone else's recording may count as one view in its owner's analytics, which the owner of
+/// open_mess accepted (spec section 10, D3).
 fn get_transcript(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let conversation = required(args, "conversation")?;
     if !meetings::is_meeting_thread(conversation) {
@@ -476,14 +477,8 @@ fn get_transcript(session: &mut Session, args: &Value) -> Result<Value, ModuleEr
     if !v2.owner_tenant.eq_ignore_ascii_case(&tenant) {
         return Err(ModuleError::NotSupported("the transcript is stored by another organization".to_string()));
     }
-    let site = personal_site(session)?;
-    let origin = meetings::own_origin(&v2.location, &site.tenant)
+    let origin = meetings::own_origin(&v2.location, &sharepoint_tenant(session)?)
         .ok_or_else(|| ModuleError::Platform("transcript stored outside your organization".to_string()))?;
-    if !meetings::in_own_onedrive(&v2.location, &site) {
-        return Err(ModuleError::NotSupported(
-            "this transcript belongs to someone else's recording, and reading it may show as a view to its owner".to_string(),
-        ));
-    }
     let (drive, item) = (v2.drive_id.as_str(), v2.drive_item_id.as_str());
     let list = meetings::transcript_list(&origin, drive, item).map_err(api::proto)?;
     let Some(odsp) = meetings::decode_transcript_list(&api::sharepoint(session, &origin, &list)?, v2.transcript_id.as_deref()).map_err(api::proto)?
@@ -505,17 +500,18 @@ fn get_transcript(session: &mut Session, args: &Value) -> Result<Value, ModuleEr
     result(Some(&chosen.id), Some(&odsp.version), odsp.language, page, next, None)
 }
 
-/// The user's own OneDrive, read once a session (spec 4.2 step 4).
-fn personal_site(session: &mut Session) -> Result<meetings::PersonalSite, ModuleError> {
-    if let Some(site) = &session.personal_site {
-        return Ok(site.clone());
+/// The label of the organization's SharePoint, from the user's own OneDrive, read once a session
+/// (spec 4.2 step 4).
+fn sharepoint_tenant(session: &mut Session) -> Result<String, ModuleError> {
+    if let Some(tenant) = &session.sharepoint_tenant {
+        return Ok(tenant.clone());
     }
     let request = meetings::user_properties(&session.directory.chat_service);
-    let site = meetings::decode_personal_site(&api::read(session, Service::Chat, &request)?)
+    let tenant = meetings::decode_personal_site(&api::read(session, Service::Chat, &request)?)
         .map_err(api::proto)?
         .ok_or_else(|| ModuleError::NotSupported("cannot tell your organization's SharePoint".to_string()))?;
-    session.personal_site = Some(site.clone());
-    Ok(site)
+    session.sharepoint_tenant = Some(tenant.clone());
+    Ok(tenant)
 }
 
 /// An AMS image of a message: only one the message references (docs 7).

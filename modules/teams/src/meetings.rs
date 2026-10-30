@@ -354,42 +354,22 @@ pub fn user_properties(chat_service: &Url) -> HttpRequest {
     HttpRequest { method: "GET".to_string(), url: url.into(), headers, body: Vec::new() }
 }
 
-/// The user's own OneDrive: the label `<t>` of `https://<t>-my.sharepoint.com` and the site's path,
-/// `/personal/<...>`, lowercase.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PersonalSite {
-    pub tenant: String,
-    pub path: String,
-}
-
-/// The user's OneDrive from the user's properties: `personalFileSite` is JSON in a string, its
-/// `personalSiteUrl` `https://<t>-my.sharepoint.com/personal/...` ("Live results" 9). None without
-/// `personalFileSite`.
-pub fn decode_personal_site(body: &[u8]) -> Result<Option<PersonalSite>, ProtoError> {
+/// The label `<t>` of the organization's SharePoint from the user's properties: `personalFileSite`
+/// is JSON in a string, its `personalSiteUrl` `https://<t>-my.sharepoint.com/personal/...` ("Live
+/// results" 9). None without `personalFileSite`.
+pub fn decode_personal_site(body: &[u8]) -> Result<Option<String>, ProtoError> {
     let v = parse_json(body)?;
     let Some(site) = v.get("personalFileSite") else { return Ok(None) };
     let bad = || incompatible("personalFileSite");
     let site: Value = site.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(bad)?;
     let url = site.get("personalSiteUrl").and_then(Value::as_str).and_then(|u| Url::parse(u).ok()).ok_or_else(bad)?;
     let label = url.host_str().and_then(|host| host.strip_suffix("-my.sharepoint.com")).map(str::to_string);
-    let path = url.path().trim_end_matches('/').to_ascii_lowercase();
+    let path = url.path().trim_end_matches('/');
     let plain = url.scheme() == "https" && url.port().is_none() && url.username().is_empty() && path.len() > "/personal/".len();
     match label {
-        Some(tenant) if plain && path.starts_with("/personal/") && dns_label(&tenant) => Ok(Some(PersonalSite { tenant, path })),
+        Some(tenant) if plain && path.starts_with("/personal/") && dns_label(&tenant) => Ok(Some(tenant)),
         _ => Err(bad()),
     }
-}
-
-/// Whether a transcript's `location` lies in the user's own OneDrive, so that its analytics are the
-/// user's own (spec 4.2 step 3).
-pub fn in_own_onedrive(location: &str, site: &PersonalSite) -> bool {
-    let Ok(url) = Url::parse(location) else { return false };
-    let host = format!("{}-my.sharepoint.com", site.tenant);
-    url.scheme() == "https"
-        && url.port().is_none()
-        && url.username().is_empty()
-        && url.host_str() == Some(host.as_str())
-        && url.path().to_ascii_lowercase().starts_with(&format!("{}/", site.path))
 }
 
 /// One lowercase DNS label, as the host's WAM scope pattern takes it.
@@ -917,20 +897,7 @@ mod tests {
     #[test]
     fn personal_site_names_the_tenant_label() {
         let body = include_bytes!("../tests/fixtures/user_properties.json");
-        let site = decode_personal_site(body).unwrap().unwrap();
-        assert_eq!(site, PersonalSite { tenant: "synthetic".into(), path: "/personal/person_one_synthetic_example".into() });
-        let own = "https://synthetic-my.sharepoint.com/personal/Person_One_Synthetic_Example/Documents/Recordings/r.mp4";
-        assert!(in_own_onedrive(own, &site));
-        for other in [
-            "https://synthetic-my.sharepoint.com/personal/person_two_synthetic_example/Documents/r.mp4",
-            "https://synthetic-my.sharepoint.com/personal/person_one_synthetic_example_x/Documents/r.mp4",
-            "https://synthetic-my.sharepoint.com/personal/person_one_synthetic_example",
-            "https://synthetic.sharepoint.com/personal/person_one_synthetic_example/r.mp4",
-            "https://synthetic.sharepoint.com/sites/team/r.mp4",
-            "http://synthetic-my.sharepoint.com/personal/person_one_synthetic_example/r.mp4",
-        ] {
-            assert!(!in_own_onedrive(other, &site), "{other}");
-        }
+        assert_eq!(decode_personal_site(body).unwrap().as_deref(), Some("synthetic"));
         assert_eq!(decode_personal_site(br#"{"locale": "en-us"}"#).unwrap(), None);
         let site = |url: &str| json!({"personalFileSite": json!({"personalSiteUrl": url}).to_string()}).to_string().into_bytes();
         for bad in [

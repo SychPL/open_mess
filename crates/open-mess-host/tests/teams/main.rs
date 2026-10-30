@@ -1349,6 +1349,7 @@ async fn too_many_meetings_ask_for_a_narrower_window() {
 const MCPS_PATH: &str = "/api/mcps/eu/contents";
 const PROPERTIES_PATH: &str = "/api/chatsvc/emea/v1/users/ME/properties";
 const SHAREPOINT: &str = "synthetic-my.sharepoint.com";
+const TEAM_SITES: &str = "synthetic.sharepoint.com";
 const MCPS_SCOPE: &str = "6bc3b958-689b-49f5-9006-36d165f30e00/.default";
 const SHAREPOINT_SCOPE: &str = "https://synthetic-my.sharepoint.com/.default";
 
@@ -1374,11 +1375,11 @@ fn transcript_server(
             Some(Reply::json(body))
         } else if s.path == PROPERTIES_PATH {
             Some(Reply::json(json_fixture("user_properties.json")))
-        } else if s.host == SHAREPOINT && s.path.ends_with("/media/transcripts") {
+        } else if [SHAREPOINT, TEAM_SITES].contains(&s.host.as_str()) && s.path.ends_with("/media/transcripts") {
             let mut body = json_fixture("odsp_transcripts.json");
             list(lists.fetch_add(1, Ordering::SeqCst), &mut body);
             Some(Reply::json(body))
-        } else if s.host == SHAREPOINT && s.path.ends_with("/streamContent") {
+        } else if [SHAREPOINT, TEAM_SITES].contains(&s.host.as_str()) && s.path.ends_with("/streamContent") {
             Some(Reply { body: fixture("transcript.vtt"), ..Reply::status(200) }.header("content-type", "text/vtt"))
         } else {
             None
@@ -1425,22 +1426,24 @@ async fn get_transcript_reads_the_users_own_recording() {
 }
 
 #[tokio::test]
-async fn someone_elses_recording_is_refused_before_any_sharepoint_token() {
+async fn someone_elses_recording_in_the_organization_is_read() {
+    // The owner's decision of 2026-10-30 (spec section 10, D3): every meeting the user is in.
     let teams = Teams::signed_in().await;
     let colleague = "https://synthetic-my.sharepoint.com/personal/person_two_synthetic_example/Documents/Recordings/r.mp4";
     teams.fake.on(transcript_server(move |v| v["resources"][0]["location"] = json!(colleague), same_list));
-    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
-    assert!(matches!(&error, ModuleError::NotSupported(why) if why.contains("someone else's recording")), "{error:?}");
-    assert_eq!(sharepoint_tokens(&teams), 0);
-    assert!(teams.fake.seen().iter().all(|s| s.host != SHAREPOINT));
-    // A team site is not the user's either; the user's own OneDrive in other letter case is.
+    let result = teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!(result["untrusted"]["cues"].as_array().unwrap().len(), 3);
+    let onedrive: Vec<fake::Seen> = teams.fake.seen().into_iter().filter(|s| s.host == SHAREPOINT).collect();
+    assert_eq!(onedrive.len(), 3);
+    assert!(onedrive.iter().all(|s| s.method == "GET" && s.audience().as_deref() == Some("https://synthetic-my.sharepoint.com")));
+    // A channel meeting's recording on a team site of the organization.
     teams.fake.on(transcript_server(|v| v["resources"][0]["location"] = json!("https://synthetic.sharepoint.com/sites/team/r.mp4"), same_list));
-    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
-    assert!(matches!(&error, ModuleError::NotSupported(why) if why.contains("someone else's recording")), "{error:?}");
-    assert_eq!(sharepoint_tokens(&teams), 0);
-    let own = "https://synthetic-my.sharepoint.com/personal/Person_One_Synthetic_Example/Documents/Recordings/r.mp4";
-    teams.fake.on(transcript_server(move |v| v["resources"][0]["location"] = json!(own), same_list));
-    teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    let result = teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!(result["untrusted"]["cues"].as_array().unwrap().len(), 3);
+    let team: Vec<fake::Seen> = teams.fake.seen().into_iter().filter(|s| s.host == TEAM_SITES).collect();
+    assert_eq!(team.len(), 3);
+    assert!(team.iter().all(|s| s.method == "GET" && s.audience().as_deref() == Some("https://synthetic.sharepoint.com")));
+    assert!(teams.wam.calls().iter().any(|c| c.scopes == ["https://synthetic.sharepoint.com/.default"] && !c.interactive));
 }
 
 #[tokio::test]
