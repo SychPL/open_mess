@@ -209,7 +209,8 @@ pub struct Cue {
 /// Parses a WebVTT transcript (`streamContent?is=1`, docs 9.5): the `WEBVTT` header, then cues of
 /// an optional identifier, a timing line `[HH:]MM:SS.mmm --> [HH:]MM:SS.mmm` (settings after it
 /// ignored) and text, where `<v Name>` names the speaker; other tags are dropped. At most
-/// [`MAX_CUES`] cues; texts and speakers past their limits are cut with a mark.
+/// [`MAX_CUES`] cues, more is an error rather than a silently shorter transcript; texts and
+/// speakers past their limits are cut with a mark.
 pub fn parse_vtt(body: &[u8]) -> Result<Vec<Cue>, ProtoError> {
     let text = std::str::from_utf8(body).map_err(|_| incompatible("vtt"))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text).replace("\r\n", "\n").replace('\r', "\n");
@@ -233,7 +234,7 @@ pub fn parse_vtt(body: &[u8]) -> Result<Vec<Cue>, ProtoError> {
         }
         let Some(at) = lines.iter().take(2).position(|line| line.contains("-->")) else { continue };
         if cues.len() == MAX_CUES {
-            break;
+            return Err(incompatible("vtt.cues"));
         }
         let timing = lines.get(at).copied().unwrap_or_default();
         let (start, rest) = timing.split_once("-->").ok_or_else(|| incompatible("vtt.timing"))?;
@@ -537,9 +538,10 @@ mod tests {
         assert_eq!(cues[0].speaker.as_ref().unwrap().chars().count(), MAX_SPEAKER);
         assert_eq!(cues[0].text.chars().count(), MAX_CUE_TEXT);
         assert!(cues[0].text.ends_with(CUT));
-        let many: String =
-            std::iter::once("WEBVTT\n".to_string()).chain((0..MAX_CUES + 10).map(|_| "\n00:00.000 --> 00:01.000\nx\n".to_string())).collect();
-        assert_eq!(parse_vtt(many.as_bytes()).unwrap().len(), MAX_CUES);
+        let cues =
+            |n| -> String { std::iter::once("WEBVTT\n".to_string()).chain((0..n).map(|_| "\n00:00.000 --> 00:01.000\nx\n".to_string())).collect() };
+        assert_eq!(parse_vtt(cues(MAX_CUES).as_bytes()).unwrap().len(), MAX_CUES);
+        assert_eq!(parse_vtt(cues(MAX_CUES + 1).as_bytes()), Err(ProtoError::Incompatible("vtt.cues".to_string())));
     }
 
     #[test]
