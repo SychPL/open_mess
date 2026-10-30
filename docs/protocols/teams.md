@@ -1476,10 +1476,15 @@ token, tenant id, user id or account name.
       `duration`, `id`, `isFinal`, `model`, `source`, `speechRecognitionServiceLatency`,
       `spokenLanguage`, `temporaryStorageOnly`, `text`, `timestampAudioSent`, `trackLanguage`,
       `userId`. No `textTracks` in these runs.
-    - So step 0b of the live captions spec is answered: a data-only offer is not accepted, but an
-      offer with audio `sendonly` and no track plus the data section is, the leg lives without
-      audio flowing (two minutes, ended by the probe's own `leave`, HTTP 204), the caption messages
-      are on data id 3, and the other participants saw nothing (item 15). The steps the module
+    - So step 0b of the live captions spec is answered, but for one offer only: audio `sendonly`
+      with no track plus the data section is accepted. The data-only offer and the offer with
+      audio `inactive` (item 15) were tried only before the three lines above were added, so
+      whether either of them works now is still open (a retest, step 0c of the spec). The leg
+      lives without audio flowing (two minutes, ended by the probe's own `leave`, HTTP 204), the
+      caption messages are on data id 3, and the other participants saw nothing (item 15). The
+      join that received captions went through the `epconv` request with `meetingData` from a
+      meeting link; the join at the call store's `conversationController` (item 15, HTTP 200)
+      has not yet carried the data section. The steps the module
       needs are those of items 14-16: registrar registration, Trouter v4c with
       `user.authenticate`, the regional `epconv` request with `meetingData` (or the live call's
       URL), `notificationLinks`, the join without a `payload` envelope, the acceptance
