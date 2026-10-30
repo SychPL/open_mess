@@ -813,8 +813,9 @@ token, tenant id, user id or account name.
       `webUrl`. **`metadata.startTime` and `endTime` are not ISO times but strings of 18 digits,
       .NET ticks** (100 ns since 0001-01-01 UTC): read so, they were 0 and 64 minutes after the
       calendar event's start. `ownerTenantId` was the account's tenant; `organizerTenantId` was an
-      empty string; `ownerId` was neither the owner nor the organizer (whoever started the
-      transcription). `id` 60 characters `[-0-9A-Za-z]`, `driveId` 66 `[!0-9A-Za-z]`, `driveItemId`
+      empty string; `ownerId` was neither the owner nor the organizer (who it names - whoever
+      started the recording or the transcription - is NOT confirmed, so spec 4.2 does not rely on
+      it). `id` 60 characters `[-0-9A-Za-z]`, `driveId` 66 `[!0-9A-Za-z]`, `driveItemId`
       34 `[0-9A-Z]`, `transcriptId` 36 `[-0-9a-z]` - all inside the classes of spec 4.2 step 4.
       `location` lay on the organization's OneDrive origin (`https://<t>-my.sharepoint.com`), and the
       WAM token for that origin was granted.

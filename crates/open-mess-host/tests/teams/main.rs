@@ -1342,3 +1342,193 @@ async fn too_many_meetings_ask_for_a_narrower_window() {
     let error = module_error(teams.call("list_meetings", json!({})).await);
     assert!(matches!(&error, ModuleError::Platform(why) if why.contains("narrow from/to")), "{error:?}");
 }
+
+// Stage 2: transcripts (spec 2026-10-28-meetings-transcripts, 4.2), against the shapes of "Live
+// results" 12 with synthetic values.
+
+const MCPS_PATH: &str = "/api/mcps/eu/contents";
+const PROPERTIES_PATH: &str = "/api/chatsvc/emea/v1/users/ME/properties";
+const SHAREPOINT: &str = "synthetic-my.sharepoint.com";
+const MCPS_SCOPE: &str = "6bc3b958-689b-49f5-9006-36d165f30e00/.default";
+const SHAREPOINT_SCOPE: &str = "https://synthetic-my.sharepoint.com/.default";
+
+fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/teams/tests/fixtures").join(name)).unwrap()
+}
+
+fn json_fixture(name: &str) -> Value {
+    serde_json::from_slice(&fixture(name)).unwrap()
+}
+
+/// MCPS, the user's properties and SharePoint as the live check saw them; `mcps` and `list` change
+/// them per test, `list` with the number of the list read (0, 1, ...).
+fn transcript_server(
+    mcps: impl Fn(&mut Value) + Send + Sync + 'static,
+    list: impl Fn(usize, &mut Value) + Send + Sync + 'static,
+) -> impl Fn(&fake::Seen) -> Option<Reply> {
+    let lists = AtomicUsize::new(0);
+    move |s| {
+        if s.path == MCPS_PATH {
+            let mut body = json_fixture("mcps_contents.json");
+            mcps(&mut body);
+            Some(Reply::json(body))
+        } else if s.path == PROPERTIES_PATH {
+            Some(Reply::json(json_fixture("user_properties.json")))
+        } else if s.host == SHAREPOINT && s.path.ends_with("/media/transcripts") {
+            let mut body = json_fixture("odsp_transcripts.json");
+            list(lists.fetch_add(1, Ordering::SeqCst), &mut body);
+            Some(Reply::json(body))
+        } else if s.host == SHAREPOINT && s.path.ends_with("/streamContent") {
+            Some(Reply { body: fixture("transcript.vtt"), ..Reply::status(200) }.header("content-type", "text/vtt"))
+        } else {
+            None
+        }
+    }
+}
+
+fn unchanged(_: &mut Value) {}
+
+fn same_list(_: usize, _: &mut Value) {}
+
+fn sharepoint_tokens(teams: &Teams) -> usize {
+    teams.wam.calls().iter().filter(|c| c.scopes.iter().any(|s| s.contains("sharepoint"))).count()
+}
+
+#[tokio::test]
+async fn get_transcript_reads_the_users_own_recording() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(transcript_server(unchanged, same_list));
+    let result = teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    let cues = result["untrusted"]["cues"].as_array().unwrap();
+    assert_eq!(cues.len(), 3);
+    assert_eq!(cues[0], json!({"start": "00:00:01.000", "end": "00:00:04.500", "speaker": "Synthetic Person One", "text": "First synthetic line."}));
+    assert_eq!((&result["language"], &result["next_cursor"], &result["reason"]), (&json!("pl-PL"), &Value::Null, &Value::Null));
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!((&result["items"][0]["start"], &result["items"][0]["selected"]), (&json!("2027-01-15T08:00:00Z"), &json!(true)));
+    assert_eq!(result["transcript"], result["items"][0]["transcript"]);
+    assert!(result["version"].is_string());
+    // Only GETs, each with its own audience; the list read before and after the content.
+    let seen: Vec<fake::Seen> = teams.fake.seen().into_iter().filter(|s| s.path != AUTHZ_PATH).collect();
+    assert!(seen.iter().all(|s| s.method == "GET"), "{seen:?}");
+    let mcps = teams.fake.requests(MCPS_PATH);
+    assert_eq!(mcps[0].audience().as_deref(), Some("6bc3b958-689b-49f5-9006-36d165f30e00"));
+    assert_eq!(mcps[0].query, "threadId=19%3Ameeting_c3ludGhldGlj%40thread.v2");
+    let sharepoint: Vec<&fake::Seen> = seen.iter().filter(|s| s.host == SHAREPOINT).collect();
+    assert_eq!(sharepoint.len(), 3);
+    assert!(sharepoint.iter().all(|s| s.audience().as_deref() == Some("https://synthetic-my.sharepoint.com")));
+    assert_eq!(sharepoint[1].query, "is=1");
+    assert!(teams.wam.calls().iter().any(|c| c.scopes == [MCPS_SCOPE] && !c.interactive));
+    assert!(teams.wam.calls().iter().any(|c| c.scopes == [SHAREPOINT_SCOPE] && !c.interactive));
+    // The OneDrive is looked up once a session.
+    teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!(teams.fake.requests(PROPERTIES_PATH).len(), 1);
+}
+
+#[tokio::test]
+async fn someone_elses_recording_is_refused_before_any_sharepoint_token() {
+    let teams = Teams::signed_in().await;
+    let colleague = "https://synthetic-my.sharepoint.com/personal/person_two_synthetic_example/Documents/Recordings/r.mp4";
+    teams.fake.on(transcript_server(move |v| v["resources"][0]["location"] = json!(colleague), same_list));
+    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
+    assert!(matches!(&error, ModuleError::NotSupported(why) if why.contains("someone else's recording")), "{error:?}");
+    assert_eq!(sharepoint_tokens(&teams), 0);
+    assert!(teams.fake.seen().iter().all(|s| s.host != SHAREPOINT));
+    // A team site is not the user's either; the user's own OneDrive in other letter case is.
+    teams.fake.on(transcript_server(|v| v["resources"][0]["location"] = json!("https://synthetic.sharepoint.com/sites/team/r.mp4"), same_list));
+    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
+    assert!(matches!(&error, ModuleError::NotSupported(why) if why.contains("someone else's recording")), "{error:?}");
+    assert_eq!(sharepoint_tokens(&teams), 0);
+    let own = "https://synthetic-my.sharepoint.com/personal/Person_One_Synthetic_Example/Documents/Recordings/r.mp4";
+    teams.fake.on(transcript_server(move |v| v["resources"][0]["location"] = json!(own), same_list));
+    teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+}
+
+#[tokio::test]
+async fn transcripts_elsewhere_get_no_token() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(transcript_server(|v| v["resources"][0]["location"] = json!("https://other-my.sharepoint.com/personal/x/r.mp4"), same_list));
+    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
+    assert!(matches!(&error, ModuleError::Platform(why) if why.contains("outside your organization")), "{error:?}");
+    teams.fake.on(transcript_server(|v| v["resources"][0]["metadata"]["ownerTenantId"] = json!("00000000-0000-0000-0000-0000000000bb"), same_list));
+    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
+    assert!(matches!(&error, ModuleError::NotSupported(why) if why.contains("another organization")), "{error:?}");
+    assert_eq!(sharepoint_tokens(&teams), 0);
+}
+
+#[tokio::test]
+async fn more_mcps_pages_are_never_picked_from() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(transcript_server(|v| v["paginationInfo"]["hasNextPage"] = json!(true), same_list));
+    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
+    assert!(matches!(&error, ModuleError::Platform(why) if why.contains("pass ical_uid")), "{error:?}");
+    // base64url of 040000008200E00074C5B7101A82E008.
+    let ical_uid = "MDQwMDAwMDA4MjAwRTAwMDc0QzVCNzEwMUE4MkUwMDg";
+    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING, "ical_uid": ical_uid})).await);
+    assert!(matches!(error, ModuleError::Incompatible(_)), "{error:?}");
+    assert!(teams.fake.requests(MCPS_PATH)[1].query.ends_with("&iCalUid=040000008200E00074C5B7101A82E008"));
+    assert_eq!(sharepoint_tokens(&teams), 0);
+}
+
+#[tokio::test]
+async fn a_transcript_that_changes_is_not_passed_off_as_the_old_one() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(transcript_server(unchanged, |n, v| v["value"][0]["cTag"] = json!(format!("c:{n}"))));
+    let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
+    assert!(matches!(&error, ModuleError::Platform(why) if why.contains("transcript changed")), "{error:?}");
+    // A later page of a version that is gone.
+    teams.fake.on(transcript_server(unchanged, same_list));
+    let first = teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    let stale = json!({"conversation": MEETING, "transcript": first["transcript"], "version": "c3RhbGU", "cursor": 1});
+    let error = module_error(teams.call("get_transcript", stale).await);
+    assert!(matches!(&error, ModuleError::Platform(why) if why.contains("transcript changed")), "{error:?}");
+}
+
+#[tokio::test]
+async fn pages_follow_the_cursor_of_one_version() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(transcript_server(unchanged, same_list));
+    let first = teams.call("get_transcript", json!({"conversation": MEETING, "max_bytes": 4096})).await.unwrap();
+    assert_eq!(first["next_cursor"], Value::Null);
+    // A cursor needs the transcript and version it pages through.
+    for args in [
+        json!({"conversation": MEETING, "cursor": 1}),
+        json!({"conversation": MEETING, "cursor": 1, "transcript": first["transcript"]}),
+        json!({"conversation": MEETING, "max_bytes": 100}),
+        json!({"conversation": MEETING, "transcript": "not+a+token"}),
+        json!({"conversation": GROUP}),
+        json!({"conversation": MEETING, "start": "yesterday"}),
+        json!({"conversation": MEETING, "start": "2027-01-15T09:00:00Z", "end": "2027-01-15T08:00:00Z"}),
+    ] {
+        assert!(matches!(module_error(teams.call("get_transcript", args.clone()).await), ModuleError::InvalidArgs(_)), "{args}");
+    }
+    let next = json!({"conversation": MEETING, "transcript": first["transcript"], "version": first["version"], "cursor": 2});
+    let page = teams.call("get_transcript", next).await.unwrap();
+    assert_eq!(page["untrusted"]["cues"].as_array().unwrap().len(), 1);
+    assert_eq!(page["untrusted"]["cues"][0]["text"], "Third.");
+}
+
+#[tokio::test]
+async fn no_transcript_and_not_ready_are_answers() {
+    let teams = Teams::signed_in().await;
+    teams.fake.on(transcript_server(|v| v["resources"].as_array_mut().unwrap().retain(|r| r["type"] != "TranscriptV2"), same_list));
+    let result = teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!((&result["reason"], &result["items"]), (&json!("no transcript"), &json!([])));
+    teams.fake.on(transcript_server(unchanged, |_, v| v["value"] = json!([])));
+    let result = teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!(result["reason"], "transcript not ready");
+    assert!(result["transcript"].is_string() && result["version"].is_null());
+}
+
+#[tokio::test]
+async fn sharepoint_refusals_are_answers_not_a_lost_sign_in() {
+    let teams = Teams::signed_in().await;
+    for (status, why) in [(403, "refused"), (401, "refused"), (404, "not found")] {
+        let ok = transcript_server(unchanged, same_list);
+        teams.fake.on(move |s| if s.host == SHAREPOINT { Some(Reply::status(status)) } else { ok(s) });
+        let error = module_error(teams.call("get_transcript", json!({"conversation": MEETING})).await);
+        assert!(matches!(&error, ModuleError::Platform(text) if text.contains(why)), "{status}: {error:?}");
+    }
+    // The account is still signed in.
+    teams.fake.on(transcript_server(unchanged, same_list));
+    teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+}
