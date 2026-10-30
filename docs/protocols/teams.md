@@ -1505,7 +1505,7 @@ token, tenant id, user id or account name.
     - Run B, the owner not in the meeting (the probe's own presence check turned off for this run):
       the `epconv` request with `meetingData` from the link and the join both gave HTTP 200, with no
       lobby (the owner organizes the meeting); the owner's entry appeared `active` with one endpoint,
-      and the observer saw "Mateusz" join. The data channel opened and captions came (110
+      and the observer saw the owner join. The data channel opened and captions came (110
       messages, 18 final; a result key `rawText` appeared next to those of item 16).
     - So a leg is never hidden: whenever any endpoint of the account is in the call, the account is
       in the roster as present. A leg without the user is not an invisible listener but a stand-in
