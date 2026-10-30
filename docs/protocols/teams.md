@@ -740,10 +740,21 @@ half of "Needs live capture" 7 and narrows 5 and 17)
   those flags come from configuration at run time and were not seen.
 - **CONFIRMED** v4c query (`buildV4cUrlParams`): `tc=<client info JSON>`,
   `timeout=<pingTimeoutMs / 1000>`, `epid=<endpoint id>`, `ccid`, `dom` (if set), `cor_id`,
-  `con_num=<client id>_<attempt>`; no `auth`, no `v`. The auth header goes on the upgrade request:
-  `X-Skypetoken` for a skype token, `Authorization: Bearer` for an AAD or CAE token. The server's
-  `trouter.connected` event then carries what allocate returns in v4a: `surl`, `connectparams`, `ttl`,
-  `ccid`, `id`, `reconnectUrl`, `curlb`.
+  `con_num=<client id>_<attempt>`; no `auth`, no `v`. The server's `trouter.connected` event then
+  carries what allocate returns in v4a: `surl`, `connectparams`, `ttl`, `ccid`, `id`,
+  `reconnectUrl`, `curlb`.
+- **CONFIRMED** (corrected 2026-10-30, REA `ev_548d5ad1...` on `cmd-trouter`, and live, "Live
+  results" 13) v4c authenticates inside the socket, not on the upgrade request (a browser WebSocket
+  cannot set headers): the socket opens anonymously (state `AnonymousConnecting`), and on `1::` the
+  client moves to `WebsocketAuthenticating` and emits the event
+  `5:::{"name":"user.authenticate","args":[{"headers":{...},"connectparams":{...}}]}`
+  (`sendV4cAuthenticationEvent`). `headers` is `extraConnectionHeaders` - one header,
+  `X-Ms-Test-User`, `"False"` for a normal user - plus the token headers of `z(token,
+  usingLegacyTokenApi)`: `X-Skypetoken` for a skype token or `Authorization: Bearer` for an AAD or
+  CAE token, and `X-MS-Migration: True` unless on the legacy token API. `connectparams` is the cached
+  `connectparams` of an earlier connection without `reconnectUrl` and `serviceUrl`, and is left out
+  on a first connection. Without this event the server sends `0::` with reason `timeout` 5 s after
+  `1::`.
 - **CONFIRMED** v4a details: allocate is a `POST` with an empty body and `Content-Type: text/plain`,
   query `cor_id`, `con_num`, `epid`, `tc` (no `auth`, no `timeout`), and the response must be JSON with
   `socketio` (base URL), `surl`, `ccid`, `id`, `ttl`, `connectparams` and optional `curlb`. The
@@ -787,7 +798,8 @@ half of "Needs live capture" 7 and narrows 5 and 17)
 - **CONFIRMED** the offer as sent: no trickle (sent after gathering), then `toOffer()`, which filters
   candidates, sets port 9 on bundle-only sections and, unless `disableMsSdp` is set, applies the MS-SDP
   transform `toMsSdp`: `msid-semantic: WMS *`, profile `RTP/SAVP`, `a=label` per section
-  (`main-audio`, ...), the data section cut down to type, port, protocol, payload `34`, mid and label,
+  (`main-audio`, ...), a disabled (port 0) section cut down to type, port, protocol, payload `34`,
+  mid and label,
   `a=x-ssrc-range` (non-multistream), `|2^31` on crypto lines, the session fingerprint copied into each
   section, candidate and extension rewrites and `rtcp` set to the m-line port. That `disableMsSdp`
   exists suggests the service also takes plain SDP; **UNCONFIRMED**.
@@ -798,6 +810,28 @@ half of "Needs live capture" 7 and narrows 5 and 17)
   balanceUpdate, retargetCompletion, ...}}}}` to `links.acknowledgement` (its own callback links). The
   client answers a callback 200 with an empty body; 400 for a missing body, a bad path or a failed
   decode, 404 for an unknown session.
+- **CONFIRMED** (added 2026-10-30) joining a call that is already running is not a `POST` to the
+  service URL above: `joinGivenConversation(conversationUrl, ...)` calls `startOrJoinCall` with
+  `newCall: false` and `conversationServiceUrl` set to the call's own conversation URL, so the join
+  goes to that URL, with the body of `uw(...)` (the keys listed above; `groupChat.messageId` is
+  `null` when the reply-chain id is unknown, not `"0"`; no `participants.to`; `endpointMetadata` is
+  the session's, an empty object `{}` by default; `endpointState` only when muted or preheating).
+  Only a new call
+  (`newCall: true`, body `EV(...)`, which adds `participants.to` and `addModalitySuccess` /
+  `addModalityFailure` / `confirmUnmute` links) goes to the service URL. The conversation URL of a
+  live call is in the chat's thread property `awareness_conversationLiveState:<n>` (a JSON string,
+  key `conversationUrl`) and equals the call store item's `conversationController` ("Live results"
+  13). Request headers (`lw`): `X-Microsoft-Skype-Chain-ID`, `X-Microsoft-Skype-Message-ID`,
+  `X-Microsoft-Skype-Client` (`Gf(clientInformation)`; the Teams client passes a string, which `Gf`
+  keeps as it is: `SkypeSpaces/<client version>/os=<os>; osVer=<version>; deviceType=<type>`, plus
+  `; browser=..; browserVer=..` outside the desktop - `signalingAgentConfig.clientInformation` in
+  `114419`),
+  the token, `X-MS-Migration: True` with the generic token API, and `MS-Teams-Ring` /
+  `MS-Teams-Region` / `MS-Teams-Partition` when the local participant has them.
+- **CONFIRMED** (corrected 2026-10-30) in the MS-SDP transform (`BO.toMsSdp`) the section cut down to
+  type, port, protocol, payload `34`, mid and label is a **disabled** one (port 0), not the data
+  section; every section gets the profile `RTP/SAVP` and an `a=label` (`main-audio`, `main-video`,
+  else the section's own label).
 - **CONFIRMED** join response (any 2xx; 200 or 201 not settled): `conversationController` (the
   conversation URL for later requests), `sequenceNumber`, `links` (`leave`, `addModality`,
   `removeModality`, `mute`, `updateEndpointMetadata`, `getAllParticipants` and others),
@@ -871,7 +905,8 @@ the user present (spec 9.5):
 3. Device code with `1fec8e78-...` (only with explicit consent, spec 9.5).
 4. ~~The full authz response shape and real `regionGtms` keys~~ - done (see "Live results", item 2).
 5. Which token Trouter allocate and AMS accept from open_mess (the chat service accepts a plain AAD
-   token for `https://ic3.teams.office.com` - see "Live results", item 3).
+   token for `https://ic3.teams.office.com` - see "Live results", item 3). Trouter v4c accepts the
+   same IC3 token in `user.authenticate` ("Live results" 13); AMS and v4a allocate are still open.
 6. Exact values for `x-ms-client-type`, `x-ms-client-version` and `clientinfo` that the services
    accept from a non-official client.
 7. Trouter allocate response fields, the downstream request envelope and the `/messaging` payload
@@ -1171,6 +1206,68 @@ token, tenant id, user id or account name.
       lag, so they are read again a day later, and the check on the owner's own recording (spec step 0)
       still stands. `@oneDrive.displayNamesOfFileViewers` shows that a counted view would carry the
       viewer's name, which is why D3 matters.
+
+13. **Step 0b of the live captions spec, second day** (2026-10-30, the owner at the computer and
+    agreeing in chat to each run; scratch probe outside the repo, own random endpoint id, no audio
+    sent or received, printing only status codes, key names, counts and redacted error bodies):
+    - Trouter v4c with `user.authenticate` (section 10.7): HTTP 101, `1::`, the event sent at once
+      with an `Authorization: Bearer` IC3 token (`https://ic3.teams.office.com`), `X-MS-Migration`
+      and `X-Ms-Test-User: False`; `trouter.connected` came 49-61 ms later, in five runs. Its keys:
+      `ccid`, `connectparams` (`issuer`, `scae`, `se`, `sig`, `sp`, `sr`, `st`), `curlb`, `dur`,
+      `healthUrl`, `id`, `reconnectUrl`, `registrarUrl`, `socketio`, `surl` (https), `ttl` (about
+      a week, in seconds), `url`. A connection with no meeting lived the full 61 s it was given,
+      with pings acked and 5 `trouter.message_loss` events and no downstream request. So an IC3 AAD
+      token is enough for Trouter ("Needs live capture" 5, Trouter part) and the 5 s `timeout` of
+      the first day was the missing `user.authenticate`.
+    - Call store: the items now have the keys `conversationController`, `correlationId`,
+      `groupContext` (`messageId`, `threadId`), `meetingInfo` (`organizerId`, `tenantId`) and
+      `userJoinTime`, and `groupContext.threadId` is the chat thread of the call - unlike item 11,
+      where no field held the thread (that was a scheduled meeting; these were a "Meet now" meeting
+      and a group chat call). The owner was in 2, then 3 calls at once.
+    - The thread property `awareness_conversationLiveState:<n>` was missing on the owner's own
+      "Meet now" chat although he was still in that call, so it is not a reliable "call is live"
+      flag. On a group chat with a running call it was a JSON string with `callStartTime`,
+      `conversationId`, `conversationType`, `conversationUrl` (https), `expiration`,
+      `groupCallInitiator`, `isHostless`, `meetingInfo` (`isBroadcast`, `organizerId`,
+      `tenantId`) and `status`; its `conversationUrl` equalled the call store's
+      `conversationController`, of the form
+      `https://api.flightproxy.teams.microsoft.com/api/v2/ep/<conversation host>/conv/<id>?i=<13 digits>&e=<18 digits>`.
+    - `GET` of that conversation URL with `X-Skypetoken`: HTTP 200, about 41 KB, top keys
+      `activeModalities`, `compositionServiceDetails`, `conversationController`,
+      `conversationStartTime`, `creatorClientVersion`, `layoutDetails`, `links`, `meetingDetails`,
+      `meetingInfo`, `meetingStates`, `originalGroupCallInitiator`, `region`, `roster`,
+      `sequenceNumber`, `state`, `streamingSetupFailureDebugInfo`, `subject`, `tenantId`; `links`
+      include `addModality`, `addParticipantAndModality`, `conversationHttpTransport`,
+      `getAllParticipants`, `leave`, `removeModality`, `updateEndpointMetadata`; the response's own
+      `conversationController` equals the URL read, and `addModality`, `addParticipantAndModality`
+      (`.../add`) and `leave` are that URL with a path segment inserted before the query, while
+      `conversationHttpTransport` is a plain `http://` URL ending in `/enc`.
+    - Join attempts (each refused, so no call leg was created; the owner saw nothing in his client
+      and the other participants reported nothing). In the owner's "Meet now" meeting, alone: `POST`
+      to the service URL `.../api/v2/epconv/` gave HTTP 400 with the body `{}`, with a data-only
+      offer and `callModalities: []` and with an inactive audio section and `["Audio"]` - the wrong
+      URL for a running call (section 10.7). In a group chat call of the owner's friends (with the
+      owner's explicit OK in chat for that call; the probe only counts and never reads content):
+      `POST` to the conversation URL gave HTTP 503 in 240-320 ms with `operationFailure`
+      `{reason: "unknown", code: 503, subCode: 70051, phrase: "Proxy Operation Failure.",
+      resultCategories: ["UnexpectedServerError"]}`, for a plain data-only offer, a data-only offer
+      with the MS-SDP changes of 10.7 and an MS-SDP offer with an inactive audio section, and no
+      Trouter callback arrived while the request was open. Later the same day, in the same call and
+      with the owner's OK, each of these changed nothing (still 503, subCode 70051, in 200-340 ms): a
+      registrar registration of the probe's endpoint first (`POST <registrarUrl>` from
+      `trouter.connected`, `registrar/prod/V2/registrations`, body of section 5 with
+      `TeamsCDLWebWorker` / `TeamsCDLWebWorker_2.6`, the surl as the only transport and TTL 900 s,
+      `Authorization: Bearer` IC3 token: HTTP 202 with an empty body; `DELETE
+      <registrarUrl>/<registrationId>` afterwards: HTTP 202), `endpointMetadata: {}`, the
+      `X-Microsoft-Skype-Client` value in the client's own format, the `MS-Teams-Region` and
+      `MS-Teams-Partition` headers, a roster-only join (no `callInvitation`, so no SDP at all), and
+      even the body `{}`. So the refusal does not depend on the body, the offer or a registration:
+      a `POST` from this probe to the conversation URL fails before the body matters, while a `GET`
+      of the same URL with the same token works. **UNCONFIRMED** why. Relay candidates were also
+      missing from these offers (TURN allocation on `default.relay.teams.microsoft.com` gave none),
+      which matters only once a join is accepted.
+    - Still open for step 0b: whether a data-only offer is accepted, data id 3 messages, and
+      whether the call lives without audio.
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
