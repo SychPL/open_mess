@@ -1347,6 +1347,28 @@ token, tenant id, user id or account name.
       `endpointMetadata`, `pstnContent`, `mediaDescriptions`, `participantPropertyBag`) and the rest
       of the SDP (13 sections, trickle). Not tested: a probe that copies a browser's `User-Agent` and
       `Origin` was stopped before it ran - open_mess must not pass itself off as a browser.
+    - Later runs the same day (same meeting, owner's OK): over HTTP/2 (negotiated by ALPN) with an
+      honest `User-Agent` of the probe, step 2 again gave 200 and **step 3 `notificationLinks` gave
+      HTTP 200**, and a `/conversation/rosterUpdate/` callback (keys `participantCounts`,
+      `participants`, `sequenceNumber`, `type`) arrived over Trouter - so POSTs to the conversation
+      URL do work and the service knows the probe's endpoint. The join of step 4 still gave 503
+      70051 with each of: `subject` taken from step 2's answer, `pstnContent` as the client builds
+      it (`emergencyCallCountry: ""`, `platformName` = the client header, `publicApiCall: false`),
+      the web client's `endpointCapabilities` 73463 and `clientEndpointCapabilities` 114259690 with
+      `mediaDescriptions` (`mid`, `direction` per section, `requestId`), an offer whose m= and c=
+      lines carry the default host candidate's address and port with that one candidate,
+      `a=ice-options:trickle`, `b=CT:4000`, `a=x-ssrc-range`, `a=rtcp`, `a=x-signaling-fb` and
+      `a=max-message-size:262144`, and with the audio section `inactive` or (as a diagnostic, no
+      track, nothing sent or received) `sendonly`. A second capture, with the owner choosing not to
+      use audio in the web pre-join screen, showed the same offer: the web client always offers
+      audio `sendrecv`, ten video sections and `m=x-data`, and mutes afterwards. After the probe's
+      registrar registration, chat notifications arrived on the Trouter path `/messaging` (keys only
+      were looked at); the registration was deleted after each run (HTTP 202).
+    - **UNCONFIRMED** what the service still misses in step 4. Left: the remaining body values
+      (`languageId`, `endpointMetadata.holographicCapabilities`, `endpointState.endpointProperties`,
+      `participantPropertyBag`, `applyChannelParameters`, the `confirmUnmute` link), the offer's
+      other sections (audio `sendrecv` plus video, which open_mess may not use) and the browser
+      request headers.
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
