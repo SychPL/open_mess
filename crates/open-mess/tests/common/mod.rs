@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use keyring_core::api::CredentialStore;
 use open_mess::accounts::Accounts;
+use open_mess::i18n;
 use open_mess::modules::{self, Modules};
 use open_mess::store::Store;
 use open_mess::tools::Registry;
@@ -75,6 +76,14 @@ pub fn store(data_dir: &Path) -> Store {
     Store::open(&data_dir.join("state.sqlite3")).unwrap()
 }
 
+/// Stores the window's `language` and settles the process's language from it, as the daemon does
+/// at its start. The language is the process's: every daemon of one test file uses the same one
+/// (`pl`, but `en` in ui_en.rs), so tests running side by side agree on it.
+pub fn set_language(store: &Store, language: &str) {
+    store.set_config(i18n::SETTING, language).unwrap();
+    i18n::apply_language(store);
+}
+
 /// Scans the data folder's modules, sending host events to `events`; sign-in prompts go nowhere.
 pub async fn scan_with(store: &Store, engine: &Engine, data_dir: &Path, events: mpsc::Sender<HostEvent>) -> Modules {
     scan_prompting(store, engine, data_dir, events, SignInPrompts::new(mpsc::channel(1).0)).await
@@ -127,8 +136,14 @@ pub struct Daemon {
 /// How long the test daemon's sign-in prompts wait for an answer.
 pub const SIGN_IN_BUDGET: Duration = Duration::from_secs(5);
 
-/// A daemon's accounts and tools over module files (file name, built module), all approved.
+/// A daemon's accounts and tools over module files (file name, built module), all approved; its
+/// window speaks Polish.
 pub async fn daemon(files: &[(&str, &str)]) -> Daemon {
+    daemon_in(files, "pl").await
+}
+
+/// [`daemon`], with the window's `language` (see [`set_language`]).
+pub async fn daemon_in(files: &[(&str, &str)], language: &str) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     for (file, module) in files {
         install(dir.path(), file, &std::fs::read(wasm(module)).unwrap());
@@ -139,6 +154,7 @@ pub async fn daemon(files: &[(&str, &str)]) -> Daemon {
     let sign_ins = SignIns::default();
     tokio::spawn(sign_ins.clone().forward(requests));
     let store = store(dir.path());
+    set_language(&store, language);
     approve_all(&store, &scan(&store, &engine, dir.path()).await);
     let modules = scan_prompting(&store, &engine, dir.path(), sender, SignInPrompts::with_budget(prompts, SIGN_IN_BUDGET)).await;
     let credentials: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();

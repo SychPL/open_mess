@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod cli;
 pub mod daemon;
 pub mod events;
+pub mod i18n;
 pub mod instance;
 pub mod modules;
 pub mod paths;
@@ -46,7 +47,7 @@ pub enum Error {
     UnknownAction(String),
     /// A new version is being checked (spec 2026-10-27-self-update, 7.2): nothing a rollback would
     /// undo is done meanwhile.
-    #[error("aktualizacja w toku, spróbuj za chwilę")]
+    #[error("update in progress, try again in a moment")]
     UpdateInProgress,
     #[error("the configuration window exists only on Windows")]
     NoWindow,

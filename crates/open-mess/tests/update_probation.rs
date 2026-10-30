@@ -19,7 +19,7 @@ use open_mess::triggers::Counters;
 use open_mess::triggers::rules::{Action, Condition, Rule};
 use open_mess::triggers::spawn::{RUN_TIMEOUT, Runs};
 use open_mess::ui::UiState;
-use open_mess::ui::commands::{self, RuleDto, UPDATE_IN_PROGRESS};
+use open_mess::ui::commands::{self, RuleDto};
 use open_mess::update::UpdateError;
 use open_mess::update::probation::{self, Start};
 use open_mess::update::quiesce::{Activity, Launcher};
@@ -375,7 +375,7 @@ async fn probation_blocks_writes_and_window_saves() {
     assert!(t.write_refused().await);
     t.d.registry.call("status", json!({})).await.unwrap();
     // Every save in the window is refused, and the window reads as usual.
-    let refused = |result: Result<(), String>| assert_eq!(result, Err(UPDATE_IN_PROGRESS.to_string()));
+    let refused = |result: Result<(), String>| assert_eq!(result, Err("aktualizacja w toku".to_string()));
     refused(commands::remove_account(&ui, "test-echo:a").await);
     refused(commands::approve_module(&ui, "test-echo", "00", "00").await);
     refused(commands::set_module_enabled(&ui, "test-echo", false).await);
@@ -387,6 +387,10 @@ async fn probation_blocks_writes_and_window_saves() {
     refused(commands::sign_in_start(&ui, "test-echo", None).await.map(drop));
     refused(commands::decide(&ui, &waiting.action, true).await.map(drop));
     refused(commands::decide(&ui, &waiting.action, false).await.map(drop));
+    // The window's language too: a rollback would undo it (spec 2026-10-30-ui-languages, 4.4).
+    refused(commands::set_language(&ui, "en").map(drop));
+    assert_eq!(open_mess::i18n::setting(&common::store(t.d.dir.path())), "pl");
+    assert_eq!(commands::language(&ui).lang, "pl");
     commands::status(&ui).unwrap();
     assert_eq!(commands::accounts(&ui).unwrap().len(), 1);
     assert_eq!(commands::modules(&ui).unwrap()[0].status, "active");
@@ -478,7 +482,7 @@ async fn daemon_finishes_check_when_helper_dies() {
     drop(helper);
     ended(watching, 2 * SECOND).await;
     assert_eq!(stage_file(&t.paths), None);
-    assert_eq!(std::fs::read_to_string(t.paths.last_result()).unwrap(), "zainstalowano\n");
+    assert_eq!(std::fs::read_to_string(t.paths.last_result()).unwrap(), "installed\n");
     assert!(!t.on() && !t.held() && !t.write_refused().await);
     assert!(!notified(&t.exit).await);
     assert!(t.task.launched().is_empty());

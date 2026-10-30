@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{Daemon, ECHO, daemon};
-use open_mess::accounts::OTHER_ACCOUNT;
+use open_mess::accounts::other_account;
+use open_mess::i18n::Lang;
 use open_mess::modules;
 use open_mess::ui::commands::{self, AccountDto, AnswerDto, SignInPromptDto};
-use open_mess::ui::sign_in::{BUSY, NO_WINDOW, NOT_FROM_WINDOW};
+use open_mess::ui::sign_in::{NO_WINDOW, NOT_FROM_WINDOW, busy};
 use open_mess::ui::{UiState, sign_in_page};
 use open_mess_host::SessionState;
 use open_mess_host::{SignInReply, SignInRequest, WamAccount};
@@ -102,7 +103,8 @@ async fn sign_in_from_window_adds_the_account() {
     let signing_in = add_account(&state);
     let page = prompt(&state, "page").await;
     // One sign-in at a time.
-    assert_eq!(commands::sign_in_start(&state, "test-echo", None).await.unwrap_err(), BUSY);
+    assert_eq!(commands::sign_in_start(&state, "test-echo", None).await.unwrap_err(), busy());
+    assert_eq!(busy(), "trwa już inne logowanie - dokończ je albo anuluj");
     // The sign-in window saw the redirect.
     state.sign_ins.answer(page.id, SignInReply::Done(Some("https://login.example.com/done?account=a&code=1".into()))).unwrap();
     let added = signing_in.await.unwrap().unwrap();
@@ -344,7 +346,8 @@ async fn re_sign_in_must_match_the_account() {
     sign_in_as(&state, None, "a").await.unwrap();
     d.accounts.set_state("test-echo", "a", SessionState::AuthRequired).unwrap();
     // Signed in again, the module returns another account: refused, nothing changes.
-    assert_eq!(sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err(), OTHER_ACCOUNT);
+    assert_eq!(sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err(), other_account(Lang::Pl));
+    assert!(other_account(Lang::Pl).starts_with("to jest inne konto"));
     assert_eq!(listed(&state), [("test-echo:a".to_string(), "auth-required".to_string())]);
     // Removed first, the other account can be added.
     commands::remove_account(&state, "test-echo:a").await.unwrap();
@@ -399,7 +402,8 @@ async fn what_changed_during_a_sign_in_is_respected() {
     sign_in_as(&state, None, "b").await.unwrap();
     d.accounts.set_state("test-echo", "b", SessionState::AuthRequired).unwrap();
     let refused = sign_in_as(&state, Some("test-echo:a"), "b").await.unwrap_err();
-    assert!(refused.starts_with(OTHER_ACCOUNT), "{refused}");
+    assert!(refused.starts_with(other_account(Lang::Pl)), "{refused}");
+    assert!(refused.ends_with("(zalogowano ponownie konto test-echo:b)"), "{refused}");
     assert_eq!(listed(&state), [("test-echo:a".to_string(), "online".to_string()), ("test-echo:b".to_string(), "online".to_string())]);
 }
 
@@ -426,6 +430,9 @@ async fn prompts_outside_the_window_are_refused() {
     // test-echo's `sign-in` tool prompts in an ordinary call: no sign-in from the window runs.
     let echo = d.accounts.modules().handle("test-echo").unwrap();
     let answers: serde_json::Value = serde_json::from_str(&echo.call("a", "sign-in", "{}").await.unwrap()).unwrap();
-    assert_eq!(answers["open-page"], format!("refused: {NOT_FROM_WINDOW}"));
+    // To the module, and through its tool to an agent: English, though the window speaks Polish.
+    assert_eq!(answers["open-page"], "refused: sign-in can only start from the configuration window");
+    assert_eq!(NOT_FROM_WINDOW, "sign-in can only start from the configuration window");
+    assert_eq!(NO_WINDOW, "the configuration window is not open");
     assert!(d.sign_ins.shown().is_none());
 }

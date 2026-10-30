@@ -25,7 +25,7 @@ pub enum UpdateError {
     #[error("state database: {0}")]
     Store(#[from] rusqlite::Error),
     /// The helper did not take `update.lock` in time; the daemon went back to work.
-    #[error("pomocnik nie wystartował")]
+    #[error("the update helper did not start")]
     HelperNotStarted,
     /// The helper may or may not run, and `update-pending.json` could not be deleted: the daemon
     /// exits, and the recovery at its next start takes over (spec 7.6).

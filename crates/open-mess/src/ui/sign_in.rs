@@ -10,14 +10,23 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use open_mess_host::{Prompt, SignInReply, SignInRequest};
 use tokio::sync::{mpsc, oneshot, watch};
 
-/// The answer to a prompt that does not come from a sign-in started in the window.
-pub const NOT_FROM_WINDOW: &str = "logowanie można zacząć tylko w oknie konfiguracji";
+use crate::i18n;
+
+/// The answer to a prompt that does not come from a sign-in started in the window. It goes to the
+/// module, and through its tool's answer maybe to an agent: English, whatever the window shows.
+pub const NOT_FROM_WINDOW: &str = "sign-in can only start from the configuration window";
+/// Why the WAM dialog can't open; to the module, like [`NOT_FROM_WINDOW`].
+pub const NO_WINDOW: &str = "the configuration window is not open";
+
 /// Why a second sign-in is refused while one runs.
-pub const BUSY: &str = "trwa już inne logowanie - dokończ je albo anuluj";
+pub fn busy() -> &'static str {
+    i18n::pick("trwa już inne logowanie - dokończ je albo anuluj", "another sign-in is in progress - finish or cancel it")
+}
+
 /// Why an answer is refused when its prompt no longer waits.
-pub const GONE: &str = "ta prośba o logowanie już nie czeka";
-/// Why the WAM dialog can't open.
-pub const NO_WINDOW: &str = "okno konfiguracji nie jest otwarte";
+pub fn gone() -> &'static str {
+    i18n::pick("ta prośba o logowanie już nie czeka", "this sign-in request is no longer waiting")
+}
 
 /// The sign-in in progress and the prompt the window shows. Clones share it.
 #[derive(Clone, Default)]
@@ -108,7 +117,7 @@ impl SignIns {
     pub fn begin(&self, module: &str) -> Result<Active, String> {
         let mut state = self.state();
         if state.module.is_some() {
-            return Err(BUSY.into());
+            return Err(busy().into());
         }
         state.module = Some(module.into());
         state.cancelled = false;
@@ -196,12 +205,12 @@ impl SignIns {
                 return Ok(());
             }
             if state.shown.as_ref().is_none_or(|shown| shown.id != id) {
-                return Err(GONE.into());
+                return Err(gone().into());
             }
             state.cancelled |= end || reply == SignInReply::Cancelled;
             match state.take_shown() {
                 Some(shown) => shown,
-                None => return Err(GONE.into()),
+                None => return Err(gone().into()),
             }
         };
         let _ = shown.reply.send(reply);
