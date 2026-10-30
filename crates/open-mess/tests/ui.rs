@@ -13,6 +13,7 @@ use chrono::NaiveTime;
 use common::{Daemon, ECHO, daemon, echo, echo_rebuilt, echo_with_another_host, info, install, scan, store};
 use open_mess::approval;
 use open_mess::events::{Bus, Event};
+use open_mess::i18n::Lang;
 use open_mess::pending::{Kind, Pending, Preview, State};
 use open_mess::tools::ToolError;
 use open_mess::triggers::Counters;
@@ -21,7 +22,7 @@ use open_mess::triggers::engine::{self, Batch, Delivery, DeliveryResult};
 use open_mess::triggers::rules::{Action, Condition, Rule, Spawn};
 use open_mess::triggers::spawn::{RUN_TIMEOUT, Runs};
 use open_mess::ui::UiState;
-use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto, RuleDto};
+use open_mess::ui::commands::{self, LanguageDto, MODULE_CHANGED, ModuleDto, RuleDto};
 use open_mess::ui::sign_in::SignIns;
 use open_mess_host::Engine;
 use serde_json::{Value, json};
@@ -56,13 +57,14 @@ fn module<'a>(list: &'a [ModuleDto], status: &str) -> &'a ModuleDto {
     list.iter().find(|module| module.status == status).unwrap_or_else(|| panic!("no {status} module in {list:?}"))
 }
 
-/// A daemon whose modules folder has `files`, none approved.
+/// A daemon whose modules folder has `files`, none approved; its window speaks Polish.
 async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
     let dir = tempfile::tempdir().unwrap();
     for (file, bytes) in files {
         install(dir.path(), file, bytes);
     }
     let engine = Engine::new().unwrap();
+    common::set_language(&store(dir.path()), "pl");
     let modules = scan(&store(dir.path()), &engine, dir.path()).await;
     let accounts = common::accounts(dir.path(), modules, keyring_core::mock::Store::new().unwrap());
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
@@ -513,6 +515,25 @@ async fn channel_setup_names_the_bridge() {
     assert_eq!(setup.sessions, 0);
 }
 
+/// The window's language is a setting of its own: `auto`, `pl` or `en`, and nothing else.
+#[tokio::test]
+async fn window_language_is_saved_and_checked() {
+    let d = daemon(&[]).await;
+    let state = state(&d);
+    assert_eq!(commands::language(&state), LanguageDto { setting: "pl", lang: "pl" });
+    // Nonsense is refused, in the window's language, and nothing is stored.
+    for nonsense in ["de", "PL", "", "auto "] {
+        assert_eq!(commands::set_language(&state, nonsense), Err("nieznany język".to_string()), "{nonsense:?}");
+    }
+    assert_eq!(store(d.dir.path()).get_config("language").unwrap().as_deref(), Some("pl"));
+    // What is stored is what the window shows as the setting; saving settles the language again.
+    store(d.dir.path()).set_config("language", "auto").unwrap();
+    assert_eq!(commands::language(&state).setting, "auto");
+    assert_eq!(commands::set_language(&state, "pl"), Ok((Lang::Pl, false)));
+    assert_eq!(commands::language(&state), LanguageDto { setting: "pl", lang: "pl" });
+    assert_eq!(store(d.dir.path()).get_config("language").unwrap().as_deref(), Some("pl"));
+}
+
 /// Every window command in build.rs has its `allow-*` in the capability file and a handler in
 /// window.rs, and nothing more: a command left out of either is refused by the window, or never
 /// reached (spec 2026-10-27-self-update, 9).
@@ -522,7 +543,7 @@ fn window_commands_are_registered() {
     let build = read("build.rs");
     let listed = build.split("const COMMANDS: &[&str] = &[").nth(1).unwrap().split("];").next().unwrap();
     let commands: Vec<&str> = listed.split(',').map(|item| item.trim().trim_matches('"')).filter(|item| !item.is_empty()).collect();
-    for command in ["update_status", "check_update", "install_update", "cancel_update", "set_auto_install"] {
+    for command in ["update_status", "check_update", "install_update", "cancel_update", "set_auto_install", "language", "set_language"] {
         assert!(commands.contains(&command), "{command} is not in build.rs");
     }
     let capability: Value = serde_json::from_str(&read("capabilities/main.json")).unwrap();

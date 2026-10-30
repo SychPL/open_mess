@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod cli;
 pub mod daemon;
 pub mod events;
+pub mod i18n;
 pub mod instance;
 pub mod modules;
 pub mod paths;

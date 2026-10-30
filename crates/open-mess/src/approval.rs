@@ -235,12 +235,17 @@ pub async fn run(pending: Arc<Pending>, present: impl Fn(&Preview), several: imp
     }
 }
 
+/// Set once [`start`] registered the AppUserModelIDs: only that process writes their names again.
+#[cfg(windows)]
+static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Registers the toasts' AppUserModelID and shows the waiting actions for the daemon's lifetime;
 /// the notice of several opens the configuration window through `window`.
 #[cfg(windows)]
 pub fn start(runtime: &Runtime, pending: Arc<Pending>, window: Opener) {
+    REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
     // ponytail: without the registration Windows may show no toast; reported once a log sink exists.
-    let _ = toast::register();
+    let _ = toast::register(crate::i18n::current());
     // Toasts are shown and taken away one after the other on one thread (showing waits for
     // Windows), so taking one away never takes the next one with it.
     let (jobs, queue) = std::sync::mpsc::channel::<toast::Job>();
@@ -260,6 +265,16 @@ pub fn start(runtime: &Runtime, pending: Arc<Pending>, window: Opener) {
 /// No notifications here: actions wait until they expire.
 #[cfg(not(windows))]
 pub fn start(_runtime: &Runtime, _pending: Arc<Pending>, _window: Opener) {}
+
+/// The notifications' names in `lang`, once the language changed: written again only by the
+/// process that registered them at its start, so the tests never write to the registry.
+#[cfg(windows)]
+pub fn rename(lang: crate::i18n::Lang) {
+    if REGISTERED.load(std::sync::atomic::Ordering::Relaxed) {
+        // ponytail: a name that fails to change keeps the old language until the next change.
+        let _ = toast::register(lang);
+    }
+}
 
 /// "open_mess <wersja> jest gotowy" with Zainstaluj and Później (spec 2026-10-27-self-update, 6);
 /// Zainstaluj is the user's consent, as in the window.
@@ -287,14 +302,15 @@ mod toast {
     use winreg::enums::HKEY_CURRENT_USER;
 
     use super::{APP_ID, Prompt, UPDATE_APP_ID};
+    use crate::i18n::Lang;
     use crate::pending::Pending;
     use crate::ui::Opener;
     use crate::update::service::UpdateService;
 
     /// `HKCU\Software\Classes\AppUserModelId\open_mess.daemon` and `...\open_mess.update` with the
     /// names toasts and the notification settings show.
-    pub(super) fn register() -> std::io::Result<()> {
-        for (id, name) in [(APP_ID, "open_mess"), (UPDATE_APP_ID, "open_mess - aktualizacje")] {
+    pub(super) fn register(lang: Lang) -> std::io::Result<()> {
+        for (id, name) in [(APP_ID, "open_mess"), (UPDATE_APP_ID, lang.pick("open_mess - aktualizacje", "open_mess - updates"))] {
             let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(format!(r"Software\Classes\AppUserModelId\{id}"))?;
             key.set_value("DisplayName", &name)?;
         }

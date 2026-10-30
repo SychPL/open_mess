@@ -74,7 +74,7 @@ pub async fn unknown_host(sign_ins: &SignIns, accounts: &Accounts, page: u64, mo
 }
 
 #[cfg(windows)]
-pub(super) use window::{close, open, page_of};
+pub(super) use window::{close, open, page_of, retitle};
 
 #[cfg(windows)]
 mod window {
@@ -87,6 +87,7 @@ mod window {
     use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
     use super::{Navigation, check_page, navigation, unknown_host};
+    use crate::i18n::{self, Lang};
     use crate::modules;
     use crate::ui::UiState;
 
@@ -157,9 +158,8 @@ mod window {
                 }
             }
         };
-        let title = |url: &Url| format!("Logowanie - {}", url.host_str().unwrap_or_default());
         WebviewWindowBuilder::new(app, label(page), WebviewUrl::External(start.clone()))
-            .title(title(&start))
+            .title(title(i18n::current(), &start))
             .inner_size(520.0, 720.0)
             .data_directory(profile.to_path_buf())
             .on_navigation(on_navigation)
@@ -168,7 +168,7 @@ mod window {
                 // A navigation stopped by the policy loads no page of a host (about:blank, say):
                 // the title keeps the last host.
                 if payload.url().host_str().is_some() {
-                    let _ = window.set_title(&title(payload.url()));
+                    let _ = window.set_title(&title(i18n::current(), payload.url()));
                 }
             })
             // No pop-ups and no downloads: they would escape the navigation policy.
@@ -177,6 +177,26 @@ mod window {
             .build()
             .map(drop)
             .map_err(|err| format!("okno logowania się nie otworzyło: {err}"))
+    }
+
+    /// The title of a sign-in window: the host of the page shown.
+    fn title(lang: Lang, url: &Url) -> String {
+        let host = url.host_str().unwrap_or_default();
+        match lang {
+            Lang::Pl => format!("Logowanie - {host}"),
+            Lang::En => format!("Sign in - {host}"),
+        }
+    }
+
+    /// The open sign-in windows' titles in `lang`, once the language changed.
+    pub fn retitle<R: tauri::Runtime>(app: &AppHandle<R>, lang: Lang) {
+        for (label, window) in app.webview_windows() {
+            if let (Some(_), Ok(url)) = (page_of(&label), window.url())
+                && url.host_str().is_some()
+            {
+                let _ = window.set_title(&title(lang, &url));
+            }
+        }
     }
 
     /// Closes the sign-in window of prompt `page`, if it is open.

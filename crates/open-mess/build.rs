@@ -31,6 +31,8 @@ const COMMANDS: &[&str] = &[
     "install_update",
     "cancel_update",
     "set_auto_install",
+    "language",
+    "set_language",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -387,6 +387,10 @@ async fn probation_blocks_writes_and_window_saves() {
     refused(commands::sign_in_start(&ui, "test-echo", None).await.map(drop));
     refused(commands::decide(&ui, &waiting.action, true).await.map(drop));
     refused(commands::decide(&ui, &waiting.action, false).await.map(drop));
+    // The window's language too: a rollback would undo it (spec 2026-10-30-ui-languages, 4.4).
+    refused(commands::set_language(&ui, "en").map(drop));
+    assert_eq!(open_mess::i18n::setting(&common::store(t.d.dir.path())), "pl");
+    assert_eq!(commands::language(&ui).lang, "pl");
     commands::status(&ui).unwrap();
     assert_eq!(commands::accounts(&ui).unwrap().len(), 1);
     assert_eq!(commands::modules(&ui).unwrap()[0].status, "active");

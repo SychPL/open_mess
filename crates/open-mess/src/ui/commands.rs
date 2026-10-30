@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use super::UiState;
 use crate::accounts::Account;
+use crate::i18n::{self, Lang};
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
 use crate::triggers::RuleCounters;
 use crate::triggers::rules::{self, Rule};
@@ -760,6 +761,32 @@ pub fn cancel_update(state: &UiState) -> Result<(), String> {
 pub fn set_auto_install(state: &UiState, on: bool) -> Result<(), String> {
     changes_allowed(state)?;
     updates(state)?.set_auto_install(on)
+}
+
+/// The window's language setting and the language the window shows now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LanguageDto {
+    /// `auto`, `pl` or `en`.
+    pub setting: &'static str,
+    /// `pl` or `en`.
+    pub lang: &'static str,
+}
+
+pub fn language(state: &UiState) -> LanguageDto {
+    LanguageDto { setting: i18n::setting(&state.accounts.store()), lang: i18n::current().code() }
+}
+
+/// Saves the window's language (`auto`, `pl` or `en`) and settles it (spec 2026-10-30-ui-languages,
+/// 4.4); returns it, and whether it changed. A window setting, not a tool: agents see no change.
+/// Refused while a new version is checked, like every save: a rollback would undo it.
+pub fn set_language(state: &UiState, setting: &str) -> Result<(Lang, bool), String> {
+    if !matches!(setting, "auto" | "pl" | "en") {
+        return Err(i18n::pick("nieznany język", "unknown language").into());
+    }
+    changes_allowed(state)?;
+    let store = state.accounts.store();
+    store.set_config(i18n::SETTING, setting).map_err(text)?;
+    Ok(i18n::apply_language(&store))
 }
 
 #[cfg(test)]
