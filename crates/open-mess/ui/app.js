@@ -528,7 +528,7 @@ const OUTCOMES = {
   done: "Wykonano.",
   rejected: "Odrzucono.",
   expired: "Wygasło - nic nie wysłano.",
-  voided: "Uczestnicy albo wiadomość zmienili się od pokazania - nic nie wysłano.",
+  voided: "Uczestnicy, wiadomość albo prawo zapisu zmieniły się od pokazania - nic nie wysłano.",
   uncertain: "Mogło dotrzeć - sprawdź rozmowę, zanim spróbujesz ponownie.",
   failed: "Nie udało się - nic nie wysłano.",
 };
