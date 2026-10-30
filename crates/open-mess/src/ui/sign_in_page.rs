@@ -9,7 +9,7 @@ use url::Url;
 
 use super::sign_in::SignIns;
 use crate::accounts::Accounts;
-use crate::modules;
+use crate::{i18n, modules};
 use open_mess_host::SignInReply;
 use open_mess_host::hosts::HostList;
 
@@ -52,7 +52,11 @@ pub fn check_page(url: &str, redirect_prefix: &str, approved: &[String]) -> Resu
     };
     match (approved_https(url), approved_https(redirect_prefix)) {
         (Some(start), Some(prefix)) => Ok((start, prefix)),
-        _ => Err("moduł poprosił o stronę logowania spoza zatwierdzonych hostów logowania".into()),
+        _ => Err(i18n::pick(
+            "moduł poprosił o stronę logowania spoza zatwierdzonych hostów logowania",
+            "the module asked for a sign-in page outside its approved sign-in hosts",
+        )
+        .into()),
     }
 }
 
@@ -88,8 +92,8 @@ mod window {
 
     use super::{Navigation, check_page, navigation, unknown_host};
     use crate::i18n::{self, Lang};
-    use crate::modules;
     use crate::ui::UiState;
+    use crate::{accounts, modules};
 
     /// The label of the sign-in window of prompt `page`. No capability names it, so its pages call
     /// no command.
@@ -114,7 +118,7 @@ mod window {
     ) -> Result<(), String> {
         let state = app.try_state::<UiState>().ok_or("the window has no state")?;
         let manifest =
-            state.accounts.modules().handle(module).and_then(|handle| handle.manifest().ok()).ok_or_else(|| format!("moduł {module} nie działa"))?;
+            state.accounts.modules().handle(module).and_then(|handle| handle.manifest().ok()).ok_or_else(|| accounts::not_running(module))?;
         let approved = modules::approved_sign_in_hosts(&state.accounts.store(), &manifest).map_err(|err| err.to_string())?;
         let (start, prefix) = check_page(url, redirect_prefix, &approved)?;
         let approved = Arc::new(Mutex::new(approved));
@@ -176,7 +180,10 @@ mod window {
             .on_download(|_, _| false)
             .build()
             .map(drop)
-            .map_err(|err| format!("okno logowania się nie otworzyło: {err}"))
+            .map_err(|err| match i18n::current() {
+                Lang::Pl => format!("okno logowania się nie otworzyło: {err}"),
+                Lang::En => format!("the sign-in window did not open: {err}"),
+            })
     }
 
     /// The title of a sign-in window: the host of the page shown.

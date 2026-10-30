@@ -22,8 +22,8 @@ impl Lang {
         }
     }
 
-    /// The text in this language.
-    pub fn pick(self, pl: &'static str, en: &'static str) -> &'static str {
+    /// The text (or whatever else has a version per language) in this language.
+    pub fn pick<T>(self, pl: T, en: T) -> T {
         match self {
             Lang::Pl => pl,
             Lang::En => en,

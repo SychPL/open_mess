@@ -22,7 +22,7 @@ use open_mess::triggers::engine::{self, Batch, Delivery, DeliveryResult};
 use open_mess::triggers::rules::{Action, Condition, Rule, Spawn};
 use open_mess::triggers::spawn::{RUN_TIMEOUT, Runs};
 use open_mess::ui::UiState;
-use open_mess::ui::commands::{self, LanguageDto, MODULE_CHANGED, ModuleDto, RuleDto};
+use open_mess::ui::commands::{self, LanguageDto, ModuleDto, RuleDto};
 use open_mess::ui::sign_in::SignIns;
 use open_mess_host::Engine;
 use serde_json::{Value, json};
@@ -115,10 +115,11 @@ async fn stale_module_approval_is_refused() {
     // The file changes after the window showed it.
     install(dir.path(), "echo.wasm", &echo_rebuilt());
     let refused = commands::approve_module(&state, "test-echo", &shown.file_sha256, &shown.manifest_sha256).await;
-    assert_eq!(refused, Err(MODULE_CHANGED.to_string()));
+    assert_eq!(refused, Err("plik modułu się zmienił - odśwież".to_string()));
+    assert_eq!(refused, Err(commands::module_changed().to_string()));
     assert!(state.accounts.modules().handle("test-echo").is_none());
     // Made-up hashes are refused the same way.
-    assert_eq!(commands::approve_module(&state, "test-echo", "00", "00").await, Err(MODULE_CHANGED.to_string()));
+    assert_eq!(commands::approve_module(&state, "test-echo", "00", "00").await, Err(commands::module_changed().to_string()));
 
     // Refreshed, the window shows the new file, and approving that loads it.
     commands::rescan_modules(&state).await.unwrap();
@@ -290,7 +291,8 @@ async fn long_target_can_only_be_rejected() {
     let action = sent["action"].as_str().unwrap();
     assert!(commands::waiting(&state)[0].target_cut);
 
-    assert_eq!(commands::decide(&state, action, true).await, Err(commands::TARGET_CUT.to_string()));
+    assert_eq!(commands::decide(&state, action, true).await, Err(commands::target_cut().to_string()));
+    assert!(commands::target_cut().starts_with("wiadomości, której dotyczy akcja"));
     assert_eq!(state.pending.state(action).unwrap(), State::Waiting);
     assert_eq!(commands::decide(&state, action, false).await.unwrap(), "rejected");
 }
@@ -432,7 +434,7 @@ async fn put_rule_returns_autonomous_warning() {
     let direct = rule("r1", Condition::Direct, channel());
     assert_eq!(commands::put_rule(&state, direct.clone()).unwrap(), None);
     commands::set_permissions(&state, "test-echo:a", None, true, "autonomous").unwrap();
-    assert_eq!(commands::put_rule(&state, direct).unwrap().as_deref(), Some(commands::AUTONOMOUS_RULE));
+    assert_eq!(commands::put_rule(&state, direct).unwrap().as_deref(), Some(commands::autonomous_rule(Lang::Pl)));
     // Saved either way, and the window gets it back as it sends it.
     let listed = commands::rules(&state).unwrap();
     assert_eq!(listed.len(), 1);

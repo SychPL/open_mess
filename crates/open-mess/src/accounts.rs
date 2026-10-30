@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::task::JoinSet;
 
 use crate::Error;
+use crate::i18n::{self, Lang};
 use crate::modules::{ModuleState, Modules};
 use crate::store::Store;
 use crate::tools::{ToolError, shared};
@@ -23,8 +24,22 @@ const MAX_DISPLAY_NAME: usize = 256;
 /// The state of an account being removed: no tool reaches it, no module report changes it, and a
 /// removal cut short (the daemon stopped) can be run again.
 pub const REMOVING: &str = "removing";
-/// Why signing in an account again with another one is refused.
-pub const OTHER_ACCOUNT: &str = "to jest inne konto - zaloguj się kontem, które ponownie logujesz, albo najpierw usuń stare konto i dodaj nowe";
+/// Why signing in an account again with another one is refused. The texts of a sign-in go to the
+/// window only (spec 8.8): they are in its language.
+pub fn other_account() -> &'static str {
+    i18n::pick(
+        "to jest inne konto - zaloguj się kontem, które ponownie logujesz, albo najpierw usuń stare konto i dodaj nowe",
+        "this is another account - sign in with the account you are signing in again, or remove the old account first and add the new one",
+    )
+}
+
+/// Why a module's sign-in can't start: the module does not run.
+pub fn not_running(module: &str) -> String {
+    match i18n::current() {
+        Lang::Pl => format!("moduł {module} nie działa"),
+        Lang::En => format!("module {module} is not running"),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
@@ -110,7 +125,10 @@ impl Accounts {
             [&account.id, &account.module, &account.module_account, &account.display_name, &account.state, REMOVING],
         )?;
         if changed == 0 {
-            return Err(Error::Account(format!("konto {} jest usuwane", account.id)));
+            return Err(Error::Account(match i18n::current() {
+                Lang::Pl => format!("konto {} jest usuwane", account.id),
+                Lang::En => format!("account {} is being removed", account.id),
+            }));
         }
         Ok(account)
     }
@@ -120,30 +138,49 @@ impl Accounts {
     /// that same account, else nothing changes. A failed sign-in adds nothing. The configuration
     /// window calls it; no tool starts a sign-in (spec 8.8).
     pub async fn sign_in(&self, module: &str, again: Option<&str>) -> Result<Account, Error> {
-        let handle = self.modules.handle(module).ok_or_else(|| Error::Account(format!("moduł {module} nie działa")))?;
+        let lang = i18n::current();
+        let handle = self.modules.handle(module).ok_or_else(|| Error::Account(not_running(module)))?;
         let expected = match again {
             Some(id) => match self.get(id)? {
                 Some(account) if account.module == module && account.state != REMOVING => Some(account),
-                _ => return Err(Error::Account(format!("nie ma konta {id} w module {module}"))),
+                _ => {
+                    return Err(Error::Account(match lang {
+                        Lang::Pl => format!("nie ma konta {id} w module {module}"),
+                        Lang::En => format!("no account {id} in module {module}"),
+                    }));
+                }
             },
             None => None,
         };
-        let info = handle.sign_in().await.map_err(|err| Error::Account(format!("logowanie nie powiodło się: {err}")))?;
+        let info = handle.sign_in().await.map_err(|err| {
+            Error::Account(match lang {
+                Lang::Pl => format!("logowanie nie powiodło się: {err}"),
+                Lang::En => format!("sign-in failed: {err}"),
+            })
+        })?;
+        let removed = |id: &str| match lang {
+            Lang::Pl => format!("konto {id} usunięto w trakcie logowania"),
+            Lang::En => format!("account {id} was removed during the sign-in"),
+        };
+        let other_account = other_account();
         // The sign-in took a while: the module may have been turned off or replaced meanwhile, and
         // the account signed in again may have been removed.
         // An account signed in again is only updated, never inserted: one removed meanwhile does
         // not come back.
         let refusal = if !self.modules.handle(module).is_some_and(|current| current.same(&handle)) {
-            format!("moduł {module} wyłączono albo podmieniono w trakcie logowania")
+            match lang {
+                Lang::Pl => format!("moduł {module} wyłączono albo podmieniono w trakcie logowania"),
+                Lang::En => format!("module {module} was turned off or replaced during the sign-in"),
+            }
         } else if let Some(expected) = &expected {
             if info.id == expected.module_account {
                 if self.renew(&expected.id, &info.display_name)? {
                     let renewed = self.get(&expected.id)?.filter(|account| account.state != REMOVING);
-                    return renewed.ok_or_else(|| Error::Account(format!("konto {} usunięto w trakcie logowania", expected.id)));
+                    return renewed.ok_or_else(|| Error::Account(removed(&expected.id)));
                 }
-                format!("konto {} usunięto w trakcie logowania", expected.id)
+                removed(&expected.id)
             } else {
-                OTHER_ACCOUNT.to_owned()
+                other_account.to_owned()
             }
         } else {
             return self.add(module, info);
@@ -151,9 +188,12 @@ impl Accounts {
         match self.get(&format!("{module}:{}", info.id))? {
             // Another account open_mess has: the module now holds its session, so it is online
             // (unless it is being removed).
-            Some(other) if refusal == OTHER_ACCOUNT => {
+            Some(other) if refusal == other_account => {
                 self.renew(&other.id, &info.display_name)?;
-                return Err(Error::Account(format!("{OTHER_ACCOUNT} (zalogowano ponownie konto {})", other.id)));
+                return Err(Error::Account(match lang {
+                    Lang::Pl => format!("{other_account} (zalogowano ponownie konto {})", other.id),
+                    Lang::En => format!("{other_account} (signed in account {} again)", other.id),
+                }));
             }
             Some(_) => {}
             // One open_mess does not have: its session and the secrets the module kept go.
@@ -167,7 +207,10 @@ impl Accounts {
                 // Said, so the user knows something of that account stayed in Credential Manager
                 // (under open_mess/module/<module>).
                 if let Err(why) = deleted {
-                    return Err(Error::Account(format!("{refusal} (sekretów tamtego konta nie udało się usunąć: {why})")));
+                    return Err(Error::Account(match lang {
+                        Lang::Pl => format!("{refusal} (sekretów tamtego konta nie udało się usunąć: {why})"),
+                        Lang::En => format!("{refusal} (that account's secrets could not be deleted: {why})"),
+                    }));
                 }
             }
         }

@@ -23,9 +23,10 @@ use super::quiesce::{Activity, Launcher, finish_work, launch, resume, switch};
 use super::release::Version;
 use super::state::{self, Paths};
 use crate::accounts::Accounts;
+use crate::i18n::{self, Lang};
 use crate::modules::ModuleState;
 use crate::pending::{State, now_ms};
-use crate::ui::commands::UPDATE_IN_PROGRESS;
+use crate::ui::commands::update_in_progress;
 
 /// The first check after the start, and then the time between checks (spec 5).
 const FIRST_CHECK: Duration = Duration::from_secs(5 * 60);
@@ -55,7 +56,7 @@ pub struct Setup {
     /// Ends the daemon once the helper took over.
     pub exit: Arc<Notify>,
     /// [`installable`] for this daemon.
-    pub installable: Result<(), String>,
+    pub installable: Result<(), NotInstallable>,
     pub announce: Announce,
 }
 
@@ -96,7 +97,7 @@ pub struct UpdateView {
     pub current: String,
     pub found: Option<Found>,
     pub state: UpdateState,
-    /// Why this daemon does not install (null when it does).
+    /// Why this daemon does not install (null when it does), in the window's language.
     #[serde(rename = "not_installable", serialize_with = "why_not")]
     pub installable: Result<(), String>,
     /// A new version is being checked: nothing is installed or saved meanwhile (spec 7.2).
@@ -108,6 +109,44 @@ pub struct UpdateView {
 
 fn why_not<S: Serializer>(installable: &Result<(), String>, serializer: S) -> Result<S::Ok, S::Error> {
     installable.as_ref().err().serialize(serializer)
+}
+
+/// Why this daemon does not install an update itself; `scripts/install.ps1` installs then. Put in
+/// words when read, so the words follow the window's language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotInstallable {
+    /// It runs from another `om.exe` than the installed one (a development build, say).
+    OtherExe { running: PathBuf, installed: PathBuf },
+    /// Its data folder is not the one the scheduled task `open_mess` gives the daemon it starts.
+    OtherDataDir { data: PathBuf, task: PathBuf },
+    /// It is not known which data folder that task gives.
+    UnknownTaskDataDir,
+    /// Windows did not say where `om.exe` is.
+    UnknownExe(String),
+}
+
+impl NotInstallable {
+    pub fn text(&self, lang: Lang) -> String {
+        let hint = lang.pick("nową wersję instaluje scripts/install.ps1", "scripts/install.ps1 installs new versions");
+        match (self, lang) {
+            (NotInstallable::OtherExe { running, installed }, Lang::Pl) => {
+                format!("ten demon działa z {}, a nie z {}: {hint}", running.display(), installed.display())
+            }
+            (NotInstallable::OtherExe { running, installed }, Lang::En) => {
+                format!("this daemon runs from {}, not from {}: {hint}", running.display(), installed.display())
+            }
+            (NotInstallable::OtherDataDir { data, task }, Lang::Pl) => {
+                format!("folder danych {} to nie ten, który dostaje zadanie open_mess ({}): {hint}", data.display(), task.display())
+            }
+            (NotInstallable::OtherDataDir { data, task }, Lang::En) => {
+                format!("the data folder {} is not the one the open_mess task gives the daemon ({}): {hint}", data.display(), task.display())
+            }
+            (NotInstallable::UnknownTaskDataDir, _) => lang
+                .pick("nie wiadomo, jaki folder danych dostaje zadanie open_mess", "it is not known which data folder the open_mess task gives")
+                .into(),
+            (NotInstallable::UnknownExe(why), _) => why.clone(),
+        }
+    }
 }
 
 /// What `status` shows agents: [`UpdateView`] without its texts, which can name local folders and so
@@ -237,7 +276,7 @@ impl UpdateService {
             current: Version::current().to_string(),
             found,
             state,
-            installable: self.0.setup.installable.clone(),
+            installable: self.installable(),
             probation: self.held(),
             auto_install: self.auto_install(),
             last_result: last_result(&self.0.setup.paths),
@@ -255,6 +294,11 @@ impl UpdateService {
             probation: self.held(),
             auto_install: self.auto_install(),
         }
+    }
+
+    /// Why this daemon does not install, in the current language.
+    fn installable(&self) -> Result<(), String> {
+        self.0.setup.installable.as_ref().map_err(|why| why.text(i18n::current())).copied()
     }
 
     fn state_and_found(&self) -> (UpdateState, Option<Found>) {
@@ -276,7 +320,7 @@ impl UpdateService {
     }
 
     fn not_held(&self) -> Result<(), String> {
-        if self.held() { Err(UPDATE_IN_PROGRESS.into()) } else { Ok(()) }
+        if self.held() { Err(update_in_progress().into()) } else { Ok(()) }
     }
 
     fn auto_install(&self) -> bool {
@@ -401,19 +445,25 @@ impl UpdateService {
     /// Installs the release that is ready; with `announced`, only if it is that one.
     fn start_install(&self, auto: bool, announced: Option<&str>) -> Result<(), String> {
         let setup = &self.0.setup;
-        setup.installable.clone()?;
+        self.installable()?;
         self.not_held()?;
         let auto = auto || self.auto_install();
         let ready = {
             let mut shared = self.shared();
             let ready = match (&shared.state, &shared.ready) {
                 (UpdateState::Ready, Some(ready)) => ready.clone(),
-                (UpdateState::Phase(_), _) => return Err("instalacja już trwa".into()),
-                (UpdateState::Checking | UpdateState::Downloading, _) => return Err("trwa sprawdzanie aktualizacji, spróbuj za chwilę".into()),
-                _ => return Err("nie ma pobranej wersji do zainstalowania".into()),
+                (UpdateState::Phase(_), _) => return Err(i18n::pick("instalacja już trwa", "an installation is already running").into()),
+                (UpdateState::Checking | UpdateState::Downloading, _) => {
+                    return Err(i18n::pick("trwa sprawdzanie aktualizacji, spróbuj za chwilę", "checking for updates, try again in a moment").into());
+                }
+                _ => return Err(i18n::pick("nie ma pobranej wersji do zainstalowania", "no downloaded version to install").into()),
             };
             if announced.is_some_and(|announced| announced != ready.downloaded.manifest_sha256) {
-                return Err("gotowa jest inna wersja niż ta z powiadomienia".into());
+                return Err(i18n::pick(
+                    "gotowa jest inna wersja niż ta z powiadomienia",
+                    "a different version than the one in the notification is ready",
+                )
+                .into());
             }
             if auto {
                 shared.auto_started = Some(ready.downloaded.manifest_sha256.clone());
@@ -497,18 +547,13 @@ fn last_result(paths: &Paths) -> Option<String> {
 /// Whether this daemon can install an update (spec 7): it runs as `<local>\bin\om.exe`, and its data
 /// folder is the one the scheduled task `open_mess` gives the daemon it starts. Otherwise (a
 /// development build, a data folder set only in one shell) `scripts/install.ps1` installs.
-pub fn installable(paths: &Paths, current_exe: &Path, task_data_dir: &Path) -> Result<(), String> {
-    const HINT: &str = "nową wersję instaluje scripts/install.ps1";
+pub fn installable(paths: &Paths, current_exe: &Path, task_data_dir: &Path) -> Result<(), NotInstallable> {
     let installed = paths.bin().join("om.exe");
     if !same(current_exe, &installed) {
-        return Err(format!("ten demon działa z {}, a nie z {}: {HINT}", current_exe.display(), installed.display()));
+        return Err(NotInstallable::OtherExe { running: current_exe.to_path_buf(), installed });
     }
     if !same(&paths.data, task_data_dir) {
-        return Err(format!(
-            "folder danych {} to nie ten, który dostaje zadanie open_mess ({}): {HINT}",
-            paths.data.display(),
-            task_data_dir.display()
-        ));
+        return Err(NotInstallable::OtherDataDir { data: paths.data.clone(), task: task_data_dir.to_path_buf() });
     }
     Ok(())
 }
@@ -520,9 +565,9 @@ fn same(a: &Path, b: &Path) -> bool {
 }
 
 /// [`installable`] for the running daemon.
-pub fn installable_here(paths: &Paths) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(text)?;
-    let task_data_dir = task_data_dir().ok_or_else(|| "nie wiadomo, jaki folder danych dostaje zadanie open_mess".to_owned())?;
+pub fn installable_here(paths: &Paths) -> Result<(), NotInstallable> {
+    let exe = std::env::current_exe().map_err(|err| NotInstallable::UnknownExe(err.to_string()))?;
+    let task_data_dir = task_data_dir().ok_or(NotInstallable::UnknownTaskDataDir)?;
     installable(paths, &exe, &task_data_dir)
 }
 

@@ -22,11 +22,15 @@ use crate::update::service::{UpdateService, UpdateView};
 use crate::{approval, cli, permissions};
 
 /// Why an approval is refused when the file on disk is not the one the window showed.
-pub const MODULE_CHANGED: &str = "plik modułu się zmienił - odśwież";
+pub fn module_changed() -> &'static str {
+    i18n::pick("plik modułu się zmienił - odśwież", "the module file changed - refresh")
+}
 
 /// Why a save from the window is refused while an update's new version is checked (spec
 /// 2026-10-27-self-update, 7.2): a rollback would undo it without a word.
-pub const UPDATE_IN_PROGRESS: &str = "aktualizacja w toku";
+pub fn update_in_progress() -> &'static str {
+    i18n::pick("aktualizacja w toku", "update in progress")
+}
 
 fn text(err: impl std::fmt::Display) -> String {
     err.to_string()
@@ -34,14 +38,14 @@ fn text(err: impl std::fmt::Display) -> String {
 
 /// Refuses a change while an update's new version is checked.
 fn changes_allowed(state: &UiState) -> Result<(), String> {
-    if state.probation.get() { Err(UPDATE_IN_PROGRESS.into()) } else { Ok(()) }
+    if state.probation.get() { Err(update_in_progress().into()) } else { Ok(()) }
 }
 
 /// Refuses a change to the modules also while an installation stops the daemon: a module loaded
 /// then is not among those phase A paused (spec 2026-10-27-self-update, 7.1).
 fn module_changes_allowed(state: &UiState) -> Result<(), String> {
     changes_allowed(state)?;
-    if state.update.as_ref().is_some_and(UpdateService::installing) { Err(UPDATE_IN_PROGRESS.into()) } else { Ok(()) }
+    if state.update.as_ref().is_some_and(UpdateService::installing) { Err(update_in_progress().into()) } else { Ok(()) }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -67,7 +71,7 @@ pub fn status(state: &UiState) -> Result<StatusDto, String> {
     let problems = modules
         .iter()
         .filter(|info| matches!(info.state, ModuleState::Crashed | ModuleState::Invalid(_)))
-        .map(|info| format!("{} ({}): {}", info.name, info.file, describe(&info.state)))
+        .map(|info| format!("{} ({}): {}", info.name, info.file, describe(&info.state, i18n::current())))
         .collect();
     Ok(StatusDto {
         version: env!("CARGO_PKG_VERSION"),
@@ -166,7 +170,7 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
                 None => modules::approved_manifest(&state.accounts.store(), &info.name).map_err(text)?,
             };
         let changes = match (&info.manifest, earlier) {
-            (Some(new), Some(old)) => changes(&modules::canonical(new), &old),
+            (Some(new), Some(old)) => changes(&modules::canonical(new), &old, i18n::current()),
             _ => Vec::new(),
         };
         let takes_over = matches!(
@@ -180,7 +184,7 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
             version: info.version.clone(),
             platform: info.platform.clone(),
             status: status_code(&info.state),
-            detail: describe(&info.state),
+            detail: describe(&info.state, i18n::current()),
             hosts,
             sign_in_hosts,
             wam: wam.map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes }),
@@ -217,52 +221,68 @@ fn status_code(state: &ModuleState) -> &'static str {
     }
 }
 
-fn describe(state: &ModuleState) -> String {
+/// The state of a module in words, as its card shows it.
+fn describe(state: &ModuleState, lang: Lang) -> String {
     match state {
-        ModuleState::Active => "działa".into(),
-        ModuleState::AwaitingApproval { reason: ApprovalReason::New } => "czeka na zatwierdzenie: nowy moduł".into(),
-        ModuleState::AwaitingApproval { reason: ApprovalReason::ManifestChanged } => "czeka na zatwierdzenie: zmieniony manifest".into(),
-        ModuleState::AwaitingApproval { reason: ApprovalReason::FileChanged } => "czeka na zatwierdzenie: zmieniony plik, ten sam manifest".into(),
-        ModuleState::PendingReplacement => "czeka, by zastąpić działającą wersję".into(),
-        ModuleState::Disabled => "wyłączony".into(),
-        ModuleState::Crashed => "zatrzymany po kilku awariach".into(),
-        ModuleState::Invalid(why) => format!("to nie jest prawidłowy moduł: {why}"),
+        ModuleState::Active => lang.pick("działa", "running").into(),
+        ModuleState::AwaitingApproval { reason: ApprovalReason::New } => {
+            lang.pick("czeka na zatwierdzenie: nowy moduł", "awaiting approval: new module").into()
+        }
+        ModuleState::AwaitingApproval { reason: ApprovalReason::ManifestChanged } => {
+            lang.pick("czeka na zatwierdzenie: zmieniony manifest", "awaiting approval: changed manifest").into()
+        }
+        ModuleState::AwaitingApproval { reason: ApprovalReason::FileChanged } => {
+            lang.pick("czeka na zatwierdzenie: zmieniony plik, ten sam manifest", "awaiting approval: changed file, same manifest").into()
+        }
+        ModuleState::PendingReplacement => lang.pick("czeka, by zastąpić działającą wersję", "waiting to replace the running version").into(),
+        ModuleState::Disabled => lang.pick("wyłączony", "turned off").into(),
+        ModuleState::Crashed => lang.pick("zatrzymany po kilku awariach", "stopped after repeated crashes").into(),
+        ModuleState::Invalid(why) => match lang {
+            Lang::Pl => format!("to nie jest prawidłowy moduł: {why}"),
+            Lang::En => format!("not a valid module: {why}"),
+        },
     }
 }
 
 /// How manifest `new` differs from `old`, line by line; both as [`modules::canonical`] gives them.
-fn changes(new: &Value, old: &Value) -> Vec<String> {
+/// Each language has templates of its own: Polish adjectives follow the noun's gender.
+fn changes(new: &Value, old: &Value, lang: Lang) -> Vec<String> {
     let mut changes = Vec::new();
-    for (key, what) in [("version", "wersja"), ("platform", "platforma")] {
+    for (key, what) in [("version", lang.pick("wersja", "version")), ("platform", lang.pick("platforma", "platform"))] {
         if field(new, key) != field(old, key) {
             changes.push(format!("{what}: {} -> {}", text_of(field(old, key)), text_of(field(new, key))));
         }
     }
-    list_changes(&mut changes, "host", field(new, "hosts"), field(old, "hosts"));
-    list_changes(&mut changes, "host logowania", field(new, "sign_in_hosts"), field(old, "sign_in_hosts"));
+    let (new_host, removed_host) = (lang.pick("nowy host", "new host"), lang.pick("usunięty host", "removed host"));
+    list_changes(&mut changes, new_host, removed_host, field(new, "hosts"), field(old, "hosts"));
+    let (new_host, removed_host) =
+        (lang.pick("nowy host logowania", "new sign-in host"), lang.pick("usunięty host logowania", "removed sign-in host"));
+    list_changes(&mut changes, new_host, removed_host, field(new, "sign_in_hosts"), field(old, "sign_in_hosts"));
     if field(new, "wam") != field(old, "wam") {
         let wam = |manifest: &Value| match field(manifest, "wam") {
             wam @ Value::Object(_) => format!("{} ({})", text_of(field(wam, "client_id")), strings(field(wam, "scopes")).join(", ")),
-            _ => "brak".to_string(),
+            _ => lang.pick("brak", "none").to_owned(),
         };
-        changes.push(format!("tożsamość WAM: {} -> {}", wam(old), wam(new)));
+        changes.push(format!("{}: {} -> {}", lang.pick("tożsamość WAM", "WAM identity"), wam(old), wam(new)));
     }
     let tools = |manifest: &Value| field(manifest, "extra_tools").as_array().cloned().unwrap_or_default();
     let (new_tools, old_tools) = (tools(new), tools(old));
     let name = |tool: &Value| text_of(field(tool, "name"));
-    let kind = |tool: &Value| if field(tool, "writes") == &Value::Bool(true) { "pisze" } else { "czyta" };
+    let kind = |tool: &Value| if field(tool, "writes") == &Value::Bool(true) { lang.pick("pisze", "writes") } else { lang.pick("czyta", "reads") };
+    let (new_tool, changed_tool) = (lang.pick("nowe narzędzie", "new tool"), lang.pick("zmienione narzędzie", "changed tool"));
     for tool in &new_tools {
         match old_tools.iter().find(|old| name(old) == name(tool)) {
-            None => changes.push(format!("nowe narzędzie: {} ({})", name(tool), kind(tool))),
-            Some(old) if old != tool => changes.push(format!("zmienione narzędzie: {} ({})", name(tool), kind(tool))),
+            None => changes.push(format!("{new_tool}: {} ({})", name(tool), kind(tool))),
+            Some(old) if old != tool => changes.push(format!("{changed_tool}: {} ({})", name(tool), kind(tool))),
             Some(_) => {}
         }
     }
+    let removed_tool = lang.pick("usunięte narzędzie", "removed tool");
     for tool in old_tools.iter().filter(|old| !new_tools.iter().any(|new| name(new) == name(old))) {
-        changes.push(format!("usunięte narzędzie: {}", name(tool)));
+        changes.push(format!("{removed_tool}: {}", name(tool)));
     }
     if changes.is_empty() {
-        changes.push("manifest bez zmian, inny plik".into());
+        changes.push(lang.pick("manifest bez zmian, inny plik", "same manifest, another file").into());
     }
     changes
 }
@@ -280,14 +300,15 @@ fn strings(value: &Value) -> Vec<String> {
     value.as_array().map(|items| items.iter().map(text_of).collect()).unwrap_or_default()
 }
 
-fn list_changes(changes: &mut Vec<String>, what: &str, new: &Value, old: &Value) {
+/// The items of list `new` that `old` lacks, as `added: item`, and the other way round.
+fn list_changes(changes: &mut Vec<String>, added: &str, removed: &str, new: &Value, old: &Value) {
     let (new, old): (BTreeSet<String>, BTreeSet<String>) = (strings(new).into_iter().collect(), strings(old).into_iter().collect());
-    changes.extend(new.difference(&old).map(|item| format!("nowy {what}: {item}")));
-    changes.extend(old.difference(&new).map(|item| format!("usunięty {what}: {item}")));
+    changes.extend(new.difference(&old).map(|item| format!("{added}: {item}")));
+    changes.extend(old.difference(&new).map(|item| format!("{removed}: {item}")));
 }
 
 /// Approves the module file the window showed, by the hashes it showed, and loads it (a module
-/// stopped after repeated crashes starts again). Refused with [`MODULE_CHANGED`] when the file is
+/// stopped after repeated crashes starts again). Refused with [`module_changed`] when the file is
 /// no longer that one. Once a file an update placed beside the module is the module, the approved
 /// file it replaced is deleted, so that the module has one file (spec 2026-10-27-self-update, 7.4);
 /// a file added by hand deletes nothing.
@@ -296,7 +317,7 @@ pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, mani
     let list = state.accounts.modules().list();
     let shown = list.iter().find(|info| info.name == name && info.file_sha256 == file_sha256 && info.manifest_sha256 == manifest_sha256);
     let Some((file, Some(manifest))) = shown.map(|info| (info.file.clone(), info.manifest.clone())) else {
-        return Err(MODULE_CHANGED.into());
+        return Err(module_changed().into());
     };
     // The module's approved file now, when the one approved is an update's file beside it.
     let approved = |state: &ModuleState| matches!(state, ModuleState::Active | ModuleState::Disabled | ModuleState::Crashed);
@@ -309,7 +330,7 @@ pub async fn approve_module(state: &UiState, name: &str, file_sha256: &str, mani
     let shown_file = file.clone();
     let on_disk = tokio::task::spawn_blocking(move || accounts.modules().file_sha256(&shown_file)).await.map_err(text)?;
     if on_disk.as_deref() != Some(file_sha256) {
-        return Err(MODULE_CHANGED.into());
+        return Err(module_changed().into());
     }
     {
         let store = state.accounts.store();
@@ -346,7 +367,10 @@ fn placed_beside(file: &str) -> bool {
 pub async fn set_module_enabled(state: &UiState, name: &str, enabled: bool) -> Result<(), String> {
     module_changes_allowed(state)?;
     if !state.accounts.modules().list().iter().any(|info| info.name == name && info.manifest.is_some()) {
-        return Err(format!("nie ma modułu {name}"));
+        return Err(match i18n::current() {
+            Lang::Pl => format!("nie ma modułu {name}"),
+            Lang::En => format!("no module {name}"),
+        });
     }
     modules::set_enabled(&state.accounts.store(), name, enabled).map_err(text)?;
     rescan(state, enabled.then_some(name)).await
@@ -387,7 +411,10 @@ const MAX_CONVERSATION: usize = 1024;
 fn known_account(state: &UiState, account: &str) -> Result<(), String> {
     match state.accounts.get(account).map_err(text)? {
         Some(found) if found.state != crate::accounts::REMOVING => Ok(()),
-        _ => Err(format!("nie ma konta {account}")),
+        _ => Err(match i18n::current() {
+            Lang::Pl => format!("nie ma konta {account}"),
+            Lang::En => format!("no account {account}"),
+        }),
     }
 }
 
@@ -416,7 +443,7 @@ pub fn set_permissions(state: &UiState, account: &str, conversation: Option<Stri
     if let Some(id) = &conversation
         && (id.is_empty() || id.len() > MAX_CONVERSATION || id.chars().any(char::is_control))
     {
-        return Err("podaj identyfikator rozmowy".into());
+        return Err(i18n::pick("podaj identyfikator rozmowy", "enter a conversation id").into());
     }
     permissions::set(&state.accounts.store(), account, conversation.as_deref(), read, write).map_err(text)
 }
@@ -448,7 +475,12 @@ pub struct PreviewDto {
 }
 
 /// Why an action whose target message could not be shown in full is not approved.
-pub const TARGET_CUT: &str = "wiadomości, której dotyczy akcja, nie da się pokazać w całości - można ją tylko odrzucić";
+pub fn target_cut() -> &'static str {
+    i18n::pick(
+        "wiadomości, której dotyczy akcja, nie da się pokazać w całości - można ją tylko odrzucić",
+        "the message this action is about can't be shown in full - it can only be rejected",
+    )
+}
 
 /// The actions waiting for approval, oldest first, in full: the window is where long content can
 /// be approved.
@@ -478,7 +510,7 @@ pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
 pub async fn decide(state: &UiState, action: &str, approve: bool) -> Result<String, String> {
     changes_allowed(state)?;
     if approve && state.pending.waiting().iter().any(|preview| preview.action == action && preview.target_cut) {
-        return Err(TARGET_CUT.into());
+        return Err(target_cut().into());
     }
     Ok(state.pending.decide(action, approve).await.map_err(text)?.name().into())
 }
@@ -592,7 +624,7 @@ pub fn sign_in_answer(state: &UiState, id: u64, answer: AnswerDto) -> Result<(),
     let reply = match answer {
         AnswerDto::Cancelled => SignInReply::Cancelled,
         AnswerDto::Done(_) if matches!(state.sign_ins.shown(), Some((shown, SignInRequest::OpenPage { .. })) if shown == id) => {
-            return Err("stronę logowania można tylko anulować".into());
+            return Err(i18n::pick("stronę logowania można tylko anulować", "a sign-in page can only be cancelled").into());
         }
         AnswerDto::Done(value) => SignInReply::Done(value),
     };
@@ -604,10 +636,10 @@ pub fn sign_in_answer(state: &UiState, id: u64, answer: AnswerDto) -> Result<(),
 pub fn sign_in_open_link(state: &UiState, id: u64) -> Result<(), String> {
     let url = match state.sign_ins.shown() {
         Some((shown, SignInRequest::DeviceCode { url, .. })) if shown == id => url,
-        _ => return Err(super::sign_in::GONE.into()),
+        _ => return Err(super::sign_in::gone().into()),
     };
     if !url.starts_with("https://") || url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') {
-        return Err("moduł podał nieprawidłowy adres strony logowania".into());
+        return Err(i18n::pick("moduł podał nieprawidłowy adres strony logowania", "the module gave an invalid sign-in page address").into());
     }
     open_in_browser(&url)
 }
@@ -642,8 +674,14 @@ pub struct RuleViewDto {
     pub counters: RuleCounters,
 }
 
-/// What the window shows when a rule wakes agents that may write on their own (spec 8.7).
-pub const AUTONOMOUS_RULE: &str = "Agenci obudzeni przez tę regułę mogą wysyłać, poprawiać i reagować bez Twojej zgody, bo konto albo rozmowa, której dotyczy, ma pisanie \"samodzielnie\". Ustaw \"z potwierdzeniem\" w sekcji Uprawnienia agentów, jeśli mają pytać.";
+/// What the window shows when a rule wakes agents that may write on their own (spec 8.7). It quotes
+/// the window's labels of the write permission and names its section, in either language.
+pub fn autonomous_rule(lang: Lang) -> &'static str {
+    lang.pick(
+        "Agenci obudzeni przez tę regułę mogą wysyłać, poprawiać i reagować bez Twojej zgody, bo konto albo rozmowa, której dotyczy, ma pisanie \"samodzielnie\". Ustaw \"z potwierdzeniem\" w sekcji Uprawnienia agentów, jeśli mają pytać.",
+        "Agents woken by this rule can send, edit and react without your approval, because the account or conversation it is about has writing set to \"autonomously\". Set \"with confirmation\" in the Agent permissions section if they should ask.",
+    )
+}
 
 /// Every trigger rule, oldest first, with its counters.
 pub fn rules(state: &UiState) -> Result<Vec<RuleViewDto>, String> {
@@ -664,14 +702,17 @@ pub fn put_rule(state: &UiState, dto: RuleDto) -> Result<Option<String>, String>
     known_account(state, &dto.account)?;
     let rule = Rule { id: dto.id, account: dto.account, enabled: dto.enabled, ..dto.rule };
     let warning = rules::put(&state.accounts.store(), &rule).map_err(text)?;
-    Ok(warning.map(|_| AUTONOMOUS_RULE.to_owned()))
+    Ok(warning.map(|_| autonomous_rule(i18n::current()).to_owned()))
 }
 
 pub fn delete_rule(state: &UiState, id: &str) -> Result<(), String> {
     changes_allowed(state)?;
     match rules::delete(&state.accounts.store(), id).map_err(text)? {
         true => Ok(()),
-        false => Err(format!("nie ma reguły {id}")),
+        false => Err(match i18n::current() {
+            Lang::Pl => format!("nie ma reguły {id}"),
+            Lang::En => format!("no rule {id}"),
+        }),
     }
 }
 
@@ -682,11 +723,12 @@ pub async fn pick_program() -> Result<Option<String>, String> {
 
 #[cfg(windows)]
 async fn pick_file() -> Result<Option<String>, String> {
-    let picked = tokio::task::spawn_blocking(|| {
+    let lang = i18n::current();
+    let picked = tokio::task::spawn_blocking(move || {
         rfd::FileDialog::new()
-            .set_title("Program, który uruchomi reguła")
-            .add_filter("Programy", &["exe", "cmd", "bat"])
-            .add_filter("Wszystkie pliki", &["*"])
+            .set_title(lang.pick("Program, który uruchomi reguła", "The program the rule starts"))
+            .add_filter(lang.pick("Programy", "Programs"), &["exe", "cmd", "bat"])
+            .add_filter(lang.pick("Wszystkie pliki", "All files"), &["*"])
             .pick_file()
     });
     Ok(picked.await.map_err(text)?.map(|path| path.display().to_string()))
@@ -733,7 +775,7 @@ pub const CHANNEL_CONFIG: &str = "channel-mcp.json";
 /// The updates, where the daemon has them (spec 2026-10-27-self-update, 6). Consent and the option
 /// to install on its own are set only here and in the toast: no tool or CLI command reaches them.
 fn updates(state: &UiState) -> Result<&UpdateService, String> {
-    state.update.as_ref().ok_or_else(|| "ten demon nie aktualizuje się sam".to_owned())
+    state.update.as_ref().ok_or_else(|| i18n::pick("ten demon nie aktualizuje się sam", "this daemon does not update itself").to_owned())
 }
 
 pub fn update_status(state: &UiState) -> Result<UpdateView, String> {
@@ -792,6 +834,82 @@ pub fn set_language(state: &UiState, setting: &str) -> Result<(Lang, bool), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_states_in_both_languages() {
+        let states = [
+            (ModuleState::Active, "działa", "running"),
+            (ModuleState::AwaitingApproval { reason: ApprovalReason::New }, "czeka na zatwierdzenie: nowy moduł", "awaiting approval: new module"),
+            (
+                ModuleState::AwaitingApproval { reason: ApprovalReason::ManifestChanged },
+                "czeka na zatwierdzenie: zmieniony manifest",
+                "awaiting approval: changed manifest",
+            ),
+            (
+                ModuleState::AwaitingApproval { reason: ApprovalReason::FileChanged },
+                "czeka na zatwierdzenie: zmieniony plik, ten sam manifest",
+                "awaiting approval: changed file, same manifest",
+            ),
+            (ModuleState::PendingReplacement, "czeka, by zastąpić działającą wersję", "waiting to replace the running version"),
+            (ModuleState::Disabled, "wyłączony", "turned off"),
+            (ModuleState::Crashed, "zatrzymany po kilku awariach", "stopped after repeated crashes"),
+            (ModuleState::Invalid("no manifest".into()), "to nie jest prawidłowy moduł: no manifest", "not a valid module: no manifest"),
+        ];
+        for (state, pl, en) in states {
+            assert_eq!((describe(&state, Lang::Pl).as_str(), describe(&state, Lang::En).as_str()), (pl, en));
+        }
+    }
+
+    #[test]
+    fn manifest_changes_in_both_languages() {
+        let old = serde_json::json!({
+            "version": "1.0.0", "platform": "teams", "hosts": ["a.example", "b.example"], "sign_in_hosts": ["login.example"],
+            "extra_tools": [{"name": "kept", "writes": false}, {"name": "changed", "writes": false}, {"name": "gone", "writes": true}],
+        });
+        let new = serde_json::json!({
+            "version": "1.1.0", "platform": "teams", "hosts": ["a.example", "c.example"], "sign_in_hosts": [],
+            "wam": {"client_id": "id", "scopes": ["s1", "s2"]},
+            "extra_tools": [{"name": "kept", "writes": false}, {"name": "changed", "writes": true}, {"name": "added", "writes": false}],
+        });
+        assert_eq!(
+            changes(&new, &old, Lang::Pl),
+            [
+                "wersja: 1.0.0 -> 1.1.0",
+                "nowy host: c.example",
+                "usunięty host: b.example",
+                "usunięty host logowania: login.example",
+                "tożsamość WAM: brak -> id (s1, s2)",
+                "zmienione narzędzie: changed (pisze)",
+                "nowe narzędzie: added (czyta)",
+                "usunięte narzędzie: gone",
+            ]
+        );
+        assert_eq!(
+            changes(&new, &old, Lang::En),
+            [
+                "version: 1.0.0 -> 1.1.0",
+                "new host: c.example",
+                "removed host: b.example",
+                "removed sign-in host: login.example",
+                "WAM identity: none -> id (s1, s2)",
+                "changed tool: changed (writes)",
+                "new tool: added (reads)",
+                "removed tool: gone",
+            ]
+        );
+        let platform = serde_json::json!({"platform": "slack", "sign_in_hosts": ["login.example"]});
+        let old_platform = serde_json::json!({"platform": "teams"});
+        assert_eq!(changes(&platform, &old_platform, Lang::Pl), ["platforma: teams -> slack", "nowy host logowania: login.example"]);
+        assert_eq!(changes(&platform, &old_platform, Lang::En), ["platform: teams -> slack", "new sign-in host: login.example"]);
+        assert_eq!(changes(&old, &old, Lang::Pl), ["manifest bez zmian, inny plik"]);
+        assert_eq!(changes(&old, &old, Lang::En), ["same manifest, another file"]);
+    }
+
+    #[test]
+    fn autonomous_rule_quotes_the_window_in_its_language() {
+        assert!(autonomous_rule(Lang::Pl).contains("\"samodzielnie\""));
+        assert!(autonomous_rule(Lang::En).contains("\"autonomously\""));
+    }
 
     #[test]
     fn only_an_update_s_names_are_placed_beside() {

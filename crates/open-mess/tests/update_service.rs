@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
+use open_mess::i18n::Lang;
 use open_mess::store::Store;
 use open_mess::tools::ToolError;
 use open_mess::triggers::spawn::Runs;
@@ -27,7 +28,7 @@ use open_mess::update::consent;
 use open_mess::update::fetch::Source;
 use open_mess::update::quiesce::{Activity, Launcher};
 use open_mess::update::release::manifest_sha256;
-use open_mess::update::service::{self, Announce, Found, Phase, Setup, UpdateService, UpdateState};
+use open_mess::update::service::{self, Announce, Found, NotInstallable, Phase, Setup, UpdateService, UpdateState};
 use open_mess::update::state::{self, Paths, Read, Stage};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -120,7 +121,7 @@ struct Harness {
     toasts: Arc<Mutex<Vec<(String, String)>>>,
 }
 
-async fn harness(installable: Result<(), String>, helper_starts: bool) -> Harness {
+async fn harness(installable: Result<(), NotInstallable>, helper_starts: bool) -> Harness {
     let d = common::daemon(&[]).await;
     let local = tempfile::tempdir().unwrap();
     let paths = Paths { data: d.dir.path().to_path_buf(), local: local.path().to_path_buf() };
@@ -306,10 +307,26 @@ async fn not_installable_from_a_dev_build() {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths { data: dir.path().join("data"), local: dir.path().join("local") };
     let installed = paths.bin().join("om.exe");
-    let dev = service::installable(&paths, &dir.path().join("src").join("target").join("debug").join("om.exe"), &paths.data).unwrap_err();
-    assert!(dev.contains("scripts/install.ps1"), "{dev}");
-    let other_data = service::installable(&paths, &installed, &dir.path().join("elsewhere")).unwrap_err();
-    assert!(other_data.contains("scripts/install.ps1"), "{other_data}");
+    let dev_exe = dir.path().join("src").join("target").join("debug").join("om.exe");
+    let dev = service::installable(&paths, &dev_exe, &paths.data).unwrap_err();
+    assert_eq!(dev, NotInstallable::OtherExe { running: dev_exe.clone(), installed: installed.clone() });
+    let elsewhere = dir.path().join("elsewhere");
+    let other_data = service::installable(&paths, &installed, &elsewhere).unwrap_err();
+    assert_eq!(other_data, NotInstallable::OtherDataDir { data: paths.data.clone(), task: elsewhere.clone() });
+    // In words, in the window's language, each with the way to install.
+    assert_eq!(
+        dev.text(Lang::Pl),
+        format!("ten demon działa z {}, a nie z {}: nową wersję instaluje scripts/install.ps1", dev_exe.display(), installed.display())
+    );
+    assert_eq!(
+        other_data.text(Lang::Pl),
+        format!(
+            "folder danych {} to nie ten, który dostaje zadanie open_mess ({}): nową wersję instaluje scripts/install.ps1",
+            paths.data.display(),
+            elsewhere.display()
+        )
+    );
+    assert_eq!(NotInstallable::UnknownTaskDataDir.text(Lang::Pl), "nie wiadomo, jaki folder danych dostaje zadanie open_mess");
     service::installable(&paths, &installed, &paths.data).unwrap();
     // Windows paths: the same folder in other letter case is the same folder.
     service::installable(&paths, &PathBuf::from(installed.display().to_string().to_uppercase()), &paths.data).unwrap();
@@ -318,9 +335,9 @@ async fn not_installable_from_a_dev_build() {
     h.service.set_auto_install(true).unwrap();
     h.check().await;
     let view = h.service.view();
-    assert_eq!((view.found, view.installable), (found(false), Err(dev.clone())));
+    assert_eq!((view.found, view.installable), (found(false), Err(dev.text(Lang::Pl))));
     sleep(10 * MINUTE).await;
-    assert_eq!(h.service.install(), Err(dev));
+    assert_eq!(h.service.install(), Err(dev.text(Lang::Pl)));
     assert!(h.consents().is_empty());
     assert!(h.launched().is_empty());
     assert!(h.toasts().is_empty(), "nothing to click in a toast");
@@ -399,7 +416,7 @@ async fn status_shows_no_local_paths() {
     let view = h.service.view();
     assert!(matches!(&view.state, UpdateState::Error(why) if why.contains(&h.paths.updates().display().to_string())), "{:?}", view.state);
     assert!(view.last_result.unwrap().contains(&backup.display().to_string()));
-    assert_eq!(view.installable, Err(reason));
+    assert_eq!(view.installable, Err(reason.text(Lang::Pl)));
 
     // Agents get none of them.
     let status = h.d.registry.call("status", json!({})).await.unwrap();
@@ -436,7 +453,7 @@ async fn cancel_and_a_helper_that_did_not_start_go_back_to_work() {
     assert_eq!(h.launched().len(), 1);
     let view = h.service.view();
     assert_eq!(view.state, UpdateState::Ready);
-    assert_eq!(view.last_result.as_deref(), Some("przerwano: pomocnik nie wystartował"));
+    assert_eq!(view.last_result.as_deref(), Some("przerwano: the update helper did not start"));
     assert!(matches!(state::read(&h.paths.pending_file()), Read::Missing));
     // Tool calls are taken again.
     h.d.registry.call("status", json!({})).await.unwrap();
@@ -500,7 +517,7 @@ async fn modules_are_not_changed_while_an_installation_stops_the_daemon() {
     let ui = h.ui();
     h.service.install().unwrap();
     assert_eq!(h.service.view().state, UpdateState::Phase(Phase::A));
-    let refused = Err(commands::UPDATE_IN_PROGRESS.to_string());
+    let refused = Err(commands::update_in_progress().to_string());
     assert_eq!(commands::rescan_modules(&ui).await, refused);
     assert_eq!(commands::set_module_enabled(&ui, "test-echo", true).await, refused);
     assert_eq!(commands::approve_module(&ui, "test-echo", "file", "manifest").await, refused);
