@@ -227,6 +227,11 @@ interface module {
     // Restores a session from stored secrets at daemon start.
     restore: func(account: string) -> result<_, module-error>;
     sign-out: func(account: string);
+    // Ends now everything of the account's that other people see (live captions: leaves the
+    // meetings), before the daemon stops, an update pauses the module's events or a scan stops or
+    // replaces the module. The instance may get calls afterwards. Limited to 5 s (spec
+    // 2026-10-29-live-captions, 4.3).
+    end-sessions: func(account: string);
     // Runs a shared tool (spec 8.5) or one of the manifest's extra tools. The writes `send`,
     // `edit_message` and `react` come only once the agent permissions and, where needed, the
     // user's approval allow them (spec 8.6); any successful result means done.

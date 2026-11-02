@@ -5,6 +5,9 @@ use std::time::Duration;
 
 /// Wall-clock limit of one call into a module, time spent in host imports included.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The `end-sessions` call: the daemon waits on it before it stops (spec 2026-10-29-live-captions,
+/// 4.3).
+pub const END_SESSIONS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Linear memory of one module instance, all its memories together.
 pub const MAX_MEMORY: usize = 256 * 1024 * 1024;
 /// Table elements of one module instance, all its tables together.

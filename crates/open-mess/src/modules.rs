@@ -199,12 +199,15 @@ impl Modules {
     /// until the user turns it off or approves a file that replaces it: a new file waiting for
     /// approval, a file that is gone or one that does not load (still being written, say) leave it
     /// running (spec 8.3). A module stopped after repeated crashes starts again only when `restart`
-    /// names it. Returns the modules that stopped, started or were replaced.
-    pub(crate) fn adopt(&self, store: &Store, found: Found, restart: Option<&str>) -> Result<Vec<String>, Error> {
+    /// names it. Returns the modules that stopped, started or were replaced, and the handles of the
+    /// loaded versions that stopped: the caller ends their sessions before it drops them (spec
+    /// 2026-10-29-live-captions, 4.3).
+    pub(crate) fn adopt(&self, store: &Store, found: Found, restart: Option<&str>) -> Result<(Vec<String>, Vec<ModuleHandle>), Error> {
         let mut fresh = decide(store, found)?;
         let mut entries = self.write();
         let mut changed = BTreeSet::new();
         let mut kept = BTreeSet::new();
+        let mut stopped = Vec::new();
         for old in entries.drain(..).filter(|old| old.handle.is_some()) {
             let name = old.info.name.clone();
             let enabled = Row::get(store.conn(), &name)?.is_some_and(|row| row.enabled);
@@ -222,6 +225,7 @@ impl Modules {
             };
             if !keep {
                 changed.insert(name);
+                stopped.extend(old.handle);
                 continue;
             }
             kept.insert(name);
@@ -244,7 +248,7 @@ impl Modules {
         *entries = fresh;
         drop(entries);
         self.changes.send_replace(());
-        Ok(changed.into_iter().collect())
+        Ok((changed.into_iter().collect(), stopped))
     }
 }
 

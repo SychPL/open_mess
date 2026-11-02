@@ -463,6 +463,13 @@ impl ModuleHandle {
         self.request(|reply| Request::SignOut(account.to_string(), reply)).await
     }
 
+    /// Ends now what other people see of the account's sessions (live captions), before the
+    /// daemon stops, an update pauses the module's events or a scan stops or replaces the module;
+    /// at most `END_SESSIONS_TIMEOUT` once its turn in the module's queue comes.
+    pub async fn end_sessions(&self, account: &str) -> Result<(), HostError> {
+        self.request(|reply| Request::EndSessions(account.to_string(), reply)).await
+    }
+
     /// Runs a tool: a shared one (spec 8.5) or one of the manifest's extra tools.
     pub async fn call(&self, account: &str, tool: &str, args_json: &str) -> Result<String, HostError> {
         self.request(|reply| Request::Call { account: account.to_string(), tool: tool.to_string(), args: args_json.to_string(), reply }).await

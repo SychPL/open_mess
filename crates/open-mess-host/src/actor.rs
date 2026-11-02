@@ -32,6 +32,7 @@ pub(crate) enum Request {
     SignIn(Reply<AccountInfo>),
     Restore(String, Reply<()>),
     SignOut(String, Reply<()>),
+    EndSessions(String, Reply<()>),
     Call {
         account: String,
         tool: String,
@@ -60,7 +61,9 @@ impl Request {
         match self {
             Request::SignIn(_) => Caller::SignIn,
             Request::PauseEvents(_) | Request::ResumeEvents(_) => Caller::Event,
-            Request::Restore(account, _) | Request::SignOut(account, _) | Request::Call { account, .. } => Caller::Account(account.clone()),
+            Request::Restore(account, _) | Request::SignOut(account, _) | Request::EndSessions(account, _) | Request::Call { account, .. } => {
+                Caller::Account(account.clone())
+            }
             Request::GetAttachment { ids: [account, ..], .. } | Request::DescribeTarget { ids: [account, ..], .. } => {
                 Caller::Account(account.clone())
             }
@@ -294,10 +297,19 @@ impl Actor {
         &mut self,
         export: impl for<'a> FnOnce(&'a PlatformModule, &'a mut Store<HostState>) -> Export<'a, R>,
     ) -> Result<R, HostError> {
+        self.run_for(self.limits.call_timeout, export).await
+    }
+
+    /// [`Actor::run`] with a shorter limit than the call limit.
+    async fn run_for<R>(
+        &mut self,
+        limit: Duration,
+        export: impl for<'a> FnOnce(&'a PlatformModule, &'a mut Store<HostState>) -> Export<'a, R>,
+    ) -> Result<R, HostError> {
         if *self.state.borrow() == ModuleState::Disabled {
             return Err(HostError::Closed);
         }
-        self.deadline.set(Some(Instant::now() + self.limits.call_timeout));
+        self.deadline.set(Some(Instant::now() + limit.min(self.limits.call_timeout)));
         let result = self.run_on_instance(export).await;
         self.deadline.set(None);
         match result {
@@ -443,6 +455,14 @@ impl Actor {
             }
             Request::SignOut(account, reply) => {
                 let result = self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_sign_out(s, &account).await })).await;
+                reply.send(result).ok();
+            }
+            Request::EndSessions(account, reply) => {
+                let result = self
+                    .run_for(limits::END_SESSIONS_TIMEOUT, move |m, s| {
+                        Box::pin(async move { m.open_mess_module_module().call_end_sessions(s, &account).await })
+                    })
+                    .await;
                 reply.send(result).ok();
             }
             Request::Call { account, tool, args, reply } => {

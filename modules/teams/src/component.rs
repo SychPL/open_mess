@@ -55,6 +55,9 @@ impl module::Guest for Teams {
         api::sign_out(&account);
     }
 
+    // The module has no session others see yet: live captions come with step 4 of the spec.
+    fn end_sessions(_account: String) {}
+
     fn call(account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
         api::begin();
         crate::tools::call(&account, &tool, &args_json)

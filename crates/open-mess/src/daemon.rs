@@ -76,6 +76,8 @@ pub fn run() -> Result<(), Error> {
     let exit = Arc::clone(&ui.exit);
     let registry = Arc::new(registry);
     runtime.spawn(Arc::clone(&registry).watch_tools());
+    runtime.spawn(Arc::clone(&ui.accounts).restore_after_crashes());
+    let accounts = Arc::clone(&ui.accounts);
     if let Some((paths, launcher)) = update.filter(|_| probation) {
         let activity = Activity {
             gate: ui.gate.clone(),
@@ -113,6 +115,9 @@ pub fn run() -> Result<(), Error> {
         runtime.block_on(window.close());
         runtime.block_on(until_stopped(ended, exit));
     }
+    // Before the modules go with the process: what others see of their sessions ends (spec
+    // 2026-10-29-live-captions, 4.3).
+    runtime.block_on(accounts.end_sessions(&accounts.modules().handles()));
     let _ = stop.send(());
     runtime.block_on(server).map_err(|err| Error::Io(std::io::Error::other(err)))?
 }

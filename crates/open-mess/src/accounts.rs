@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use keyring_core::api::CredentialStore;
-use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, SessionState};
+use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, ModuleHandle, SessionState};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 use tokio::task::JoinSet;
@@ -259,9 +259,9 @@ impl Accounts {
     /// described them; their sessions are then restored, or marked offline.
     pub async fn rescan_modules(&self, restart: Option<&str>) -> Result<Vec<String>, Error> {
         let found = self.modules.load().await?;
-        let changed = {
+        let (changed, stopped) = {
             let store = self.store();
-            let changed = self.modules.adopt(&store, found, restart)?;
+            let (changed, stopped) = self.modules.adopt(&store, found, restart)?;
             for module in &changed {
                 store.conn().execute(
                     "UPDATE pending SET state = 'expired', args = '', detail = 'its module stopped or was replaced before it was approved'
@@ -269,10 +269,58 @@ impl Accounts {
                     [module],
                 )?;
             }
-            changed
+            (changed, stopped)
         };
+        // The versions that stopped leave what others see before they go (spec
+        // 2026-10-29-live-captions, 4.3).
+        self.end_sessions(&stopped).await;
+        drop(stopped);
         self.restore_where(|module| changed.iter().any(|name| name == module)).await?;
         Ok(changed)
+    }
+
+    /// Asks each module to end now what other people see of its accounts' sessions (live
+    /// captions): `end-sessions` for every account of the module, one at a time, each limited by
+    /// the host (spec 2026-10-29-live-captions, 4.3). Before the daemon stops, an update pauses the
+    /// modules' events, or a scan drops a module. A module that fails is passed over.
+    pub async fn end_sessions(&self, handles: &[ModuleHandle]) {
+        let Ok(accounts) = self.list() else { return };
+        for handle in handles {
+            let Ok(manifest) = handle.manifest() else { continue };
+            for account in accounts.iter().filter(|account| account.module == manifest.name) {
+                let _ = handle.end_sessions(&account.module_account).await;
+            }
+        }
+    }
+
+    /// Restores the accounts of a module the moment it crashes, so that a new instance starts at
+    /// once and ends the sessions the crashed one left (spec 2026-10-29-live-captions, 4.3, R3);
+    /// the host otherwise starts one only at the module's next call. Runs while the modules do.
+    pub async fn restore_after_crashes(self: Arc<Self>) {
+        let mut changes = self.modules.changes();
+        // Each loaded module and the crashes seen of it.
+        let mut seen: Vec<(ModuleHandle, u32)> = Vec::new();
+        while changes.changed().await.is_ok() {
+            let handles = self.modules.handles();
+            seen.retain(|(old, _)| handles.iter().any(|handle| handle.same(old)));
+            for handle in handles {
+                let crashes = handle.crashes_since_load();
+                let before = match seen.iter_mut().find(|(old, _)| old.same(&handle)) {
+                    Some((_, count)) => std::mem::replace(count, crashes),
+                    None => {
+                        seen.push((handle.clone(), crashes));
+                        0
+                    }
+                };
+                if crashes > before
+                    && handle.state() != open_mess_host::ModuleState::Disabled
+                    && let Ok(manifest) = handle.manifest()
+                {
+                    // ponytail: a failed restore leaves the stored states, as at the daemon's start.
+                    let _ = self.restore_where(|module| module == manifest.name).await;
+                }
+            }
+        }
     }
 
     /// Restores the sessions of the accounts of the modules `module` picks.

@@ -32,7 +32,9 @@
 //! `{"error"}`. `rtc-open` opens a media connection with the data channel `{"label"}` and returns
 //! `{"conn", "offer"}`; `rtc-accept` gives connection `{"conn"}` the answer `{"answer"}` and returns
 //! `{}`; both return `{"error", "why"}` instead when refused, and `rtc-close` closes `{"conn"}`. The
-//! manifest's media range is 52.112.0.0/14; data channel batches and states go to `host.log`.
+//! manifest's media range is 52.112.0.0/14; data channel batches and states go to `host.log`. The
+//! `end-sessions` and `restore` exports append their account to the storage keys "ended" and
+//! "restored", which the tool `ended` returns as `{"ended", "restored"}`.
 //!
 //! Extra tools (the manifest's, for the core's registry): `peek` reads; it returns two items, one in
 //! `{"conversation"}` (else "c1") and one in "c2", one item without a conversation and some
@@ -179,6 +181,7 @@ mod guest {
                 rtc::close(args.get("conn").and_then(Value::as_u64).and_then(|c| u32::try_from(c).ok()).unwrap_or_default());
                 json!({})
             }
+            "ended" => json!({ "ended": stored("ended"), "restored": stored("restored") }),
             "trap" => std::process::abort(),
             // Opens a socket, stays busy while the server's frames pile up, then sends 40 frames.
             "ws-burst" => match websocket::open(&text("url"), &[]) {
@@ -296,6 +299,13 @@ mod guest {
         ]
     }
 
+    /// Appends `account` to the list stored under `key`.
+    fn remember(key: &str, account: &str) {
+        let mut list: Vec<Value> = stored(key).as_array().cloned().unwrap_or_default();
+        list.push(Value::from(account));
+        storage::set(key, Value::from(list).to_string().as_bytes()).ok();
+    }
+
     /// A JSON value the module stored under `key`, else null.
     fn stored(key: &str) -> Value {
         storage::get(key).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
@@ -364,11 +374,16 @@ mod guest {
 
         // Only account "known" has a session, so tests can tell restore from sign-out.
         fn restore(account: String) -> Result<(), types::ModuleError> {
+            remember("restored", &account);
             if account == "known" { Ok(()) } else { Err(types::ModuleError::AuthRequired(account)) }
         }
 
         fn sign_out(account: String) {
             host::session(&account, host::SessionState::Offline);
+        }
+
+        fn end_sessions(account: String) {
+            remember("ended", &account);
         }
 
         fn call(account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {

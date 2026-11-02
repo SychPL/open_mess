@@ -41,6 +41,8 @@ mod guest {
 
         fn sign_out(_account: String) {}
 
+        fn end_sessions(_account: String) {}
+
         fn get_attachment(
             _account: String,
             _conversation: String,
