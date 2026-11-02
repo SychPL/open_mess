@@ -4,6 +4,7 @@
 //! recording and dropped after it, so the daemon's memory comes back between them. The same
 //! thread runs the retention pass every hour (4.4).
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -40,8 +41,6 @@ struct Inner {
     running: Option<Running>,
     /// Why recordings wait although nothing records.
     reason: Option<&'static str>,
-    /// The model failed its checksum: nothing starts until [`Queue::wake`] (a new download).
-    damaged: bool,
     /// Recordings being deleted: not started again meanwhile.
     deleting: Vec<String>,
     /// Something changed since the queue last looked.
@@ -97,10 +96,10 @@ impl Queue {
         });
     }
 
-    /// Something a transcription waits for may have come: a recording waits, the model was
-    /// downloaded again, a failed one is tried again.
+    /// Something a transcription waits for may have come: a recording waits, a failed one is
+    /// tried again.
     pub fn wake(&self) {
-        self.shared.change(|inner| inner.damaged = false);
+        self.shared.change(|_| ());
     }
 
     /// Deletes the recording `id` from `recordings`. Its transcription, if it runs, stops first and
@@ -151,9 +150,13 @@ impl Worker {
                 let _ = self.recordings.expire(millis(SystemTime::now()));
                 pass = Some(Instant::now());
             }
-            match self.next() {
-                Some(id) => self.transcribe(id),
-                None => {
+            // A transcription that came to nothing (stopped, could not start) waits for a change,
+            // as an empty queue does, rather than starting again at once.
+            let moved = self.next().is_some_and(|id| self.transcribe(id));
+            if !moved {
+                // Only for the reason, as things stand after a transcription that came to nothing.
+                let _ = self.next();
+                {
                     let inner = self.shared.locked();
                     let (mut inner, _) =
                         self.shared.changed.wait_timeout_while(inner, IDLE, |inner| !inner.changed).unwrap_or_else(PoisonError::into_inner);
@@ -173,17 +176,18 @@ impl Worker {
             inner.reason = Some("recording");
             return None;
         }
-        let ready = if inner.damaged { Err("model damaged") } else { (self.ready)() };
+        let ready = (self.ready)();
         inner.reason = ready.err();
         ready.ok().map(|()| oldest)
     }
 
-    fn transcribe(&self, id: String) {
+    /// Runs the transcription of `id`; true when it ended done or failed.
+    fn transcribe(&self, id: String) -> bool {
         let (cancel, progress) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU8::new(0)));
         {
             let mut inner = self.shared.locked();
             if inner.recording.is_some() || inner.deleting.contains(&id) {
-                return;
+                return false;
             }
             inner.running = Some(Running { id: id.clone(), cancel: Arc::clone(&cancel), progress: Arc::clone(&progress) });
         }
@@ -195,52 +199,60 @@ impl Worker {
             }
             _ => false,
         };
-        self.shared.change(|inner| {
-            inner.running = None;
-            inner.damaged |= outcome;
-        });
+        // Not a change for the queue itself (that would start it again at once); it wakes those
+        // waiting for this transcription to end.
+        self.shared.locked().running = None;
+        self.shared.changed.notify_all();
+        outcome
     }
 
-    /// Writes what a transcription came to; true when the model turned out damaged.
+    /// Writes what a transcription came to; true when the recording is done or failed.
     fn finish(&self, id: &str, meta: Meta, result: Result<Transcript, SttError>) -> bool {
         // ponytail: a write that fails leaves `transcribing`, which the next pass puts back to waiting.
         match result {
-            Ok(transcript) => {
-                let _ = self.recordings.finish_transcript(id, &transcript);
-                false
-            }
-            // Stopped by a call or a deletion: it waits again, if it is still there.
-            Err(SttError::Cancelled) => {
+            Ok(transcript) => self.recordings.finish_transcript(id, &transcript).is_ok(),
+            // Stopped by a call or a deletion, or the model is damaged (4.7): the recording is not
+            // at fault and waits again, if it is still there.
+            Err(SttError::Cancelled | SttError::Damaged) => {
                 let _ = self.recordings.set_meta(id, &Meta { state: State::Waiting, ..meta });
                 false
             }
-            // The model failed its checksum (4.7): the recording is not at fault and waits.
-            Err(SttError::Io(err)) if err.kind() == std::io::ErrorKind::InvalidData => {
-                let _ = self.recordings.set_meta(id, &Meta { state: State::Waiting, ..meta });
-                true
-            }
-            Err(_) => {
-                let _ = self.recordings.set_meta(id, &Meta { state: State::Failed, reason: Some(Reason::Failed), ..meta });
-                false
-            }
+            // Its own tracks, among others a bad WAV file (4.4): this recording fails, the queue goes on.
+            Err(_) => self.recordings.set_meta(id, &Meta { state: State::Failed, reason: Some(Reason::Failed), ..meta }).is_ok(),
         }
     }
 }
 
-/// The pinned Whisper model in `local` (4.3).
-pub fn whisper(local: PathBuf) -> Arc<Engine> {
-    Arc::new(move |folder, language, cancel, progress| {
-        let revision = model::installed(&local).ok_or_else(|| SttError::Model("no model".into()))?;
-        stt::Model::load(&local, revision, cancel)?.transcribe(folder, language, cancel, progress)
-    })
+/// When the model's weights in `local` were last written, if there is a model.
+fn written(local: &Path) -> Option<SystemTime> {
+    let revision = model::installed(local)?;
+    let [.., weights] = &revision.files;
+    fs::metadata(model::folder(local, revision).join(weights.name)).and_then(|found| found.modified()).ok()
 }
 
-/// A transcription starts with the model on disk and [`MEMORY`] free (4.3): Rust ends the process
-/// on a failed allocation, so this gate is what keeps the daemon up.
-pub fn ready(local: PathBuf) -> Arc<Ready> {
-    Arc::new(move || {
+/// The pinned Whisper model in `local` (4.3): what transcribes, and the gate a transcription
+/// waits at. It starts with the model on disk and [`MEMORY`] free: Rust ends the process on a
+/// failed allocation, so the gate is what keeps the daemon up. A model that failed its checksum
+/// holds the gate ("model damaged") until its files change, as a new download changes them.
+pub fn whisper(local: PathBuf) -> (Arc<Engine>, Arc<Ready>) {
+    let damaged: Arc<Mutex<Option<Option<SystemTime>>>> = Arc::default();
+    let engine = {
+        let (local, damaged) = (local.clone(), Arc::clone(&damaged));
+        Arc::new(move |folder: &Path, language: Option<&str>, cancel: &AtomicBool, progress: &AtomicU8| {
+            let revision = model::installed(&local).ok_or_else(|| SttError::Model("no model".into()))?;
+            let model = stt::Model::load(&local, revision, cancel);
+            if matches!(model, Err(SttError::Damaged)) {
+                *damaged.lock().unwrap_or_else(PoisonError::into_inner) = Some(written(&local));
+            }
+            model?.transcribe(folder, language, cancel, progress)
+        })
+    };
+    let ready = Arc::new(move || {
         if model::installed(&local).is_none() {
             return Err("no model");
+        }
+        if damaged.lock().unwrap_or_else(PoisonError::into_inner).is_some_and(|when| when == written(&local)) {
+            return Err("model damaged");
         }
         let mut system = sysinfo::System::new();
         system.refresh_memory();
@@ -248,7 +260,8 @@ pub fn ready(local: PathBuf) -> Arc<Ready> {
             return Err("low memory");
         }
         Ok(())
-    })
+    });
+    (engine, ready)
 }
 
 #[cfg(test)]
@@ -364,20 +377,60 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_model_holds_the_queue_until_woken() {
+    fn a_damaged_model_leaves_the_recording_waiting() {
         let dir = tempfile::tempdir().unwrap();
         let recordings = Recordings::new(dir.path());
         let id = waiting(&recordings, 1_000);
-        let fixed = Arc::new(AtomicBool::new(false));
-        let model = Arc::clone(&fixed);
-        let queue = start(dir.path(), move |_, _| {
-            if model.load(Ordering::SeqCst) { Ok(transcript()) } else { Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into()) }
+        // As whisper() pairs them: the engine finds the damage, the gate holds until it is fixed.
+        let (damaged, fixed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (found, model) = (Arc::clone(&damaged), Arc::clone(&fixed));
+        let engine = Arc::new(move |_: &Path, _: Option<&str>, _: &AtomicBool, _: &AtomicU8| {
+            if model.load(Ordering::SeqCst) {
+                return Ok(transcript());
+            }
+            found.store(true, Ordering::SeqCst);
+            Err(SttError::Damaged)
         });
+        let gate = (Arc::clone(&damaged), Arc::clone(&fixed));
+        let ready = Arc::new(move || if gate.0.load(Ordering::SeqCst) && !gate.1.load(Ordering::SeqCst) { Err("model damaged") } else { Ok(()) });
+        let queue = Queue::start(dir.path(), engine, ready, Arc::new(|| None)).unwrap();
         eventually(|| queue.view().reason == Some("model damaged"));
         assert_eq!(state(&recordings, &id), State::Waiting);
         fixed.store(true, Ordering::SeqCst);
         queue.wake();
         eventually(|| state(&recordings, &id) == State::Done);
+    }
+
+    #[test]
+    fn a_bad_track_fails_its_recording_not_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = Recordings::new(dir.path());
+        let (bad, good) = (waiting(&recordings, 1_000), waiting(&recordings, 2_000));
+        let broken = bad.clone();
+        let _queue = start(dir.path(), move |folder, _| {
+            if folder.ends_with(&broken) { Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into()) } else { Ok(transcript()) }
+        });
+        eventually(|| state(&recordings, &good) == State::Done);
+        assert_eq!(state(&recordings, &bad), State::Failed);
+    }
+
+    #[test]
+    fn a_transcription_that_comes_to_nothing_is_not_started_again_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = Recordings::new(dir.path());
+        let id = waiting(&recordings, 1_000);
+        let calls = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&calls);
+        let queue = start(dir.path(), move |_, _| {
+            *counted.lock().unwrap() += 1;
+            Err(SttError::Cancelled)
+        });
+        eventually(|| *calls.lock().unwrap() == 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(*calls.lock().unwrap(), 1);
+        // A change lets it try again.
+        queue.wake();
+        eventually(|| *calls.lock().unwrap() == 2 && state(&recordings, &id) == State::Waiting);
     }
 
     #[test]

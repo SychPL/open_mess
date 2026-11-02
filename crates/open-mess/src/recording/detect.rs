@@ -4,7 +4,11 @@
 //! muting stops its streams but keeps the sessions, and Teams removes them about 180 s after the
 //! call. The logic here takes what was read and the time, so it is tested without Windows.
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::time::{Duration, Instant};
+
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// The process whose sessions are a call (4.9). WebView2's sessions in the Teams tree are the
 /// interface's sounds and do not count.
@@ -122,10 +126,20 @@ impl Detector {
     }
 }
 
+/// The names of the processes `pids`; pid 0, the system's own sounds, is left out. An error when
+/// none of them could be read: an empty answer would end a call that goes on.
+pub fn names(pids: &[u32]) -> Result<HashMap<u32, OsString>, String> {
+    let wanted: Vec<Pid> = pids.iter().filter(|pid| **pid != 0).map(|pid| Pid::from_u32(*pid)).collect();
+    let mut system = System::new();
+    if system.refresh_processes_specifics(ProcessesToUpdate::Some(&wanted), true, ProcessRefreshKind::nothing()) == 0 && !wanted.is_empty() {
+        return Err("the process list could not be read".into());
+    }
+    Ok(wanted.iter().filter_map(|pid| system.process(*pid).map(|process| (pid.as_u32(), process.name().to_os_string()))).collect())
+}
+
 /// The Teams sessions of every active capture and render device. Needs COM on the thread.
 #[cfg(windows)]
 pub fn sessions() -> Result<Vec<Session>, String> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     use wasapi::{DeviceEnumerator, Direction, SessionState};
 
     let text = |err: wasapi::WasapiError| err.to_string();
@@ -148,11 +162,9 @@ pub fn sessions() -> Result<Vec<Session>, String> {
             }
         }
     }
-    let pids: Vec<Pid> = found.iter().map(|(pid, _)| Pid::from_u32(*pid)).collect();
-    let mut system = System::new();
-    system.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::nothing());
-    let teams = |pid: u32| system.process(Pid::from_u32(pid)).is_some_and(|process| process.name().eq_ignore_ascii_case(PROCESS));
-    Ok(found.into_iter().filter(|(pid, _)| teams(*pid)).map(|(_, session)| session).collect())
+    let names = names(&found.iter().map(|(pid, _)| *pid).collect::<Vec<_>>())?;
+    let teams = |pid: &u32| names.get(pid).is_some_and(|name| name.eq_ignore_ascii_case(PROCESS));
+    Ok(found.into_iter().filter(|(pid, _)| teams(pid)).map(|(_, session)| session).collect())
 }
 
 #[cfg(test)]
@@ -226,6 +238,15 @@ mod tests {
         // Outside a call Teams has none; during one, the microphone and the headset.
         let found = sessions().unwrap();
         assert!(found.iter().all(|session| !session.device.is_empty()));
+    }
+
+    #[test]
+    fn process_names_are_read_and_the_system_left_out() {
+        let me = std::process::id();
+        let found = names(&[me, 0]).unwrap();
+        assert!(found.get(&me).is_some_and(|name| !name.is_empty()));
+        assert!(!found.contains_key(&0));
+        assert!(names(&[0]).unwrap().is_empty());
     }
 
     #[test]

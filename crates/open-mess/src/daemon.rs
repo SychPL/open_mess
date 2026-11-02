@@ -196,7 +196,8 @@ fn start(
         // The window's setting: `auto` (or none) lets the model find the language (4.3).
         let language = Arc::new(move || store.store().get_config("recording.language").ok().flatten().filter(|code| code != "auto"));
         // ponytail: a queue whose thread cannot start leaves recordings waiting; reported once a log sink exists.
-        let queue = queue::Queue::start(&local, queue::whisper(local.clone()), queue::ready(local.clone()), language).ok().map(Arc::new);
+        let (engine, ready) = queue::whisper(local.clone());
+        let queue = queue::Queue::start(&local, engine, ready, language).ok().map(Arc::new);
         registry.set_recordings(crate::recording::Recordings::new(&local), queue);
     }
     let models = update.as_ref().and_then(|(paths, _)| {

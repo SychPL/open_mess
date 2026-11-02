@@ -235,7 +235,6 @@ impl Audio for Wasapi {
     }
 
     fn microphone_on(&mut self, device: &str) -> bool {
-        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
         let Ok(list) = self
             .enumerator
             .get_device(device)
@@ -247,11 +246,14 @@ impl Audio for Wasapi {
         for index in 0..list.get_count().unwrap_or(0) {
             let Ok(session) = list.get_session(index) else { continue };
             let Ok(pid) = session.get_process_id() else { continue };
-            let teams = *self.teams.entry(pid).or_insert_with(|| {
-                let mut system = System::new();
-                system.refresh_processes_specifics(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true, ProcessRefreshKind::nothing());
-                system.process(Pid::from_u32(pid)).is_some_and(|process| process.name().eq_ignore_ascii_case(super::detect::PROCESS))
-            });
+            let teams = match self.teams.get(&pid) {
+                Some(teams) => *teams,
+                None => {
+                    let Ok(names) = super::detect::names(&[pid]) else { continue };
+                    let teams = names.get(&pid).is_some_and(|name| name.eq_ignore_ascii_case(super::detect::PROCESS));
+                    *self.teams.entry(pid).or_insert(teams)
+                }
+            };
             if teams && session.get_state().is_ok_and(|state| state == wasapi::SessionState::Active) {
                 return true;
             }

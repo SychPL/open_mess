@@ -47,6 +47,9 @@ pub enum SttError {
     Panicked,
     #[error("the model does not fit: {0}")]
     Model(String),
+    /// A model file failed its size or checksum (4.7); the recording is not at fault.
+    #[error("the model is damaged")]
+    Damaged,
     #[error("model: {0}")]
     Candle(#[from] candle_core::Error),
     #[error(transparent)]
@@ -409,8 +412,11 @@ impl Model {
         let dir = model::folder(local, revision);
         let [config, tokenizer, weights] = &revision.files;
         let read = |file| {
-            model::read_verified(&dir, file, cancel)
-                .map_err(|err| if err.kind() == std::io::ErrorKind::Interrupted { SttError::Cancelled } else { err.into() })
+            model::read_verified(&dir, file, cancel).map_err(|err| match err.kind() {
+                std::io::ErrorKind::Interrupted => SttError::Cancelled,
+                std::io::ErrorKind::InvalidData => SttError::Damaged,
+                _ => err.into(),
+            })
         };
         let config: Config = serde_json::from_slice(&read(config)?).map_err(|err| SttError::Model(format!("config.json: {err}")))?;
         let vocab = Vocab::parse(&read(tokenizer)?)?;
