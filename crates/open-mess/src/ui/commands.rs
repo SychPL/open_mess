@@ -142,6 +142,8 @@ pub struct ModuleDto {
     pub detail: String,
     pub hosts: Vec<String>,
     pub sign_in_hosts: Vec<String>,
+    /// The address ranges of the module's media connections; empty without media access.
+    pub media: Vec<String>,
     pub wam: Option<WamDto>,
     /// The module's own tools.
     pub tools: Vec<ToolDto>,
@@ -172,7 +174,7 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
             info.state,
             ModuleState::PendingReplacement | ModuleState::AwaitingApproval { reason: ApprovalReason::ManifestChanged | ApprovalReason::FileChanged }
         );
-        let Manifest { hosts, sign_in_hosts, wam, extra_tools, .. } = info.manifest.clone().unwrap_or_else(|| empty_manifest(info));
+        let Manifest { hosts, sign_in_hosts, wam, extra_tools, media, .. } = info.manifest.clone().unwrap_or_else(|| empty_manifest(info));
         dtos.push(ModuleDto {
             name: info.name.clone(),
             file: info.file.clone(),
@@ -182,6 +184,7 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
             detail: describe(&info.state),
             hosts,
             sign_in_hosts,
+            media: media.map(|media| media.peers).unwrap_or_default(),
             wam: wam.map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes.iter().map(|scope| scope_text(scope)).collect() }),
             tools: extra_tools.into_iter().map(|tool| ToolDto { name: tool.name, writes: tool.writes }).collect(),
             file_sha256: info.file_sha256.clone(),
@@ -214,6 +217,7 @@ fn empty_manifest(info: &ModuleInfo) -> Manifest {
         sign_in_hosts: Vec::new(),
         wam: None,
         extra_tools: Vec::new(),
+        media: None,
     }
 }
 
@@ -251,6 +255,7 @@ fn changes(new: &Value, old: &Value) -> Vec<String> {
     }
     list_changes(&mut changes, "host", field(new, "hosts"), field(old, "hosts"));
     list_changes(&mut changes, "host logowania", field(new, "sign_in_hosts"), field(old, "sign_in_hosts"));
+    list_changes(&mut changes, "zakres mediów", field(field(new, "media"), "peers"), field(field(old, "media"), "peers"));
     if field(new, "wam") != field(old, "wam") {
         let wam = |manifest: &Value| match field(manifest, "wam") {
             wam @ Value::Object(_) => format!("{} ({})", text_of(field(wam, "client_id")), strings(field(wam, "scopes")).join(", ")),
@@ -777,6 +782,14 @@ pub fn set_auto_install(state: &UiState, on: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_media_range_is_a_change_to_approve() {
+        let old = serde_json::json!({"hosts": []});
+        let new = serde_json::json!({"hosts": [], "media": {"peers": ["52.112.0.0/14"]}});
+        assert!(changes(&new, &old).contains(&"nowy zakres mediów: 52.112.0.0/14".to_string()), "{:?}", changes(&new, &old));
+        assert!(changes(&old, &new).contains(&"usunięty zakres mediów: 52.112.0.0/14".to_string()));
+    }
 
     #[test]
     fn only_an_update_s_names_are_placed_beside() {

@@ -217,6 +217,7 @@ async function renderModules() {
         ["Platforma", module.platform || "-"],
         ["Hosty", list(module.hosts)],
         ["Hosty logowania", list(module.sign_in_hosts)],
+        ["Połączenie mediów (bez dźwięku i obrazu, poza proxy)", module.media.length > 0 ? list(module.media) : "brak"],
         ["Konto Windows (WAM)", wam],
         ["Własne narzędzia", list(tools)],
         ["SHA-256 pliku", el("code", module.file_sha256 || "-")],

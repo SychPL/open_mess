@@ -37,6 +37,7 @@ impl module::Guest for Teams {
                 .into_iter()
                 .map(|t| types::ToolDecl { name: t.name, description: t.description, input_schema: t.input_schema, writes: t.writes })
                 .collect(),
+            media: None,
         }
     }
 
@@ -74,6 +75,10 @@ impl events::Guest for Teams {
     fn on_ws_message(_conn: u32, _text: String) {}
 
     fn on_ws_closed(_conn: u32, _reason: String) {}
+
+    fn on_rtc_data(_conn: u32, _messages: Vec<Vec<u8>>, _dropped: u32) {}
+
+    fn on_rtc_state(_conn: u32, _state: String) {}
 
     /// The poll (`poll`): every signed-in account, each round starting with the next one so a
     /// slow account cannot keep the others from their turn, then the timer again.

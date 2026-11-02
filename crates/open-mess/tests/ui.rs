@@ -96,6 +96,7 @@ async fn module_dto_lists_hosts_and_identity() {
     assert_eq!((teams.name.as_str(), teams.status, teams.detail.as_str()), ("teams", "awaiting-approval", "czeka na zatwierdzenie: nowy moduł"));
     assert!(teams.hosts.contains(&"*.sharepoint.com".to_string()), "{:?}", teams.hosts);
     assert_eq!(teams.sign_in_hosts, ["login.microsoftonline.com"]);
+    assert!(teams.media.is_empty(), "{:?}", teams.media);
     let wam = teams.wam.as_ref().unwrap();
     assert_eq!(wam.client_id, "1fec8e78-bce4-4aaf-ab1b-5451cc387264");
     assert_eq!(wam.scopes.len(), 5);

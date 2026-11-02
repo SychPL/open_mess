@@ -29,7 +29,10 @@
 //! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
 //! named after any other. `wam-token` asks WAM for `{"scopes"}` and returns `{"token"}` or
-//! `{"error"}`.
+//! `{"error"}`. `rtc-open` opens a media connection with the data channel `{"label"}` and returns
+//! `{"conn", "offer"}`; `rtc-accept` gives connection `{"conn"}` the answer `{"answer"}` and returns
+//! `{}`; both return `{"error", "why"}` instead when refused, and `rtc-close` closes `{"conn"}`. The
+//! manifest's media range is 52.112.0.0/14; data channel batches and states go to `host.log`.
 //!
 //! Extra tools (the manifest's, for the core's registry): `peek` reads; it returns two items, one in
 //! `{"conversation"}` (else "c1") and one in "c2", one item without a conversation and some
@@ -50,7 +53,7 @@ mod guest {
     }
 
     use bindings::exports::open_mess::module::{events, module};
-    use bindings::open_mess::module::{host, http, sign_in, storage, types, websocket};
+    use bindings::open_mess::module::{host, http, rtc, sign_in, storage, types, websocket};
     use serde_json::{Value, json};
 
     struct Echo;
@@ -74,6 +77,13 @@ mod guest {
             http::HttpError::TooLarge => "too-large",
             http::HttpError::Throttled(_) => "throttled",
             http::HttpError::Network(_) => "network",
+        }
+    }
+
+    fn http_why(e: &http::HttpError) -> String {
+        match e {
+            http::HttpError::Blocked(why) | http::HttpError::Network(why) => why.clone(),
+            _ => String::new(),
         }
     }
 
@@ -153,6 +163,21 @@ mod guest {
                         "untrusted": { "text": format!("peeked at {account}") },
                     }),
                 }
+            }
+            "rtc-open" => match rtc::open(&text("label")) {
+                Ok((conn, offer)) => json!({ "conn": conn, "offer": offer }),
+                Err(e) => json!({ "error": http_error(&e), "why": http_why(&e) }),
+            },
+            "rtc-accept" => {
+                let conn = args.get("conn").and_then(Value::as_u64).and_then(|c| u32::try_from(c).ok()).unwrap_or_default();
+                match rtc::accept(conn, &text("answer")) {
+                    Ok(()) => json!({}),
+                    Err(e) => json!({ "error": http_error(&e), "why": http_why(&e) }),
+                }
+            }
+            "rtc-close" => {
+                rtc::close(args.get("conn").and_then(Value::as_u64).and_then(|c| u32::try_from(c).ok()).unwrap_or_default());
+                json!({})
             }
             "trap" => std::process::abort(),
             // Opens a socket, stays busy while the server's frames pile up, then sends 40 frames.
@@ -295,6 +320,7 @@ mod guest {
                     scopes: vec![CHAT_SCOPE.to_string(), SHAREPOINT_SCOPE.to_string()],
                 }),
                 extra_tools: extra_tools(),
+                media: Some(types::MediaAccess { peers: vec!["52.112.0.0/14".to_string()] }),
             }
         }
 
@@ -387,6 +413,15 @@ mod guest {
 
         fn on_ws_closed(conn: u32, reason: String) {
             host::log(2, &format!("ws {conn} closed {reason}"));
+        }
+
+        fn on_rtc_data(conn: u32, messages: Vec<Vec<u8>>, dropped: u32) {
+            let texts: Vec<String> = messages.iter().map(|m| String::from_utf8_lossy(m).into_owned()).collect();
+            host::log(2, &format!("rtc {conn} data {} dropped {dropped}: {}", messages.len(), texts.join(",")));
+        }
+
+        fn on_rtc_state(conn: u32, state: String) {
+            host::log(2, &format!("rtc {conn} state {state}"));
         }
 
         fn on_timer(id: u32) {

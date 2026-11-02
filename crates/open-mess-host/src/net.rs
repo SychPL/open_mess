@@ -140,6 +140,10 @@ impl Net {
         }
     }
 
+    pub(crate) fn policy(&self) -> AddressPolicy {
+        self.policy
+    }
+
     /// Test support: every host on a module's list is served by the loopback server at `addr`,
     /// over plain HTTP, with the request's own host in its `Host` header. The host list is still
     /// checked, and nothing is resolved, so a module under test never reaches the real host.

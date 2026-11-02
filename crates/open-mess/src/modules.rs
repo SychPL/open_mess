@@ -501,7 +501,7 @@ pub fn canonical(manifest: &Manifest) -> Value {
         .iter()
         .map(|tool| json!({"description": tool.description, "input_schema": tool.input_schema, "name": tool.name, "writes": tool.writes}))
         .collect();
-    json!({
+    let mut canonical = json!({
         "extra_tools": tools,
         "hosts": manifest.hosts,
         "name": manifest.name,
@@ -509,7 +509,13 @@ pub fn canonical(manifest: &Manifest) -> Value {
         "sign_in_hosts": manifest.sign_in_hosts,
         "version": manifest.version,
         "wam": manifest.wam.as_ref().map(|wam| json!({"client_id": wam.client_id, "scopes": wam.scopes})),
-    })
+    });
+    // Only when present, so the hash of a manifest without media access stays what the user
+    // approved before modules could ask for it.
+    if let (Some(media), Some(object)) = (&manifest.media, canonical.as_object_mut()) {
+        object.insert("media".to_string(), json!({"peers": media.peers}));
+    }
+    canonical
 }
 
 fn approved_manifest_key(name: &str) -> String {
@@ -570,5 +576,24 @@ mod tests {
         assert!(read_capped(&path).unwrap_err().contains("larger than 64 MiB"));
         std::fs::File::create(&path).unwrap().set_len(16).unwrap();
         assert_eq!(read_capped(&path).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn media_access_is_approved_with_the_manifest_only_when_present() {
+        let without = Manifest {
+            name: "m".into(),
+            version: "1".into(),
+            platform: "test".into(),
+            hosts: Vec::new(),
+            sign_in_hosts: Vec::new(),
+            wam: None,
+            extra_tools: Vec::new(),
+            media: None,
+        };
+        // A manifest without media access hashes as it did before modules could ask for it.
+        assert!(canonical(&without).get("media").is_none());
+        let with = Manifest { media: Some(open_mess_host::MediaAccess { peers: vec!["52.112.0.0/14".into()] }), ..without.clone() };
+        assert_eq!(canonical(&with)["media"]["peers"][0], "52.112.0.0/14");
+        assert!(!version_only_change(&with, &without));
     }
 }

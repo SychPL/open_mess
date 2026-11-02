@@ -28,6 +28,7 @@ mod guest {
                 sign_in_hosts: Vec::new(),
                 wam: None,
                 extra_tools: Vec::new(),
+                media: None,
             }
         }
 
@@ -68,5 +69,9 @@ mod guest {
         fn on_ws_closed(_conn: u32, _reason: String) {}
 
         fn on_timer(_id: u32) {}
+
+        fn on_rtc_data(_conn: u32, _messages: Vec<Vec<u8>>, _dropped: u32) {}
+
+        fn on_rtc_state(_conn: u32, _state: String) {}
     }
 }

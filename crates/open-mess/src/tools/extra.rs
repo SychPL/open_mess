@@ -187,6 +187,7 @@ mod tests {
             sign_in_hosts: Vec::new(),
             wam: None,
             extra_tools: tools,
+            media: None,
         };
         ModuleInfo {
             name: name.into(),

@@ -36,6 +36,13 @@ interface types {
         scopes: list<string>,
     }
 
+    // Address ranges of the media peers a module's `rtc` connections may reach (CIDR, e.g.
+    // "52.112.0.0/14"): no private ranges, a prefix of at least /8 for IPv4 and /16 for IPv6, at
+    // most 32 ranges (spec 2026-10-29-live-captions, 5.2).
+    record media-access {
+        peers: list<string>,
+    }
+
     record manifest {
         // Unique module name; accounts are bound to it (spec 8.3).
         name: string,
@@ -47,6 +54,8 @@ interface types {
         sign-in-hosts: list<string>,
         wam: option<wam-identity>,
         extra-tools: list<tool-decl>,
+        // Present only for a module that uses `rtc`; part of what the user approves.
+        media: option<media-access>,
     }
 
     // An attachment's bytes, which the module fetches with `http.fetch`; during `get-attachment`
@@ -124,6 +133,21 @@ interface websocket {
     // Connections are held by the core; frames arrive through the `events` export.
     open: func(url: string, headers: list<tuple<string, string>>) -> result<u32, http-error>;
     send: func(conn: u32, text: string) -> result<_, http-error>;
+    close: func(conn: u32);
+}
+
+// A peer connection with one data channel and nothing else (spec 2026-10-29-live-captions,
+// 5.2): no audio or video is ever sent or received. Only for a module whose manifest has `media`.
+interface rtc {
+    use http.{http-error};
+
+    // Opens a connection whose data channel is named `label`. Returns the connection and the
+    // host's offer: standard SDP with one data section and local candidates only, gathered fully.
+    open: func(label: string) -> result<tuple<u32, string>, http-error>;
+    // The remote answer (standard SDP). It must have the offer's single data section and nothing
+    // else; candidates outside the manifest's `media` ranges, private ones and ones the system
+    // proxy covers are dropped, and an answer with none left is refused.
+    accept: func(conn: u32, answer: string) -> result<_, http-error>;
     close: func(conn: u32);
 }
 
@@ -218,11 +242,17 @@ interface events {
     on-ws-message: func(conn: u32, text: string);
     on-ws-closed: func(conn: u32, reason: string);
     on-timer: func(id: u32);
+    // Data channel messages that arrived since the last call, and how many were dropped (limits,
+    // a full queue) in that time.
+    on-rtc-data: func(conn: u32, messages: list<list<u8>>, dropped: u32);
+    // "connected", "failed" or "closed"; after "failed" or "closed" the connection is gone.
+    on-rtc-state: func(conn: u32, state: string);
 }
 
 world platform-module {
     import http;
     import websocket;
+    import rtc;
     import storage;
     import secrets;
     import sign-in;

@@ -20,8 +20,9 @@ use crate::sign_in::Caller;
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
-/// WebSocket frames and timer firings waiting for a module; a full queue holds the socket back.
-/// With `MAX_WS_MESSAGE` frames that is at most 64 MiB held for a module outside its memory.
+/// WebSocket frames, media batches and timer firings waiting for a module; a full queue holds the
+/// socket or connection back. With `MAX_WS_MESSAGE` frames (or `MAX_RTC_QUEUE_BYTES` batches) that
+/// is at most 64 MiB held for a module outside its memory.
 const EVENT_QUEUE: usize = 16;
 
 pub(crate) type Reply<T> = oneshot::Sender<Result<T, HostError>>;
@@ -73,6 +74,8 @@ pub(crate) enum GuestEvent {
     WsMessage { conn: u32, text: String },
     WsClosed { conn: u32, reason: String },
     Timer { id: u32, generation: u64 },
+    RtcData { conn: u32, messages: Vec<Vec<u8>>, dropped: u32 },
+    RtcState { conn: u32, state: String },
 }
 
 /// A task that belongs to a module instance (a socket, a timer): aborted when dropped, so an
@@ -378,6 +381,21 @@ impl Actor {
                     Box::pin(async move {
                         s.data_mut().sockets.close(conn);
                         m.open_mess_module_events().call_on_ws_closed(s, conn, &reason).await
+                    })
+                })
+                .await
+            }
+            GuestEvent::RtcData { conn, messages, dropped } => {
+                self.run(move |m, s| Box::pin(async move { m.open_mess_module_events().call_on_rtc_data(s, conn, &messages, dropped).await })).await
+            }
+            GuestEvent::RtcState { conn, state } => {
+                self.run(move |m, s| {
+                    Box::pin(async move {
+                        // A failed or closed connection is gone; the module hears it once.
+                        if state != "connected" {
+                            s.data_mut().rtc.close(conn);
+                        }
+                        m.open_mess_module_events().call_on_rtc_state(s, conn, &state).await
                     })
                 })
                 .await
