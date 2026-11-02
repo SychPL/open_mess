@@ -27,3 +27,25 @@ indexing_slicing = "deny"
 # println!/eprintln! panic when stdout/stderr is closed; write with writeln! and ignore the error.
 print_stdout = "deny"
 print_stderr = "deny"
+
+# Debug builds and tests compile every module with Cranelift, and unoptimized that took 15-30 s
+# per test daemon. The tests starting beside it starved, and their timed module calls ran out
+# (flaky Windows CI). Optimizing the compiler's own crates makes a daemon start about ten times
+# faster.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3
+
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
