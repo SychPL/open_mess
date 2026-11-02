@@ -6,6 +6,7 @@
 pub mod model;
 pub mod stt;
 pub mod wav;
+mod whisper;
 
 use std::fs::{self, File};
 use std::io::{self, Read as _, Write as _};

@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::whisper::{self as m, Config, audio, model::Whisper};
+use candle_transformers::models::whisper::{self as m, Config, audio};
 use serde::Deserialize;
 
 use super::model::{self, Revision};
+use super::whisper::Whisper;
 use super::{Cue, MAX_TRANSCRIPT, Speaker, TRACKS, Transcript, wav};
 
 /// The mel filters of Whisper large-v3 (128 bands of 201 FFT bins, f32 little-endian), the file
@@ -57,7 +58,7 @@ pub fn isolated<T: Send + 'static>(job: impl FnOnce() -> Result<T, SttError> + S
     thread.join().unwrap_or(Err(SttError::Panicked))
 }
 
-fn check(cancel: &AtomicBool) -> Result<(), SttError> {
+pub(super) fn check(cancel: &AtomicBool) -> Result<(), SttError> {
     if cancel.load(Ordering::SeqCst) { Err(SttError::Cancelled) } else { Ok(()) }
 }
 
@@ -317,19 +318,19 @@ impl Model {
     }
 
     /// The encoder's output for one window of samples (at most 30 s).
-    fn encode(&mut self, samples: &[i16]) -> Result<Tensor, SttError> {
+    fn encode(&mut self, samples: &[i16], cancel: &AtomicBool) -> Result<Tensor, SttError> {
         let pcm: Vec<f32> = samples.iter().map(|sample| f32::from(*sample) / 32768.0).collect();
         // Padded by candle to at least one more window, so always 3000 frames after the cut.
         let mel = audio::pcm_to_mel(&self.whisper.config, &pcm, &self.filters);
         let frames = mel.len() / MEL_BINS;
         let mel = Tensor::from_vec(mel, (1, MEL_BINS, frames), &self.device)?.narrow(2, 0, frames.min(m::N_FRAMES))?;
-        Ok(self.whisper.encoder.forward(&mel, true)?)
+        self.whisper.encoder.forward(&mel, cancel)
     }
 
-    /// The decoder's logits after `tokens`, at each position.
+    /// The decoder's output for `tokens`, the ones not given since the last `first`, one row each.
     fn forward(&mut self, tokens: &[u32], features: &Tensor, first: bool) -> Result<Tensor, SttError> {
         let tokens = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-        Ok(self.whisper.decoder.forward(&tokens, features, first)?)
+        self.whisper.decoder.forward(&tokens, features, first)
     }
 
     fn logits_at(&self, hidden: &Tensor, position: usize) -> Result<Vec<f32>, SttError> {
@@ -356,15 +357,18 @@ impl Model {
         let suppress = self.whisper.config.suppress_tokens.clone();
         let (mut sum_logprob, mut no_speech_prob) = (0.0, 0.0);
         // Up to Whisper's 448 positions of the decoder, prompt included.
-        let mut step = 0;
+        // The decoder keeps what it has seen: the prompt goes in first, then one token a step.
+        let (mut step, mut given) = (0, 0);
         while tokens.len() < max {
             check(cancel)?;
-            let hidden = self.forward(&tokens, features, step == 0)?;
+            let hidden = self.forward(tokens.get(given..).unwrap_or_default(), features, step == 0)?;
+            let rows = tokens.len() - given;
+            given = tokens.len();
             if step == 0 {
                 let first = log_softmax(&self.logits_at(&hidden, 0)?);
                 no_speech_prob = f64::from(first.get(self.vocab.no_speech as usize).copied().unwrap_or(f32::NEG_INFINITY).exp());
             }
-            let mut logits = self.logits_at(&hidden, tokens.len() - 1)?;
+            let mut logits = self.logits_at(&hidden, rows - 1)?;
             timestamp_rules(&self.vocab, &suppress, &mut logits, tokens.get(prompt.len()..).unwrap_or_default());
             let next = if temperature > 0.0 { sample(&logits, temperature)? } else { argmax(&logits) };
             tokens.push(next);
@@ -426,7 +430,7 @@ impl Model {
                 let length = samples.len() as u64 * 1000 / u64::from(wav::SAMPLE_RATE);
                 if !silent(&samples) {
                     check(cancel)?;
-                    let features = self.encode(&samples)?;
+                    let features = self.encode(&samples, cancel)?;
                     let found = match language {
                         Some(found) => found,
                         None => self.detect_language(&features)?,
