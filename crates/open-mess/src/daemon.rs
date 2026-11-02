@@ -30,7 +30,7 @@ use crate::update::quiesce::{Activity, Launcher};
 use crate::update::release::RELEASE_KEY;
 use crate::update::service::{self, Setup, UpdateService};
 use crate::update::state::Paths;
-use crate::{Error, api, approval, paths, secrets, ui};
+use crate::{Error, api, approval, i18n, paths, secrets, ui};
 
 /// Why the last `om daemon` failed to start, one line, in the data folder. The CLI shows it when
 /// it can't reach the daemon; a successful start deletes it.
@@ -164,6 +164,8 @@ fn start(
     update: Option<Update>,
 ) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
     let store = Store::open(&dir.join("state.sqlite3"))?;
+    // Before anything shows a text: the tray, the toasts, the window.
+    i18n::apply_language(&store);
     let port = store.port()?;
     let token = secrets::local_api_token()?;
     let runtime = Runtime::new()?;

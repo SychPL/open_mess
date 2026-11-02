@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use chrono::NaiveTime;
 use common::{Daemon, ECHO, daemon, echo, echo_rebuilt, echo_with_another_host, info, install, scan, store};
 use open_mess::approval;
 use open_mess::events::{Bus, Event};
+use open_mess::i18n::Lang;
 use open_mess::pending::{Kind, Pending, Preview, State};
 use open_mess::tools::ToolError;
 use open_mess::triggers::Counters;
@@ -21,7 +23,7 @@ use open_mess::triggers::engine::{self, Batch, Delivery, DeliveryResult};
 use open_mess::triggers::rules::{Action, Condition, Rule, Spawn};
 use open_mess::triggers::spawn::{RUN_TIMEOUT, Runs};
 use open_mess::ui::UiState;
-use open_mess::ui::commands::{self, MODULE_CHANGED, ModuleDto, RuleDto};
+use open_mess::ui::commands::{self, LanguageDto, ModuleDto, RuleDto};
 use open_mess::ui::sign_in::SignIns;
 use open_mess_host::Engine;
 use serde_json::{Value, json};
@@ -56,13 +58,14 @@ fn module<'a>(list: &'a [ModuleDto], status: &str) -> &'a ModuleDto {
     list.iter().find(|module| module.status == status).unwrap_or_else(|| panic!("no {status} module in {list:?}"))
 }
 
-/// A daemon whose modules folder has `files`, none approved.
+/// A daemon whose modules folder has `files`, none approved; its window speaks Polish.
 async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
     let dir = tempfile::tempdir().unwrap();
     for (file, bytes) in files {
         install(dir.path(), file, bytes);
     }
     let engine = Engine::new().unwrap();
+    common::set_language(&store(dir.path()), "pl");
     let modules = scan(&store(dir.path()), &engine, dir.path()).await;
     let accounts = common::accounts(dir.path(), modules, keyring_core::mock::Store::new().unwrap());
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
@@ -113,10 +116,11 @@ async fn stale_module_approval_is_refused() {
     // The file changes after the window showed it.
     install(dir.path(), "echo.wasm", &echo_rebuilt());
     let refused = commands::approve_module(&state, "test-echo", &shown.file_sha256, &shown.manifest_sha256).await;
-    assert_eq!(refused, Err(MODULE_CHANGED.to_string()));
+    assert_eq!(refused, Err("plik modułu się zmienił - odśwież".to_string()));
+    assert_eq!(refused, Err(commands::module_changed().to_string()));
     assert!(state.accounts.modules().handle("test-echo").is_none());
     // Made-up hashes are refused the same way.
-    assert_eq!(commands::approve_module(&state, "test-echo", "00", "00").await, Err(MODULE_CHANGED.to_string()));
+    assert_eq!(commands::approve_module(&state, "test-echo", "00", "00").await, Err(commands::module_changed().to_string()));
 
     // Refreshed, the window shows the new file, and approving that loads it.
     commands::rescan_modules(&state).await.unwrap();
@@ -288,7 +292,8 @@ async fn long_target_can_only_be_rejected() {
     let action = sent["action"].as_str().unwrap();
     assert!(commands::waiting(&state)[0].target_cut);
 
-    assert_eq!(commands::decide(&state, action, true).await, Err(commands::TARGET_CUT.to_string()));
+    assert_eq!(commands::decide(&state, action, true).await, Err(commands::target_cut().to_string()));
+    assert!(commands::target_cut().starts_with("wiadomości, której dotyczy akcja"));
     assert_eq!(state.pending.state(action).unwrap(), State::Waiting);
     assert_eq!(commands::decide(&state, action, false).await.unwrap(), "rejected");
 }
@@ -430,7 +435,7 @@ async fn put_rule_returns_autonomous_warning() {
     let direct = rule("r1", Condition::Direct, channel());
     assert_eq!(commands::put_rule(&state, direct.clone()).unwrap(), None);
     commands::set_permissions(&state, "test-echo:a", None, true, "autonomous").unwrap();
-    assert_eq!(commands::put_rule(&state, direct).unwrap().as_deref(), Some(commands::AUTONOMOUS_RULE));
+    assert_eq!(commands::put_rule(&state, direct).unwrap().as_deref(), Some(commands::autonomous_rule(Lang::Pl)));
     // Saved either way, and the window gets it back as it sends it.
     let listed = commands::rules(&state).unwrap();
     assert_eq!(listed.len(), 1);
@@ -513,16 +518,35 @@ async fn channel_setup_names_the_bridge() {
     assert_eq!(setup.sessions, 0);
 }
 
+/// The window's language is a setting of its own: `auto`, `pl` or `en`, and nothing else.
+#[tokio::test]
+async fn window_language_is_saved_and_checked() {
+    let d = daemon(&[]).await;
+    let state = state(&d);
+    assert_eq!(commands::language(&state), LanguageDto { setting: "pl", lang: "pl" });
+    // Nonsense is refused, in the window's language, and nothing is stored.
+    for nonsense in ["de", "PL", "", "auto "] {
+        assert_eq!(commands::set_language(&state, nonsense), Err("nieznany język".to_string()), "{nonsense:?}");
+    }
+    assert_eq!(store(d.dir.path()).get_config("language").unwrap().as_deref(), Some("pl"));
+    // What is stored is what the window shows as the setting; saving settles the language again.
+    store(d.dir.path()).set_config("language", "auto").unwrap();
+    assert_eq!(commands::language(&state).setting, "auto");
+    assert_eq!(commands::set_language(&state, "pl"), Ok((Lang::Pl, false)));
+    assert_eq!(commands::language(&state), LanguageDto { setting: "pl", lang: "pl" });
+    assert_eq!(store(d.dir.path()).get_config("language").unwrap().as_deref(), Some("pl"));
+}
+
 /// Every window command in build.rs has its `allow-*` in the capability file and a handler in
 /// window.rs, and nothing more: a command left out of either is refused by the window, or never
 /// reached (spec 2026-10-27-self-update, 9).
 #[test]
 fn window_commands_are_registered() {
-    let read = |file: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+    let read = repo_file;
     let build = read("build.rs");
     let listed = build.split("const COMMANDS: &[&str] = &[").nth(1).unwrap().split("];").next().unwrap();
     let commands: Vec<&str> = listed.split(',').map(|item| item.trim().trim_matches('"')).filter(|item| !item.is_empty()).collect();
-    for command in ["update_status", "check_update", "install_update", "cancel_update", "set_auto_install"] {
+    for command in ["update_status", "check_update", "install_update", "cancel_update", "set_auto_install", "language", "set_language"] {
         assert!(commands.contains(&command), "{command} is not in build.rs");
     }
     let capability: Value = serde_json::from_str(&read("capabilities/main.json")).unwrap();
@@ -540,5 +564,107 @@ fn window_commands_are_registered() {
     assert_eq!(handled, commands, "window.rs handles exactly the commands of build.rs");
     for command in &commands {
         assert!(window.contains(&format!("pub async fn {command}(")), "no handler fn {command}");
+    }
+}
+
+/// A file of this crate, as the repository has it.
+fn repo_file(file: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap()
+}
+
+fn polish(c: char) -> bool {
+    "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ".contains(c)
+}
+
+/// Every element of index.html with text of its own has the English one in `data-en`, and every
+/// `aria-label` has `data-en-aria-label` (spec 2026-10-30-ui-languages, 7.3 and 10.8).
+#[test]
+fn every_text_of_the_page_has_its_english() {
+    let html = repo_file("ui/index.html");
+    let mut texts = 0;
+    for part in html.split('<').skip(1) {
+        let (tag, text) = part.split_once('>').unwrap_or_else(|| panic!("unclosed <{part}"));
+        let text = text.trim();
+        if tag.starts_with('!') {
+            continue;
+        }
+        // Text after a closing tag belongs to an element with children: there is no place for it.
+        if tag.starts_with('/') {
+            assert!(text.is_empty(), "text {text:?} after <{tag}>");
+            continue;
+        }
+        if !text.is_empty() {
+            texts += 1;
+            assert!(tag.contains("data-en=\""), "<{tag}> shows {text:?} without data-en");
+        }
+        if tag.contains(" aria-label=\"") {
+            assert!(tag.contains("data-en-aria-label=\""), "<{tag}> has an aria-label without data-en-aria-label");
+        }
+    }
+    assert!(texts >= 17, "{texts} texts in index.html");
+}
+
+/// Every line of app.js with a Polish letter has its English beside it: in `tr(...)`, or as a form
+/// of `plural` (spec 2026-10-30-ui-languages, 7.2 and 10.8).
+#[test]
+fn every_polish_text_of_the_window_script_has_its_english() {
+    let script = repo_file("ui/app.js");
+    for (number, line) in script.lines().enumerate() {
+        if line.chars().any(polish) {
+            let plural_form = ["one:", "few:", "many:"].iter().any(|form| line.contains(form));
+            assert!(line.contains("tr(") || plural_form, "app.js:{}: {line}", number + 1);
+        }
+    }
+}
+
+/// Every Polish literal of the daemon's code has its English beside it: on a line that picks the
+/// language, or one of the 4 lines before it (rustfmt breaks long calls), spec 10.8. Tests and
+/// comments aside.
+#[test]
+fn every_polish_literal_of_the_daemon_has_its_english() {
+    fn files(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let mut sources = Vec::new();
+    files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
+    assert!(sources.len() > 30, "{sources:?}");
+    for source in sources {
+        let text = std::fs::read_to_string(&source).unwrap();
+        let lines: Vec<&str> = text.lines().take_while(|line| !line.contains("#[cfg(test)]")).collect();
+        for (at, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains('"') || !line.chars().any(polish) {
+                continue;
+            }
+            let picked =
+                lines[at.saturating_sub(4)..=at].iter().any(|line| ["pick(", "Lang::Pl", "plural_pl("].iter().any(|mark| line.contains(mark)));
+            assert!(picked, "{}:{}: {line}", source.display(), at + 1);
+        }
+    }
+}
+
+/// The warning about a rule whose agents write on their own quotes the window's labels of the write
+/// permission and names its section, in each language as the window shows them.
+#[test]
+fn autonomous_warning_quotes_what_the_window_shows() {
+    let (script, html) = (repo_file("ui/app.js"), repo_file("ui/index.html"));
+    let menu = html.split("data-section=\"permissions\"").nth(1).unwrap().split("</button>").next().unwrap();
+    let english = menu.split("data-en=\"").nth(1).unwrap().split('"').next().unwrap();
+    let polish = menu.rsplit('>').next().unwrap();
+    assert_eq!((polish, english), ("Uprawnienia agentów", "Agent permissions"));
+    for (lang, section) in [(Lang::Pl, polish), (Lang::En, english)] {
+        let warning = commands::autonomous_rule(lang);
+        assert!(warning.contains(section), "{warning:?} does not name {section:?}");
+        let quoted: Vec<&str> = warning.split('"').skip(1).step_by(2).collect();
+        assert_eq!(quoted.len(), 2, "{warning:?}");
+        for label in quoted {
+            assert!(script.contains(&format!("\"{label}\"")), "app.js has no label {label:?}, which the {lang:?} warning quotes");
+        }
     }
 }

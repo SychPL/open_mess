@@ -29,6 +29,8 @@
     "allow-check-update",
     "allow-install-update",
     "allow-cancel-update",
-    "allow-set-auto-install"
+    "allow-set-auto-install",
+    "allow-language",
+    "allow-set-language"
   ]
 }

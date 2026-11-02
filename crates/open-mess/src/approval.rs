@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 
+use crate::i18n::{Lang, plural_pl};
 use crate::pending::{Kind, Pending, Preview};
 use crate::ui::Opener;
 use crate::update::release::Version;
@@ -34,8 +35,22 @@ const TOAST_WIDTH: usize = 24;
 /// be rejected there; approving it waits for the configuration window (milestone E).
 const DIALOG_LINES: usize = 25;
 const DIALOG_WIDTH: usize = 40;
-const APPROVE: &[(&str, &str)] = &[("Approve", "approve"), ("Reject", "reject")];
-const SHOW_ALL: &[(&str, &str)] = &[("Show all", "show")];
+
+/// The buttons of a toast that can approve: label and argument; the arguments are what is matched.
+fn approve(lang: Lang) -> &'static [(&'static str, &'static str)] {
+    match lang {
+        Lang::Pl => &[("Zatwierdź", "approve"), ("Odrzuć", "reject")],
+        Lang::En => &[("Approve", "approve"), ("Reject", "reject")],
+    }
+}
+
+/// The button of a toast that can't.
+fn show_all(lang: Lang) -> &'static [(&'static str, &'static str)] {
+    match lang {
+        Lang::Pl => &[("Pokaż całość", "show")],
+        Lang::En => &[("Show all", "show")],
+    }
+}
 
 /// What the approval of one action shows: the account, the conversation, the participants and the
 /// whole content (spec 8.6), cleaned of control characters and direction marks.
@@ -48,6 +63,8 @@ pub struct Prompt {
     pub participants: Vec<String>,
     /// The text; an edit's text before and after; a reaction and the message it is under.
     pub content: String,
+    /// The language of the toast and the dialog.
+    pub lang: Lang,
 }
 
 /// What a toast shows.
@@ -62,29 +79,36 @@ pub struct ToastText {
 }
 
 impl Prompt {
-    pub fn new(preview: &Preview) -> Prompt {
-        let what = match preview.kind {
-            Kind::Send => "send",
-            Kind::Edit => "edit",
-            Kind::React => "reaction",
+    pub fn new(preview: &Preview, lang: Lang) -> Prompt {
+        let title = match (preview.kind, lang) {
+            (Kind::Send, Lang::Pl) => "open_mess: zatwierdź wysłanie",
+            (Kind::Edit, Lang::Pl) => "open_mess: zatwierdź edycję",
+            (Kind::React, Lang::Pl) => "open_mess: zatwierdź reakcję",
+            (Kind::Send, Lang::En) => "open_mess: approve send",
+            (Kind::Edit, Lang::En) => "open_mess: approve edit",
+            (Kind::React, Lang::En) => "open_mess: approve reaction",
         };
         let conversation = format!("{} - {}", clean(&preview.account), clean(&preview.conversation_title));
         let participants = preview.participants.iter().map(|name| clean(name)).collect();
         let field = |text: &Option<String>| clean(text.as_deref().unwrap_or_default());
-        let content = match (preview.kind, &preview.target_text) {
-            (Kind::Send, None) => field(&preview.text),
-            (Kind::Send, Some(_)) => format!("{}\n\nIn reply to: {}", field(&preview.text), field(&preview.target_text)),
-            (Kind::Edit, _) => format!("Before: {}\nAfter: {}", field(&preview.target_text), field(&preview.text)),
-            (Kind::React, _) => format!("{} on: {}", field(&preview.reaction), field(&preview.target_text)),
+        let (text, target, reaction) = (field(&preview.text), field(&preview.target_text), field(&preview.reaction));
+        let content = match (preview.kind, &preview.target_text, lang) {
+            (Kind::Send, None, _) => text,
+            (Kind::Send, Some(_), Lang::Pl) => format!("{text}\n\nW odpowiedzi na: {target}"),
+            (Kind::Send, Some(_), Lang::En) => format!("{text}\n\nIn reply to: {target}"),
+            (Kind::Edit, _, Lang::Pl) => format!("Przed: {target}\nPo: {text}"),
+            (Kind::Edit, _, Lang::En) => format!("Before: {target}\nAfter: {text}"),
+            (Kind::React, _, Lang::Pl) => format!("{reaction} pod: {target}"),
+            (Kind::React, _, Lang::En) => format!("{reaction} on: {target}"),
         };
-        Prompt { title: format!("open_mess: approve {what}"), conversation, participants, content }
+        Prompt { title: title.into(), conversation, participants, content, lang }
     }
 
     /// The conversation and the first `named` participants.
     fn context(&self, named: usize) -> String {
         let mut context = self.conversation.clone();
         if !self.participants.is_empty() {
-            context.push_str("\nWith ");
+            context.push_str(self.lang.pick("\nZ: ", "\nWith "));
             context.push_str(&participants(&self.participants, named));
         }
         context
@@ -95,9 +119,10 @@ impl Prompt {
         let context = self.context(NAMED_PARTICIPANTS);
         let fits = lines(&context, TOAST_WIDTH) + lines(&self.content, TOAST_WIDTH) <= TOAST_LINES;
         if fits && self.participants.len() <= NAMED_PARTICIPANTS {
-            ToastText { context, line: self.content.clone(), buttons: APPROVE }
+            ToastText { context, line: self.content.clone(), buttons: approve(self.lang) }
         } else {
-            ToastText { context, line: "Open it to read all of it before you decide.".into(), buttons: SHOW_ALL }
+            let line = self.lang.pick("Otwórz, żeby przeczytać całość przed decyzją.", "Open it to read all of it before you decide.");
+            ToastText { context, line: line.into(), buttons: show_all(self.lang) }
         }
     }
 
@@ -106,6 +131,28 @@ impl Prompt {
     pub fn dialog(&self) -> Option<String> {
         let text = format!("{}\n\n{}", self.context(usize::MAX), self.content);
         (lines(&text, DIALOG_WIDTH) <= DIALOG_LINES).then_some(text)
+    }
+
+    /// What the dialog says under [`Prompt::dialog`]. Windows labels its Yes and No buttons in its
+    /// own language, which a language picked in the window may not be.
+    pub fn question(&self) -> &'static str {
+        self.lang.pick("Zatwierdzić? Tak zatwierdza, Nie odrzuca.", "Approve this? Yes approves it, No rejects it.")
+    }
+
+    /// What the dialog says when the content is too long for it.
+    pub fn too_long(&self) -> &'static str {
+        self.lang.pick(
+            "To jest za długie, żeby pokazać całość tutaj, więc tu nie można tego zatwierdzić.\n\nOdrzucić? Tak odrzuca, Nie zostawia do wygaśnięcia.",
+            "This is too long to show here in full, so it can't be approved here.\n\nReject it? Yes rejects it, No leaves it waiting until it expires.",
+        )
+    }
+}
+
+/// The title of the notice that `count` actions (2 or more) wait.
+pub fn several_title(count: usize, lang: Lang) -> String {
+    match lang {
+        Lang::Pl => format!("open_mess: {count} {} na zatwierdzenie", plural_pl(count, "akcja czeka", "akcje czekają", "akcji czeka")),
+        Lang::En => format!("open_mess: {count} actions wait for your approval"),
     }
 }
 
@@ -235,12 +282,17 @@ pub async fn run(pending: Arc<Pending>, present: impl Fn(&Preview), several: imp
     }
 }
 
+/// Set once [`start`] registered the AppUserModelIDs: only that process writes their names again.
+#[cfg(windows)]
+static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Registers the toasts' AppUserModelID and shows the waiting actions for the daemon's lifetime;
 /// the notice of several opens the configuration window through `window`.
 #[cfg(windows)]
 pub fn start(runtime: &Runtime, pending: Arc<Pending>, window: Opener) {
+    REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
     // ponytail: without the registration Windows may show no toast; reported once a log sink exists.
-    let _ = toast::register();
+    let _ = toast::register(crate::i18n::current());
     // Toasts are shown and taken away one after the other on one thread (showing waits for
     // Windows), so taking one away never takes the next one with it.
     let (jobs, queue) = std::sync::mpsc::channel::<toast::Job>();
@@ -251,7 +303,7 @@ pub fn start(runtime: &Runtime, pending: Arc<Pending>, window: Opener) {
     let open_on = runtime.handle().clone();
     runtime.spawn(run(
         pending,
-        move |preview| drop(jobs.send(toast::show(&shown, &handle, Prompt::new(preview), preview.action.clone()))),
+        move |preview| drop(jobs.send(toast::show(&shown, &handle, Prompt::new(preview, crate::i18n::current()), preview.action.clone()))),
         move |count| drop(several.send(toast::several(count, window.clone(), open_on.clone()))),
         move || drop(withdrawn.send(Box::new(toast::withdraw))),
     ));
@@ -260,6 +312,16 @@ pub fn start(runtime: &Runtime, pending: Arc<Pending>, window: Opener) {
 /// No notifications here: actions wait until they expire.
 #[cfg(not(windows))]
 pub fn start(_runtime: &Runtime, _pending: Arc<Pending>, _window: Opener) {}
+
+/// The notifications' names in `lang`, once the language changed: written again only by the
+/// process that registered them at its start, so the tests never write to the registry.
+#[cfg(windows)]
+pub fn rename(lang: crate::i18n::Lang) {
+    if REGISTERED.load(std::sync::atomic::Ordering::Relaxed) {
+        // ponytail: a name that fails to change keeps the old language until the next change.
+        let _ = toast::register(lang);
+    }
+}
 
 /// "open_mess <wersja> jest gotowy" with Zainstaluj and Później (spec 2026-10-27-self-update, 6);
 /// Zainstaluj is the user's consent, as in the window.
@@ -286,15 +348,16 @@ mod toast {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
-    use super::{APP_ID, Prompt, UPDATE_APP_ID};
+    use super::{APP_ID, Prompt, UPDATE_APP_ID, several_title};
+    use crate::i18n::{self, Lang};
     use crate::pending::Pending;
     use crate::ui::Opener;
     use crate::update::service::UpdateService;
 
     /// `HKCU\Software\Classes\AppUserModelId\open_mess.daemon` and `...\open_mess.update` with the
     /// names toasts and the notification settings show.
-    pub(super) fn register() -> std::io::Result<()> {
-        for (id, name) in [(APP_ID, "open_mess"), (UPDATE_APP_ID, "open_mess - aktualizacje")] {
+    pub(super) fn register(lang: Lang) -> std::io::Result<()> {
+        for (id, name) in [(APP_ID, "open_mess"), (UPDATE_APP_ID, lang.pick("open_mess - aktualizacje", "open_mess - updates"))] {
             let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(format!(r"Software\Classes\AppUserModelId\{id}"))?;
             key.set_value("DisplayName", &name)?;
         }
@@ -305,10 +368,15 @@ mod toast {
     /// that release, the one with `manifest_sha256`, and nothing else.
     pub(super) fn update(service: UpdateService, version: &str, manifest_sha256: String) {
         let _ = ToastNotificationManager::History().and_then(|history| history.ClearWithId(&HSTRING::from(UPDATE_APP_ID)));
+        let lang = i18n::current();
+        let title = match lang {
+            Lang::Pl => format!("open_mess {version} jest gotowy"),
+            Lang::En => format!("open_mess {version} is ready"),
+        };
         let toast = Toast::new(UPDATE_APP_ID)
-            .title(&format!("open_mess {version} jest gotowy"))
-            .add_button("Zainstaluj", "install")
-            .add_button("Później", "later")
+            .title(&title)
+            .add_button(lang.pick("Zainstaluj", "Install"), "install")
+            .add_button(lang.pick("Później", "Later"), "later")
             .on_activated(move |argument| {
                 if argument.as_deref() == Some("install") {
                     // ponytail: a refusal (a check or an installation running, a new version being
@@ -365,12 +433,13 @@ mod toast {
     /// Shows that `count` actions wait; it only opens the configuration window, where each is shown
     /// in full and decided on its own.
     pub(super) fn several(count: usize, window: Opener, runtime: Handle) -> Job {
+        let lang = i18n::current();
         Box::new(move || {
             let toast = Toast::new(APP_ID)
-                .title(&format!("open_mess: {count} actions wait for your approval"))
-                .text1("Open the list to read each one before you decide.")
+                .title(&several_title(count, lang))
+                .text1(lang.pick("Otwórz listę, żeby przeczytać każdą przed decyzją.", "Open the list to read each one before you decide."))
                 .scenario(Scenario::Reminder)
-                .add_button("Open the list", "open")
+                .add_button(lang.pick("Otwórz listę", "Open the list"), "open")
                 .on_activated(move |_| {
                     let window = window.clone();
                     // ponytail: a window that fails to open says nothing here; reported once a log
@@ -398,13 +467,10 @@ mod toast {
     fn ask(prompt: &Prompt) -> Option<bool> {
         let dialog = rfd::MessageDialog::new().set_level(rfd::MessageLevel::Warning).set_title(&prompt.title);
         let Some(text) = prompt.dialog() else {
-            let why = "This is too long to show here in full, so it can't be approved here.\n\n\
-                       Reject it? Yes rejects it, No leaves it waiting until it expires.";
-            let answer = dialog.set_description(why).set_buttons(rfd::MessageButtons::YesNo).show();
+            let answer = dialog.set_description(prompt.too_long()).set_buttons(rfd::MessageButtons::YesNo).show();
             return (answer == rfd::MessageDialogResult::Yes).then_some(false);
         };
-        let answer =
-            dialog.set_description(format!("{text}\n\nApprove this? Yes approves it, No rejects it.")).set_buttons(rfd::MessageButtons::YesNo).show();
+        let answer = dialog.set_description(format!("{text}\n\n{}", prompt.question())).set_buttons(rfd::MessageButtons::YesNo).show();
         match answer {
             rfd::MessageDialogResult::Yes => Some(true),
             rfd::MessageDialogResult::No => Some(false),
@@ -434,52 +500,99 @@ mod tests {
     #[test]
     fn toast_text_is_truncated_with_show_all() {
         let mut send = preview("a1", Kind::Send);
-        let prompt = Prompt::new(&send);
+        let prompt = Prompt::new(&send, Lang::En);
         assert_eq!(prompt.title, "open_mess: approve send");
         let toast = prompt.toast();
         assert_eq!(toast.context, "Ann (teams:ann) - Project\nWith Pat, Sam");
-        assert_eq!((toast.line.as_str(), toast.buttons), ("on my way", APPROVE));
+        assert_eq!((toast.line.as_str(), toast.buttons), ("on my way", approve(Lang::En)));
 
         // The context takes three of the four lines Windows shows: one line of content fits.
         send.text = Some("x".repeat(TOAST_WIDTH));
-        assert_eq!(Prompt::new(&send).toast().buttons, APPROVE);
+        assert_eq!(Prompt::new(&send, Lang::En).toast().buttons, approve(Lang::En));
         // One character more and the toast shows none of it, only the way to all of it.
         send.text = Some("x".repeat(TOAST_WIDTH + 1));
-        let prompt = Prompt::new(&send);
+        let prompt = Prompt::new(&send, Lang::En);
         let toast = prompt.toast();
         assert!(!toast.line.contains('x'));
-        assert_eq!(toast.buttons, SHOW_ALL);
+        assert_eq!(toast.buttons, show_all(Lang::En));
         assert_eq!(prompt.content, "x".repeat(TOAST_WIDTH + 1));
         // Short lines count as lines, wide characters as two.
         send.text = Some("a\nb".into());
-        assert_eq!(Prompt::new(&send).toast().buttons, SHOW_ALL);
+        assert_eq!(Prompt::new(&send, Lang::En).toast().buttons, show_all(Lang::En));
         send.text = Some("\u{4f60}".repeat(TOAST_WIDTH / 2 + 1));
-        assert_eq!(Prompt::new(&send).toast().buttons, SHOW_ALL);
+        assert_eq!(Prompt::new(&send, Lang::En).toast().buttons, show_all(Lang::En));
         // A reply's target counts too.
         send.text = Some("ok".into());
         send.target_text = Some("fine".into());
-        assert_eq!(Prompt::new(&send).toast().buttons, SHOW_ALL);
+        assert_eq!(Prompt::new(&send, Lang::En).toast().buttons, show_all(Lang::En));
 
         // The dialog shows everything, up to what fits a screen.
         send.target_text = None;
         send.text = Some("x".repeat(DIALOG_WIDTH * 20));
-        assert!(Prompt::new(&send).dialog().unwrap().ends_with(&"x".repeat(DIALOG_WIDTH * 20)));
+        assert!(Prompt::new(&send, Lang::En).dialog().unwrap().ends_with(&"x".repeat(DIALOG_WIDTH * 20)));
         send.text = Some("x".repeat(DIALOG_WIDTH * DIALOG_LINES));
-        assert_eq!(Prompt::new(&send).dialog(), None);
+        assert_eq!(Prompt::new(&send, Lang::En).dialog(), None);
 
         let mut edit = preview("a2", Kind::Edit);
         edit.target_text = Some("on my wya".into());
-        assert_eq!(Prompt::new(&edit).content, "Before: on my wya\nAfter: on my way");
+        assert_eq!(Prompt::new(&edit, Lang::En).content, "Before: on my wya\nAfter: on my way");
         let mut react = preview("a3", Kind::React);
         react.reaction = Some("like".into());
         react.target_text = Some("lunch?".into());
-        assert_eq!(Prompt::new(&react).title, "open_mess: approve reaction");
-        assert_eq!(Prompt::new(&react).content, "like on: lunch?");
+        assert_eq!(Prompt::new(&react, Lang::En).title, "open_mess: approve reaction");
+        assert_eq!(Prompt::new(&react, Lang::En).content, "like on: lunch?");
 
         // A name or text can't hide or reorder what the toast says.
         send.target_text = None;
         send.text = Some("pay \u{202e}gpj.exe\u{7} now\nplease".into());
-        assert_eq!(Prompt::new(&send).content, "pay gpj.exe now\nplease");
+        assert_eq!(Prompt::new(&send, Lang::En).content, "pay gpj.exe now\nplease");
+    }
+
+    #[test]
+    fn prompts_in_both_languages() {
+        let mut send = preview("a1", Kind::Send);
+        send.target_text = Some("lunch?".into());
+        let mut edit = preview("a2", Kind::Edit);
+        edit.target_text = Some("on my wya".into());
+        let mut react = preview("a3", Kind::React);
+        react.reaction = Some("like".into());
+        react.target_text = Some("lunch?".into());
+        for (preview, lang, title, content) in [
+            (&send, Lang::Pl, "open_mess: zatwierdź wysłanie", "on my way\n\nW odpowiedzi na: lunch?"),
+            (&send, Lang::En, "open_mess: approve send", "on my way\n\nIn reply to: lunch?"),
+            (&edit, Lang::Pl, "open_mess: zatwierdź edycję", "Przed: on my wya\nPo: on my way"),
+            (&edit, Lang::En, "open_mess: approve edit", "Before: on my wya\nAfter: on my way"),
+            (&react, Lang::Pl, "open_mess: zatwierdź reakcję", "like pod: lunch?"),
+            (&react, Lang::En, "open_mess: approve reaction", "like on: lunch?"),
+        ] {
+            let prompt = Prompt::new(preview, lang);
+            assert_eq!((prompt.title.as_str(), prompt.content.as_str()), (title, content));
+        }
+        // The toast and the dialog speak the prompt's language; the arguments stay.
+        send.target_text = None;
+        let toast = Prompt::new(&send, Lang::Pl).toast();
+        assert_eq!(toast.context, "Ann (teams:ann) - Project\nZ: Pat, Sam");
+        assert_eq!(toast.buttons, [("Zatwierdź", "approve"), ("Odrzuć", "reject")]);
+        send.text = Some("x".repeat(TOAST_WIDTH * 2));
+        let prompt = Prompt::new(&send, Lang::Pl);
+        assert_eq!(prompt.toast().line, "Otwórz, żeby przeczytać całość przed decyzją.");
+        assert_eq!(prompt.toast().buttons, [("Pokaż całość", "show")]);
+        assert!(prompt.question().contains("Tak zatwierdza, Nie odrzuca"));
+        assert!(prompt.too_long().contains("Tak odrzuca"));
+        let prompt = Prompt::new(&send, Lang::En);
+        assert_eq!(prompt.toast().line, "Open it to read all of it before you decide.");
+        assert!(prompt.question().contains("Yes approves it, No rejects it"));
+        assert!(prompt.too_long().contains("Yes rejects it"));
+    }
+
+    #[test]
+    fn notice_of_several_counts_in_both_languages() {
+        assert_eq!(several_title(2, Lang::Pl), "open_mess: 2 akcje czekają na zatwierdzenie");
+        assert_eq!(several_title(5, Lang::Pl), "open_mess: 5 akcji czeka na zatwierdzenie");
+        assert_eq!(several_title(22, Lang::Pl), "open_mess: 22 akcje czekają na zatwierdzenie");
+        assert_eq!(several_title(12, Lang::Pl), "open_mess: 12 akcji czeka na zatwierdzenie");
+        assert_eq!(several_title(2, Lang::En), "open_mess: 2 actions wait for your approval");
+        assert_eq!(several_title(12, Lang::En), "open_mess: 12 actions wait for your approval");
     }
 
     #[test]
@@ -493,13 +606,13 @@ mod tests {
         let mut group = preview("a1", Kind::Send);
         group.text = Some("ok".into());
         group.participants = names(6);
-        let prompt = Prompt::new(&group);
+        let prompt = Prompt::new(&group, Lang::En);
         assert_eq!(prompt.toast().context, "Ann (teams:ann) - Project\nWith P1, P2, P3, P4, P5, +1");
-        assert_eq!(prompt.toast().buttons, SHOW_ALL);
+        assert_eq!(prompt.toast().buttons, show_all(Lang::En));
         assert!(prompt.dialog().unwrap().contains("P1, P2, P3, P4, P5, P6\n"));
         let mut channel = preview("a1", Kind::Send);
         channel.participants.clear();
-        assert_eq!(Prompt::new(&channel).toast().context, "Ann (teams:ann) - Project");
+        assert_eq!(Prompt::new(&channel, Lang::En).toast().context, "Ann (teams:ann) - Project");
     }
 
     #[test]

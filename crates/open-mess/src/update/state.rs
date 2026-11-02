@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::apply::Outcome;
 use crate::{Error, paths};
 
 /// The folders an installation works in.
@@ -158,10 +159,10 @@ pub fn helper_alive(paths: &Paths) -> bool {
     matches!(try_lock(&paths.lock_file(), Duration::ZERO), Ok(None))
 }
 
-/// The installation's result, one line, for the window. Best effort: one that cannot be written is
-/// only not shown.
-pub fn record_result(paths: &Paths, text: &str) {
-    let _ = std::fs::write(paths.last_result(), format!("{}\n", text.replace(['\r', '\n'], " ")));
+/// The installation's result, one line, for the window: always an [`Outcome`], in its English form.
+/// Best effort: one that cannot be written is only not shown.
+pub fn record_result(paths: &Paths, outcome: &Outcome) {
+    let _ = std::fs::write(paths.last_result(), format!("{}\n", outcome.to_string().replace(['\r', '\n'], " ")));
 }
 
 #[cfg(test)]
