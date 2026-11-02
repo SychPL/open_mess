@@ -59,7 +59,14 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::set_auto_install,
             ipc::model_status,
             ipc::download_model,
-            ipc::delete_model
+            ipc::delete_model,
+            ipc::recordings,
+            ipc::set_recording_settings,
+            ipc::show_transcript,
+            ipc::delete_recording,
+            ipc::delete_all_recordings,
+            ipc::retry_recording,
+            ipc::stop_recording
         ])
         .build(tauri::generate_context!())
         .map_err(failed)?;
@@ -313,6 +320,42 @@ mod ipc {
     #[tauri::command(rename_all = "snake_case")]
     pub async fn delete_model(state: State<'_, UiState>) -> Result<(), String> {
         commands::delete_model(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn recordings(state: State<'_, UiState>) -> Result<commands::RecordingsDto, String> {
+        commands::recordings(&state)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn set_recording_settings(state: State<'_, UiState>, auto: bool, microphone: bool, language: String) -> Result<(), String> {
+        commands::set_recording_settings(&state, auto, microphone, &language)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn show_transcript(state: State<'_, UiState>, id: String) -> Result<Vec<commands::CueDto>, String> {
+        commands::show_transcript(&state, &id)
+    }
+
+    // Deleting waits for a transcription to stop: off the async workers.
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn delete_recording(state: State<'_, UiState>, id: String) -> Result<(), String> {
+        tokio::task::block_in_place(|| commands::delete_recording(&state, &id))
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn delete_all_recordings(state: State<'_, UiState>) -> Result<(), String> {
+        tokio::task::block_in_place(|| commands::delete_all_recordings(&state))
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn retry_recording(state: State<'_, UiState>, id: String) -> Result<(), String> {
+        commands::retry_recording(&state, &id)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn stop_recording(state: State<'_, UiState>) -> Result<(), String> {
+        tokio::task::block_in_place(|| commands::stop_recording(&state))
     }
 
     #[tauri::command(rename_all = "snake_case")]

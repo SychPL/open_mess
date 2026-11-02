@@ -589,3 +589,91 @@ async fn the_model_is_handled_only_where_recording_is() {
     // Nothing to delete is no error.
     commands::delete_model(&state).unwrap();
 }
+
+/// Tells the owner nothing: the window's commands are under test, not the toasts.
+struct Quiet;
+
+impl open_mess::recording::recorder::Notices for Quiet {
+    fn started(&self, _: &str, _: bool) {}
+    fn not_recording(&self, _: &str) {}
+    fn track_lost(&self, _: bool) {}
+    fn agent_stopped(&self) {}
+    fn clear(&self) {}
+}
+
+/// A recorder over `local` whose capture only waits for its stop, and whose transcriptions are
+/// held, so the recordings stay as the test leaves them.
+fn recorder(local: &std::path::Path) -> Arc<open_mess::recording::recorder::Recorder> {
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+    use open_mess::recording::queue::Queue;
+    use open_mess::recording::recorder::{Hooks, Recorder, Settings};
+    use open_mess::recording::stt::SttError;
+
+    let engine = Arc::new(|_: &std::path::Path, _: Option<&str>, _: &AtomicBool, _: &AtomicU8| Err(SttError::Cancelled));
+    let queue = Arc::new(Queue::start(local, engine, Arc::new(|| Err("held")), Arc::new(|| None)).unwrap());
+    let hooks = Hooks {
+        settings: Box::new(|| Settings { auto: true, microphone: false }),
+        free_disk: Box::new(|| u64::MAX),
+        model: Box::new(|| "ready"),
+        capture: Box::new(|others, _, control| {
+            std::thread::Builder::new().spawn(move || {
+                while !control.stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                others.finish(Duration::ZERO)
+            })
+        }),
+        notices: Arc::new(Quiet),
+    };
+    Arc::new(Recorder::new(local, queue, Arc::new(AtomicBool::new(true)), hooks))
+}
+
+#[tokio::test]
+async fn the_recording_section_manages_settings_and_recordings() {
+    use open_mess::recording::detect::Observation;
+    use open_mess::recording::{Cue, Meta, Reason, Speaker, State as RecordingState, Transcript, wav};
+
+    let d = daemon(&[]).await;
+    let mut state = state(&d);
+    let recorder = recorder(&d.dir.path().join("local"));
+    state.recorder = Some(Arc::clone(&recorder));
+
+    // Settings: saved and checked.
+    commands::set_recording_settings(&state, true, false, "pl").unwrap();
+    let view = commands::recordings(&state).unwrap();
+    assert_eq!((view.auto, view.microphone, view.language.as_str()), (true, false, "pl"));
+    assert!(commands::set_recording_settings(&state, true, true, "../x").is_err());
+
+    // A done recording is shown to the owner, also with agents refused; as text, untouched.
+    let recordings = recorder.recordings();
+    let done = recordings.create(1_000).unwrap();
+    let cue = Cue { start_ms: 61_000, end_ms: 62_000, speaker: Speaker::Others, text: "<b>hej</b>".into() };
+    recordings.finish_transcript(&done, &Transcript { language: Some("pl".into()), cues: vec![cue] }).unwrap();
+    commands::set_permissions(&state, "local", None, false, "never").unwrap();
+    let cues = commands::show_transcript(&state, &done).unwrap();
+    assert_eq!((cues[0].start_ms, cues[0].text.as_str()), (61_000, "<b>hej</b>"));
+    assert!(commands::show_transcript(&state, "../x").is_err());
+
+    // A failed recording with its audio waits again; one without audio, or not failed, does not.
+    let failed = recordings.create(2_000).unwrap();
+    let mut track = wav::Writer::create(&recordings.path(&failed).unwrap().join("others.wav")).unwrap();
+    track.write(&[1, 2, 3]).unwrap();
+    track.finish().unwrap();
+    recordings.set_meta(&failed, &Meta { state: RecordingState::Failed, reason: Some(Reason::Failed), ..recordings.meta(&failed).unwrap() }).unwrap();
+    commands::retry_recording(&state, &failed).unwrap();
+    let meta = recordings.meta(&failed).unwrap();
+    assert_eq!((meta.state, meta.reason), (RecordingState::Waiting, None));
+    assert!(commands::retry_recording(&state, &done).is_err());
+
+    // While a call is recorded the model stays; deleting the recording stops it first.
+    let call = Observation { works: true, call: true, active: true, speaker: Some("headset".into()), ..Observation::default() };
+    recorder.observe(&call, Instant::now());
+    let active = commands::recordings(&state).unwrap().active.unwrap();
+    assert_eq!(commands::delete_model(&state).unwrap_err(), "trwa nagrywanie albo transkrypcja");
+    commands::delete_recording(&state, &active).unwrap();
+    assert!(recorder.active().is_none() && recordings.meta(&active).is_err());
+
+    commands::delete_all_recordings(&state).unwrap();
+    assert!(commands::recordings(&state).unwrap().recordings.is_empty());
+}

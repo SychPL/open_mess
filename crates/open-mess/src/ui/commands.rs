@@ -14,6 +14,8 @@ use serde_json::Value;
 use super::UiState;
 use crate::accounts::Account;
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
+use crate::recording::recorder::{By, Recorder};
+use crate::recording::{Entry, Meta, Reason, Speaker, State, valid_id};
 use crate::triggers::RuleCounters;
 use crate::triggers::rules::{self, Rule};
 use crate::update::release::Version;
@@ -782,9 +784,154 @@ pub fn download_model(state: &UiState) -> Result<(), String> {
     models(state)?.start_download(source)
 }
 
-/// "Usuń model".
+/// "Usuń model"; refused while a call is recorded or transcribed (4.6).
 pub fn delete_model(state: &UiState) -> Result<(), String> {
+    if let Some(recorder) = &state.recorder
+        && (recorder.active().is_some() || recorder.queue().view().running.is_some())
+    {
+        return Err("trwa nagrywanie albo transkrypcja".into());
+    }
     models(state)?.delete()
+}
+
+/// What records the calls (spec 2026-10-28-local-transcription, 4.6).
+fn recorder(state: &UiState) -> Result<&Arc<Recorder>, String> {
+    state.recorder.as_ref().ok_or_else(|| "nagrywanie rozmów działa tylko w Windows".to_owned())
+}
+
+fn unknown() -> String {
+    "nieznane nagranie".into()
+}
+
+/// One recording on the window's list.
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordingDto {
+    pub id: String,
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub state: &'static str,
+    pub progress: Option<u8>,
+    pub reason: Option<Reason>,
+    /// The audio is still there: a failed one can be tried again.
+    pub audio: bool,
+}
+
+/// The Nagrywanie rozmów section: its settings, the recording going on, `status`'s recording
+/// object and the recordings, newest first.
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordingsDto {
+    pub auto: bool,
+    pub microphone: bool,
+    pub language: String,
+    pub active: Option<String>,
+    pub status: Value,
+    pub recordings: Vec<RecordingDto>,
+}
+
+pub fn recordings(state: &UiState) -> Result<RecordingsDto, String> {
+    let recorder = recorder(state)?;
+    let setting = |key: &str| state.accounts.store().get_config(key).ok().flatten();
+    let recordings = recorder
+        .recordings()
+        .list()
+        .into_iter()
+        .map(|Entry { id, meta }| RecordingDto {
+            progress: recorder.queue().progress(&id),
+            audio: recorder.recordings().has_audio(&id),
+            start_ms: meta.start_ms,
+            end_ms: meta.end_ms,
+            state: meta.state.name(),
+            reason: meta.reason,
+            id,
+        })
+        .collect();
+    Ok(RecordingsDto {
+        auto: setting("recording.auto").as_deref() == Some("true"),
+        microphone: setting("recording.mic").as_deref() != Some("false"),
+        language: setting("recording.language").unwrap_or_else(|| "auto".into()),
+        active: recorder.active(),
+        status: recorder.status(),
+        recordings,
+    })
+}
+
+/// "Nagrywaj rozmowy Teams automatycznie", "Nagrywaj mój mikrofon" and the language (4.6). The
+/// language is `auto` or a Whisper code; one Whisper does not know fails the transcription, not
+/// the daemon. Turning the mode off ends a recording going on.
+pub fn set_recording_settings(state: &UiState, auto: bool, microphone: bool, language: &str) -> Result<(), String> {
+    changes_allowed(state)?;
+    let recorder = recorder(state)?;
+    if language != "auto" && !((2..=8).contains(&language.len()) && language.bytes().all(|b| b.is_ascii_lowercase())) {
+        return Err("nieznany język".into());
+    }
+    {
+        let store = state.accounts.store();
+        let flag = |on: bool| if on { "true" } else { "false" };
+        store.set_config("recording.auto", flag(auto)).map_err(text)?;
+        store.set_config("recording.mic", flag(microphone)).map_err(text)?;
+        store.set_config("recording.language", language).map_err(text)?;
+    }
+    recorder.settings_changed();
+    Ok(())
+}
+
+/// One piece of a transcript, as "Pokaż" shows it.
+#[derive(Clone, Debug, Serialize)]
+pub struct CueDto {
+    pub start_ms: u64,
+    pub speaker: Speaker,
+    pub text: String,
+}
+
+/// "Pokaż": a done recording's transcript, for the owner, whatever agents may read (4.6). It is
+/// other people's speech: the window puts it in as text, never as HTML.
+pub fn show_transcript(state: &UiState, id: &str) -> Result<Vec<CueDto>, String> {
+    let recorder = recorder(state)?;
+    if !valid_id(id) {
+        return Err(unknown());
+    }
+    let meta = recorder.recordings().meta(id).map_err(|_| unknown())?;
+    if meta.state != State::Done {
+        return Err("transkrypcja nie jest gotowa".into());
+    }
+    let transcript = recorder.recordings().transcript(id).map_err(|_| "transkrypcja jest uszkodzona".to_owned())?;
+    Ok(transcript.cues.into_iter().map(|cue| CueDto { start_ms: cue.start_ms, speaker: cue.speaker, text: cue.text }).collect())
+}
+
+/// "Usuń": the recording going on stops first, a transcription running stops first.
+pub fn delete_recording(state: &UiState, id: &str) -> Result<(), String> {
+    if !valid_id(id) {
+        return Err(unknown());
+    }
+    recorder(state)?.delete(id).map_err(text)
+}
+
+/// "Usuń wszystkie": a folder that cannot go (a file another program holds) stays, the rest go.
+pub fn delete_all_recordings(state: &UiState) -> Result<(), String> {
+    let recorder = recorder(state)?;
+    let failed = recorder.recordings().list().iter().filter(|entry| recorder.delete(&entry.id).is_err()).count();
+    if failed == 0 { Ok(()) } else { Err(format!("nie udało się usunąć nagrań: {failed} (plik trzyma inny program)")) }
+}
+
+/// "Ponów": a failed recording whose audio is still there waits for its transcription again. An
+/// interrupted one stays marked so.
+pub fn retry_recording(state: &UiState, id: &str) -> Result<(), String> {
+    let recorder = recorder(state)?;
+    let recordings = recorder.recordings();
+    let meta = if valid_id(id) { recordings.meta(id).map_err(|_| unknown())? } else { return Err(unknown()) };
+    if meta.state != State::Failed || !recordings.has_audio(id) {
+        return Err("tego nagrania nie da się ponowić".into());
+    }
+    let reason = meta.reason.filter(|reason| *reason == Reason::Interrupted);
+    recordings.set_meta(id, &Meta { state: State::Waiting, reason, ..meta }).map_err(text)?;
+    recorder.queue().wake();
+    Ok(())
+}
+
+/// "Zatrzymaj" in the window: as the tray's and the toast's (4.2).
+pub fn stop_recording(state: &UiState) -> Result<(), String> {
+    recorder(state)?.stop(By::Owner, false, None);
+    Ok(())
 }
 
 /// "Instaluj aktualizacje automatycznie".

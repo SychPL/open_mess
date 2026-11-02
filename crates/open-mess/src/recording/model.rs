@@ -243,8 +243,8 @@ impl Models {
         Ok(())
     }
 
-    /// "Usuń model": every revision's folder. Refused while a download runs.
-    // ponytail: refused also while recording or transcribing, once those run (4.6, spec step 5).
+    /// "Usuń model": every revision's folder. Refused while a download runs; the window refuses
+    /// it while a call is recorded or transcribed too.
     pub fn delete(&self) -> Result<(), String> {
         if matches!(*locked(&self.download), Download::Running { .. }) {
             return Err("model się pobiera".into());

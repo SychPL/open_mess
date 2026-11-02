@@ -950,12 +950,40 @@ function megabytes(bytes) {
   return Math.round(bytes / (1024 * 1024)).toLocaleString("pl-PL") + " MB";
 }
 
-// Nagrywanie rozmów (spec 2026-10-28-local-transcription, 4.6). The model for now; the recording
-// settings and the list of recordings come with the recording itself.
+const RECORDING_STATES = {
+  recording: "nagrywanie",
+  waiting: "czeka na transkrypcję",
+  transcribing: "transkrypcja",
+  done: "gotowe",
+  failed: "nieudane",
+};
+const SPEAKERS = { me: "ja", others: "rozmówcy" };
+const LANGUAGES = [
+  ["auto", "wykryj sam"],
+  ["pl", "polski"],
+  ["en", "angielski"],
+  ["de", "niemiecki"],
+  ["uk", "ukraiński"],
+  ["fr", "francuski"],
+  ["es", "hiszpański"],
+];
+
+/** HH:MM:SS of `ms`. */
+function clock(ms) {
+  const seconds = Math.floor(ms / 1000);
+  return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+/** The recording whose transcript "Pokaż" shows, and its pieces. */
+let shownRecording = null;
+
+// Nagrywanie rozmów (spec 2026-10-28-local-transcription, 4.6): the settings, the model and the
+// recordings. A transcript is other people's speech: it goes in through `el` only.
 async function renderRecording() {
-  const model = await call("model_status");
+  const [model, recording] = await Promise.all([call("model_status"), call("recordings")]);
   const root = content("recording");
   root.replaceChildren();
+  renderRecordingSettings(root, recording);
   root.append(
     el(
       "p",
@@ -988,11 +1016,135 @@ async function renderRecording() {
     );
   }
   root.append(buttons);
+  renderRecordings(root, recording);
   // Progress while the section is open.
-  if (download.state === "running") {
+  const busy = recording.active || recording.recordings.some((item) => item.state === "transcribing");
+  if (download.state === "running" || busy) {
     setTimeout(() => {
       if (current === "recording") renderRecording().catch(showError);
-    }, 1000);
+    }, 2000);
+  }
+}
+
+function renderRecordingSettings(root, recording) {
+  const auto = el("input");
+  auto.type = "checkbox";
+  auto.checked = recording.auto;
+  const autoLabel = el("label", null, "row");
+  autoLabel.append(auto, el("span", "Nagrywaj rozmowy Teams automatycznie"));
+  root.append(
+    autoLabel,
+    el(
+      "p",
+      "Gdy jest włączone, każda rozmowa Teams jest nagrywana bez pytania: wszystko, co gra urządzenie rozmowy (także powiadomienia i inne aplikacje) przez cały czas rozmowy, oraz Twój mikrofon, tylko gdy jest włączony w Teams. Nagrania leżą w %LOCALAPPDATA%\\open_mess\\recordings na tym komputerze; dźwięk znika po transkrypcji, tekst zostaje, dopóki go nie usuniesz. Uczestników informujesz Ty.",
+      "muted",
+    ),
+  );
+  const microphone = el("input");
+  microphone.type = "checkbox";
+  microphone.checked = recording.microphone;
+  const microphoneLabel = el("label", null, "row");
+  microphoneLabel.append(microphone, el("span", "Nagrywaj mój mikrofon"));
+  const known = LANGUAGES.some(([code]) => code === recording.language);
+  const language = select(known ? LANGUAGES : [...LANGUAGES, [recording.language, recording.language]], recording.language);
+  const languageLabel = el("label", null, "row");
+  languageLabel.append(el("span", "Język rozmów"), language);
+  root.append(
+    microphoneLabel,
+    languageLabel,
+    button("Zapisz ustawienia", async () => {
+      if (auto.checked && !recording.auto && !confirm("Nagrywać automatycznie każdą rozmowę Teams na tym komputerze?")) return;
+      await call("set_recording_settings", { auto: auto.checked, microphone: microphone.checked, language: language.value });
+      await renderRecording();
+    }),
+  );
+  if (recording.active) {
+    const row = el("div", null, "row");
+    row.append(
+      el("strong", "Trwa nagrywanie rozmowy."),
+      button("Zatrzymaj", async () => {
+        await call("stop_recording");
+        await renderRecording();
+      }),
+    );
+    root.append(row);
+  }
+  const status = recording.status || {};
+  if (status.detect === "unavailable") root.append(el("p", "Nie można wykryć rozmów Teams.", "muted"));
+  if (status.reason) root.append(el("p", "Czeka: " + status.reason, "muted"));
+}
+
+function renderRecordings(root, recording) {
+  root.append(el("h2", "Nagrania"));
+  if (recording.recordings.length === 0) {
+    root.append(el("p", "Brak nagrań.", "muted"));
+    return;
+  }
+  const table = el("table");
+  const head = el("tr");
+  for (const label of ["Data", "Długość", "Stan", ""]) head.append(el("th", label));
+  table.append(head);
+  for (const item of recording.recordings) {
+    const row = el("tr");
+    const length = item.end_ms ? clock(item.end_ms - item.start_ms) : "";
+    let state = RECORDING_STATES[item.state] || item.state;
+    if (item.progress !== null && item.progress !== undefined) state += " " + item.progress + "%";
+    if (item.reason) state += " (" + item.reason + ")";
+    const actions = el("td", null, "row");
+    if (item.state === "done") {
+      actions.append(
+        button("Pokaż", async () => {
+          shownRecording = { id: item.id, cues: await call("show_transcript", { id: item.id }) };
+          await renderRecording();
+        }),
+      );
+    }
+    if (item.state === "failed" && item.audio) {
+      actions.append(
+        button("Ponów", async () => {
+          await call("retry_recording", { id: item.id });
+          await renderRecording();
+        }),
+      );
+    }
+    actions.append(
+      button(
+        "Usuń",
+        async () => {
+          if (!confirm("Usunąć to nagranie i jego tekst?")) return;
+          await call("delete_recording", { id: item.id });
+          if (shownRecording && shownRecording.id === item.id) shownRecording = null;
+          await renderRecording();
+        },
+        "danger",
+      ),
+    );
+    row.append(el("td", new Date(item.start_ms).toLocaleString("pl-PL")), el("td", length), el("td", state), actions);
+    table.append(row);
+  }
+  root.append(
+    table,
+    button(
+      "Usuń wszystkie",
+      async () => {
+        if (!confirm("Usunąć wszystkie nagrania i ich teksty?")) return;
+        shownRecording = null;
+        await call("delete_all_recordings");
+        await renderRecording();
+      },
+      "danger",
+    ),
+  );
+  if (shownRecording && recording.recordings.some((item) => item.id === shownRecording.id)) {
+    root.append(el("h2", "Transkrypcja"));
+    const text = el("div", null, "transcript");
+    for (const cue of shownRecording.cues) {
+      text.append(el("p", "[" + clock(cue.start_ms) + "] " + (SPEAKERS[cue.speaker] || cue.speaker) + ": " + cue.text));
+    }
+    root.append(text, button("Zamknij", async () => {
+      shownRecording = null;
+      await renderRecording();
+    }));
   }
 }
 
