@@ -254,6 +254,24 @@ async fn never_is_refused() {
 }
 
 #[tokio::test]
+async fn never_set_while_waiting_voids_the_approval() {
+    let (d, pending) = setup(Write::Confirm).await;
+    let store = || common::store(d.dir.path());
+    let account = pending.create(Kind::Send, "test-echo:a", "c1", send("account")).await.unwrap();
+    let conversation = pending.create(Kind::Send, "test-echo:a", "c2", json!({"conversation": "c2", "text": "conversation"})).await.unwrap();
+    // The user turns writing off for the account, then approves what is still on screen.
+    permissions::set(&store(), "test-echo:a", None, true, Write::Never).unwrap();
+    assert_eq!(pending.decide(&account.action, true).await.unwrap(), State::Voided);
+    // The same for one conversation.
+    permissions::set(&store(), "test-echo:a", None, true, Write::Confirm).unwrap();
+    permissions::set(&store(), "test-echo:a", Some("c2"), true, Write::Never).unwrap();
+    assert_eq!(pending.decide(&conversation.action, true).await.unwrap(), State::Voided);
+    assert!(writes(&d).await.is_empty());
+    let listed = pending.list(None, Some(State::Voided), 10).unwrap();
+    assert!(listed["items"].as_array().unwrap().iter().all(|item| item["detail"].as_str().unwrap().contains("not allowed")), "{listed}");
+}
+
+#[tokio::test]
 async fn count_by_state() {
     let (d, pending) = setup(Write::Confirm).await;
     let first = pending.create(Kind::Send, "test-echo:a", "c1", send("one")).await.unwrap();

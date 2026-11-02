@@ -5,7 +5,8 @@
 //!
 //! The approval binds to a fingerprint: SHA-256 of the conversation's sorted participant ids and
 //! the target message's text, as the module describes them. Before running an approved action the
-//! core describes the target again; another fingerprint voids the action (spec 8.6, R5-R7).
+//! core describes the target again; another fingerprint voids the action (spec 8.6, R5-R7), and so
+//! does a write permission set to `never` meanwhile.
 //! An action that may have reached the platform without an answer is `uncertain` and never run
 //! again by itself (spec 8.5, R7). Nothing here logs or returns message text.
 
@@ -88,7 +89,7 @@ pub enum State {
     Done,
     Rejected,
     Expired,
-    /// The target changed after the approval; nothing was sent.
+    /// The target changed after the approval, or writing was turned off; nothing was sent.
     Voided,
     /// It may have reached the platform; not run again.
     Uncertain,
@@ -398,6 +399,12 @@ impl Pending {
                 Ok(_) => {}
             }
         }
+        // The user may have turned writing off while the action waited.
+        match permissions::effective(&self.accounts.store(), &account.id, Some(&row.conversation)) {
+            Err(err) => return (State::Failed, Some(format!("cannot check the write permission: {err}"))),
+            Ok(effective) if effective.write == Write::Never => return (State::Voided, Some(NOT_ALLOWED.into())),
+            Ok(_) => {}
+        }
         let module_name = &account.module;
         match tokio::time::timeout(CALL_TIMEOUT, handle.call(&account.module_account, kind.tool(), &row.args)).await {
             // What the module returns besides success is not needed, and never shown.
@@ -465,6 +472,7 @@ struct Row {
 }
 
 const VOIDED: &str = "the participants or the target message changed after the approval; nothing was sent";
+const NOT_ALLOWED: &str = "writing to this conversation is not allowed any more; nothing was sent";
 const CHECK: &str = "it may have reached the platform - check the conversation before trying again";
 
 fn failed(err: impl std::fmt::Display) -> ToolError {

@@ -3,54 +3,54 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>open_mess - ustawienia</title>
+  <title data-en="open_mess - settings">open_mess - ustawienia</title>
   <link rel="stylesheet" href="app.css">
   <script src="app.js" defer></script>
 </head>
 <body>
-  <nav id="menu" aria-label="Sekcje">
-    <div class="brand">open_mess</div>
-    <button type="button" data-section="accounts">Konta</button>
-    <button type="button" data-section="permissions">Uprawnienia agentów</button>
-    <button type="button" data-section="triggers">Wyzwalacze</button>
-    <button type="button" data-section="waiting">Do zatwierdzenia <span id="waiting-count" class="badge" hidden></span></button>
-    <button type="button" data-section="modules">Moduły</button>
-    <button type="button" data-section="integrations">Integracje</button>
-    <button type="button" data-section="daemon">Demon i logi</button>
-    <footer id="daemon-state" class="muted">Demon działa</footer>
+  <nav id="menu" aria-label="Sekcje" data-en-aria-label="Sections">
+    <div class="brand" data-en="open_mess">open_mess</div>
+    <button type="button" data-section="accounts" data-en="Accounts">Konta</button>
+    <button type="button" data-section="permissions" data-en="Agent permissions">Uprawnienia agentów</button>
+    <button type="button" data-section="triggers" data-en="Triggers">Wyzwalacze</button>
+    <button type="button" data-section="waiting"><span data-en="Waiting for approval">Do zatwierdzenia</span> <span id="waiting-count" class="badge" hidden></span></button>
+    <button type="button" data-section="modules" data-en="Modules">Moduły</button>
+    <button type="button" data-section="integrations" data-en="Integrations">Integracje</button>
+    <button type="button" data-section="daemon" data-en="Daemon and logs">Demon i logi</button>
+    <footer id="daemon-state" class="muted" data-en="Daemon running">Demon działa</footer>
   </nav>
   <main>
     <p id="error" class="error" role="alert" hidden></p>
-    <p id="update-held" class="notice" role="status" hidden>aktualizacja w toku - zmiany zapiszesz, gdy nowa wersja zostanie sprawdzona (zwykle do minuty)</p>
+    <p id="update-held" class="notice" role="status" hidden data-en="update in progress - you can save changes once the new version has been checked (usually within a minute)">aktualizacja w toku - zmiany zapiszesz, gdy nowa wersja zostanie sprawdzona (zwykle do minuty)</p>
     <section id="accounts">
-      <h1>Konta</h1>
+      <h1 data-en="Accounts">Konta</h1>
       <div class="content"></div>
     </section>
     <section id="permissions" hidden>
-      <h1>Uprawnienia agentów</h1>
+      <h1 data-en="Agent permissions">Uprawnienia agentów</h1>
       <div class="content"></div>
     </section>
     <section id="triggers" hidden>
-      <h1>Wyzwalacze</h1>
+      <h1 data-en="Triggers">Wyzwalacze</h1>
       <div class="content"></div>
     </section>
     <section id="waiting" hidden>
-      <h1>Do zatwierdzenia</h1>
+      <h1 data-en="Waiting for approval">Do zatwierdzenia</h1>
       <div class="content"></div>
     </section>
     <section id="modules" hidden>
-      <h1>Moduły</h1>
+      <h1 data-en="Modules">Moduły</h1>
       <div class="content"></div>
     </section>
     <section id="integrations" hidden>
-      <h1>Integracje (MCP / CLI)</h1>
+      <h1 data-en="Integrations (MCP / CLI)">Integracje (MCP / CLI)</h1>
       <div class="content"></div>
     </section>
     <section id="daemon" hidden>
-      <h1>Demon i logi</h1>
+      <h1 data-en="Daemon and logs">Demon i logi</h1>
       <div class="content"></div>
     </section>
   </main>
-  <div id="sign-in" role="dialog" aria-modal="true" aria-label="Logowanie" hidden><div class="dialog"></div></div>
+  <div id="sign-in" role="dialog" aria-modal="true" aria-label="Logowanie" data-en-aria-label="Sign in" hidden><div class="dialog"></div></div>
 </body>
 </html>

@@ -146,7 +146,8 @@ interface rtc {
     open: func(label: string) -> result<tuple<u32, string>, http-error>;
     // The remote answer (standard SDP). It must have the offer's single data section and nothing
     // else; candidates outside the manifest's `media` ranges, private ones and ones the system
-    // proxy covers are dropped, and an answer with none left is refused.
+    // proxy covers are dropped, and an answer with none left is refused (`blocked`, its reason
+    // starting with "proxy:" when the proxy took the last ones).
     accept: func(conn: u32, answer: string) -> result<_, http-error>;
     close: func(conn: u32);
 }

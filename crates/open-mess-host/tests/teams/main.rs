@@ -58,7 +58,7 @@ impl Teams {
     }
 
     async fn next_message(&mut self) -> Option<NewMessage> {
-        next_message(&mut self.events).await
+        next_message(&mut self.events, &self.fake).await
     }
 
     /// The module signed in as the test user.
@@ -852,14 +852,23 @@ fn now_ms() -> i64 {
     i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap()
 }
 
-/// The next message event, if one comes within a few polls.
-async fn next_message(events: &mut mpsc::Receiver<HostEvent>) -> Option<NewMessage> {
-    let deadline = Instant::now() + Duration::from_millis(u64::from(POLL) * 6);
+/// The next message event, if a poll that starts after this is called reports one. A poll reports
+/// at its end, however long it took, and polls run one at a time: once a second poll has started,
+/// the first has reported everything.
+async fn next_message(events: &mut mpsc::Receiver<HostEvent>, fake: &Fake) -> Option<NewMessage> {
+    // A poll starts with the list's first page; the next pages carry a `syncState`.
+    let polls = || fake.seen().iter().filter(|s| s.path == CHAT_PATH && !s.query.contains("syncState")).count();
+    let first = polls() + 1;
+    // Polls stopped (the module crashed): give up once two would have run.
+    let give_up = Instant::now() + 2 * (Duration::from_millis(POLL.into()) + limits::for_tests().call_timeout);
     loop {
-        match tokio::time::timeout_at(deadline.into(), events.recv()).await {
+        let reported = polls() > first;
+        match tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
             Ok(Some(HostEvent::MessageArrived(message))) => return Some(message),
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => return None,
+            Ok(None) => return None,
+            Err(_) if reported || Instant::now() >= give_up => return None,
+            Err(_) => {}
         }
     }
 }
@@ -1176,23 +1185,24 @@ async fn mentions_and_direct_are_set() {
 async fn restart_does_not_replay_old_messages() {
     let data = tempfile::tempdir().unwrap();
     let (fake, wam) = (Fake::start().await, Wam::new());
-    // Sent after the sign-in below, which starts the count once the module has loaded.
-    let old = conversation(GROUP, None, Some(message("1900000000005", GROUP, OTHER, "<p>old</p>", now_ms() + 60_000)));
-    let listed = Arc::new(std::sync::Mutex::new(vec![old]));
+    let listed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let list = listed.clone();
     fake.on(move |s| (s.path == CHAT_PATH).then(|| Reply::json(page("conversations", list.lock().unwrap().clone(), None))));
     {
         let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL)).await;
         module.sign_in().await.unwrap();
-        assert_eq!(next_message(&mut events).await.map(|m| m.message).as_deref(), Some("1900000000005"));
+        // Sent after the sign-in, which starts the count, however long loading the module took.
+        let old = conversation(GROUP, None, Some(message("1900000000005", GROUP, OTHER, "<p>old</p>", now_ms() + 1000)));
+        *listed.lock().unwrap() = vec![old];
+        assert_eq!(next_message(&mut events, &fake).await.map(|m| m.message).as_deref(), Some("1900000000005"));
     }
     // A new instance, as after a crash or a daemon restart: the same storage, nothing in memory.
     let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL)).await;
     module.restore(ME_OID).await.unwrap();
-    assert_eq!(next_message(&mut events).await, None);
+    assert_eq!(next_message(&mut events, &fake).await, None);
     let new = conversation(GROUP, None, Some(message("1900000000006", GROUP, OTHER, "<p>new</p>", now_ms() + 61_000)));
     *listed.lock().unwrap() = vec![new];
-    assert_eq!(next_message(&mut events).await.map(|m| m.message).as_deref(), Some("1900000000006"));
+    assert_eq!(next_message(&mut events, &fake).await.map(|m| m.message).as_deref(), Some("1900000000006"));
 }
 
 #[tokio::test]

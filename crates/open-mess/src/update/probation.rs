@@ -86,7 +86,7 @@ pub fn launch_helper(paths: &Paths, launcher: &dyn Launcher) -> Result<(), Updat
 /// - `installed`, helper alive: the helper is checking;
 /// - `installed`, helper gone: the daemon judges its own `status` as the helper would, keeping
 ///   `update.lock` so that a helper the task starts meanwhile leaves the check to it. Healthy: it
-///   deletes the file, records "zainstalowano" and lets everything go. Failed, or not there in time
+///   deletes the file, records "installed" and lets everything go. Failed, or not there in time
 ///   (60 s from `started`, 10 minutes for the accounts): the daemon starts the helper's task, which
 ///   rolls back, and notifies `exit`;
 /// - any other stage, or a file that does not parse: the helper is changing the files, or must. The
@@ -120,7 +120,7 @@ pub async fn watch(paths: &Paths, activity: &Activity, launcher: &dyn Launcher, 
             Judgement::Healthy => {
                 // Not deleted: tried again in a second, the lock still held.
                 if fs::remove_file(paths.pending_file()).is_ok() {
-                    state::record_result(paths, &Outcome::Installed.to_string());
+                    state::record_result(paths, &Outcome::Installed);
                     // As the helper does: a backup of a finished installation is never restored.
                     // The version is this daemon's own: `judge` compared it.
                     let update_dir = paths.updates().join(&file.version);

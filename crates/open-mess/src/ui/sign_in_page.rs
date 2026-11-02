@@ -9,7 +9,7 @@ use url::Url;
 
 use super::sign_in::SignIns;
 use crate::accounts::Accounts;
-use crate::modules;
+use crate::{i18n, modules};
 use open_mess_host::SignInReply;
 use open_mess_host::hosts::HostList;
 
@@ -52,7 +52,11 @@ pub fn check_page(url: &str, redirect_prefix: &str, approved: &[String]) -> Resu
     };
     match (approved_https(url), approved_https(redirect_prefix)) {
         (Some(start), Some(prefix)) => Ok((start, prefix)),
-        _ => Err("moduł poprosił o stronę logowania spoza zatwierdzonych hostów logowania".into()),
+        _ => Err(i18n::pick(
+            "moduł poprosił o stronę logowania spoza zatwierdzonych hostów logowania",
+            "the module asked for a sign-in page outside its approved sign-in hosts",
+        )
+        .into()),
     }
 }
 
@@ -74,7 +78,7 @@ pub async fn unknown_host(sign_ins: &SignIns, accounts: &Accounts, page: u64, mo
 }
 
 #[cfg(windows)]
-pub(super) use window::{close, open, page_of};
+pub(super) use window::{close, open, page_of, retitle};
 
 #[cfg(windows)]
 mod window {
@@ -87,8 +91,9 @@ mod window {
     use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 
     use super::{Navigation, check_page, navigation, unknown_host};
-    use crate::modules;
+    use crate::i18n::{self, Lang};
     use crate::ui::UiState;
+    use crate::{accounts, modules};
 
     /// The label of the sign-in window of prompt `page`. No capability names it, so its pages call
     /// no command.
@@ -113,7 +118,7 @@ mod window {
     ) -> Result<(), String> {
         let state = app.try_state::<UiState>().ok_or("the window has no state")?;
         let manifest =
-            state.accounts.modules().handle(module).and_then(|handle| handle.manifest().ok()).ok_or_else(|| format!("moduł {module} nie działa"))?;
+            state.accounts.modules().handle(module).and_then(|handle| handle.manifest().ok()).ok_or_else(|| accounts::not_running(module))?;
         let approved = modules::approved_sign_in_hosts(&state.accounts.store(), &manifest).map_err(|err| err.to_string())?;
         let (start, prefix) = check_page(url, redirect_prefix, &approved)?;
         let approved = Arc::new(Mutex::new(approved));
@@ -157,9 +162,8 @@ mod window {
                 }
             }
         };
-        let title = |url: &Url| format!("Logowanie - {}", url.host_str().unwrap_or_default());
         WebviewWindowBuilder::new(app, label(page), WebviewUrl::External(start.clone()))
-            .title(title(&start))
+            .title(title(i18n::current(), &start))
             .inner_size(520.0, 720.0)
             .data_directory(profile.to_path_buf())
             .on_navigation(on_navigation)
@@ -168,7 +172,7 @@ mod window {
                 // A navigation stopped by the policy loads no page of a host (about:blank, say):
                 // the title keeps the last host.
                 if payload.url().host_str().is_some() {
-                    let _ = window.set_title(&title(payload.url()));
+                    let _ = window.set_title(&title(i18n::current(), payload.url()));
                 }
             })
             // No pop-ups and no downloads: they would escape the navigation policy.
@@ -176,7 +180,30 @@ mod window {
             .on_download(|_, _| false)
             .build()
             .map(drop)
-            .map_err(|err| format!("okno logowania się nie otworzyło: {err}"))
+            .map_err(|err| match i18n::current() {
+                Lang::Pl => format!("okno logowania się nie otworzyło: {err}"),
+                Lang::En => format!("the sign-in window did not open: {err}"),
+            })
+    }
+
+    /// The title of a sign-in window: the host of the page shown.
+    fn title(lang: Lang, url: &Url) -> String {
+        let host = url.host_str().unwrap_or_default();
+        match lang {
+            Lang::Pl => format!("Logowanie - {host}"),
+            Lang::En => format!("Sign in - {host}"),
+        }
+    }
+
+    /// The open sign-in windows' titles in `lang`, once the language changed.
+    pub fn retitle<R: tauri::Runtime>(app: &AppHandle<R>, lang: Lang) {
+        for (label, window) in app.webview_windows() {
+            if let (Some(_), Ok(url)) = (page_of(&label), window.url())
+                && url.host_str().is_some()
+            {
+                let _ = window.set_title(&title(lang, &url));
+            }
+        }
     }
 
     /// Closes the sign-in window of prompt `page`, if it is open.

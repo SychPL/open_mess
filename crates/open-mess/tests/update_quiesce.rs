@@ -188,7 +188,7 @@ async fn phase_b_rejects_new_calls_and_waits_for_in_flight() {
     let d = writable().await;
     let activity = activity(&d, runs(&d), mpsc::channel(8).0);
     let (_cancel, cancelled) = watch::channel(false);
-    // test-echo answers this write only at its call limit (2 s in tests).
+    // test-echo answers this write only at its call limit (10 s in tests).
     let slow = async {
         let result = d.registry.call("send", send("slow")).await;
         (result, Instant::now())
@@ -393,7 +393,8 @@ async fn helper_not_started_resumes_after_30_s() {
     let started = Instant::now();
     let result = quiesce::launch(&r.paths, &r.downloaded, Vec::new(), &helper, &exit).await;
     assert!(matches!(&result, Err(UpdateError::HelperNotStarted)), "{result:?}");
-    assert_eq!(result.unwrap_err().to_string(), "pomocnik nie wystartował");
+    // Shared with the CLI and the tools: English in either language of the window.
+    assert_eq!(result.unwrap_err().to_string(), "the update helper did not start");
     assert!((30 * SECOND..31 * SECOND).contains(&started.elapsed()), "{:?}", started.elapsed());
     assert!(!notified(&exit).await);
     // A helper that starts late finds nothing to install; the lock is free for it.
