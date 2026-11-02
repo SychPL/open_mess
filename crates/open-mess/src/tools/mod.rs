@@ -29,6 +29,7 @@ use crate::pending::{Kind, Pending, State};
 use crate::permissions;
 use crate::recording::Recordings;
 use crate::recording::queue::Queue;
+use crate::recording::recorder::{By, Recorder};
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
 use crate::triggers::engine::now_ms;
@@ -153,6 +154,8 @@ pub struct Registry {
     recordings: Option<Recordings>,
     /// Their transcription queue, for its progress.
     queue: Option<Arc<Queue>>,
+    /// What records the calls, for `stop_recording` and `status`; None where nothing is recorded.
+    recorder: Option<Arc<Recorder>>,
 }
 
 impl Registry {
@@ -171,6 +174,7 @@ impl Registry {
             update: None,
             recordings: None,
             queue: None,
+            recorder: None,
         }
     }
 
@@ -223,6 +227,15 @@ impl Registry {
         self.queue = queue;
     }
 
+    pub fn set_recorder(&mut self, recorder: Arc<Recorder>) {
+        self.recorder = Some(recorder);
+    }
+
+    /// The transcription queue, once the recordings are set.
+    pub fn queue(&self) -> Option<Arc<Queue>> {
+        self.queue.clone()
+    }
+
     pub fn list(&self) -> Vec<ToolInfo> {
         let mut tools = vec![ToolInfo {
             name: "status".into(),
@@ -247,6 +260,9 @@ impl Registry {
         }
         if [recordings::LIST, recordings::TRANSCRIPT].contains(&name) {
             return self.recording_tool(name, args);
+        }
+        if name == recordings::STOP {
+            return self.stop_recording(&args);
         }
         let args = shared::validate(name, args)?;
         let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending) else {
@@ -291,6 +307,19 @@ impl Registry {
         recordings::call(recordings, &progress, readable, name, args)
     }
 
+    /// `stop_recording`, under the same read permission of `local` as the other recording tools
+    /// (4.5).
+    fn stop_recording(&self, args: &Value) -> Result<Value, ToolError> {
+        no_params(args)?;
+        let (Some(recorder), Some(accounts)) = (&self.recorder, &self.accounts) else {
+            return Err(ToolError::Module("not supported yet: local recording works on Windows only".into()));
+        };
+        if !permissions::effective(&accounts.store(), permissions::LOCAL, None).map_err(failed)?.read {
+            return Err(ToolError::NotAllowed("the local recordings are not allowed".into()));
+        }
+        Ok(json!({"recording": recorder.stop(By::Agent, false, None)}))
+    }
+
     /// What the `status` tool answers; the daemon's own check during an update's probation reads it
     /// too (spec 2026-10-27-self-update, 7.2).
     pub fn status(&self) -> Result<Value, ToolError> {
@@ -330,6 +359,7 @@ impl Registry {
             "ui_ready": self.ui_ready.load(Ordering::SeqCst),
             "accounts_restored": self.accounts_restored.load(Ordering::SeqCst),
             "update": self.update.as_ref().map(UpdateService::status),
+            "recording": self.recorder.as_ref().map(|recorder| recorder.status()),
         }))
     }
 }

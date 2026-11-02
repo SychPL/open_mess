@@ -226,6 +226,7 @@ Wykrywanie (sesje audio procesu) i przechwyt (urządzenia tych sesji) są opisan
 - Tylko nowy klient Teams na Windows (pakiet `MSTeams_8wekyb3d8bbwe`).
 - Dwie rozmowy, między którymi Teams nie zdążył usunąć sesji (ok. 180 s), są dla demona jedną rozmową: jedno nagranie, z przerwą nagraną na `others`, i pominięcie pierwszej obejmuje drugą. Restart demona, który przeoczył koniec pominiętej rozmowy, a zastał już następną, pomija i ją (4.1).
 - Wykrywanie widzi sesje audio `ms-teams.exe`, nie rozmowę: ekran przed dołączeniem (podgląd mikrofonu), test urządzenia, a także dzwonek albo wideo w czacie, jeśli gra je `ms-teams.exe` (krok 0b), dają krótkie nagranie. Rozmowa, w której Teams nic nie gra i nie otwiera mikrofonu (np. dołączenie z wyłączonym mikrofonem do spotkania, na którym nikt nie mówi), zaczyna się nagrywać dopiero, gdy Teams coś zagra albo otworzy mikrofon.
+- Utrata wykrywania (60 s błędów odczytu, 4.1) kończy nagranie z przyczyną "detect failed"; gdy odczyt wróci w trakcie rozmowy, jej reszta jest osobnym nagraniem.
 - Nagranie zaczyna się do ok. 1 s po tym, jak sesja Teams stała się aktywna (odczyt co 1 s, 4.1), więc pierwsza sekunda rozmowy może przepaść.
 - Bez potwierdzenia z kroku 0b nagranie nie jest przycinane i obejmuje do ok. 3 min po rozłączeniu (4.1).
 - Jeśli Teams usuwa sesje przy wyciszeniu dłuższym niż ok. 180 s, w którym nic nie gra (krok 0b), długie wyciszenie dzieli nagranie na dwa; nic nie przepada, bo dźwięk Teams znowu tworzy aktywną sesję i zaczyna nowe nagranie.

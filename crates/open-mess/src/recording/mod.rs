@@ -6,7 +6,10 @@
 pub mod capture;
 pub mod detect;
 pub mod model;
+#[cfg(windows)]
+mod notice;
 pub mod queue;
+pub mod recorder;
 pub mod stt;
 pub mod wav;
 mod whisper;
@@ -75,6 +78,15 @@ pub enum Reason {
     CaptureFailed,
     #[serde(rename = "write failed")]
     WriteFailed,
+    /// The audio sessions could not be read for a minute (4.1).
+    #[serde(rename = "detect failed")]
+    DetectFailed,
+    /// Six hours, the longest recording (4.2).
+    #[serde(rename = "too long")]
+    TooLong,
+    /// Less than [`MIN_FREE_DISK`] free (4.4).
+    #[serde(rename = "low disk")]
+    LowDisk,
 }
 
 /// `meta.json`. Unknown fields are ignored, not refused: a rolled-back daemon still reads the

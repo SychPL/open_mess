@@ -23,6 +23,9 @@ pub const APP_ID: &str = "open_mess.daemon";
 /// toasts away (`ClearWithId(APP_ID)`) leaves it on screen. tauri-winrt-notification gives a toast a
 /// tag only with a progress bar, and a group never.
 pub const UPDATE_APP_ID: &str = "open_mess.update";
+/// The recording's toasts (spec 2026-10-28-local-transcription, 4.2): taking the approvals' toasts
+/// away leaves them too.
+pub const RECORDING_APP_ID: &str = "open_mess.recording";
 /// Participants a toast names; the others are counted.
 const NAMED_PARTICIPANTS: usize = 5;
 /// Windows shows at most four lines of a toast's two text elements (the title has its own two).
@@ -286,7 +289,7 @@ mod toast {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
-    use super::{APP_ID, Prompt, UPDATE_APP_ID};
+    use super::{APP_ID, Prompt, RECORDING_APP_ID, UPDATE_APP_ID};
     use crate::pending::Pending;
     use crate::ui::Opener;
     use crate::update::service::UpdateService;
@@ -294,7 +297,7 @@ mod toast {
     /// `HKCU\Software\Classes\AppUserModelId\open_mess.daemon` and `...\open_mess.update` with the
     /// names toasts and the notification settings show.
     pub(super) fn register() -> std::io::Result<()> {
-        for (id, name) in [(APP_ID, "open_mess"), (UPDATE_APP_ID, "open_mess - aktualizacje")] {
+        for (id, name) in [(APP_ID, "open_mess"), (UPDATE_APP_ID, "open_mess - aktualizacje"), (RECORDING_APP_ID, "open_mess - nagrywanie")] {
             let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(format!(r"Software\Classes\AppUserModelId\{id}"))?;
             key.set_value("DisplayName", &name)?;
         }

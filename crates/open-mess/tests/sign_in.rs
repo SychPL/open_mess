@@ -39,6 +39,7 @@ fn state(d: &Daemon) -> Arc<UiState> {
         probation: d.registry.pending().unwrap().probation().clone(),
         update: None,
         models: None,
+        recorder: None,
     })
 }
 

@@ -47,6 +47,7 @@ fn state(d: &Daemon) -> UiState {
         probation: d.registry.pending().unwrap().probation().clone(),
         update: None,
         models: None,
+        recorder: None,
     }
 }
 
@@ -86,6 +87,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         exit: Arc::default(),
         update: None,
         models: None,
+        recorder: None,
     };
     (dir, state)
 }
@@ -267,6 +269,10 @@ async fn the_local_recordings_have_one_read_permission() {
 
     commands::set_permissions(&state, "local", None, true, "never").unwrap();
     assert!(list().await.is_ok());
+    // Nothing records in this daemon, as off Windows: nothing to stop, and `status` says so.
+    assert!(matches!(d.registry.call("stop_recording", json!({})).await, Err(ToolError::Module(_))));
+    assert!(matches!(d.registry.call("stop_recording", json!({"now": true})).await, Err(ToolError::InvalidArgs(_))));
+    assert_eq!(d.registry.call("status", json!({})).await.unwrap()["recording"], json!(null));
 }
 
 #[tokio::test]

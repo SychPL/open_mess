@@ -321,19 +321,30 @@ mod ipc {
     }
 }
 
-fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
+/// The tray's menu; while a call is recorded it can stop it (spec 2026-10-28-local-transcription, 4.2).
+fn menu<R: tauri::Runtime, M: tauri::Manager<R>>(app: &M, recording: bool) -> tauri::Result<Menu<R>> {
     let open = MenuItem::with_id(app, "open", "Otwórz ustawienia", true, None::<&str>)?;
+    let stop = MenuItem::with_id(app, "stop_recording", "Zatrzymaj nagrywanie", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Zakończ", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &quit])?;
+    if recording { Menu::with_items(app, &[&open, &stop, &quit]) } else { Menu::with_items(app, &[&open, &quit]) }
+}
+
+fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
+    let items = menu(app, false)?;
     let on_click = profile.clone();
     let mut tray = TrayIconBuilder::with_id("open_mess")
         .tooltip("open_mess")
-        .menu(&menu)
+        .menu(&items)
         .show_menu_on_left_click(false)
         // ponytail: a window the tray fails to open is reported once a log sink exists; `om config`
         // reports it now.
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => drop(open_window(app, &profile, false)),
+            "stop_recording" => {
+                if let Some(recorder) = &app.state::<UiState>().recorder {
+                    recorder.stop(crate::recording::recorder::By::Owner, false, None);
+                }
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -346,6 +357,17 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
         tray = tray.icon(icon.clone());
     }
     tray.build(app)?;
+    if let Some(recorder) = &app.state::<UiState>().recorder {
+        let handle = app.handle().clone();
+        recorder.set_indicator(Box::new(move |recording| {
+            if let Some(tray) = handle.tray_by_id("open_mess") {
+                let _ = tray.set_tooltip(Some(if recording { "open_mess - nagrywanie" } else { "open_mess" }));
+                if let Ok(menu) = menu(&handle, recording) {
+                    let _ = tray.set_menu(Some(menu));
+                }
+            }
+        }));
+    }
     Ok(())
 }
 

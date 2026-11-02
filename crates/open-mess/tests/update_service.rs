@@ -197,6 +197,7 @@ impl Harness {
             exit: Arc::clone(&self.exit),
             update: Some(self.service.clone()),
             models: None,
+            recorder: None,
         }
     }
 

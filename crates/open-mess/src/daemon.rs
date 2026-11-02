@@ -204,6 +204,10 @@ fn start(
         let base = url::Url::parse(crate::recording::model::BASE).ok()?;
         Some(Arc::new(crate::recording::model::Models::new(&paths.local, base, runtime.handle().clone())))
     });
+    let recorder = recorder(&update, registry.queue(), Arc::clone(registry.ui_ready()), &accounts, models.as_ref());
+    if let Some(recorder) = &recorder {
+        registry.set_recorder(Arc::clone(recorder));
+    }
     let activity = Arc::new(triggers::Activity::default());
     if probation {
         // Before the trigger engine, the approvals and the API run; the probation lets them go.
@@ -283,8 +287,51 @@ fn start(
         exit,
         update,
         models,
+        recorder,
     };
     Ok((runtime, listener, registry, ui))
+}
+
+/// The recorder of the calls, where they are recorded (Windows, spec 2026-10-28-local-transcription).
+#[cfg(windows)]
+fn recorder(
+    update: &Option<Update>,
+    queue: Option<Arc<crate::recording::queue::Queue>>,
+    ui_ready: Arc<std::sync::atomic::AtomicBool>,
+    accounts: &Arc<Accounts>,
+    models: Option<&Arc<crate::recording::model::Models>>,
+) -> Option<Arc<crate::recording::recorder::Recorder>> {
+    use crate::recording::model::Download;
+    use crate::recording::recorder::{self, Settings};
+    let ((paths, _), queue, models) = (update.as_ref()?, queue?, Arc::clone(models?));
+    let store = Arc::clone(accounts);
+    let settings = Box::new(move || {
+        let store = store.store();
+        let setting = |key: &str| store.get_config(key).ok().flatten();
+        // The automatic mode is off unless the window turned it on (4.6); the microphone is on.
+        Settings { auto: setting("recording.auto").as_deref() == Some("true"), microphone: setting("recording.mic").as_deref() != Some("false") }
+    });
+    let model = Box::new(move || {
+        let view = models.view();
+        match view.download {
+            Download::Running { .. } => "downloading",
+            _ if view.installed.is_none() => "missing",
+            _ => "ready",
+        }
+    });
+    // ponytail: a recorder whose threads cannot start records nothing; reported once a log sink exists.
+    recorder::start(&paths.local, queue, ui_ready, settings, model).ok()
+}
+
+#[cfg(not(windows))]
+fn recorder(
+    _update: &Option<Update>,
+    _queue: Option<Arc<crate::recording::queue::Queue>>,
+    _ui_ready: Arc<std::sync::atomic::AtomicBool>,
+    _accounts: &Arc<Accounts>,
+    _models: Option<&Arc<crate::recording::model::Models>>,
+) -> Option<Arc<crate::recording::recorder::Recorder>> {
+    None
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.

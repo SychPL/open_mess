@@ -12,6 +12,7 @@ use crate::recording::{Entry, Recordings, State, valid_id};
 
 pub const LIST: &str = "list_recordings";
 pub const TRANSCRIPT: &str = "get_recording_transcript";
+pub const STOP: &str = "stop_recording";
 /// The most cues of one page, and the bounds of a page's size.
 const MAX_PAGE_CUES: usize = 2000;
 const MAX_BYTES: (u64, u64, u64) = (4096, 786_432, 131_072);
@@ -48,6 +49,13 @@ pub fn tools() -> Vec<ToolInfo> {
                 "required": ["recording"],
                 "additionalProperties": false,
             }),
+        },
+        ToolInfo {
+            name: STOP.into(),
+            description: "Stops the recording of the call going on, if one is made; that call is then not recorded again. \
+                          The owner is shown that an agent stopped it. Starting a recording is up to the owner."
+                .into(),
+            input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         },
     ]
 }

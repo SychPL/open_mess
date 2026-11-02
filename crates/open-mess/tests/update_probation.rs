@@ -660,6 +660,7 @@ fn ui_state(d: &common::Daemon) -> UiState {
         exit: Arc::default(),
         update: None,
         models: None,
+        recorder: None,
     }
 }
 
