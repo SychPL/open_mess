@@ -28,6 +28,7 @@ pub fn tools() -> Vec<ToolInfo> {
                 "properties": {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
                     "since": {"type": "string", "description": "Only recordings that started after this time (RFC 3339)."},
+                    "before": {"type": "string", "description": "The last recording of the previous page: the next page, older recordings."},
                 },
                 "additionalProperties": false,
             }),
@@ -56,6 +57,7 @@ pub fn tools() -> Vec<ToolInfo> {
 struct ListArgs {
     limit: Option<u32>,
     since: Option<String>,
+    before: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -120,9 +122,18 @@ fn list(recordings: &Recordings, args: ListArgs) -> Result<Value, ToolError> {
         ),
         None => None,
     };
-    let items: Vec<Value> = recordings
-        .list()
+    let entries = recordings.list();
+    let first = match args.before {
+        Some(before) => entries
+            .iter()
+            .position(|Entry { id, .. }| *id == before)
+            .map(|at| at + 1)
+            .ok_or_else(|| ToolError::InvalidArgs("unknown recording in before - list_recordings lists them".into()))?,
+        None => 0,
+    };
+    let items: Vec<Value> = entries
         .into_iter()
+        .skip(first)
         .filter(|Entry { meta, .. }| since.is_none_or(|since| i64::try_from(meta.start_ms).is_ok_and(|start| start >= since)))
         .take(limit as usize)
         .map(|Entry { id, meta }| {
@@ -198,7 +209,7 @@ mod tests {
             speaker: Speaker::Others,
             text: format!("zdanie {i}"),
         });
-        recordings.finish_transcript(&id, &Transcript { cues: cues.collect() }, Some("pl".into())).unwrap();
+        recordings.finish_transcript(&id, &Transcript { language: Some("pl".into()), cues: cues.collect() }).unwrap();
         let meta = recordings.meta(&id).unwrap();
         recordings.set_meta(&id, &Meta { end_ms: Some(1_700_000_060_000), ..meta }).unwrap();
         id
@@ -269,6 +280,24 @@ mod tests {
         assert_eq!(all["items"][1]["end"], Value::Null);
         let recent = call(&recordings, yes, LIST, json!({"since": "2023-01-01T00:00:00Z", "limit": 5})).unwrap();
         assert_eq!(recent["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn before_pages_past_the_newest_recordings() {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = Recordings::new(dir.path());
+        let ids: Vec<String> = (1..=3).map(|start| recordings.create(start * 1000).unwrap()).collect();
+        let page = |args: Value| -> Vec<String> {
+            let page = call(&recordings, yes, LIST, args).unwrap();
+            page["items"].as_array().unwrap().iter().map(|item| item["recording"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(page(json!({"limit": 1})), [ids[2].clone()]);
+        assert_eq!(page(json!({"limit": 1, "before": ids[2]})), [ids[1].clone()]);
+        assert_eq!(page(json!({"before": ids[1]})), [ids[0].clone()]);
+        assert!(page(json!({"before": ids[0]})).is_empty());
+        for before in ["0123456789abcdef0123456789abcdef", "..\\x"] {
+            assert!(matches!(call(&recordings, yes, LIST, json!({"before": before})), Err(ToolError::InvalidArgs(_))), "{before}");
+        }
     }
 
     #[test]

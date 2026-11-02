@@ -101,9 +101,12 @@ pub struct Cue {
     pub text: String,
 }
 
-/// `transcript.json`.
+/// `transcript.json`. The language is kept here as well as in `meta.json`, so a crash between
+/// the two writes loses nothing (4.3).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transcript {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     pub cues: Vec<Cue>,
 }
 
@@ -217,7 +220,7 @@ impl Recordings {
 
     /// Ends a transcription in the order that survives a crash anywhere (4.3): the transcript,
     /// then the state `done`, then the audio is deleted.
-    pub fn finish_transcript(&self, id: &str, transcript: &Transcript, language: Option<String>) -> io::Result<()> {
+    pub fn finish_transcript(&self, id: &str, transcript: &Transcript) -> io::Result<()> {
         let path = self.path(id).ok_or_else(not_found)?;
         let bytes = serde_json::to_vec(transcript).map_err(io::Error::other)?;
         if bytes.len() as u64 > MAX_TRANSCRIPT {
@@ -225,7 +228,7 @@ impl Recordings {
         }
         write_atomic(&path.join(TRANSCRIPT), &bytes)?;
         let meta = self.meta(id)?;
-        self.set_meta(id, &Meta { state: State::Done, language, ..meta })?;
+        self.set_meta(id, &Meta { state: State::Done, language: transcript.language.clone(), ..meta })?;
         delete_audio(&path)
     }
 
@@ -269,10 +272,12 @@ impl Recordings {
             let Some(path) = self.path(&id) else { continue };
             let result = match meta.state {
                 State::Recording => self.recover_recording(&id, &path, meta),
-                State::Transcribing if self.transcript(&id).is_ok() => {
-                    self.set_meta(&id, &Meta { state: State::Done, ..meta }).and_then(|()| delete_audio(&path))
-                }
-                State::Transcribing => self.set_meta(&id, &Meta { state: State::Waiting, ..meta }),
+                State::Transcribing => match self.transcript(&id) {
+                    Ok(transcript) => {
+                        self.set_meta(&id, &Meta { state: State::Done, language: transcript.language, ..meta }).and_then(|()| delete_audio(&path))
+                    }
+                    Err(_) => self.set_meta(&id, &Meta { state: State::Waiting, ..meta }),
+                },
                 State::Done => delete_audio(&path),
                 State::Waiting | State::Failed => Ok(()),
             };
@@ -388,7 +393,9 @@ mod tests {
     }
 
     fn transcript() -> Transcript {
-        Transcript { cues: vec![Cue { start_ms: 0, end_ms: 900, speaker: Speaker::Others, text: "dzień dobry".into() }] }
+        Transcript {
+            language: Some("pl".into()), cues: vec![Cue { start_ms: 0, end_ms: 900, speaker: Speaker::Others, text: "dzień dobry".into() }]
+        }
     }
 
     #[test]
@@ -526,11 +533,12 @@ mod tests {
         assert_eq!(recordings.meta(&id).unwrap().state, State::Waiting);
         assert!(recordings.has_audio(&id));
 
-        // Stopped after the transcript, before the state: done, audio gone.
+        // Stopped after the transcript, before the state: done with its language, audio gone.
         recordings.set_meta(&id, &transcribing).unwrap();
         write_atomic(&path.join(TRANSCRIPT), &serde_json::to_vec(&transcript()).unwrap()).unwrap();
         assert!(recordings.recover(&[]).is_empty());
-        assert_eq!(recordings.meta(&id).unwrap().state, State::Done);
+        let meta = recordings.meta(&id).unwrap();
+        assert_eq!((meta.state, meta.language.as_deref()), (State::Done, Some("pl")));
         assert!(!recordings.has_audio(&id));
 
         // Stopped after the state, before the audio was deleted: the audio goes at start.
@@ -545,7 +553,7 @@ mod tests {
         let (_dir, recordings) = recordings();
         let id = recordings.create(1_000).unwrap();
         with_track(&recordings, &id, &[1, 2]);
-        recordings.finish_transcript(&id, &transcript(), Some("pl".into())).unwrap();
+        recordings.finish_transcript(&id, &transcript()).unwrap();
         let meta = recordings.meta(&id).unwrap();
         assert_eq!((meta.state, meta.language.as_deref()), (State::Done, Some("pl")));
         assert!(!recordings.has_audio(&id));
@@ -594,7 +602,7 @@ mod tests {
         assert_eq!(recordings.refusal(MIN_FREE_DISK - 1), Some(Refusal::DiskFull));
         let done = recordings.create(0).unwrap();
         with_track(&recordings, &done, &[1, 2, 3]);
-        recordings.finish_transcript(&done, &transcript(), None).unwrap();
+        recordings.finish_transcript(&done, &transcript()).unwrap();
         let waiting = recordings.create(0).unwrap();
         with_track(&recordings, &waiting, &[1, 2, 3]);
         let usage = recordings.usage();

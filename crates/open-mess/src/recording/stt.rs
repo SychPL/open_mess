@@ -401,9 +401,9 @@ impl Model {
     }
 
     /// Transcribes a recording's tracks (`others.wav` and `me.wav` in `folder`), with `language`
-    /// (a Whisper code) or the language found in each track's first window with sound. Returns the
-    /// transcript and the language of the first track with speech.
-    pub fn transcribe(&mut self, folder: &Path, language: Option<&str>, cancel: &AtomicBool) -> Result<(Transcript, Option<String>), SttError> {
+    /// (a Whisper code) or the language found in each track's first window with sound. The
+    /// transcript's language is the one of the first track with speech.
+    pub fn transcribe(&mut self, folder: &Path, language: Option<&str>, cancel: &AtomicBool) -> Result<Transcript, SttError> {
         let fixed = match language {
             Some(code) => Some(self.vocab.language(code).ok_or_else(|| SttError::Model(format!("no language {code}")))?),
             None => None,
@@ -442,7 +442,7 @@ impl Model {
         }
         // Stable: at the same time the other side comes first, as the tracks were read.
         cues.sort_by_key(|cue| cue.start_ms);
-        Ok((Transcript { cues: cap(cues) }, first_language.and_then(|id| self.vocab.code(id))))
+        Ok(Transcript { language: first_language.and_then(|id| self.vocab.code(id)), cues: cap(cues) })
     }
 }
 
@@ -590,7 +590,8 @@ mod tests {
         let kept = cap((0..MAX_CUES + 5).map(|_| cue("a".into())).collect());
         assert_eq!(kept.len(), MAX_CUES);
         assert!(kept.last().unwrap().text.ends_with(CUT));
-        let json = serde_json::to_vec(&Transcript { cues: cap((0..5000).map(|_| cue("\u{1}".repeat(MAX_CUE_TEXT))).collect()) }).unwrap();
+        let cues = cap((0..5000).map(|_| cue("\u{1}".repeat(MAX_CUE_TEXT))).collect());
+        let json = serde_json::to_vec(&Transcript { language: Some("pl".into()), cues }).unwrap();
         assert!(json.len() as u64 <= MAX_TRANSCRIPT);
     }
 
@@ -633,15 +634,15 @@ mod tests {
         let noise: Vec<i16> = (0..32_000).map(|i| if i % 2 == 0 { 3000 } else { -3000 }).collect();
         track(dir.path(), "me.wav", &noise);
         let mut model = zero_model();
-        let (transcript, language) = model.transcribe(dir.path(), None, &AtomicBool::new(false)).unwrap();
-        assert!(language.is_some());
+        let transcript = model.transcribe(dir.path(), None, &AtomicBool::new(false)).unwrap();
+        assert!(transcript.language.is_some());
         for cue in &transcript.cues {
             assert_eq!(cue.speaker, Speaker::Me);
             assert!(cue.start_ms <= cue.end_ms && cue.end_ms <= 2000);
         }
         let silent_only = tempfile::tempdir().unwrap();
         track(silent_only.path(), "others.wav", &vec![0; 16_000]);
-        assert!(model.transcribe(silent_only.path(), Some("pl"), &AtomicBool::new(false)).unwrap().0.cues.is_empty());
+        assert!(model.transcribe(silent_only.path(), Some("pl"), &AtomicBool::new(false)).unwrap().cues.is_empty());
         assert!(matches!(model.transcribe(silent_only.path(), Some("xx"), &AtomicBool::new(false)), Err(SttError::Model(_))));
     }
 
