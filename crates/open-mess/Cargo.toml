@@ -89,6 +89,9 @@ tauri-winrt-notification = "0.8.1"
 # tauri-winrt-notification already builds.
 windows = { version = "0.62.2", features = ["UI_Notifications"] }
 windows-native-keyring-store = "1.1.0"
+# The audio sessions that tell a Teams call (recording/detect.rs) and the call's capture
+# (spec 2026-10-28-local-transcription, 4.1 and 4.2); safe functions over WASAPI.
+wasapi = "0.26.0"
 # Registers the toasts' AppUserModelID for the current user.
 winreg = "0.56.0"
 
