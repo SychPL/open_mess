@@ -325,6 +325,26 @@ fn install_swaps_exe_and_approves_version_only_module() {
 }
 
 #[test]
+fn a_module_built_for_an_older_contract_is_still_the_predecessor() {
+    let new_echo = common::echo_with_version("9.9.9");
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", new_echo.clone())]);
+    // The approved module as a daemon with an older module contract approved it: a file this
+    // release's host cannot load, its approval and remembered manifest still in the database.
+    let manifest = s.modules()[0].manifest.clone().unwrap();
+    let old = b"a module built for an older contract".to_vec();
+    std::fs::write(s.module("echo.wasm"), &old).unwrap();
+    let store = s.store();
+    modules::approve(store.conn(), "test-echo", &sha(&old), &sha(modules::canonical(&manifest).to_string().as_bytes())).unwrap();
+    modules::remember_approved(store.conn(), &manifest).unwrap();
+    assert_eq!(s.run(&Machine::new(false, Health::Healthy)), Outcome::Installed);
+    // Replaced and approved as for a version-only change, not left waiting next to it.
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), new_echo);
+    let modules = s.modules();
+    assert_eq!(modules.len(), 1, "{modules:?}");
+    assert_eq!((modules[0].state.clone(), modules[0].version.as_str()), (ModuleState::Active, "9.9.9"));
+}
+
+#[test]
 fn earlier_backup_is_moved_aside() {
     let s = Setup::new(&echo_installed(), &[("echo.wasm", common::echo_with_version("9.9.9"))]);
     // Left by an earlier attempt whose rollback failed: maybe the only copy of the user's data.

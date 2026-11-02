@@ -333,16 +333,36 @@ pub(crate) async fn inspect(engine: &Engine, path: &Path) -> Result<Inspected, E
     Ok(Inspected { manifest_sha256: manifest_sha256(&manifest), file_sha256, manifest })
 }
 
-/// Whether two manifests differ at most in `version` (spec 2026-10-27-self-update, 7.4).
-pub(crate) fn version_only_change(a: &Manifest, b: &Manifest) -> bool {
-    let without_version = |manifest: &Manifest| {
-        let mut json = canonical(manifest);
+/// Whether two manifests, as [`canonical`] gives them, differ at most in `version` (spec
+/// 2026-10-27-self-update, 7.4).
+pub(crate) fn version_only_change(a: &Value, b: &Value) -> bool {
+    let without_version = |json: &Value| {
+        let mut json = json.clone();
         if let Some(fields) = json.as_object_mut() {
             fields.remove("version");
         }
         json
     };
     without_version(a) == without_version(b)
+}
+
+/// The module whose approved file is the one at `path`, and the manifest approved with it (as
+/// [`canonical`] gives it), without loading the file: for a file this daemon's host cannot load,
+/// one built for an older module contract (spec 2026-10-27-self-update, 7.4). None unless the file
+/// is a module's approved file and its approved manifest was remembered.
+pub(crate) fn approved_file(conn: &Connection, path: &Path) -> Result<Option<(String, Value)>, Error> {
+    let Ok(bytes) = read_capped(path) else { return Ok(None) };
+    let approved = conn
+        .query_row("SELECT name, approved_manifest_sha256 FROM modules WHERE approved_file_sha256 = ?1", [sha256_hex(&bytes)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .optional()?;
+    let Some((name, Some(manifest_sha256))) = approved else { return Ok(None) };
+    let remembered: Option<String> =
+        conn.query_row("SELECT value FROM config WHERE key = ?1", [approved_manifest_key(&name)], |row| row.get(0)).optional()?;
+    // The remembered manifest is the approved one only when its hash is the approved hash.
+    let manifest = remembered.filter(|json| sha256_hex(json.as_bytes()) == manifest_sha256).and_then(|json| serde_json::from_str(&json).ok());
+    Ok(manifest.map(|manifest| (name, manifest)))
 }
 
 /// Whether this is the file and manifest the user approved for its module.
@@ -598,6 +618,6 @@ mod tests {
         assert!(canonical(&without).get("media").is_none());
         let with = Manifest { media: Some(open_mess_host::MediaAccess { peers: vec!["52.112.0.0/14".into()] }), ..without.clone() };
         assert_eq!(canonical(&with)["media"]["peers"][0], "52.112.0.0/14");
-        assert!(!version_only_change(&with, &without));
+        assert!(!version_only_change(&canonical(&with), &canonical(&without)));
     }
 }

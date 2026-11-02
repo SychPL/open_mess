@@ -580,13 +580,23 @@ fn place_modules(paths: &Paths, pending: &mut PendingFile, manifest: &Manifest) 
     // Reading a manifest runs the module under the host, which needs a runtime.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
+        // Each approved file: its module's name and approved manifest.
         let mut approved = Vec::new();
         for path in modules::module_files(&dir)? {
-            // A file that is no module, or not the approved one, is nobody's predecessor.
-            if let Ok(found) = modules::inspect(&engine, &path).await
-                && modules::is_approved(&conn, &found).map_err(other)?
-            {
-                approved.push((path, found));
+            match modules::inspect(&engine, &path).await {
+                // A file that is no module, or not the approved one, is nobody's predecessor.
+                Ok(found) => {
+                    if modules::is_approved(&conn, &found).map_err(other)? {
+                        approved.push((path, found.manifest.name.clone(), modules::canonical(&found.manifest)));
+                    }
+                }
+                // One this release's host cannot load, built for an older module contract, is
+                // known by its approval.
+                Err(_) => {
+                    if let Some((name, manifest)) = modules::approved_file(&conn, &path).map_err(other)? {
+                        approved.push((path, name, manifest));
+                    }
+                }
             }
         }
         for entry in entries {
@@ -596,8 +606,9 @@ fn place_modules(paths: &Paths, pending: &mut PendingFile, manifest: &Manifest) 
             if new.file_sha256 != entry.sha256 {
                 return Err(UpdateError::Rejected(format!("{} does not match the release manifest", entry.name)));
             }
-            let predecessor = approved.iter().find(|(_, old)| old.manifest.name == new.manifest.name);
-            if let Some((path, _)) = predecessor.filter(|(_, old)| modules::version_only_change(&old.manifest, &new.manifest)) {
+            let predecessor = approved.iter().find(|(_, name, _)| *name == new.manifest.name);
+            let new_manifest = modules::canonical(&new.manifest);
+            if let Some((path, _, _)) = predecessor.filter(|(_, _, old)| modules::version_only_change(old, &new_manifest)) {
                 // Copied next to it and renamed over it: atomic within the folder.
                 pending.replaced.push(path.clone());
                 let temp = with_suffix(path, ".new");
