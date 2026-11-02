@@ -17,6 +17,8 @@ use super::wav;
 const PER_MS: u64 = wav::SAMPLE_RATE as u64 / 1000;
 /// How far a track may run ahead of or behind the clock: packets come in bursts.
 const SLACK: u64 = 200 * PER_MS;
+/// Samples that arrive this much later than the track has got are placed at their own time.
+const JITTER: u64 = 50 * PER_MS;
 /// Silence is written in pieces of this many samples.
 const SILENCE: [i16; 1600] = [0; 1600];
 /// A track that failed to open this many times in a row stays silent (at most 3 tries a minute).
@@ -58,6 +60,11 @@ impl Track {
     /// the clock, for what never came.
     pub fn feed(&mut self, elapsed: Duration, samples: &[i16], open: bool) -> io::Result<()> {
         let due = Self::due(elapsed);
+        // Samples that come after a gap end at the clock: silence first, so they keep their time.
+        let start = due.saturating_sub(samples.len() as u64);
+        if !samples.is_empty() && self.written + JITTER < start {
+            self.silence(start - self.written)?;
+        }
         let room = (due + SLACK).saturating_sub(self.written);
         let take = samples.len().min(usize::try_from(room).unwrap_or(usize::MAX));
         if open {
@@ -135,26 +142,35 @@ impl Feed {
     /// (at most [`TRIES`] in a row, [`RETRY`] apart), and reads what came.
     fn read(&mut self, audio: &mut dyn Audio, wanted: Option<String>, now: Duration, into: &mut Vec<i16>) {
         if wanted != self.device {
-            (self.device, self.source, self.failures, self.last_try) = (wanted, None, 0, None);
+            // Another device is a fresh start: it gets its own tries.
+            (self.device, self.source, self.failures, self.last_try, self.dead) = (wanted, None, 0, None, false);
         }
         let Some(device) = self.device.clone() else { return };
         if self.source.is_none() && !self.dead && self.last_try.is_none_or(|at| now.saturating_sub(at) >= RETRY) {
             self.last_try = Some(now);
             match audio.open(&device, self.loopback) {
-                Ok(source) => (self.source, self.failures) = (Some(source), 0),
+                Ok(source) => self.source = Some(source),
+                Err(_) => self.fail(),
+            }
+        }
+        if let Some(source) = &mut self.source {
+            match source.read(into) {
+                // Only a read that works resets the count: a device that opens and fails every
+                // read is as lost as one that does not open.
+                Ok(()) => self.failures = 0,
                 Err(_) => {
-                    self.failures += 1;
-                    self.dead = self.failures >= TRIES;
+                    // Unplugged, or the device went away: opened again by the next reads.
+                    self.source = None;
+                    into.clear();
+                    self.fail();
                 }
             }
         }
-        if let Some(source) = &mut self.source
-            && source.read(into).is_err()
-        {
-            // Unplugged, or the device went away: opened again by the next reads.
-            self.source = None;
-            into.clear();
-        }
+    }
+
+    fn fail(&mut self) {
+        self.failures += 1;
+        self.dead = self.failures >= TRIES;
     }
 }
 
@@ -444,6 +460,62 @@ mod tests {
     }
 
     #[test]
+    fn samples_after_a_gap_keep_their_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.wav");
+        let mut track = Track::create(&path).unwrap();
+        track.feed(ms(100), &[1; 1600], true).unwrap();
+        // A second with nothing, then 100 ms of sound: it belongs to 1.0-1.1 s.
+        for at in (200..=1000).step_by(100) {
+            track.feed(ms(at), &[], true).unwrap();
+        }
+        track.feed(ms(1100), &[9; 1600], true).unwrap();
+        track.finish(ms(1100)).unwrap();
+        let samples = read(&path);
+        assert_eq!(samples.len(), 17_600);
+        assert!(samples.get(16_000..).unwrap().iter().all(|sample| *sample == 9));
+        assert!(samples.get(1600..16_000).unwrap().iter().all(|sample| *sample == 0));
+    }
+
+    /// Opens, then fails every read.
+    struct Broken;
+
+    impl Source for Broken {
+        fn read(&mut self, _: &mut Vec<i16>) -> Result<(), String> {
+            Err("gone".into())
+        }
+    }
+
+    struct Failing;
+
+    impl Audio for Failing {
+        fn open(&mut self, _: &str, _: bool) -> Result<Box<dyn Source>, String> {
+            Ok(Box::new(Broken))
+        }
+
+        fn microphone_on(&mut self, _: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_device_whose_reads_fail_counts_as_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = Control::default();
+        control.targets.lock().unwrap().speaker = Some("flaky".into());
+        let tick = Cell::new(0u64);
+        let clock = || ms(tick.get() * 10_000);
+        let mut pause = || {
+            tick.set(tick.get() + 1);
+            if tick.get() == 12 {
+                control.stop.store(true, Ordering::SeqCst);
+            }
+        };
+        run(&mut Failing, Track::create(&dir.path().join("o.wav")).unwrap(), None, &control, &clock, &mut pause).unwrap();
+        assert_eq!(control.dead(), (true, false));
+    }
+
+    #[test]
     fn a_device_that_does_not_open_leaves_its_track_silent() {
         let mut audio = Devices { values: HashMap::from([("mic".into(), 200)]), ..Devices::default() };
         audio.microphone_on.set(true);
@@ -453,5 +525,15 @@ mod tests {
         assert_eq!(audio.opened.iter().filter(|device| *device == "gone").count(), 3);
         assert_eq!(control.dead(), (true, false));
         assert!(others.iter().all(|sample| *sample == 0) && others.len() == me.len());
+
+        // Teams moves to a device that works: the track comes back.
+        let mut audio = Devices { values: HashMap::from([("good".into(), 5)]), ..Devices::default() };
+        let control = Control::default();
+        let (others, _) = capture(&mut audio, false, &control, 700, |tick, control| {
+            let speaker = if tick < 600 { "gone" } else { "good" };
+            control.targets.lock().unwrap().speaker = Some(speaker.into());
+        });
+        assert_eq!(control.dead(), (false, false));
+        assert!(others.get(610 * 1600..690 * 1600).unwrap().iter().all(|sample| *sample == 5));
     }
 }

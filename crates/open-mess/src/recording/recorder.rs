@@ -173,7 +173,12 @@ impl Recorder {
                 self.set_skip(&mut inner, listed);
             }
         }
-        if seen.ended || (!seen.call && !listed) {
+        // A skip that could not be written is tried again, so a restart keeps it.
+        if inner.skip && !self.skip_file().exists() {
+            self.set_skip(&mut inner, true);
+        }
+        // Only a working read tells that the call is over: one lost detection is not its end.
+        if seen.works && (seen.ended || (!seen.call && !listed)) {
             if inner.skip {
                 self.set_skip(&mut inner, false);
             }
@@ -184,7 +189,14 @@ impl Recorder {
                 let active = inner.active.take();
                 drop(inner);
                 if let Some(active) = active {
-                    self.end(active, reason, false, None);
+                    // Six hours, or a capture that failed, end it as a stop does: the rest of the
+                    // call is not recorded, no new recording every few seconds (4.2).
+                    // Only while the call goes on: one that ended with this read leaves nothing to skip.
+                    let reason = self.end(active, reason, false, None);
+                    if seen.call && !seen.ended && matches!(reason, Some(Reason::TooLong | Reason::CaptureFailed | Reason::WriteFailed)) {
+                        let mut inner = self.locked();
+                        self.set_skip(&mut inner, true);
+                    }
                 }
             }
             return;
@@ -276,8 +288,8 @@ impl Recorder {
     }
 
     /// Ends `active`: the capture stops, the recording waits for its transcription (or goes,
-    /// `delete`), the toasts go and the tray shows it.
-    fn end(&self, active: Active, reason: Option<Reason>, delete: bool, by: Option<By>) {
+    /// `delete`), the toasts go and the tray shows it. The reason it ended with.
+    fn end(&self, active: Active, reason: Option<Reason>, delete: bool, by: Option<By>) -> Option<Reason> {
         active.control.stop.store(true, Ordering::SeqCst);
         let reason = match active.capture.join() {
             Ok(Ok(())) => reason,
@@ -300,6 +312,7 @@ impl Recorder {
         if by == Some(By::Agent) {
             self.hooks.notices.agent_stopped();
         }
+        reason
     }
 
     /// Stops the recording going on, if any (only `id`'s, when given: a toast left in the action
@@ -313,7 +326,7 @@ impl Recorder {
         self.set_skip(&mut inner, true);
         drop(inner);
         let stopped = active.id.clone();
-        self.end(active, None, delete, Some(by));
+        let _ = self.end(active, None, delete, Some(by));
         Some(stopped)
     }
 
@@ -324,7 +337,7 @@ impl Recorder {
         }
         let active = self.locked().active.take();
         if let Some(active) = active {
-            self.end(active, None, false, None);
+            let _ = self.end(active, None, false, None);
         }
     }
 
@@ -334,6 +347,18 @@ impl Recorder {
             return Ok(());
         }
         self.queue.delete(&self.recordings, id)
+    }
+
+    #[cfg(test)]
+    fn stop_capture_for_test(&self) {
+        if let Some(active) = &self.locked().active {
+            active.control.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(test)]
+    fn capture_finished_for_test(&self) -> bool {
+        self.locked().active.as_ref().is_none_or(|active| active.capture.is_finished())
     }
 
     /// The recording going on, if any.
@@ -658,6 +683,39 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_that_fails_during_a_call_does_not_start_again_in_it() {
+        let setup = setup();
+        setup.recorder.observe(&on(true), Instant::now());
+        let id = setup.recorder.active().unwrap();
+        setup.panics.store(true, Ordering::SeqCst);
+        // The capture stops on its own: the next read sees it finished.
+        setup.recorder.stop_capture_for_test();
+        while !setup.recorder.capture_finished_for_test() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        setup.recorder.observe(&on(true), Instant::now());
+        assert_eq!(state(&setup, &id).reason, Some(Reason::CaptureFailed));
+        setup.recorder.observe(&on(true), Instant::now());
+        assert!(setup.recorder.active().is_none());
+        // The next call is recorded.
+        setup.panics.store(false, Ordering::SeqCst);
+        setup.recorder.observe(&ended(), Instant::now());
+        setup.recorder.observe(&on(true), Instant::now());
+        assert!(setup.recorder.active().is_some());
+    }
+
+    #[test]
+    fn a_stopped_call_stays_stopped_when_the_detection_comes_back() {
+        let setup = setup();
+        setup.recorder.observe(&on(true), Instant::now());
+        setup.recorder.stop(By::Owner, false, None).unwrap();
+        // A minute of failed reads, then the same call again.
+        setup.recorder.observe(&Observation { ended: true, ..Observation::default() }, Instant::now());
+        setup.recorder.observe(&on(true), Instant::now());
+        assert!(setup.recorder.active().is_none());
+    }
+
+    #[test]
     fn the_disk_of_a_path_is_found() {
         let dir = tempfile::tempdir().unwrap();
         assert!(free_disk(dir.path()) > 0);
@@ -677,5 +735,8 @@ mod tests {
         let long = setup.recorder.active().unwrap();
         setup.recorder.observe(&on(true), now + LONGEST);
         assert_eq!(state(&setup, &long).reason, Some(Reason::TooLong));
+        // As after a stop: the rest of that call is not recorded.
+        setup.recorder.observe(&on(true), now + LONGEST);
+        assert!(setup.recorder.active().is_none());
     }
 }
