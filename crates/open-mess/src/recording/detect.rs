@@ -223,8 +223,9 @@ mod tests {
     #[ignore = "reads the audio devices of the computer it runs on"]
     fn live_sessions() {
         wasapi::initialize_mta().ok().unwrap();
+        // Outside a call Teams has none; during one, the microphone and the headset.
         let found = sessions().unwrap();
-        println!("{} Teams sessions, {} active", found.len(), found.iter().filter(|session| session.active).count());
+        assert!(found.iter().all(|session| !session.device.is_empty()));
     }
 
     #[test]
