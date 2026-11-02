@@ -9,7 +9,7 @@ use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -63,12 +63,16 @@ impl Peers {
     }
 
     fn contains(&self, ip: IpAddr) -> bool {
-        // An IPv4 address may come mapped into IPv6 from a dual-stack socket.
-        let ip = match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-            v4 => v4,
-        };
+        let ip = plain(ip);
         self.0.iter().any(|&(net, len)| mask(ip, len) == net && ip.is_ipv4() == net.is_ipv4())
+    }
+}
+
+/// An IPv4 address mapped into IPv6 (as a dual-stack socket reports it) as plain IPv4.
+fn plain(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
     }
 }
 
@@ -80,19 +84,37 @@ fn mask(ip: IpAddr, len: u32) -> IpAddr {
 }
 
 /// Who a module's media connections may exchange packets with: an address in the manifest's
-/// ranges that the address policy allows, and loopback under the tests' policy.
+/// ranges that the address policy allows, and loopback under the tests' policy. Once a connection
+/// has its answer, only the answer's candidate addresses that the system proxy leaves direct: a
+/// peer-reflexive address in the ranges was never asked about the proxy.
 #[derive(Clone, Debug)]
 pub(crate) struct Allowed {
     peers: Peers,
     policy: AddressPolicy,
+    /// Set by `accept`; shared with the connection's sockets.
+    direct: Arc<Mutex<Option<Vec<IpAddr>>>>,
 }
 
 impl Allowed {
     pub(crate) fn new(peers: Peers, policy: AddressPolicy) -> Allowed {
-        Allowed { peers, policy }
+        Allowed { peers, policy, direct: Arc::default() }
+    }
+
+    /// The same ranges with a pinned set of its own, for one connection.
+    fn for_connection(&self) -> Allowed {
+        Allowed { direct: Arc::default(), ..self.clone() }
+    }
+
+    fn pin(&self, direct: &[SocketAddr]) {
+        *self.direct.lock().unwrap_or_else(PoisonError::into_inner) = Some(direct.iter().map(|addr| plain(addr.ip())).collect());
     }
 
     fn allows(&self, ip: IpAddr) -> bool {
+        if let Some(direct) = &*self.direct.lock().unwrap_or_else(PoisonError::into_inner)
+            && !direct.contains(&plain(ip))
+        {
+            return false;
+        }
         #[cfg(any(test, feature = "test-support"))]
         if self.policy == AddressPolicy::AllowLoopbackForTests && ip.is_loopback() {
             return true;
@@ -252,9 +274,10 @@ fn check_answer(answer: &str, allowed: &Allowed) -> Result<(Vec<String>, Vec<Soc
     Ok((lines, candidates))
 }
 
-/// The answer without the candidates the system proxy covers; refused when none is left.
-async fn without_proxied(lines: Vec<String>, candidates: Vec<SocketAddr>) -> Result<String, HttpError> {
-    let direct = crate::proxy::direct(candidates.clone()).await?;
+/// The answer without the candidates the system proxy covers, and the addresses left; refused when
+/// none is left.
+async fn without_proxied(lines: Vec<String>, candidates: Vec<SocketAddr>) -> Result<(String, Vec<SocketAddr>), HttpError> {
+    let direct = crate::proxy::direct(candidates).await?;
     if direct.is_empty() {
         return Err(blocked("proxy: your network sends traffic through a proxy; media needs a direct connection"));
     }
@@ -267,7 +290,7 @@ async fn without_proxied(lines: Vec<String>, candidates: Vec<SocketAddr>) -> Res
             addr.is_some_and(|(ip, port)| direct.contains(&SocketAddr::new(ip, port)))
         })
         .collect();
-    Ok(kept.join("\r\n") + "\r\n")
+    Ok((kept.join("\r\n") + "\r\n", direct))
 }
 
 /// Data channel messages waiting for the module, within the per-connection limits.
@@ -389,7 +412,7 @@ impl Connections {
         label: &str,
         events: &mpsc::Sender<GuestEvent>,
     ) -> Result<(u32, String), HttpError> {
-        let allowed = allowed.ok_or_else(|| blocked("the module's manifest has no media access"))?.clone();
+        let allowed = allowed.ok_or_else(|| blocked("the module's manifest has no media access"))?.for_connection();
         if self.open.len() >= limits::MAX_RTC {
             return Err(blocked(format!("at most {} open media connections", limits::MAX_RTC)));
         }
@@ -448,8 +471,10 @@ impl Connections {
             return Err(HttpError::TooLarge);
         }
         let (lines, candidates) = check_answer(answer, &open.allowed)?;
-        let sdp = without_proxied(lines, candidates).await?;
+        let (sdp, direct) = without_proxied(lines, candidates).await?;
         let answer = RTCSessionDescription::answer(sdp).map_err(network)?;
+        // Before the answer nothing reaches a far end: ICE has no remote candidate to check.
+        open.allowed.pin(&direct);
         open.pc.set_remote_description(answer).await.map_err(network)?;
         open.answered = true;
         Ok(())
@@ -495,6 +520,19 @@ mod tests {
         a=candidate:2 1 UDP 2130706431 8.8.8.8 3478 typ relay\r\n\
         a=candidate:3 1 UDP 2130706431 host.local 3478 typ host\r\n\
         a=candidate:4 1 UDP 2130706431 10.0.0.1 3478 typ host\r\na=sctp-port:5000\r\n";
+
+    #[test]
+    fn after_the_answer_only_its_direct_candidates_are_reachable() {
+        let allowed = allowed(&["52.112.0.0/14"]).for_connection();
+        assert!(allowed.allows("52.113.1.3".parse().unwrap()));
+        allowed.pin(&["52.113.1.2:3478".parse().unwrap()]);
+        assert!(allowed.allows("52.113.1.2".parse().unwrap()));
+        assert!(allowed.allows("::ffff:52.113.1.2".parse().unwrap()));
+        // In the ranges, but never asked about the proxy (a peer-reflexive address).
+        assert!(!allowed.allows("52.113.1.3".parse().unwrap()));
+        // Another connection of the module keeps its own set.
+        assert!(allowed.for_connection().allows("52.113.1.3".parse().unwrap()));
+    }
 
     #[test]
     fn the_answer_keeps_only_candidates_in_the_ranges() {
