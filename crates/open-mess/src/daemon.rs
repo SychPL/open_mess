@@ -83,6 +83,7 @@ pub fn run() -> Result<(), Error> {
             runs: Arc::clone(&ui.runs),
             modules: ui.accounts.modules().handles(),
             host_events: ui.host_events.clone(),
+            recording: ui.recorder.as_ref().map(|recorder| recorder.link()).unwrap_or_default(),
         };
         let (registry, exit) = (Arc::clone(&registry), Arc::clone(&exit));
         runtime.spawn(async move {
@@ -258,6 +259,7 @@ fn start(
                 runs: Arc::clone(&runs),
                 modules: Vec::new(),
                 host_events: event_queue.clone(),
+                recording: recorder.as_ref().map(|recorder| recorder.link()).unwrap_or_default(),
             },
             launcher,
             exit: Arc::clone(&exit),

@@ -120,6 +120,7 @@ fn activity(d: &common::Daemon) -> Activity {
         runs: Runs::new(d.dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
         modules: d.accounts.modules().handles(),
         host_events: mpsc::channel(8).0,
+        recording: Arc::default(),
     }
 }
 

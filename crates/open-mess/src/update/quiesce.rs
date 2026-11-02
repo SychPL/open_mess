@@ -50,6 +50,9 @@ pub struct Activity {
     pub modules: Vec<ModuleHandle>,
     /// The modules' event queue: at full capacity it is empty.
     pub host_events: mpsc::Sender<HostEvent>,
+    /// The call recording: a call recorded in phase A or B stops the installation (spec
+    /// 2026-10-28-local-transcription, 4.8).
+    pub recording: Arc<crate::recording::UpdateLink>,
 }
 
 /// The user cancelled; everything was resumed.
@@ -68,7 +71,7 @@ pub async fn finish_work(activity: &Activity, cancel: &watch::Receiver<bool>) ->
     let mut ends = (activity.triggers.last_delivery_ms.load(Ordering::SeqCst), activity.gate.last_end_ms());
     let mut idle_before = false;
     loop {
-        if *cancel.borrow() {
+        if stopped(activity, cancel) {
             resume(activity).await;
             return Err(Cancelled);
         }
@@ -114,7 +117,7 @@ fn look(activity: &Activity) -> (bool, (u64, u64), usize) {
 pub async fn switch(activity: &Activity, cancel: &watch::Receiver<bool>) -> Result<(), Cancelled> {
     activity.gate.set(GateMode::Closed);
     loop {
-        if *cancel.borrow() {
+        if stopped(activity, cancel) {
             resume(activity).await;
             return Err(Cancelled);
         }
@@ -128,6 +131,12 @@ pub async fn switch(activity: &Activity, cancel: &watch::Receiver<bool>) -> Resu
         }
         sleep(POLL).await;
     }
+}
+
+/// The user cancelled, or a call is being recorded: the installation waits for its end (spec
+/// 2026-10-28-local-transcription, 4.8), so phase A never ends by giving up during one.
+fn stopped(activity: &Activity, cancel: &watch::Receiver<bool>) -> bool {
+    *cancel.borrow() || activity.recording.recording.load(Ordering::SeqCst)
 }
 
 /// Back to work: tool calls are taken and the modules get their events again.

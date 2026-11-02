@@ -133,6 +133,16 @@ pub struct Entry {
     pub meta: Meta,
 }
 
+/// What a recording and an update tell each other (4.8): an update does not stop the daemon
+/// while a call is recorded, and no recording starts once the daemon hands over to the helper.
+#[derive(Debug, Default)]
+pub struct UpdateLink {
+    /// A call is recorded now.
+    pub recording: std::sync::atomic::AtomicBool,
+    /// The daemon hands over to the update's helper and is about to end.
+    pub handover: std::sync::atomic::AtomicBool,
+}
+
 /// Why a recording cannot start (4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {

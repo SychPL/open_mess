@@ -51,6 +51,7 @@ fn activity(d: &common::Daemon, runs: Arc<Runs>, host_events: mpsc::Sender<HostE
         runs,
         modules: d.accounts.modules().handles(),
         host_events,
+        recording: Arc::default(),
     }
 }
 
@@ -149,6 +150,20 @@ async fn phase_a_waits_for_a_running_spawn() {
     let (result, ended) = phase.await.unwrap();
     assert_eq!(result, Ok(()));
     assert!(ended - run_ended < SECOND, "{:?}", ended - run_ended);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recorded_call_stops_phase_a_and_phase_b() {
+    let t = setup().await;
+    let phase = phase_a(&t);
+    sleep(5 * SECOND).await;
+    t.activity.recording.recording.store(true, Ordering::SeqCst);
+    let (result, _) = phase.await.unwrap();
+    assert_eq!(result, Err(Cancelled));
+    let switched = quiesce::switch(&t.activity, &t.cancel.subscribe()).await;
+    assert_eq!(switched, Err(Cancelled));
+    // Resumed: tool calls are taken again.
+    t.d.registry.call("status", json!({})).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

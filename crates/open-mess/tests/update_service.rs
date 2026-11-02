@@ -115,6 +115,8 @@ struct Harness {
     service: UpdateService,
     helper: Arc<Helper>,
     triggers: Arc<triggers::Activity>,
+    /// The call recording an installation waits for.
+    recording: Arc<open_mess::recording::UpdateLink>,
     exit: Arc<Notify>,
     /// The releases announced in a toast: version and manifest SHA-256.
     toasts: Arc<Mutex<Vec<(String, String)>>>,
@@ -126,6 +128,7 @@ async fn harness(installable: Result<(), String>, helper_starts: bool) -> Harnes
     let paths = Paths { data: d.dir.path().to_path_buf(), local: local.path().to_path_buf() };
     let release = release().await;
     let triggers = Arc::new(triggers::Activity::default());
+    let recording = Arc::new(open_mess::recording::UpdateLink::default());
     let helper = Arc::new(Helper { starts: helper_starts, launched: Mutex::default(), lock: Mutex::default() });
     let (exit, toasts) = (Arc::new(Notify::new()), Arc::new(Mutex::new(Vec::new())));
     let announce: Announce = {
@@ -146,13 +149,14 @@ async fn harness(installable: Result<(), String>, helper_starts: bool) -> Harnes
             runs: Runs::new(d.dir.path().join("runs"), Duration::from_secs(60 * 60), Counters::default()),
             modules: Vec::new(),
             host_events: mpsc::channel(1).0,
+            recording: Arc::clone(&recording),
         },
         launcher: Arc::clone(&helper) as Arc<dyn Launcher>,
         exit: Arc::clone(&exit),
         installable,
         announce,
     });
-    Harness { d, _local: local, paths, release, service, helper, triggers, exit, toasts }
+    Harness { d, _local: local, paths, release, service, helper, triggers, recording, exit, toasts }
 }
 
 impl Harness {
@@ -382,6 +386,46 @@ async fn a_cancelled_install_is_not_followed_by_one_on_its_own() {
     sleep(10 * MINUTE).await;
     assert_eq!(h.service.view().state, UpdateState::Ready);
     assert!(h.launched().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recorded_call_holds_the_installation_until_it_ends() {
+    let h = harness(Ok(()), true).await;
+    h.check().await;
+    // Not while a call is recorded.
+    h.recording.recording.store(true, Ordering::SeqCst);
+    assert_eq!(h.service.install(), Err("aktualizacja po końcu nagrania".to_string()));
+    h.recording.recording.store(false, Ordering::SeqCst);
+    // A call that starts in phase A stops the installation; the window says why.
+    h.triggers.open_batches.store(1, Ordering::SeqCst);
+    h.service.install().unwrap();
+    sleep(MINUTE).await;
+    h.recording.recording.store(true, Ordering::SeqCst);
+    sleep(Duration::from_secs(1)).await;
+    let view = h.service.view();
+    assert_eq!(view.state, UpdateState::Ready);
+    assert_eq!(view.last_result.as_deref(), Some("przerwano: nagrywanie rozmowy"));
+    assert!(h.launched().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn installing_on_its_own_tries_again_after_the_call() {
+    let h = harness(Ok(()), true).await;
+    h.service.set_auto_install(true).unwrap();
+    h.triggers.open_batches.store(1, Ordering::SeqCst);
+    h.check().await;
+    sleep(Duration::from_secs(1)).await;
+    // Started on its own (it waits in phase A for the batch), then stopped by a call.
+    h.service.install().unwrap();
+    sleep(MINUTE).await;
+    h.recording.recording.store(true, Ordering::SeqCst);
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(h.service.view().state, UpdateState::Ready);
+    // The call ends and everything is quiet: the same release installs on its own.
+    h.recording.recording.store(false, Ordering::SeqCst);
+    h.triggers.open_batches.store(0, Ordering::SeqCst);
+    timeout(5 * MINUTE, h.exit.notified()).await.expect("installed on its own after the call");
+    assert_eq!(h.launched().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

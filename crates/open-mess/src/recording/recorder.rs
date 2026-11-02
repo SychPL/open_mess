@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use super::capture::{Control, Targets, Track};
 use super::detect::Observation;
 use super::queue::Queue;
-use super::{MIN_FREE_DISK, Meta, Reason, Recordings, Refusal, State, millis};
+use super::{MIN_FREE_DISK, Meta, Reason, Recordings, Refusal, State, UpdateLink, millis};
 
 /// The longest recording (4.2).
 const LONGEST: Duration = Duration::from_secs(6 * 60 * 60);
@@ -105,6 +105,8 @@ pub struct Recorder {
     inner: Mutex<Inner>,
     /// Shows in the tray whether a recording is made; set once the tray is up.
     indicator: Mutex<Option<Indicator>>,
+    /// What the update sees of the recording, and the recording of the update (4.8).
+    link: Arc<UpdateLink>,
 }
 
 impl Recorder {
@@ -117,7 +119,13 @@ impl Recorder {
             hooks,
             inner: Mutex::default(),
             indicator: Mutex::default(),
+            link: Arc::default(),
         }
+    }
+
+    /// What an update watches (4.8).
+    pub fn link(&self) -> Arc<UpdateLink> {
+        Arc::clone(&self.link)
     }
 
     fn locked(&self) -> MutexGuard<'_, Inner> {
@@ -249,6 +257,10 @@ impl Recorder {
     }
 
     fn start(&self, inner: &mut Inner, seen: &Observation, now: Instant) -> Result<(), &'static str> {
+        // The daemon is about to end for an update; the rest of the call is recorded after it (4.1).
+        if self.link.handover.load(Ordering::SeqCst) {
+            return Err("trwa aktualizacja");
+        }
         if !self.ui_ready.load(Ordering::SeqCst) {
             return Err("brak ikony w zasobniku");
         }
@@ -279,6 +291,7 @@ impl Recorder {
                 return Err("błąd tworzenia nagrania");
             }
         };
+        self.link.recording.store(true, Ordering::SeqCst);
         self.queue.recording(Some(&id));
         self.hooks.notices.started(&id, microphone);
         self.indicate(true);
@@ -301,6 +314,7 @@ impl Recorder {
         if let Ok(meta) = self.recordings.meta(&active.id) {
             let _ = self.recordings.set_meta(&active.id, &Meta { state: State::Waiting, end_ms: Some(millis(SystemTime::now())), reason, ..meta });
         }
+        self.link.recording.store(false, Ordering::SeqCst);
         self.queue.recording(None);
         if delete {
             let _ = self.queue.delete(&self.recordings, &active.id);
@@ -713,6 +727,21 @@ mod tests {
         setup.recorder.observe(&Observation { ended: true, ..Observation::default() }, Instant::now());
         setup.recorder.observe(&on(true), Instant::now());
         assert!(setup.recorder.active().is_none());
+    }
+
+    #[test]
+    fn an_update_sees_the_recording_and_holds_new_ones_at_the_handover() {
+        let setup = setup();
+        let link = setup.recorder.link();
+        setup.recorder.observe(&on(true), Instant::now());
+        assert!(link.recording.load(Ordering::SeqCst));
+        setup.recorder.observe(&ended(), Instant::now());
+        assert!(!link.recording.load(Ordering::SeqCst));
+        setup.told.take();
+        link.handover.store(true, Ordering::SeqCst);
+        setup.recorder.observe(&on(true), Instant::now());
+        assert!(setup.recorder.active().is_none());
+        assert_eq!(setup.told.take(), ["not recording: trwa aktualizacja"]);
     }
 
     #[test]
