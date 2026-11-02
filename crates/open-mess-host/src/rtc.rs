@@ -85,14 +85,14 @@ fn mask(ip: IpAddr, len: u32) -> IpAddr {
 
 /// Who a module's media connections may exchange packets with: an address in the manifest's
 /// ranges that the address policy allows, and loopback under the tests' policy. Once a connection
-/// has its answer, only the answer's candidate addresses that the system proxy leaves direct: a
-/// peer-reflexive address in the ranges was never asked about the proxy.
+/// has its answer, only the answer's candidates (address and port) that the system proxy leaves
+/// direct: a peer-reflexive address or port in the ranges was never asked about the proxy.
 #[derive(Clone, Debug)]
 pub(crate) struct Allowed {
     peers: Peers,
     policy: AddressPolicy,
     /// Set by `accept`; shared with the connection's sockets.
-    direct: Arc<Mutex<Option<Vec<IpAddr>>>>,
+    direct: Arc<Mutex<Option<Vec<SocketAddr>>>>,
 }
 
 impl Allowed {
@@ -106,15 +106,22 @@ impl Allowed {
     }
 
     fn pin(&self, direct: &[SocketAddr]) {
-        *self.direct.lock().unwrap_or_else(PoisonError::into_inner) = Some(direct.iter().map(|addr| plain(addr.ip())).collect());
+        let direct = direct.iter().map(|addr| SocketAddr::new(plain(addr.ip()), addr.port())).collect();
+        *self.direct.lock().unwrap_or_else(PoisonError::into_inner) = Some(direct);
     }
 
-    fn allows(&self, ip: IpAddr) -> bool {
+    /// Whether a packet may go to or come from `addr`.
+    fn allows(&self, addr: SocketAddr) -> bool {
         if let Some(direct) = &*self.direct.lock().unwrap_or_else(PoisonError::into_inner)
-            && !direct.contains(&plain(ip))
+            && !direct.contains(&SocketAddr::new(plain(addr.ip()), addr.port()))
         {
             return false;
         }
+        self.in_ranges(addr.ip())
+    }
+
+    /// Whether `ip` is in the manifest's ranges and allowed by the address policy.
+    fn in_ranges(&self, ip: IpAddr) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         if self.policy == AddressPolicy::AllowLoopbackForTests && ip.is_loopback() {
             return true;
@@ -147,7 +154,7 @@ impl AsyncUdpSocket for PolicedUdp {
     }
 
     fn poll_send(&self, cx: &mut Context<'_>, transmit: &Transmit<'_>) -> Poll<io::Result<usize>> {
-        if !self.allowed.allows(transmit.destination.ip()) {
+        if !self.allowed.allows(transmit.destination) {
             // Reported as sent: an error could make the library give the socket up.
             return Poll::Ready(Ok(transmit.contents.len()));
         }
@@ -159,7 +166,7 @@ impl AsyncUdpSocket for PolicedUdp {
         let (Some(buf), Some(meta)) = (bufs.get_mut(..1), meta.get_mut(..1)) else { return Poll::Ready(Ok(0)) };
         loop {
             match self.inner.poll_recv(cx, buf, meta) {
-                Poll::Ready(Ok(n)) if n > 0 && meta.first().is_some_and(|m| !self.allowed.allows(m.addr.ip())) => continue,
+                Poll::Ready(Ok(n)) if n > 0 && meta.first().is_some_and(|m| !self.allowed.allows(m.addr)) => continue,
                 other => return other,
             }
         }
@@ -258,7 +265,7 @@ fn check_answer(answer: &str, allowed: &Allowed) -> Result<(Vec<String>, Vec<Soc
             let fields: Vec<&str> = candidate.split_whitespace().collect();
             let addr = fields.get(4).and_then(|a| a.parse::<IpAddr>().ok()).zip(fields.get(5).and_then(|p| p.parse::<u16>().ok()));
             match addr {
-                Some((ip, port)) if allowed.allows(ip) => candidates.push(SocketAddr::new(ip, port)),
+                Some((ip, port)) if allowed.in_ranges(ip) => candidates.push(SocketAddr::new(ip, port)),
                 // A name (mDNS), a malformed line or an address outside the ranges.
                 _ => continue,
             }
@@ -507,9 +514,9 @@ mod tests {
     #[test]
     fn only_addresses_in_the_ranges_are_allowed() {
         let allowed = allowed(&["52.112.0.0/14"]);
-        assert!(allowed.allows("52.113.1.2".parse().unwrap()));
-        assert!(allowed.allows("::ffff:52.113.1.2".parse().unwrap()));
-        for other in ["52.116.0.1", "8.8.8.8", "127.0.0.1", "10.0.0.1"] {
+        assert!(allowed.allows("52.113.1.2:3478".parse().unwrap()));
+        assert!(allowed.allows("[::ffff:52.113.1.2]:3478".parse().unwrap()));
+        for other in ["52.116.0.1:3478", "8.8.8.8:3478", "127.0.0.1:3478", "10.0.0.1:3478"] {
             assert!(!allowed.allows(other.parse().unwrap()), "{other}");
         }
     }
@@ -524,14 +531,16 @@ mod tests {
     #[test]
     fn after_the_answer_only_its_direct_candidates_are_reachable() {
         let allowed = allowed(&["52.112.0.0/14"]).for_connection();
-        assert!(allowed.allows("52.113.1.3".parse().unwrap()));
+        assert!(allowed.allows("52.113.1.3:3478".parse().unwrap()));
         allowed.pin(&["52.113.1.2:3478".parse().unwrap()]);
-        assert!(allowed.allows("52.113.1.2".parse().unwrap()));
-        assert!(allowed.allows("::ffff:52.113.1.2".parse().unwrap()));
-        // In the ranges, but never asked about the proxy (a peer-reflexive address).
-        assert!(!allowed.allows("52.113.1.3".parse().unwrap()));
+        assert!(allowed.allows("52.113.1.2:3478".parse().unwrap()));
+        assert!(allowed.allows("[::ffff:52.113.1.2]:3478".parse().unwrap()));
+        // In the ranges, but never asked about the proxy: a peer-reflexive address, or another port
+        // of the candidate's address that a PAC script may send through a proxy.
+        assert!(!allowed.allows("52.113.1.3:3478".parse().unwrap()));
+        assert!(!allowed.allows("52.113.1.2:5000".parse().unwrap()));
         // Another connection of the module keeps its own set.
-        assert!(allowed.for_connection().allows("52.113.1.3".parse().unwrap()));
+        assert!(allowed.for_connection().allows("52.113.1.3:3478".parse().unwrap()));
     }
 
     #[test]
