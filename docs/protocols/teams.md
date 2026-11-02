@@ -620,7 +620,9 @@ to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the brow
 - **CONFIRMED** the user's own official client notices: `checkForActiveCallOnDifferentEndpoints` ->
   `activeCallOnDifferentEndpointExists` drives "You're in {{title}} on another device. Want to join on
   this one?", "How would you like to join on this device?", "Transfer to this device" and "Add this
-  device".
+  device". This is static analysis only, and the wording is that of the join flow on a device that
+  is not in the call. Live ("Live results" 18): with the owner in the meeting in the official client,
+  the owner never saw this notice while the probe's leg was in the call.
 - **UNCONFIRMED** what other participants see ("Needs live capture" 18): the call model keeps a participant's endpoints as a list
   (`userEndpointCount` = `endpoints.endpointDetails.length`, GraphQL `...endpointDetailsFields`), which
   suggests one roster row with two endpoints; the roster rendering, join toast and sound were not checked.
@@ -639,9 +641,9 @@ offer SDP with audio and video inactive or disabled and a data channel, run ICE,
 Teams media relays, and parse the JSON messages of data id 3. That is a WebRTC-class transport, far
 beyond the HTTP and WebSocket host imports modules have today (a new host capability, its own spec).
 
-Main risks: the user's own official client shows "You're in this meeting on another device" while
+Main risks: the user's own official client may show "You're in this meeting on another device" while
 open_mess is in the call (it disturbs the official client, against AGENTS.md, unless the owner accepts
-it); others probably see one entry but that is unverified; starting captions when no one has them on
+it; live, the owner did not see it while in the meeting, "Live results" 18); others probably see one entry but that is unverified; starting captions when no one has them on
 adds the caption bot for everyone; E2EE meetings refuse the second device; a no-media timeout may end
 the call; the conversation-service host and media relay details come from ECS at run time and were not
 seen. A live check of 10.3 and 10.5 would need the owner's consent and a test meeting.
@@ -1515,6 +1517,56 @@ token, tenant id, user id or account name.
     - `timestampAudioSent` is a number that is not a Unix time (s, ms, us), .NET ticks or a
       FILETIME within 10 minutes of the local clock, so probably relative to something;
       `duration` was of the order 1e6-1e7 (in 100 ns units that would be 0.1-10 s; unconfirmed).
+
+18. **Step 0c of the live captions spec** (2026-11-02, a scheduled team meeting the owner organizes, from
+    the owner's calendar, the colleagues in it told about the tests, captions on in the owner's
+    official client, the owner's OK in chat for the runs; the probe printed only codes, key names, counts and enum values). All joins
+    went the module's way: the conversation URL from the call store item whose
+    `groupContext.threadId` is the meeting chat, no `epconv`, no `notificationLinks`, and the probe
+    left Trouter unread while the join `POST` was open, answering its callbacks only afterwards (as
+    the module will, its frames arriving between calls):
+    - **Scheduled meeting**: the call store had one item, keys `conversationController`,
+      `correlationId`, `groupContext` (`messageId`, `threadId`), `meetingInfo` (`organizerId`,
+      `tenantId`), `userJoinTime`; `groupContext.threadId` was the meeting chat's thread, and
+      `conversationController` was the same URL as the `conversationUrl` of the chat's
+      `awareness_conversationLiveState` (an https URL on `api.flightproxy.teams.microsoft.com`). A
+      `GET` of that URL returns the conversation with the `roster` and `links` (`leave`,
+      `notificationLinks` among them). Item 11 found no `groupContext` on a scheduled meeting on
+      2026-10-29; what differed then is not known.
+    - **Join at the call store's URL, callbacks answered late**: HTTP 200 in 0.35-1.4 s; no callback
+      was answered while the `POST` was open, and the acceptance with the SDP answer came after it.
+      Offer audio `sendonly` with no track plus the data section: the data channel opened, 183
+      messages in 90 s, 19 final results, 0 broken frames. The service does not wait for the
+      callbacks' answers.
+    - **Data-only offer** (one `m=x-data` section, `callModalities: []`): accepted, answer
+      `m=x-data 3480 RTP/SAVP` with four relay candidates in 52.112.0.0/16, ICE and DTLS connected,
+      126 messages in 60 s, 15 final. So no audio section is needed.
+    - **Audio `inactive` plus the data section**: answered with audio `inactive` and the data section,
+      but ICE failed (one try, not repeated, since the data-only offer works); the roster delta then
+      showed the owner's entry with one endpoint.
+    - **Callbacks**: one `/call/acceptance/` and one `/conversation/rosterUpdate/` per run, and 5
+      `trouter.message_loss` events in every run (cause unknown; test B of item 17 had 1).
+    - **Trouter reconnection** (the same day, no meeting): after a clean close, a new socket 3 s later
+      with the same `epid` and the cached `connectparams` (without `reconnectUrl` and `serviceUrl`) in
+      `user.authenticate` got `trouter.connected` with the same `surl`, `id`, `ccid` and
+      `reconnectUrl`, both at `reconnectUrl` (a `wss://` URL on `*.teams.microsoft.com:443`, path
+      `v4/c`, no query) and at the default `go.trouter` URL.
+    - **The user's endpoints in the roster**: the entry's `endpoints` is an object keyed by endpoint
+      id. The probe's endpoint showed `languageId` `en-US`, `isMuted: true`, one media stream,
+      `endpointCapabilities` 67 and no `endpointMetadata`; the official client's showed the client's
+      language, four media streams and `endpointMetadata.transcriptionPrefs.closedCaptions: true`.
+    - **Others**: the owner asked the colleagues after the runs; nobody saw anything. The owner,
+      in the meeting in the official client, never saw the "on another device" notice of
+      section 10.5 - that notice belongs to a device that is not in the call.
+    - **A leg that vanishes without `leave`** (the probe exited after captions came, with no `leave`,
+      no DTLS or SCTP close and no unregister): the leg stayed. Reads of the conversation every 15 s
+      showed the owner's entry with two endpoints, `state: active`, for 10 min 20 s; the probe then
+      sent the skipped `leave` from a new process as that endpoint (its `endpointId` and
+      `participantId` from the roster entry, picked as the one endpoint with the probe's own
+      `clientVersion`, `en-US`, muted and no transcription preferences) - HTTP 204, and the next read
+      showed one endpoint. So a leg with no media flowing does not end within 10 minutes when its
+      client vanishes - whether it ends when the registration's 900 s TTL runs out, or only with
+      the meeting, is not known - and a `leave` sent as that endpoint from another process ends it.
 
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
