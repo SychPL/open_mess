@@ -3,6 +3,7 @@
 //! may roam to a server): `meta.json` with its state, the tracks' WAV files until the transcription
 //! is done, and `transcript.json`. The folder is the record; nothing of it is in the database.
 
+pub mod capture;
 pub mod detect;
 pub mod model;
 pub mod queue;
