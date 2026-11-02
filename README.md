@@ -75,6 +75,28 @@ one syntax and real sign-in.
 - **Coexistence**: open_mess acts like a separate device. Your official Teams keeps working as
   before, and reading through open_mess never marks anything as read.
 
+## Local call recording (Windows)
+
+open_mess can record your Teams calls on your own computer and turn them into text there, with
+Whisper (large-v3-turbo) on the CPU. It is off until you turn it on in the configuration window
+(Nagrywanie rozmów); the model, about 1.6 GB, is downloaded only from there. The design is
+[`.specs/2026-10-28-local-transcription.md`](.specs/2026-10-28-local-transcription.md) (in Polish).
+
+- **What is recorded**: from the moment a Teams call starts until it ends, everything the device
+  Teams plays the call on plays (the other participants, but also notifications and other apps),
+  and your microphone only while it is on in Teams. A toast and the tray show each recording and
+  can stop it; a stopped call is not recorded again.
+- **Where it stays**: `%LOCALAPPDATA%\open_mess\recordings`, never in a roaming profile, never in
+  logs and never sent anywhere. The audio is deleted once it is transcribed (or after 7 days if it
+  cannot be); the text stays until you delete it.
+- **Who reads it**: agents with the read permission of "Nagrania lokalne" (on by default), through
+  `list_recordings` and `get_recording_transcript`, with the text marked as other people's words;
+  agents can stop a recording (`stop_recording`) but never start one. You read your transcripts in
+  the window, whatever agents may.
+- **Telling the participants** is up to you: open_mess reminds you with every recording and sends
+  nothing to them. Recording calls may be against your organisation's policies or the law where you
+  are; that decision is yours.
+
 ## Roadmap
 
 1. **Messages**: core, CLI, MCP, configuration window, triggers, the Teams module. Then Discord
