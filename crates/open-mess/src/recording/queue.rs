@@ -239,7 +239,8 @@ pub fn whisper(local: PathBuf) -> (Arc<Engine>, Arc<Ready>) {
     let engine = {
         let (local, damaged) = (local.clone(), Arc::clone(&damaged));
         Arc::new(move |folder: &Path, language: Option<&str>, cancel: &AtomicBool, progress: &AtomicU8| {
-            let revision = model::installed(&local).ok_or_else(|| SttError::Model("no model".into()))?;
+            // Deleted since the gate looked: the recording waits, like with a damaged model.
+            let revision = model::installed(&local).ok_or(SttError::Damaged)?;
             let model = stt::Model::load(&local, revision, cancel);
             if matches!(model, Err(SttError::Damaged)) {
                 *damaged.lock().unwrap_or_else(PoisonError::into_inner) = Some(written(&local));

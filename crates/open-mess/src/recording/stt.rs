@@ -414,7 +414,8 @@ impl Model {
         let read = |file| {
             model::read_verified(&dir, file, cancel).map_err(|err| match err.kind() {
                 std::io::ErrorKind::Interrupted => SttError::Cancelled,
-                std::io::ErrorKind::InvalidData => SttError::Damaged,
+                // Of another size or sum, or gone while it was read (the model was deleted).
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound => SttError::Damaged,
                 _ => err.into(),
             })
         };

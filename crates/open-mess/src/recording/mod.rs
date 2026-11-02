@@ -135,12 +135,42 @@ pub struct Entry {
 
 /// What a recording and an update tell each other (4.8): an update does not stop the daemon
 /// while a call is recorded, and no recording starts once the daemon hands over to the helper.
+/// One state for both, so that a recording that starts and a handover never both go ahead.
 #[derive(Debug, Default)]
-pub struct UpdateLink {
+pub struct UpdateLink(std::sync::atomic::AtomicU8);
+
+const IDLE: u8 = 0;
+const RECORDING: u8 = 1;
+const HANDOVER: u8 = 2;
+
+impl UpdateLink {
+    fn swap(&self, from: u8, to: u8) -> bool {
+        self.0.compare_exchange(from, to, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok()
+    }
+
+    /// A recording starts, unless the daemon hands over.
+    pub fn start_recording(&self) -> bool {
+        self.swap(IDLE, RECORDING)
+    }
+
+    pub fn end_recording(&self) {
+        self.swap(RECORDING, IDLE);
+    }
+
     /// A call is recorded now.
-    pub recording: std::sync::atomic::AtomicBool,
-    /// The daemon hands over to the update's helper and is about to end.
-    pub handover: std::sync::atomic::AtomicBool,
+    pub fn recording(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) == RECORDING
+    }
+
+    /// The daemon hands over to the update's helper, unless a call is recorded.
+    pub fn start_handover(&self) -> bool {
+        self.swap(IDLE, HANDOVER)
+    }
+
+    /// The handover failed: the daemon goes on.
+    pub fn end_handover(&self) {
+        self.swap(HANDOVER, IDLE);
+    }
 }
 
 /// Why a recording cannot start (4.4).

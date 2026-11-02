@@ -94,6 +94,9 @@ struct Inner {
     works: bool,
     /// `skip.json` was looked at with the first read.
     checked: bool,
+    /// The device whose capture could not be opened in the call going on: no new recording
+    /// starts while Teams stays on it (4.2).
+    lost: Option<String>,
 }
 
 pub struct Recorder {
@@ -190,19 +193,26 @@ impl Recorder {
             if inner.skip {
                 self.set_skip(&mut inner, false);
             }
-            (inner.told, inner.reason) = (false, None);
+            (inner.told, inner.reason, inner.lost) = (false, None, None);
         }
         if inner.active.is_some() {
             if let Some(reason) = self.end_reason(&mut inner, seen, now) {
                 let active = inner.active.take();
                 drop(inner);
                 if let Some(active) = active {
-                    // Six hours, or a capture that failed, end it as a stop does: the rest of the
-                    // call is not recorded, no new recording every few seconds (4.2).
-                    // Only while the call goes on: one that ended with this read leaves nothing to skip.
+                    // No track left open: the recording ends without skipping the call (4.2), and
+                    // starts again once Teams moves to another device.
+                    let tracks_lost = reason == Some(Reason::CaptureFailed);
                     let reason = self.end(active, reason, false, None);
-                    if seen.call && !seen.ended && matches!(reason, Some(Reason::TooLong | Reason::CaptureFailed | Reason::WriteFailed)) {
-                        let mut inner = self.locked();
+                    // Only while the call goes on: one that ended with this read leaves nothing to skip.
+                    let going_on = seen.call && !seen.ended;
+                    let mut inner = self.locked();
+                    if going_on && tracks_lost {
+                        inner.lost = seen.speaker.clone();
+                    } else if going_on && matches!(reason, Some(Reason::TooLong | Reason::CaptureFailed | Reason::WriteFailed)) {
+                        // Six hours, a capture that panicked or a write that failed end it as a
+                        // stop does: the rest of the call is not recorded, no new recording every
+                        // few seconds (4.2).
                         self.set_skip(&mut inner, true);
                     }
                 }
@@ -257,9 +267,9 @@ impl Recorder {
     }
 
     fn start(&self, inner: &mut Inner, seen: &Observation, now: Instant) -> Result<(), &'static str> {
-        // The daemon is about to end for an update; the rest of the call is recorded after it (4.1).
-        if self.link.handover.load(Ordering::SeqCst) {
-            return Err("trwa aktualizacja");
+        // Teams moved to no other device since the capture could not open this one in this call.
+        if inner.lost.is_some() && inner.lost == seen.speaker {
+            return Err("nie da się otworzyć urządzenia rozmowy");
         }
         if !self.ui_ready.load(Ordering::SeqCst) {
             return Err("brak ikony w zasobniku");
@@ -275,7 +285,17 @@ impl Recorder {
             });
         }
         let microphone = (self.hooks.settings)().microphone;
-        let id = self.recordings.create(millis(SystemTime::now())).map_err(|_| "błąd tworzenia nagrania")?;
+        // The daemon is about to end for an update; the rest of the call is recorded after it (4.1).
+        if !self.link.start_recording() {
+            return Err("trwa aktualizacja");
+        }
+        let id = match self.recordings.create(millis(SystemTime::now())) {
+            Ok(id) => id,
+            Err(_) => {
+                self.link.end_recording();
+                return Err("błąd tworzenia nagrania");
+            }
+        };
         let started = self.recordings.path(&id).ok_or(io::ErrorKind::NotFound).map_err(io::Error::from).and_then(|path| {
             let others = Track::create(&path.join("others.wav"))?;
             let me = if microphone { Some(Track::create(&path.join("me.wav"))?) } else { None };
@@ -288,10 +308,10 @@ impl Recorder {
             Ok(started) => started,
             Err(_) => {
                 let _ = self.recordings.delete(&id);
+                self.link.end_recording();
                 return Err("błąd tworzenia nagrania");
             }
         };
-        self.link.recording.store(true, Ordering::SeqCst);
         self.queue.recording(Some(&id));
         self.hooks.notices.started(&id, microphone);
         self.indicate(true);
@@ -314,7 +334,7 @@ impl Recorder {
         if let Ok(meta) = self.recordings.meta(&active.id) {
             let _ = self.recordings.set_meta(&active.id, &Meta { state: State::Waiting, end_ms: Some(millis(SystemTime::now())), reason, ..meta });
         }
-        self.link.recording.store(false, Ordering::SeqCst);
+        self.link.end_recording();
         self.queue.recording(None);
         if delete {
             let _ = self.queue.delete(&self.recordings, &active.id);
@@ -355,12 +375,22 @@ impl Recorder {
         }
     }
 
-    /// Deletes a recording from the window: the one going on stops first.
+    /// Deletes a recording from the window: the one going on stops first (and its call is not
+    /// recorded again, as with Zatrzymaj i usuń). A folder that cannot go is an error.
     pub fn delete(&self, id: &str) -> io::Result<()> {
-        if self.stop(By::Owner, true, Some(id)).is_some() {
-            return Ok(());
-        }
+        let _ = self.stop(By::Owner, false, Some(id));
         self.queue.delete(&self.recordings, id)
+    }
+
+    /// Runs `work` (the model's removal) while nothing is recorded or transcribed, and holds new
+    /// recordings back meanwhile (4.6); refused otherwise. A transcription that starts during it
+    /// finds the model gone and waits.
+    pub fn without_work<T>(&self, work: impl FnOnce() -> T) -> Result<T, &'static str> {
+        let inner = self.locked();
+        if inner.active.is_some() || self.queue.view().running.is_some() {
+            return Err("trwa nagrywanie albo transkrypcja");
+        }
+        Ok(work())
     }
 
     #[cfg(test)]
@@ -497,6 +527,8 @@ mod tests {
         model: Arc<AtomicBool>,
         /// Makes the capture thread panic once stopped.
         panics: Arc<AtomicBool>,
+        /// Makes the capture find no device it can open.
+        no_device: Arc<AtomicBool>,
     }
 
     fn setup() -> Setup {
@@ -511,6 +543,7 @@ mod tests {
         let queue = Arc::new(Queue::start(dir.path(), engine, Arc::new(|| Err("held in tests")), Arc::new(|| None)).unwrap());
         let (told, auto, model, panics) =
             (Arc::new(Told::default()), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let no_device = Arc::new(AtomicBool::new(false));
         let hooks = Hooks {
             settings: {
                 let auto = Arc::clone(&auto);
@@ -522,9 +555,12 @@ mod tests {
                 Box::new(move || if model.load(Ordering::SeqCst) { "ready" } else { "missing" })
             },
             capture: {
-                let panics = Arc::clone(&panics);
+                let (panics, no_device) = (Arc::clone(&panics), Arc::clone(&no_device));
                 Box::new(move |others, me, control| {
                     let panics = Arc::clone(&panics);
+                    if no_device.load(Ordering::SeqCst) {
+                        *control.dead.lock().unwrap() = (true, true);
+                    }
                     std::thread::Builder::new().spawn(move || {
                         while !control.stop.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_millis(2));
@@ -538,7 +574,7 @@ mod tests {
             notices: Arc::clone(&told) as Arc<dyn Notices>,
         };
         let recorder = Recorder::new(dir.path(), queue, Arc::new(AtomicBool::new(true)), hooks);
-        Setup { _dir: dir, recorder, told, auto, model, panics }
+        Setup { _dir: dir, recorder, told, auto, model, panics, no_device }
     }
 
     fn on(active: bool) -> Observation {
@@ -719,6 +755,23 @@ mod tests {
     }
 
     #[test]
+    fn a_device_that_does_not_open_ends_the_recording_without_skipping_the_call() {
+        let setup = setup();
+        setup.no_device.store(true, Ordering::SeqCst);
+        setup.recorder.observe(&on(true), Instant::now());
+        let id = setup.recorder.active().unwrap();
+        setup.recorder.observe(&on(true), Instant::now());
+        assert_eq!(state(&setup, &id).reason, Some(Reason::CaptureFailed));
+        // Teams stays on that device: nothing new starts.
+        setup.recorder.observe(&on(true), Instant::now());
+        assert!(setup.recorder.active().is_none() && !setup.recorder.skip_file().exists());
+        // Teams moves to another one: the call is recorded again.
+        setup.no_device.store(false, Ordering::SeqCst);
+        setup.recorder.observe(&Observation { speaker: Some("speakers".into()), ..on(true) }, Instant::now());
+        assert!(setup.recorder.active().is_some());
+    }
+
+    #[test]
     fn a_stopped_call_stays_stopped_when_the_detection_comes_back() {
         let setup = setup();
         setup.recorder.observe(&on(true), Instant::now());
@@ -734,11 +787,13 @@ mod tests {
         let setup = setup();
         let link = setup.recorder.link();
         setup.recorder.observe(&on(true), Instant::now());
-        assert!(link.recording.load(Ordering::SeqCst));
+        assert!(link.recording());
+        // While a call is recorded the daemon does not hand over.
+        assert!(!link.start_handover());
         setup.recorder.observe(&ended(), Instant::now());
-        assert!(!link.recording.load(Ordering::SeqCst));
+        assert!(!link.recording());
         setup.told.take();
-        link.handover.store(true, Ordering::SeqCst);
+        assert!(link.start_handover());
         setup.recorder.observe(&on(true), Instant::now());
         assert!(setup.recorder.active().is_none());
         assert_eq!(setup.told.take(), ["not recording: trwa aktualizacja"]);

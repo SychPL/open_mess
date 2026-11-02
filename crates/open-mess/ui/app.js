@@ -1018,7 +1018,7 @@ async function renderRecording() {
   root.append(buttons);
   renderRecordings(root, recording);
   // Progress while the section is open.
-  const busy = recording.active || recording.recordings.some((item) => item.state === "transcribing");
+  const busy = recording.active || recording.recordings.some((item) => item.state === "transcribing" || item.state === "waiting");
   if (download.state === "running" || busy) {
     setTimeout(() => {
       if (current === "recording") renderRecording().catch(showError);

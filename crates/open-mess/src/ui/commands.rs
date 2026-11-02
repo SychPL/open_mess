@@ -786,12 +786,12 @@ pub fn download_model(state: &UiState) -> Result<(), String> {
 
 /// "Usuń model"; refused while a call is recorded or transcribed (4.6).
 pub fn delete_model(state: &UiState) -> Result<(), String> {
-    if let Some(recorder) = &state.recorder
-        && (recorder.active().is_some() || recorder.queue().view().running.is_some())
-    {
-        return Err("trwa nagrywanie albo transkrypcja".into());
+    let delete = || models(state)?.delete();
+    match &state.recorder {
+        // Checked and deleted while no recording can start (Codex on db70d3c).
+        Some(recorder) => recorder.without_work(delete).map_err(str::to_owned)?,
+        None => delete(),
     }
-    models(state)?.delete()
 }
 
 /// What records the calls (spec 2026-10-28-local-transcription, 4.6).

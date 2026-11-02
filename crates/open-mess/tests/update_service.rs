@@ -393,18 +393,38 @@ async fn a_recorded_call_holds_the_installation_until_it_ends() {
     let h = harness(Ok(()), true).await;
     h.check().await;
     // Not while a call is recorded.
-    h.recording.recording.store(true, Ordering::SeqCst);
+    assert!(h.recording.start_recording());
     assert_eq!(h.service.install(), Err("aktualizacja po końcu nagrania".to_string()));
-    h.recording.recording.store(false, Ordering::SeqCst);
+    h.recording.end_recording();
     // A call that starts in phase A stops the installation; the window says why.
     h.triggers.open_batches.store(1, Ordering::SeqCst);
     h.service.install().unwrap();
     sleep(MINUTE).await;
-    h.recording.recording.store(true, Ordering::SeqCst);
+    assert!(h.recording.start_recording());
     sleep(Duration::from_secs(1)).await;
     let view = h.service.view();
     assert_eq!(view.state, UpdateState::Ready);
     assert_eq!(view.last_result.as_deref(), Some("przerwano: nagrywanie rozmowy"));
+    assert!(h.launched().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_during_a_call_is_still_the_users() {
+    let h = harness(Ok(()), true).await;
+    h.service.set_auto_install(true).unwrap();
+    h.triggers.open_batches.store(1, Ordering::SeqCst);
+    h.check().await;
+    h.service.install().unwrap();
+    sleep(MINUTE).await;
+    // The user cancels; a call is being recorded at the same time.
+    h.service.cancel();
+    assert!(h.recording.start_recording());
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(h.service.view().state, UpdateState::Ready);
+    // After the call nothing starts on its own: the user said no.
+    h.recording.end_recording();
+    h.triggers.open_batches.store(0, Ordering::SeqCst);
+    sleep(10 * MINUTE).await;
     assert!(h.launched().is_empty());
 }
 
@@ -418,11 +438,11 @@ async fn installing_on_its_own_tries_again_after_the_call() {
     // Started on its own (it waits in phase A for the batch), then stopped by a call.
     h.service.install().unwrap();
     sleep(MINUTE).await;
-    h.recording.recording.store(true, Ordering::SeqCst);
+    assert!(h.recording.start_recording());
     sleep(Duration::from_secs(1)).await;
     assert_eq!(h.service.view().state, UpdateState::Ready);
     // The call ends and everything is quiet: the same release installs on its own.
-    h.recording.recording.store(false, Ordering::SeqCst);
+    h.recording.end_recording();
     h.triggers.open_batches.store(0, Ordering::SeqCst);
     timeout(5 * MINUTE, h.exit.notified()).await.expect("installed on its own after the call");
     assert_eq!(h.launched().len(), 1);
