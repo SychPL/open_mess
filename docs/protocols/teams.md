@@ -4,13 +4,15 @@ Status: sections 1-8 (2026-10-26) and 9 (2026-10-27) come from static analysis: 
 request was sent to a Microsoft service, and nothing from the official client's user data
 (`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\`) or any browser profile was read. Facts later
 checked on the wire, with the user present, are in "Live results" at the end and override the
-static sections where they differ.
+static sections where they differ. Section 10 (2026-10-29) is about what Windows shows of the
+client's audio, checked live, not about the protocol.
 
 Every fact carries one marker:
 
 - **CONFIRMED** - present in the shipped client code or configuration; evidence given.
 - **CHANGED** - the spec (section 9) assumed something else; what the code actually does is given.
 - **UNCONFIRMED** - static analysis could not settle it; see "Needs live capture".
+- **FAILED** - checked live and does not work; what works instead is given next to it.
 
 "Shipped code does X" never proves the server accepts X from a different client. Everything that
 open_mess will depend on still needs one redacted live capture before code relies on it (AGENTS.md,
@@ -507,6 +509,95 @@ item 9.
 MCPS also returns `AISummary` and `callCrux` resources, and the recap reads AI notes from
 `meetingRecapServiceEndpoint` and `.../api/mcps/prod/meetingcatchup/...`. These are Copilot outputs,
 not transcripts; not analysed further (stage 2 leaves summaries to the agent).
+
+## 10. Local recording (Windows audio)
+
+Added 2026-10-29 for `.specs/2026-10-28-local-transcription.md` (step 0). Nothing here comes from
+Teams' protocol or data: these are facts about what Windows shows of the official client's audio
+while it is in a call, checked live on the owner's computer (Windows 11 build 26300, a USB headset)
+with a scratch probe outside the repository (`wasapi` 0.26, `sysinfo` 0.37, `winreg` 0.56). The
+probe printed only per-second stream states, packet counts, sample counts and RMS levels; no audio
+was saved, and no device id, process path or name of a participant is recorded here. Two calls with
+the owner present, the second with one mute of about 40 s.
+
+### 10.1 Detecting a call
+
+- **FAILED** `HKCU\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone`:
+  on this computer Windows has not written `LastUsedTimeStart` / `LastUsedTimeStop` for any app since
+  2026-09-22, including the probe itself while it held the microphone for 15 minutes. The key cannot
+  tell whether Teams uses the microphone.
+- **CONFIRMED LIVE** audio sessions (`IAudioSessionManager2` through `wasapi`:
+  `Device::get_iaudiosessionmanager`, `get_audiosessionenumerator`, `AudioSessionControl::get_process_id`
+  and `get_state`, all safe functions). During a call one `ms-teams.exe` process (a child of the main
+  one, not the main one) has an `Active` capture session on the headset microphone and two `Active`
+  render sessions on the headset. Outside a call `ms-teams.exe` has no session.
+- **CONFIRMED LIVE** mute: within 1 s of muting in Teams the capture session and both render sessions
+  turn `Inactive`; on unmute the render sessions turn `Active` again about 4 s before the capture
+  session. The sessions stay listed while muted.
+- **CONFIRMED LIVE** hang-up: the same switch to `Inactive` within 1 s, and about 180 s later the
+  sessions leave the list (both calls). Mute and hang-up look alike until then.
+- **CONFIRMED LIVE** interface sounds (on mute, the call-end tone) come from `msedgewebview2.exe` in the
+  Teams process tree, in short separate render sessions that also leave the list about 180 s after
+  their last use.
+
+### 10.2 Capturing the call
+
+- **FAILED** process loopback (`AudioClient::new_application_loopback_client`): the main Teams process
+  with its tree, the child that owns the call sessions, and exclude mode on the other processes all
+  return digital silence during a call (packets arrive, every sample 0), at 16 kHz with
+  `AUTOCONVERTPCM` and at 48 kHz float alike. The same call captures a quiet test tone played by
+  another process, so the method works; the call audio is not visible to it.
+- **CONFIRMED LIVE** endpoint loopback of the headset (render device opened for capture in shared
+  mode) carries the call: RMS 1000-4700 while the other side spoke.
+- **CONFIRMED LIVE** a shared-mode capture of the headset microphone beside Teams works and changes
+  nothing in the call; `AUTOCONVERTPCM` gives 16 kHz mono 16-bit for the microphone, endpoint loopback
+  and process loopback.
+
+### 10.3 Model download hosts
+
+- **CONFIRMED LIVE** (2026-10-28, response headers only, then one full download through open_mess's
+  own download code with its host list): `https://huggingface.co/openai/whisper-large-v3-turbo/resolve/<commit>/<file>`
+  redirects the weights to a host under `hf.co` (`us.aws.cdn.hf.co` from this network). Every file
+  of the pinned revision downloaded with the allowed hosts `huggingface.co` and `*.hf.co` and matched
+  its SHA-256.
+
+### 10.4 Transcription on the CPU (spec step 0e)
+
+Not a Teams fact, kept here with the rest of the spec's step 0. Measured 2026-10-30 on the owner's
+computer (i9-13900K, 64 GB) with candle 0.11, `openai/whisper-large-v3-turbo` at the pinned revision,
+on Polish speech made with the Windows text-to-speech voices (no sample was downloaded). Release
+builds of scratch benchmarks outside the repository; each line is one run.
+
+- The spec's path (`recording/stt.rs`: timestamps, temperature fallback, f32, 16 threads), 600 s of
+  continuous speech on one track: 716 s, peak working set 4.54 GB, text nearly word-perfect. One
+  30 s window: about 9.5 s for the encoder and language detection, which is also how long a cancel
+  waited when it came during the encoder.
+- 119 s sample (4 windows), a plain greedy decoder without timestamps, same in every line:
+
+  | Variant | Encoder per window | Decoder step | Peak |
+  | --- | --- | --- | --- |
+  | f32, 16 threads | 9.27 s | 151 ms | 4.55 GB |
+  | f32, 32 threads | 8.69 s | 156 ms | 4.55 GB |
+  | q8_0 (quantized in memory from the same weights) | 43.9 s | 333 ms | 1.54 GB |
+  | q5k | 24.9 s | 208 ms | 1.28 GB |
+  | q4k | 23.6 s | 206 ms | 1.21 GB |
+  | f32, decoder keeps its self-attention keys and values | 9.67 s | 72 ms | 5.04 GB |
+
+  The cached decoder's text was byte-identical to the plain f32 one; q8_0 matched it on every window
+  without a repetition loop, q5k and q4k did not.
+- A two-track dialogue (turns of 5-20 s, each track silent while the other speaks, 10 minutes): all
+  40 windows of 30 s have speech in them, so skipping silent windows saves nothing; packing only the
+  speech (30 ms frames over the silence threshold) needs 16 windows.
+
+### 10.5 Still to check (spec step 0b)
+
+- With the owner muted and another participant speaking: the endpoint loopback level and the state of
+  the `ms-teams.exe` render sessions.
+- A mute longer than 4 minutes: whether the `ms-teams.exe` sessions stay listed.
+- Joining with the microphone off: which `ms-teams.exe` sessions turn `Active`.
+- An incoming call's ring and a video played in a chat: whether `ms-teams.exe` has an `Active` session
+  outside a call.
+- Switching the device in Teams during a call: how long the sessions are gone.
 
 ## Proposed spec changes
 
