@@ -254,12 +254,14 @@ fn silent(samples: &[i16]) -> bool {
 }
 
 /// The speech of the track at `path`, as ranges of samples `[start, end)` in order: the loud
-/// frames with [`MARGIN`] on both sides, pauses shorter than [`JOIN`] joined.
-fn speech(path: &Path) -> Result<Vec<(u64, u64)>, SttError> {
+/// frames with [`MARGIN`] on both sides, pauses shorter than [`JOIN`] joined. `cancel` is checked
+/// every 30 s of audio: a 6 h track takes seconds to read.
+fn speech(path: &Path, cancel: &AtomicBool) -> Result<Vec<(u64, u64)>, SttError> {
     let mut reader = wav::Reader::open(path)?;
     let total = reader.remaining();
     let (mut ranges, mut chunk, mut at): (Vec<(u64, u64)>, _, u64) = (Vec::new(), Vec::with_capacity(m::N_SAMPLES), 0);
     while {
+        check(cancel)?;
         chunk.clear();
         reader.read(&mut chunk, m::N_SAMPLES)? > 0
     } {
@@ -288,8 +290,13 @@ struct Part {
 
 /// Packs the `ranges` of the track at `path` into windows of at most 30 s, [`GAP`] of silence
 /// between pieces and a range longer than a window split, and hands `each` every window with its
-/// parts. The file is read once, in order.
-fn pack(path: &Path, ranges: &[(u64, u64)], mut each: impl FnMut(&[i16], &[Part]) -> Result<(), SttError>) -> Result<(), SttError> {
+/// parts. The file is read once, in order; `cancel` is checked while silence is skipped too.
+fn pack(
+    path: &Path,
+    ranges: &[(u64, u64)],
+    cancel: &AtomicBool,
+    mut each: impl FnMut(&[i16], &[Part]) -> Result<(), SttError>,
+) -> Result<(), SttError> {
     let mut reader = wav::Reader::open(path)?;
     let (mut window, mut parts, mut skipped) = (Vec::with_capacity(m::N_SAMPLES), Vec::new(), Vec::new());
     let mut read = 0u64;
@@ -305,6 +312,7 @@ fn pack(path: &Path, ranges: &[(u64, u64)], mut each: impl FnMut(&[i16], &[Part]
                 continue;
             }
             while read < at {
+                check(cancel)?;
                 skipped.clear();
                 let got = reader.read(&mut skipped, (at - read).min(m::N_SAMPLES as u64) as usize)?;
                 if got == 0 {
@@ -531,9 +539,9 @@ impl Model {
         let mut before = 0;
         progress.store(0, Ordering::SeqCst);
         for (path, speaker, length) in tracks {
-            let ranges = speech(&path)?;
+            let ranges = speech(&path, cancel)?;
             let mut language = fixed;
-            pack(&path, &ranges, |samples, parts| {
+            pack(&path, &ranges, cancel, |samples, parts| {
                 check(cancel)?;
                 let features = self.encode(samples, cancel)?;
                 let found = match language {
@@ -749,7 +757,8 @@ mod tests {
 
     fn windows(path: &Path) -> Vec<Vec<Part>> {
         let mut found = Vec::new();
-        pack(path, &speech(path).unwrap(), |samples, parts| {
+        let go = AtomicBool::new(false);
+        pack(path, &speech(path, &go).unwrap(), &go, |samples, parts| {
             assert!(samples.len() <= m::N_SAMPLES);
             found.push(parts.to_vec());
             Ok(())
@@ -766,7 +775,11 @@ mod tests {
         track(dir.path(), "others.wav", &samples);
         let path = dir.path().join("others.wav");
         // In whole frames of 480 samples, 300 ms around each.
-        assert_eq!(speech(&path).unwrap(), [(0, 36_960), (986_880, 1_008_000)]);
+        assert_eq!(speech(&path, &AtomicBool::new(false)).unwrap(), [(0, 36_960), (986_880, 1_008_000)]);
+        // A call that starts stops the reading of a track (4.3).
+        let stop = AtomicBool::new(true);
+        assert!(matches!(speech(&path, &stop), Err(SttError::Cancelled)));
+        assert!(matches!(pack(&path, &[(986_880, 1_008_000)], &stop, |_, _| Ok(())), Err(SttError::Cancelled)));
         // 63 s of track, one window: the minute of silence is not there.
         let found = windows(&path);
         assert_eq!(found, [vec![Part { window: 0, track: 0, len: 36_960 }, Part { window: 40_160, track: 986_880, len: 21_120 }]]);
