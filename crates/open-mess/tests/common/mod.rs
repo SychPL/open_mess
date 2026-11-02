@@ -145,7 +145,7 @@ pub async fn daemon(files: &[(&str, &str)]) -> Daemon {
     let credentials: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
     let accounts = accounts(dir.path(), modules, Arc::clone(&credentials));
     let mut registry = Registry::new(Instant::now(), Arc::clone(&accounts));
-    registry.set_recordings(Recordings::new(&dir.path().join("local")));
+    registry.set_recordings(Recordings::new(&dir.path().join("local")), None);
     Daemon { dir, accounts, registry, events, credentials, sign_ins }
 }
 

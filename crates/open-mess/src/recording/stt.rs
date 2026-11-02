@@ -6,8 +6,8 @@
 //! capped, and none of it reaches a path or a log.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
@@ -395,15 +395,20 @@ pub struct Model {
 impl Model {
     /// Loads a revision's files from `<local>\models`, each checked against its sum. The weights
     /// are read whole and handed over without mapping the file, which candle offers only as
-    /// `unsafe` (AGENTS.md).
-    pub fn load(local: &Path, revision: &Revision) -> Result<Model, SttError> {
+    /// `unsafe` (AGENTS.md). `cancel` stops it while the files are read and before the network
+    /// is built.
+    pub fn load(local: &Path, revision: &Revision, cancel: &AtomicBool) -> Result<Model, SttError> {
         let dir = model::folder(local, revision);
         let [config, tokenizer, weights] = &revision.files;
-        let config: Config =
-            serde_json::from_slice(&model::read_verified(&dir, config)?).map_err(|err| SttError::Model(format!("config.json: {err}")))?;
-        let vocab = Vocab::parse(&model::read_verified(&dir, tokenizer)?)?;
+        let read = |file| {
+            model::read_verified(&dir, file, cancel)
+                .map_err(|err| if err.kind() == std::io::ErrorKind::Interrupted { SttError::Cancelled } else { err.into() })
+        };
+        let config: Config = serde_json::from_slice(&read(config)?).map_err(|err| SttError::Model(format!("config.json: {err}")))?;
+        let vocab = Vocab::parse(&read(tokenizer)?)?;
         let device = Device::Cpu;
-        let vb = VarBuilder::from_buffered_safetensors(model::read_verified(&dir, weights)?, m::DTYPE, &device)?;
+        let vb = VarBuilder::from_buffered_safetensors(read(weights)?, m::DTYPE, &device)?;
+        check(cancel)?;
         Model::new(Whisper::load(&vb, config)?, vocab, device)
     }
 
@@ -505,19 +510,27 @@ impl Model {
 
     /// Transcribes a recording's tracks (`others.wav` and `me.wav` in `folder`), with `language`
     /// (a Whisper code) or the language found in each track's first window with sound. The
-    /// transcript's language is the one of the first track with speech.
-    pub fn transcribe(&mut self, folder: &Path, language: Option<&str>, cancel: &AtomicBool) -> Result<Transcript, SttError> {
+    /// transcript's language is the one of the first track with speech. `progress` follows the
+    /// share of both tracks' audio done, in percent.
+    pub fn transcribe(&mut self, folder: &Path, language: Option<&str>, cancel: &AtomicBool, progress: &AtomicU8) -> Result<Transcript, SttError> {
         let fixed = match language {
             Some(code) => Some(self.vocab.language(code).ok_or_else(|| SttError::Model(format!("no language {code}")))?),
             None => None,
         };
         let mut cues = Vec::new();
         let mut first_language = None;
+        let mut tracks: Vec<(PathBuf, Speaker, u64)> = Vec::new();
         for (track, speaker) in TRACKS.iter().zip([Speaker::Others, Speaker::Me]) {
             let path = folder.join(track);
-            if !path.exists() {
-                continue;
+            if path.exists() {
+                let length = wav::Reader::open(&path)?.remaining();
+                tracks.push((path, speaker, length));
             }
+        }
+        let total = tracks.iter().map(|(_, _, length)| length).sum::<u64>().max(1);
+        let mut before = 0;
+        progress.store(0, Ordering::SeqCst);
+        for (path, speaker, length) in tracks {
             let ranges = speech(&path)?;
             let mut language = fixed;
             pack(&path, &ranges, |samples, parts| {
@@ -533,8 +546,11 @@ impl Model {
                     let start_ms = to_track(parts, start, true);
                     cues.push(Cue { start_ms, end_ms: to_track(parts, end, false).max(start_ms), speaker, text });
                 }
+                let done = before + parts.last().map_or(0, |part| part.track + part.len);
+                progress.store((done * 100 / total).min(100) as u8, Ordering::SeqCst);
                 Ok(())
             })?;
+            before += length;
         }
         // Stable: at the same time the other side comes first, as the tracks were read.
         cues.sort_by_key(|cue| cue.start_ms);
@@ -791,22 +807,25 @@ mod tests {
         let noise: Vec<i16> = (0..32_000).map(|i| if i % 2 == 0 { 3000 } else { -3000 }).collect();
         track(dir.path(), "me.wav", &noise);
         let mut model = zero_model();
-        let transcript = model.transcribe(dir.path(), None, &AtomicBool::new(false)).unwrap();
+        let progress = AtomicU8::new(50);
+        let transcript = model.transcribe(dir.path(), None, &AtomicBool::new(false), &progress).unwrap();
         assert!(transcript.language.is_some());
+        // Both tracks counted: the microphone's 2 s are the last of 33 s.
+        assert_eq!(progress.load(Ordering::SeqCst), 100);
         for cue in &transcript.cues {
             assert_eq!(cue.speaker, Speaker::Me);
             assert!(cue.start_ms <= cue.end_ms && cue.end_ms <= 2000);
         }
         let silent_only = tempfile::tempdir().unwrap();
         track(silent_only.path(), "others.wav", &vec![0; 16_000]);
-        assert!(model.transcribe(silent_only.path(), Some("pl"), &AtomicBool::new(false)).unwrap().cues.is_empty());
-        assert!(matches!(model.transcribe(silent_only.path(), Some("xx"), &AtomicBool::new(false)), Err(SttError::Model(_))));
+        assert!(model.transcribe(silent_only.path(), Some("pl"), &AtomicBool::new(false), &AtomicU8::new(0)).unwrap().cues.is_empty());
+        assert!(matches!(model.transcribe(silent_only.path(), Some("xx"), &AtomicBool::new(false), &AtomicU8::new(0)), Err(SttError::Model(_))));
     }
 
     #[test]
     fn a_cancelled_transcription_stops() {
         let dir = tempfile::tempdir().unwrap();
         track(dir.path(), "me.wav", &(0..16_000).map(|i| if i % 2 == 0 { 3000 } else { -3000 }).collect::<Vec<_>>());
-        assert!(matches!(zero_model().transcribe(dir.path(), None, &AtomicBool::new(true)), Err(SttError::Cancelled)));
+        assert!(matches!(zero_model().transcribe(dir.path(), None, &AtomicBool::new(true), &AtomicU8::new(0)), Err(SttError::Cancelled)));
     }
 }

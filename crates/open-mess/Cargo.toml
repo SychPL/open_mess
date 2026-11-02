@@ -69,6 +69,8 @@ minisign-verify = "0.3.0"
 miniz_oxide = "0.8.9"
 # Module files and manifests are approved by their SHA-256.
 sha2 = "0.10.9"
+# Free memory before a transcription starts (recording/queue.rs, spec 2026-10-28-local-transcription 4.3).
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
 # Sign-in pages' URLs (ui/sign_in_page.rs); the version the module host builds.

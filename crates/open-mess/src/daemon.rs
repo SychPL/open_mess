@@ -190,7 +190,14 @@ fn start(
     // In %LOCALAPPDATA%, which only Windows has (spec 2026-10-28-local-transcription, 4.4); elsewhere
     // the recording tools say they are not supported.
     if let Some((paths, _)) = &update {
-        registry.set_recordings(crate::recording::Recordings::new(&paths.local));
+        use crate::recording::queue;
+        let local = paths.local.clone();
+        let store = Arc::clone(&accounts);
+        // The window's setting: `auto` (or none) lets the model find the language (4.3).
+        let language = Arc::new(move || store.store().get_config("recording.language").ok().flatten().filter(|code| code != "auto"));
+        // ponytail: a queue whose thread cannot start leaves recordings waiting; reported once a log sink exists.
+        let queue = queue::Queue::start(&local, queue::whisper(local.clone()), queue::ready(local.clone()), language).ok().map(Arc::new);
+        registry.set_recordings(crate::recording::Recordings::new(&local), queue);
     }
     let models = update.as_ref().and_then(|(paths, _)| {
         let base = url::Url::parse(crate::recording::model::BASE).ok()?;

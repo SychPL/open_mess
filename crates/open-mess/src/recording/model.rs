@@ -6,6 +6,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -86,17 +87,30 @@ fn remove_unfinished(revisions: &[Revision], local: &Path) {
     }
 }
 
+/// Bytes read between two looks at the cancel flag (4.3).
+const READ_STEP: usize = 64 * 1024 * 1024;
+
 /// Reads a model file whole. One of another size, or whose SHA-256 differs, is `InvalidData`
-/// (the model is damaged).
-pub fn read_verified(dir: &Path, file: &ModelFile) -> io::Result<Vec<u8>> {
-    let found = File::open(dir.join(file.name))?;
+/// (the model is damaged); `cancel` set meanwhile stops it as `Interrupted`.
+pub fn read_verified(dir: &Path, file: &ModelFile, cancel: &AtomicBool) -> io::Result<Vec<u8>> {
+    let mut found = File::open(dir.join(file.name))?.take(file.size + 1);
     // Sized up front: growing by doubling would hold up to twice the weights' 1.6 GB.
-    let mut bytes = Vec::with_capacity(found.metadata()?.len().min(file.size + 1) as usize);
-    found.take(file.size + 1).read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(found.get_ref().metadata()?.len().min(file.size + 1) as usize);
+    let mut hasher = Sha256::new();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let before = bytes.len();
+        if (&mut found).take(READ_STEP as u64).read_to_end(&mut bytes)? == 0 {
+            break;
+        }
+        hasher.update(bytes.get(before..).unwrap_or_default());
+    }
     if bytes.len() as u64 != file.size {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} has another size than expected", file.name)));
     }
-    let sum: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let sum: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if sum != file.sha256 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} does not match its checksum", file.name)));
     }
@@ -262,13 +276,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("abc"), b"abc").unwrap();
         let sum = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        assert_eq!(read_verified(dir.path(), &ModelFile { name: "abc", sha256: sum, size: 3 }).unwrap(), b"abc");
+        let go = AtomicBool::new(false);
+        let abc = ModelFile { name: "abc", sha256: sum, size: 3 };
+        assert_eq!(read_verified(dir.path(), &abc, &go).unwrap(), b"abc");
         let wrong = ModelFile { name: "abc", sha256: "00", size: 3 };
-        assert_eq!(read_verified(dir.path(), &wrong).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(read_verified(dir.path(), &wrong, &go).unwrap_err().kind(), io::ErrorKind::InvalidData);
         for size in [2, 4] {
             let other = ModelFile { name: "abc", sha256: sum, size };
-            assert_eq!(read_verified(dir.path(), &other).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(read_verified(dir.path(), &other, &go).unwrap_err().kind(), io::ErrorKind::InvalidData);
         }
+        // A call that starts stops the reading (4.3).
+        assert_eq!(read_verified(dir.path(), &abc, &AtomicBool::new(true)).unwrap_err().kind(), io::ErrorKind::Interrupted);
     }
 
     /// Two revisions, newest first, for what the window shows; files of one byte, never downloaded.

@@ -588,6 +588,10 @@ builds of scratch benchmarks outside the repository; each line is one run.
 - A two-track dialogue (turns of 5-20 s, each track silent while the other speaks, 10 minutes): all
   40 windows of 30 s have speech in them, so skipping silent windows saves nothing; packing only the
   speech (30 ms frames over the silence threshold) needs 16 windows.
+- After both changes (`recording/whisper.rs` with the cached decoder and the cancel check, speech
+  packed into windows), the spec's path on that two-track dialogue: 418 s for the 10 minutes, about
+  42 minutes per hour of a call, peak 4.54 GB; one window alone 22.8 s instead of 32.8 s with the
+  same text, and a cancel during the encoder returned after 0.11 s.
 
 ### 10.5 Still to check (spec step 0b)
 

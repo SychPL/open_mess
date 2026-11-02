@@ -28,6 +28,7 @@ use crate::modules::{ModuleInfo, ModuleState};
 use crate::pending::{Kind, Pending, State};
 use crate::permissions;
 use crate::recording::Recordings;
+use crate::recording::queue::Queue;
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
 use crate::triggers::engine::now_ms;
@@ -150,6 +151,8 @@ pub struct Registry {
     update: Option<UpdateService>,
     /// The local recordings; None where the daemon records nothing (not on Windows).
     recordings: Option<Recordings>,
+    /// Their transcription queue, for its progress.
+    queue: Option<Arc<Queue>>,
 }
 
 impl Registry {
@@ -167,6 +170,7 @@ impl Registry {
             accounts_restored: Arc::default(),
             update: None,
             recordings: None,
+            queue: None,
         }
     }
 
@@ -213,9 +217,10 @@ impl Registry {
         self.update = Some(update);
     }
 
-    /// The local recordings the recording tools read.
-    pub fn set_recordings(&mut self, recordings: Recordings) {
+    /// The local recordings the recording tools read, and their transcription queue.
+    pub fn set_recordings(&mut self, recordings: Recordings, queue: Option<Arc<Queue>>) {
         self.recordings = Some(recordings);
+        self.queue = queue;
     }
 
     pub fn list(&self) -> Vec<ToolInfo> {
@@ -282,7 +287,8 @@ impl Registry {
             return Err(ToolError::Module("not supported yet: local recording works on Windows only".into()));
         };
         let readable = || Ok(permissions::effective(&accounts.store(), permissions::LOCAL, None).map_err(failed)?.read);
-        recordings::call(recordings, readable, name, args)
+        let progress = |id: &str| self.queue.as_ref().and_then(|queue| queue.progress(id));
+        recordings::call(recordings, &progress, readable, name, args)
     }
 
     /// What the `status` tool answers; the daemon's own check during an update's probation reads it

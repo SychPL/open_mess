@@ -92,8 +92,15 @@ fn not_allowed() -> ToolError {
 
 /// Runs `name` (one of [`LIST`] and [`TRANSCRIPT`]); `readable` says whether an agent may read
 /// the recordings now. It is asked before the files are read and again before the answer goes
-/// out, so a permission taken back meanwhile lets nothing through (4.5).
-pub fn call(recordings: &Recordings, readable: impl Fn() -> Result<bool, ToolError>, name: &str, arguments: Value) -> Result<Value, ToolError> {
+/// out, so a permission taken back meanwhile lets nothing through (4.5). `progress` is the
+/// transcription's progress of a recording, while it runs.
+pub fn call(
+    recordings: &Recordings,
+    progress: &dyn Fn(&str) -> Option<u8>,
+    readable: impl Fn() -> Result<bool, ToolError>,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, ToolError> {
     if !arguments.is_object() {
         return Err(ToolError::InvalidArgs("arguments must be a JSON object".into()));
     }
@@ -101,7 +108,7 @@ pub fn call(recordings: &Recordings, readable: impl Fn() -> Result<bool, ToolErr
         return Err(not_allowed());
     }
     let result = match name {
-        LIST => list(recordings, args(arguments)?)?,
+        LIST => list(recordings, progress, args(arguments)?)?,
         TRANSCRIPT => transcript(recordings, args(arguments)?)?,
         _ => return Err(ToolError::UnknownTool(name.into())),
     };
@@ -111,7 +118,7 @@ pub fn call(recordings: &Recordings, readable: impl Fn() -> Result<bool, ToolErr
     Ok(shared::with_notice(result))
 }
 
-fn list(recordings: &Recordings, args: ListArgs) -> Result<Value, ToolError> {
+fn list(recordings: &Recordings, progress: &dyn Fn(&str) -> Option<u8>, args: ListArgs) -> Result<Value, ToolError> {
     let limit = args.limit.unwrap_or(50);
     if !(1..=500).contains(&limit) {
         return Err(ToolError::InvalidArgs("limit must be from 1 to 500".into()));
@@ -137,13 +144,13 @@ fn list(recordings: &Recordings, args: ListArgs) -> Result<Value, ToolError> {
         .filter(|Entry { meta, .. }| since.is_none_or(|since| i64::try_from(meta.start_ms).is_ok_and(|start| start >= since)))
         .take(limit as usize)
         .map(|Entry { id, meta }| {
+            let percent = (meta.state == State::Transcribing).then(|| progress(&id)).flatten();
             json!({
                 "recording": id,
                 "start": time(meta.start_ms),
                 "end": meta.end_ms.and_then(time),
                 "state": meta.state,
-                // ponytail: filled in once the transcription queue reports it.
-                "progress": null,
+                "progress": percent,
                 "language": language(&meta.language),
                 "reason": meta.reason,
             })
@@ -225,10 +232,10 @@ mod tests {
         let recordings = Recordings::new(dir.path());
         let id = done(&recordings, 3000);
         // A small default page; the largest one takes the most cues a page has.
-        let small = call(&recordings, yes, TRANSCRIPT, json!({"recording": id})).unwrap();
+        let small = call(&recordings, &|_| None, yes, TRANSCRIPT, json!({"recording": id})).unwrap();
         let small = small["untrusted"]["cues"].as_array().unwrap();
         assert!(small.len() < MAX_PAGE_CUES && serde_json::to_vec(small).unwrap().len() as u64 <= MAX_BYTES.2 + small.len() as u64);
-        let page = call(&recordings, yes, TRANSCRIPT, json!({"recording": id, "max_bytes": MAX_BYTES.1})).unwrap();
+        let page = call(&recordings, &|_| None, yes, TRANSCRIPT, json!({"recording": id, "max_bytes": MAX_BYTES.1})).unwrap();
         assert_eq!(page["language"], "pl");
         assert_eq!(page["start"], "2023-11-14T22:13:20.000Z");
         let cues = page["untrusted"]["cues"].as_array().unwrap();
@@ -236,11 +243,11 @@ mod tests {
         assert_eq!(cues[1], json!({"start": "00:00:01.000", "end": "00:00:01.900", "speaker": "others", "text": "zdanie 1"}));
         assert!(page["untrusted_notice"].is_string());
         assert_eq!(page["next_cursor"], 2000);
-        let last = call(&recordings, yes, TRANSCRIPT, json!({"recording": id, "cursor": 2000, "max_bytes": 4096})).unwrap();
+        let last = call(&recordings, &|_| None, yes, TRANSCRIPT, json!({"recording": id, "cursor": 2000, "max_bytes": 4096})).unwrap();
         let cues = last["untrusted"]["cues"].as_array().unwrap();
         assert!(!cues.is_empty() && serde_json::to_vec(cues).unwrap().len() <= 4096 + 100);
         assert_eq!(last["next_cursor"], 2000 + cues.len());
-        let end = call(&recordings, yes, TRANSCRIPT, json!({"recording": id, "cursor": 3000})).unwrap();
+        let end = call(&recordings, &|_| None, yes, TRANSCRIPT, json!({"recording": id, "cursor": 3000})).unwrap();
         assert_eq!((end["untrusted"]["cues"].as_array().unwrap().len(), &end["next_cursor"]), (0, &Value::Null));
     }
 
@@ -259,12 +266,12 @@ mod tests {
             json!({"recording": id, "extra": 1}),
             json!([id]),
         ] {
-            assert!(matches!(call(&recordings, yes, TRANSCRIPT, args.clone()), Err(ToolError::InvalidArgs(_))), "{args}");
+            assert!(matches!(call(&recordings, &|_| None, yes, TRANSCRIPT, args.clone()), Err(ToolError::InvalidArgs(_))), "{args}");
         }
-        let err = call(&recordings, yes, TRANSCRIPT, json!({"recording": waiting})).unwrap_err();
+        let err = call(&recordings, &|_| None, yes, TRANSCRIPT, json!({"recording": waiting})).unwrap_err();
         assert_eq!(err.to_string(), "transcript not ready: waiting");
-        assert!(matches!(call(&recordings, yes, LIST, json!({"since": "yesterday"})), Err(ToolError::InvalidArgs(_))));
-        assert!(matches!(call(&recordings, yes, LIST, json!({"limit": 0})), Err(ToolError::InvalidArgs(_))));
+        assert!(matches!(call(&recordings, &|_| None, yes, LIST, json!({"since": "yesterday"})), Err(ToolError::InvalidArgs(_))));
+        assert!(matches!(call(&recordings, &|_| None, yes, LIST, json!({"limit": 0})), Err(ToolError::InvalidArgs(_))));
     }
 
     #[test]
@@ -273,13 +280,27 @@ mod tests {
         let recordings = Recordings::new(dir.path());
         let old = recordings.create(1_000).unwrap();
         let new = done(&recordings, 1);
-        let all = call(&recordings, yes, LIST, json!({})).unwrap();
+        let all = call(&recordings, &|_| None, yes, LIST, json!({})).unwrap();
         let ids: Vec<&str> = all["items"].as_array().unwrap().iter().map(|item| item["recording"].as_str().unwrap()).collect();
         assert_eq!(ids, [new.as_str(), old.as_str()]);
         assert_eq!(all["items"][0]["state"], "done");
         assert_eq!(all["items"][1]["end"], Value::Null);
-        let recent = call(&recordings, yes, LIST, json!({"since": "2023-01-01T00:00:00Z", "limit": 5})).unwrap();
+        let recent = call(&recordings, &|_| None, yes, LIST, json!({"since": "2023-01-01T00:00:00Z", "limit": 5})).unwrap();
         assert_eq!(recent["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_transcription_running_shows_its_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = Recordings::new(dir.path());
+        let running = recordings.create(2_000).unwrap();
+        recordings.set_meta(&running, &Meta { state: State::Transcribing, ..recordings.meta(&running).unwrap() }).unwrap();
+        let done = done(&recordings, 1);
+        let percent = |id: &str| (id == running).then_some(42);
+        let list = call(&recordings, &percent, yes, LIST, json!({})).unwrap();
+        let progress: Vec<(&str, &Value)> =
+            list["items"].as_array().unwrap().iter().map(|item| (item["recording"].as_str().unwrap(), &item["progress"])).collect();
+        assert_eq!(progress, [(done.as_str(), &Value::Null), (running.as_str(), &json!(42))]);
     }
 
     #[test]
@@ -288,7 +309,7 @@ mod tests {
         let recordings = Recordings::new(dir.path());
         let ids: Vec<String> = (1..=3).map(|start| recordings.create(start * 1000).unwrap()).collect();
         let page = |args: Value| -> Vec<String> {
-            let page = call(&recordings, yes, LIST, args).unwrap();
+            let page = call(&recordings, &|_| None, yes, LIST, args).unwrap();
             page["items"].as_array().unwrap().iter().map(|item| item["recording"].as_str().unwrap().to_string()).collect()
         };
         assert_eq!(page(json!({"limit": 1})), [ids[2].clone()]);
@@ -296,7 +317,7 @@ mod tests {
         assert_eq!(page(json!({"before": ids[1]})), [ids[0].clone()]);
         assert!(page(json!({"before": ids[0]})).is_empty());
         for before in ["0123456789abcdef0123456789abcdef", "..\\x"] {
-            assert!(matches!(call(&recordings, yes, LIST, json!({"before": before})), Err(ToolError::InvalidArgs(_))), "{before}");
+            assert!(matches!(call(&recordings, &|_| None, yes, LIST, json!({"before": before})), Err(ToolError::InvalidArgs(_))), "{before}");
         }
     }
 
@@ -306,14 +327,14 @@ mod tests {
         let recordings = Recordings::new(dir.path());
         let id = done(&recordings, 1);
         let no = || Ok(false);
-        assert!(matches!(call(&recordings, no, LIST, json!({})), Err(ToolError::NotAllowed(_))));
+        assert!(matches!(call(&recordings, &|_| None, no, LIST, json!({})), Err(ToolError::NotAllowed(_))));
         // Allowed when asked first, taken back before the answer.
         let asked = Cell::new(0);
         let revoked = || {
             asked.set(asked.get() + 1);
             Ok(asked.get() == 1)
         };
-        assert!(matches!(call(&recordings, revoked, TRANSCRIPT, json!({"recording": id})), Err(ToolError::NotAllowed(_))));
+        assert!(matches!(call(&recordings, &|_| None, revoked, TRANSCRIPT, json!({"recording": id})), Err(ToolError::NotAllowed(_))));
         assert_eq!(asked.get(), 2);
     }
 }

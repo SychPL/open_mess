@@ -4,6 +4,7 @@
 //! is done, and `transcript.json`. The folder is the record; nothing of it is in the database.
 
 pub mod model;
+pub mod queue;
 pub mod stt;
 pub mod wav;
 mod whisper;
