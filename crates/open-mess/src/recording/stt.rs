@@ -1,7 +1,8 @@
 //! Speech to text with Whisper on candle, on the CPU (spec 2026-10-28-local-transcription, 4.3).
-//! Each track is cut into 30 s windows. A silent window is skipped, since Whisper invents text
-//! over silence; the others go through the encoder and a decoder with timestamps that falls back
-//! to higher temperatures, as Whisper does. Everything the model writes is untrusted: lengths are
+//! Only the speech of a track goes to the model: it is found in 30 ms frames and packed into
+//! windows of at most 30 s, since Whisper invents text over silence and each track of a call is
+//! silent much of the time. A window goes through the encoder and a decoder with timestamps that
+//! falls back to higher temperatures, as Whisper does, and its times are mapped back to the track. Everything the model writes is untrusted: lengths are
 //! capped, and none of it reaches a path or a log.
 
 use std::collections::HashMap;
@@ -21,9 +22,15 @@ use super::{Cue, MAX_TRANSCRIPT, Speaker, TRACKS, Transcript, wav};
 /// of the whisper example in candle 0.11.0 (MIT OR Apache-2.0).
 const MEL_FILTERS: &[u8] = include_bytes!("melfilters128.bytes");
 const MEL_BINS: usize = 128;
-/// A window whose RMS (of 32768) is below this is silence and skipped.
-/// ponytail: a guess until step 0 measures real calls; a per-recording noise floor if it misfires.
+/// A 30 ms frame whose RMS (of 32768) is below this is silence.
+/// ponytail: a guess until step 0b measures real calls; a per-recording noise floor if it misfires.
 const SILENCE_RMS: f64 = 60.0;
+/// Samples of a frame (30 ms), kept around speech (300 ms), of a pause still joined (1 s), and of
+/// silence between the pieces packed into one window (200 ms).
+const FRAME: usize = 480;
+const MARGIN: u64 = 4_800;
+const JOIN: u64 = 16_000;
+const GAP: usize = 3_200;
 /// The first timestamp may be at most this many 20 ms steps into a window (Whisper's 1 s).
 const MAX_INITIAL_TIMESTAMP: u32 = 50;
 /// Characters of one cue, and cues of one transcript (4.3).
@@ -246,6 +253,98 @@ fn silent(samples: &[i16]) -> bool {
     samples.is_empty() || (energy / samples.len() as f64).sqrt() < SILENCE_RMS
 }
 
+/// The speech of the track at `path`, as ranges of samples `[start, end)` in order: the loud
+/// frames with [`MARGIN`] on both sides, pauses shorter than [`JOIN`] joined.
+fn speech(path: &Path) -> Result<Vec<(u64, u64)>, SttError> {
+    let mut reader = wav::Reader::open(path)?;
+    let total = reader.remaining();
+    let (mut ranges, mut chunk, mut at): (Vec<(u64, u64)>, _, u64) = (Vec::new(), Vec::with_capacity(m::N_SAMPLES), 0);
+    while {
+        chunk.clear();
+        reader.read(&mut chunk, m::N_SAMPLES)? > 0
+    } {
+        for frame in chunk.chunks(FRAME) {
+            if !silent(frame) {
+                let (start, end) = (at.saturating_sub(MARGIN), (at + frame.len() as u64 + MARGIN).min(total));
+                match ranges.last_mut() {
+                    Some(last) if start <= last.1 + JOIN => last.1 = last.1.max(end),
+                    _ => ranges.push((start, end)),
+                }
+            }
+            at += frame.len() as u64;
+        }
+    }
+    Ok(ranges)
+}
+
+/// A piece of a track in a packed window: where it starts in the window and in the track, and
+/// its length, in samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Part {
+    window: u64,
+    track: u64,
+    len: u64,
+}
+
+/// Packs the `ranges` of the track at `path` into windows of at most 30 s, [`GAP`] of silence
+/// between pieces and a range longer than a window split, and hands `each` every window with its
+/// parts. The file is read once, in order.
+fn pack(path: &Path, ranges: &[(u64, u64)], mut each: impl FnMut(&[i16], &[Part]) -> Result<(), SttError>) -> Result<(), SttError> {
+    let mut reader = wav::Reader::open(path)?;
+    let (mut window, mut parts, mut skipped) = (Vec::with_capacity(m::N_SAMPLES), Vec::new(), Vec::new());
+    let mut read = 0u64;
+    'ranges: for &(start, end) in ranges {
+        let mut at = start.max(read);
+        while at < end {
+            let gap = if window.is_empty() { 0 } else { GAP };
+            let room = m::N_SAMPLES.saturating_sub(window.len() + gap) as u64;
+            if room < FRAME as u64 {
+                each(&window, &parts)?;
+                window.clear();
+                parts.clear();
+                continue;
+            }
+            while read < at {
+                skipped.clear();
+                let got = reader.read(&mut skipped, (at - read).min(m::N_SAMPLES as u64) as usize)?;
+                if got == 0 {
+                    break 'ranges;
+                }
+                read += got as u64;
+            }
+            window.resize(window.len() + gap, 0);
+            let placed = window.len() as u64;
+            let got = reader.read(&mut window, room.min(end - at) as usize)? as u64;
+            if got == 0 {
+                break 'ranges;
+            }
+            parts.push(Part { window: placed, track: at, len: got });
+            (read, at) = (read + got, at + got);
+        }
+    }
+    if !parts.is_empty() {
+        each(&window, &parts)?;
+    }
+    Ok(())
+}
+
+/// A time in a packed window (ms) as a time in the track (ms). Inside a part it moves with the
+/// part; in a pause between parts or outside them, a start goes to the next part's start and an
+/// end to the previous part's end, so a cue stays on speech.
+fn to_track(parts: &[Part], ms: u64, start: bool) -> u64 {
+    let per_ms = u64::from(wav::SAMPLE_RATE) / 1000;
+    // The model's times are untrusted: a huge one ends up past the last part.
+    let sample = ms.saturating_mul(per_ms);
+    let found = if start {
+        let next = parts.iter().find(|part| sample < part.window + part.len);
+        next.map(|part| part.track + sample.saturating_sub(part.window)).or_else(|| parts.last().map(|part| part.track + part.len))
+    } else {
+        let previous = parts.iter().rev().find(|part| sample > part.window);
+        previous.map(|part| part.track + (sample - part.window).min(part.len)).or_else(|| parts.first().map(|part| part.track))
+    };
+    found.unwrap_or(0) / per_ms
+}
+
 struct Decoding {
     tokens: Vec<u32>,
     avg_logprob: f64,
@@ -419,30 +518,23 @@ impl Model {
             if !path.exists() {
                 continue;
             }
-            let mut reader = wav::Reader::open(&path)?;
+            let ranges = speech(&path)?;
             let mut language = fixed;
-            let (mut offset, mut samples) = (0u64, Vec::with_capacity(m::N_SAMPLES));
-            loop {
-                samples.clear();
-                if reader.read(&mut samples, m::N_SAMPLES)? == 0 {
-                    break;
+            pack(&path, &ranges, |samples, parts| {
+                check(cancel)?;
+                let features = self.encode(samples, cancel)?;
+                let found = match language {
+                    Some(found) => found,
+                    None => self.detect_language(&features)?,
+                };
+                language = Some(found);
+                first_language = first_language.or(Some(found));
+                for (start, end, text) in self.transcribe_window(&features, found, cancel)? {
+                    let start_ms = to_track(parts, start, true);
+                    cues.push(Cue { start_ms, end_ms: to_track(parts, end, false).max(start_ms), speaker, text });
                 }
-                let length = samples.len() as u64 * 1000 / u64::from(wav::SAMPLE_RATE);
-                if !silent(&samples) {
-                    check(cancel)?;
-                    let features = self.encode(&samples, cancel)?;
-                    let found = match language {
-                        Some(found) => found,
-                        None => self.detect_language(&features)?,
-                    };
-                    language = Some(found);
-                    first_language = first_language.or(Some(found));
-                    for (start, end, text) in self.transcribe_window(&features, found, cancel)? {
-                        cues.push(Cue { start_ms: offset + start.min(length), end_ms: offset + end.min(length), speaker, text });
-                    }
-                }
-                offset += length;
-            }
+                Ok(())
+            })?;
         }
         // Stable: at the same time the other side comes first, as the tracks were read.
         cues.sort_by_key(|cue| cue.start_ms);
@@ -628,6 +720,67 @@ mod tests {
         let mut writer = wav::Writer::create(&dir.join(name)).unwrap();
         writer.write(samples).unwrap();
         writer.finish().unwrap();
+    }
+
+    /// A square wave: loud for the model's purposes.
+    fn loud(seconds: f64) -> Vec<i16> {
+        (0..(seconds * 16_000.0) as usize).map(|i| if i % 2 == 0 { 3000 } else { -3000 }).collect()
+    }
+
+    fn quiet(seconds: f64) -> Vec<i16> {
+        vec![0; (seconds * 16_000.0) as usize]
+    }
+
+    fn windows(path: &Path) -> Vec<Vec<Part>> {
+        let mut found = Vec::new();
+        pack(path, &speech(path).unwrap(), |samples, parts| {
+            assert!(samples.len() <= m::N_SAMPLES);
+            found.push(parts.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        found
+    }
+
+    #[test]
+    fn speech_is_packed_and_silence_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        // Speech, a short pause (joined), speech, a minute of silence, speech.
+        let samples = [loud(1.0), quiet(0.5), loud(0.5), quiet(60.0), loud(1.0)].concat();
+        track(dir.path(), "others.wav", &samples);
+        let path = dir.path().join("others.wav");
+        // In whole frames of 480 samples, 300 ms around each.
+        assert_eq!(speech(&path).unwrap(), [(0, 36_960), (986_880, 1_008_000)]);
+        // 63 s of track, one window: the minute of silence is not there.
+        let found = windows(&path);
+        assert_eq!(found, [vec![Part { window: 0, track: 0, len: 36_960 }, Part { window: 40_160, track: 986_880, len: 21_120 }]]);
+
+        // Speech longer than a window is split.
+        track(dir.path(), "me.wav", &loud(70.0));
+        let found = windows(&dir.path().join("me.wav"));
+        let starts: Vec<(u64, u64)> = found.iter().map(|parts| (parts[0].track, parts[0].len)).collect();
+        assert_eq!(starts, [(0, 480_000), (480_000, 480_000), (960_000, 160_000)]);
+
+        // Silence only: nothing for the model.
+        track(dir.path(), "silent.wav", &quiet(40.0));
+        assert!(windows(&dir.path().join("silent.wav")).is_empty());
+    }
+
+    #[test]
+    fn times_in_a_window_map_back_to_the_track() {
+        // Two pieces of 1 s, 200 ms apart in the window, 10 s apart in the track.
+        let parts = [Part { window: 0, track: 0, len: 16_000 }, Part { window: 19_200, track: 160_000, len: 16_000 }];
+        assert_eq!(to_track(&parts, 500, true), 500);
+        assert_eq!(to_track(&parts, 1300, true), 10_100);
+        // In the pause: a start goes to the next piece, an end to the previous one.
+        assert_eq!(to_track(&parts, 1100, true), 10_000);
+        assert_eq!(to_track(&parts, 1100, false), 1000);
+        // Past the end, and before the start.
+        assert_eq!(to_track(&parts, 2400, false), 11_000);
+        assert_eq!(to_track(&parts, 2400, true), 11_000);
+        assert_eq!(to_track(&parts, 0, false), 0);
+        assert_eq!(to_track(&[], 700, true), 0);
+        assert_eq!((to_track(&parts, u64::MAX, true), to_track(&parts, u64::MAX, false)), (11_000, 11_000));
     }
 
     #[test]
