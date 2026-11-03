@@ -21,6 +21,8 @@ Poza zakresem: agent mówiący lub piszący na spotkaniu, nagrywanie, dźwięk i
 
 - 2026-10-30, krok 0b: właściciel pozwolił testować sondą także na swoim spotkaniu ze znajomymi (dziewięć-dziesięć innych osób), za zgodą w czacie na każdą serię; jeden przebieg diagnostyczny z audio `sendrecv` bez ścieżki (usługa wysłała dźwięk, sonda go odrzuciła bez dekodowania) był jego decyzją dla sondy - produkt nigdy tak nie robi (4.4).
 
+- 2026-11-03: "pamietaj jeszcze że powinniśmy brać treść czata ze spotkań do kontekstu spotkania". Kontekst spotkania dla agenta to napisy i czat spotkania (wątek `19:meeting_...@thread.v2`), bez drugiego czytnika czatu: `teams_list_meetings` daje id wątku, a `read_messages` i `search` już go czytają. Treść czatu to dane innych osób, pod `untrusted`, jak napisy. Jak to spiąć (np. `teams_read_captions` zwraca też nowe wiadomości czatu od kursora albo tylko wskazuje wątek dla `read_messages`), rozstrzyga zmiana specu przed krokiem 4, z recenzją Codex i GLM.
+
 Otwartych decyzji nie ma (O2 bez decyzji po kroku 0c - sekcja 10).
 
 ## 3. Kontekst w kodzie i protokole
