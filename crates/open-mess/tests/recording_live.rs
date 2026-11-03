@@ -22,8 +22,8 @@ use open_mess::recording::recorder::{self, By, Settings};
 use open_mess::recording::stt::SttError;
 use open_mess::recording::{Transcript, detect, wav};
 
-/// The temporary folders of this check.
-const PREFIX: &str = "open_mess-live-call";
+/// The folder under `%TEMP%` that holds this check's temporary folder.
+const FOLDER: &str = "open_mess-live-call";
 
 /// RMS of each second of a track.
 fn levels(path: &Path) -> Vec<u32> {
@@ -45,12 +45,11 @@ fn levels(path: &Path) -> Vec<u32> {
 #[allow(clippy::print_stdout)]
 fn live_call() {
     let seconds: u64 = std::env::var("OPEN_MESS_LIVE_SECONDS").ok().and_then(|value| value.parse().ok()).unwrap_or(300);
-    for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
-        if entry.file_name().to_string_lossy().starts_with(PREFIX) {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-    let local = tempfile::Builder::new().prefix(PREFIX).tempdir().unwrap();
+    // What a killed run left goes with its folder, found by its exact name only.
+    let parent = std::env::temp_dir().join(FOLDER);
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(&parent).unwrap();
+    let local = tempfile::tempdir_in(&parent).unwrap();
     // Nothing is transcribed here: the queue is held.
     let engine = Arc::new(|_: &Path, _: Option<&str>, _: &AtomicBool, _: &AtomicU8| -> Result<Transcript, SttError> { Err(SttError::Cancelled) });
     let queue = Arc::new(Queue::start(local.path(), engine, Arc::new(|| Err("live check")), Arc::new(|| None)).unwrap());
