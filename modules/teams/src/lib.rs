@@ -15,6 +15,7 @@ pub mod search;
 pub mod session;
 pub mod text;
 pub mod time;
+pub mod trouter;
 pub mod unread;
 pub mod writing;
 

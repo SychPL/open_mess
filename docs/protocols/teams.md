@@ -1223,6 +1223,19 @@ token, tenant id, user id or account name.
       with pings acked and 5 `trouter.message_loss` events and no downstream request. So an IC3 AAD
       token is enough for Trouter ("Needs live capture" 5, Trouter part) and the 5 s `timeout` of
       the first day was the missing `user.authenticate`.
+    - What the probe sent on Trouter, the same in every later run (items 14-18; written down from
+      its code on 2026-11-03): the query `tc` (URL-encoded JSON `{"cv": "2026.31.01.1", "ua":
+      "TeamsCDL", "hr": "", "v": "1415/<client build>"}`, the Trouter client version and the build
+      of the client), `timeout=40`, `epid` (its own random endpoint id), `cor_id` (a random UUID)
+      and `con_num` (`<random UUID>_<attempt, from 1>`), no `ccid`; `user.authenticate` as
+      `5:::{"name": "user.authenticate", "args": [{"headers": {...}}]}`, its `connectparams` only
+      on a reconnection; `2::` echoed, `6:::<n>` for each event `5:<n>+::...`, and the ping
+      `5:<n>+::{"name":"ping"}` every 15 s; every downstream request answered
+      `3:::{"id": <its id>, "status": 200, "headers": {}, "body": ""}` - no `MS-CV` or
+      `trouter-client` header, and the service went on (callbacks of items 15-18 came). The
+      registrar request had `X-Ms-Test-User: False`, `Accept: application/json, text/javascript`,
+      the IC3 bearer with `X-MS-Migration: True` and, in the body of section 5, `languageId`
+      `en-US`, `platform` `edge` and `platformUIVersion` `1415/<client build>`.
     - Call store: the items now have the keys `conversationController`, `correlationId`,
       `groupContext` (`messageId`, `threadId`), `meetingInfo` (`organizerId`, `tenantId`) and
       `userJoinTime`, and `groupContext.threadId` is the chat thread of the call - unlike item 11,
