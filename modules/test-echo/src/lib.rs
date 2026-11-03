@@ -15,7 +15,8 @@
 //! tool `writes` returns them) and succeed, except a `text` of "uncertain" (the module error), "fail"
 //! (a platform error) or "slow" (recorded, then busy until the call limit). `describe-target`
 //! returns the target the tool `set-target` stored for `{"conversation"}` (`{"participants"}` as
-//! `[id, name]` pairs, `{"text"}` for any message), else participant "p1" (Pat) and "message <id>".
+//! `[id, name]` pairs, `{"text"}` for any message, `{"title"}`), else participant "p1" (Pat),
+//! "message <id>" and the title "Echo <conversation>".
 //! The `restore` export succeeds only for account "known"; the `sign-in` export shows a device code,
 //! then opens the page `https://login.example.com/start` with the redirect prefix
 //! `https://login.example.com/done` and signs in the account named by the redirect's `account=`
@@ -34,13 +35,17 @@
 //! `{}`; both return `{"error", "why"}` instead when refused, and `rtc-close` closes `{"conn"}`. The
 //! manifest's media range is 52.112.0.0/14; data channel batches and states go to `host.log`. The
 //! `end-sessions` and `restore` exports append their account to the storage keys "ended" and
-//! "restored", which the tool `ended` returns as `{"ended", "restored"}`.
+//! "restored", which the tool `ended` returns as `{"ended", "restored"}`; `end-sessions` of account
+//! "slow" is busy for 2 s first.
 //!
 //! Extra tools (the manifest's, for the core's registry): `peek` reads; it returns two items, one in
 //! `{"conversation"}` (else "c1") and one in "c2", one item without a conversation and some
 //! untrusted text; `{"answer": "big"}` returns a result over 1 MiB, `{"answer": "list"}` a JSON
-//! array and `{"answer": "slow"}` the items after 1 s. Each call counts in the tool `peeks`. The others are never exposed: `poke` writes, `Bad-Name` breaks the name rule,
-//! `with_account` declares `account`, `loose` takes any property, and `twin` is declared twice.
+//! array and `{"answer": "slow"}` the items after 1 s. Each call counts in the tool `peeks`. `poke`
+//! writes to its required `{"conversation"}` as `send` does (recorded under "writes", `{"text"}`
+//! picks the outcome). The others are never exposed: `nudge` writes without naming a conversation,
+//! `Bad-Name` breaks the name rule, `with_account` declares `account`, `loose` takes any property,
+//! and `twin` is declared twice.
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -212,7 +217,7 @@ mod guest {
                 "unread": "unread",
                 "untrusted": {"title": format!("Echo {account}")},
             }]}),
-            "send" | "edit_message" | "react" => {
+            "send" | "edit_message" | "react" | "poke" => {
                 let mut writes = stored("writes").as_array().cloned().unwrap_or_default();
                 writes.push(json!({ "tool": tool, "args": args }));
                 storage::set("writes", Value::from(writes).to_string().as_bytes())
@@ -277,7 +282,7 @@ mod guest {
         }
     }
 
-    /// The manifest's own tools: `peek`, and the ones the core never exposes.
+    /// The manifest's own tools: `peek`, `poke`, and the ones the core never exposes.
     fn extra_tools() -> Vec<types::ToolDecl> {
         let string = json!({"type": "string"});
         let schema = |properties: Value| json!({"type": "object", "properties": properties, "additionalProperties": false}).to_string();
@@ -288,9 +293,20 @@ mod guest {
             writes,
         };
         let peek = schema(json!({"conversation": string, "answer": string}));
+        let poke = json!({
+            "type": "object",
+            "properties": {"conversation": string, "text": string},
+            "required": ["conversation"],
+            "additionalProperties": false,
+        });
+        let poke = types::ToolDecl {
+            description: "Pokes the conversation. It records its arguments as a write.".to_string(),
+            ..tool("poke", poke.to_string(), true)
+        };
         vec![
             tool("peek", peek.clone(), false),
-            tool("poke", peek.clone(), true),
+            poke,
+            tool("nudge", peek.clone(), true),
             tool("Bad-Name", peek.clone(), false),
             tool("with_account", schema(json!({"account": string})), false),
             tool("loose", json!({"type": "object", "properties": {}, "additionalProperties": true}).to_string(), false),
@@ -383,6 +399,12 @@ mod guest {
         }
 
         fn end_sessions(account: String) {
+            if account == "slow" {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(2) {
+                    std::hint::spin_loop();
+                }
+            }
             remember("ended", &account);
         }
 
@@ -417,7 +439,8 @@ mod guest {
                 None => vec![types::Participant { id: "p1".to_string(), display_name: "Pat".to_string() }],
             };
             let text = |id: String| target.get("text").and_then(Value::as_str).map_or_else(|| format!("message {id}"), str::to_string);
-            Ok(types::Target { conversation_title: format!("Echo {conversation}"), participants, target_text: message.map(text) })
+            let title = target.get("title").and_then(Value::as_str).map_or_else(|| format!("Echo {conversation}"), str::to_string);
+            Ok(types::Target { conversation_title: title, participants, target_text: message.map(text) })
         }
     }
 

@@ -479,8 +479,8 @@ pub fn clear_permission_override(state: &UiState, account: &str, conversation: &
 #[derive(Clone, Debug, Serialize)]
 pub struct PreviewDto {
     pub action: String,
-    /// `send`, `edit` or `react`.
-    pub kind: &'static str,
+    /// `send`, `edit` or `react`, or a module write tool's full name.
+    pub kind: String,
     /// The account's name and id.
     pub account: String,
     pub conversation: String,
@@ -493,6 +493,10 @@ pub struct PreviewDto {
     pub target_text: Option<String>,
     /// That message is longer than shown: the action can only be rejected.
     pub target_cut: bool,
+    /// A module write tool's description, from its approved manifest.
+    pub description: Option<String>,
+    /// A module write tool's arguments but `conversation`, each as `key: value`.
+    pub arguments: Vec<String>,
 }
 
 /// Why an action whose target message could not be shown in full is not approved.
@@ -513,7 +517,7 @@ pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
         .iter()
         .map(|preview| PreviewDto {
             action: preview.action.clone(),
-            kind: preview.kind.name(),
+            kind: preview.kind.name().to_string(),
             account: approval::clean(&preview.account),
             conversation: approval::clean(&preview.conversation_title),
             participants: preview.participants.iter().map(|name| approval::clean(name)).collect(),
@@ -521,6 +525,8 @@ pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
             reaction: clean(&preview.reaction),
             target_text: clean(&preview.target_text),
             target_cut: preview.target_cut,
+            description: clean(&preview.description),
+            arguments: preview.arguments.iter().map(|argument| approval::clean(argument)).collect(),
         })
         .collect()
 }

@@ -270,7 +270,7 @@ async fn decide_from_window_updates_state() {
     let waiting = commands::waiting(&state);
     assert_eq!(waiting.len(), 1);
     let preview = &waiting[0];
-    assert_eq!((preview.action.as_str(), preview.kind), (action.as_str(), "send"));
+    assert_eq!((preview.action.as_str(), preview.kind.as_str()), (action.as_str(), "send"));
     assert_eq!(preview.account, "User a (test-echo:a)");
     assert_eq!(preview.conversation, "Echo c1");
     assert_eq!(preview.participants, ["Pat"]);
@@ -285,6 +285,24 @@ async fn decide_from_window_updates_state() {
     let rejected = d.registry.call("send", json!({"account": "test-echo:a", "conversation": "c1", "text": "no"})).await.unwrap();
     assert_eq!(commands::decide(&state, rejected["action"].as_str().unwrap(), false).await.unwrap(), "rejected");
     assert!(commands::decide(&state, "nope", true).await.is_err());
+}
+
+#[tokio::test]
+async fn module_write_with_many_participants_is_approved_in_the_window() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let state = state(&d);
+    // A meeting of 60: too many for a toast or the dialog, all of them in the window.
+    let people: Vec<Value> = (1..=60).map(|n| json!([format!("p{n}"), format!("Person {n}")])).collect();
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    echo.call("a", "set-target", &json!({"conversation": "c1", "participants": people}).to_string()).await.unwrap();
+    let poked = d.registry.call("test_echo_poke", json!({"account": "test-echo:a", "conversation": "c1", "text": "hi"})).await.unwrap();
+    let action = poked["action"].as_str().unwrap();
+    let preview = &commands::waiting(&state)[0];
+    assert_eq!((preview.kind.as_str(), preview.participants.len(), preview.target_cut), ("test_echo_poke", 60, false));
+    assert_eq!(preview.description.as_deref(), Some("Pokes the conversation. It records its arguments as a write."));
+    assert_eq!(preview.arguments, ["text: hi"]);
+    assert_eq!(commands::decide(&state, action, true).await.unwrap(), "done");
 }
 
 #[tokio::test]

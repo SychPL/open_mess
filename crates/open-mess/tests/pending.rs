@@ -76,7 +76,7 @@ async fn confirm_waits_then_runs_on_approve() {
     let waiting = pending.waiting();
     assert_eq!(waiting.len(), 1);
     let preview = &waiting[0];
-    assert_eq!((preview.action.as_str(), preview.kind), (outcome.action.as_str(), Kind::Send));
+    assert_eq!((preview.action.as_str(), &preview.kind), (outcome.action.as_str(), &Kind::Send));
     assert_eq!(preview.account, "User a (test-echo:a)");
     assert_eq!(preview.conversation_title, "Echo c1");
     assert_eq!(preview.participants, ["Pat"]);

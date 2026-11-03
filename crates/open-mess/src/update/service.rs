@@ -490,7 +490,10 @@ impl UpdateService {
         let setup = &self.0.setup;
         let activity = Activity { modules: setup.accounts.modules().handles(), ..setup.activity.clone() };
         // Before phase A pauses the modules' events: what others see of the sessions ends now, and
-        // agents join again after the update (spec 2026-10-29-live-captions, 4.3, R8).
+        // agents join again after the update (spec 2026-10-29-live-captions, 4.3, R8). Until the
+        // update ends or is cancelled, no module write tool runs, so no join gets in after this.
+        let _block = setup.accounts.module_writes().block();
+        setup.accounts.module_writes().finished().await;
         setup.accounts.end_sessions(&activity.modules).await;
         let cancel = self.0.cancel.subscribe();
         // Both phases resume everything themselves when cancelled.

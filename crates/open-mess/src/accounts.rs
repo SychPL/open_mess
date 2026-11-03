@@ -9,6 +9,7 @@ use keyring_core::api::CredentialStore;
 use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, ModuleHandle, SessionState};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::Error;
@@ -69,11 +70,95 @@ pub struct Accounts {
     /// Held while an attachment is saved and while a removed account's attachments are deleted, so
     /// a download that ends during a removal leaves no file behind.
     attachments: Mutex<()>,
+    module_writes: ModuleWrites,
+    /// Held for a whole scan of the modules folder: scans run one after the other.
+    scans: tokio::sync::Mutex<()>,
+}
+
+/// The block on the modules' write tools (spec 2026-10-29-live-captions, 4.3). While an update's
+/// phase A or a scan of the modules folder holds one, no module write tool makes an action and no
+/// approved one calls its module; the holder waits for the module calls already running before it
+/// ends the modules' sessions, so no join gets in after them.
+pub struct ModuleWrites(watch::Sender<WriteCounts>);
+
+#[derive(Clone, Copy, Default)]
+struct WriteCounts {
+    /// The blocks held: the tools work again only when every holder lifted its own.
+    blocks: usize,
+    /// Module calls of approved actions running.
+    running: usize,
+}
+
+impl Default for ModuleWrites {
+    fn default() -> ModuleWrites {
+        ModuleWrites(watch::Sender::new(WriteCounts::default()))
+    }
+}
+
+impl ModuleWrites {
+    pub fn blocked(&self) -> bool {
+        self.0.borrow().blocks > 0
+    }
+
+    /// Blocks the module write tools until the guard is dropped.
+    pub fn block(&self) -> WriteBlock<'_> {
+        self.0.send_modify(|counts| counts.blocks += 1);
+        WriteBlock(self)
+    }
+
+    /// Returns once no module call of an approved action runs.
+    pub async fn finished(&self) {
+        let _ = self.0.subscribe().wait_for(|counts| counts.running == 0).await;
+    }
+
+    /// A module call of an approved action, counted while the guard lives; None while blocked.
+    pub(crate) fn start(&self) -> Option<RunningWrite<'_>> {
+        let mut started = false;
+        self.0.send_if_modified(|counts| {
+            started = counts.blocks == 0;
+            if started {
+                counts.running += 1;
+            }
+            started
+        });
+        started.then_some(RunningWrite(self))
+    }
+}
+
+/// A block of the module write tools; lifted when dropped.
+pub struct WriteBlock<'a>(&'a ModuleWrites);
+
+impl Drop for WriteBlock<'_> {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|counts| counts.blocks = counts.blocks.saturating_sub(1));
+    }
+}
+
+/// A module call of an approved action that [`ModuleWrites::start`] let in.
+pub(crate) struct RunningWrite<'a>(&'a ModuleWrites);
+
+impl Drop for RunningWrite<'_> {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|counts| counts.running = counts.running.saturating_sub(1));
+    }
 }
 
 impl Accounts {
     pub fn new(store: Store, modules: Modules, data_dir: PathBuf, credentials: Arc<CredentialStore>) -> Accounts {
-        Accounts { store: Mutex::new(store), modules, data_dir, credentials, attachments: Mutex::new(()) }
+        Accounts {
+            store: Mutex::new(store),
+            modules,
+            data_dir,
+            credentials,
+            attachments: Mutex::new(()),
+            module_writes: ModuleWrites::default(),
+            scans: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The block on the modules' write tools.
+    pub fn module_writes(&self) -> &ModuleWrites {
+        &self.module_writes
     }
 
     /// Never held across an await.
@@ -256,9 +341,15 @@ impl Accounts {
     /// restarts the module `restart` if it was stopped after repeated crashes. Returns the modules
     /// that stopped, started or were replaced. Their accounts' waiting actions expire in the same
     /// step, before any of them can be approved and run on another module than the one that
-    /// described them; their sessions are then restored, or marked offline.
+    /// described them; their sessions are then restored, or marked offline. From before the swap
+    /// until the versions that stopped ended their sessions, the module write tools are blocked, so
+    /// a new version takes no join before the old one has left (spec 2026-10-29-live-captions, 4.3).
     pub async fn rescan_modules(&self, restart: Option<&str>) -> Result<Vec<String>, Error> {
+        // A second scan waits for this one's end, and so never lifts its block.
+        let _scan = self.scans.lock().await;
         let found = self.modules.load().await?;
+        let block = self.module_writes.block();
+        self.module_writes.finished().await;
         let (changed, stopped) = {
             let store = self.store();
             let (changed, stopped) = self.modules.adopt(&store, found, restart)?;
@@ -275,6 +366,7 @@ impl Accounts {
         // 2026-10-29-live-captions, 4.3).
         self.end_sessions(&stopped).await;
         drop(stopped);
+        drop(block);
         self.restore_where(|module| changed.iter().any(|name| name == module)).await?;
         Ok(changed)
     }

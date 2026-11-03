@@ -69,6 +69,21 @@ impl Request {
             }
         }
     }
+
+    /// Nobody waits for the answer any more: the caller's limit passed while the request queued
+    /// behind others. Such a call is not run, so a write its caller reported as uncertain never goes
+    /// out late (spec 2026-10-29-live-captions, 4.1, R17). Ending the sessions and signing out still
+    /// run: they take back what other people see.
+    fn abandoned(&self) -> bool {
+        match self {
+            Request::SignIn(reply) => reply.is_closed(),
+            Request::Restore(_, reply) => reply.is_closed(),
+            Request::Call { reply, .. } => reply.is_closed(),
+            Request::GetAttachment { reply, .. } => reply.is_closed(),
+            Request::DescribeTarget { reply, .. } => reply.is_closed(),
+            Request::SignOut(..) | Request::EndSessions(..) | Request::PauseEvents(_) | Request::ResumeEvents(_) => false,
+        }
+    }
 }
 
 /// What a module instance's sockets and timers deliver to its `events` export, through the actor
@@ -427,6 +442,9 @@ impl Actor {
     }
 
     async fn answer(&mut self, request: Request) {
+        if request.abandoned() {
+            return;
+        }
         self.caller = request.caller();
         match request {
             // The actor runs one request or event at a time, so answering proves no handler runs.
