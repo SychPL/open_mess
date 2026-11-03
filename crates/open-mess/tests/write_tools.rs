@@ -228,6 +228,22 @@ async fn module_write_tool_is_a_write_for_the_gate_and_the_module_block() {
     assert_eq!(d.registry.call("test_echo_poke", poke("hi")).await.unwrap()["state"], "waiting");
 }
 
+// Two threads, as in the daemon: test-echo's slow description holds one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_that_starts_while_the_target_is_described_refuses_the_action() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    // test-echo describes conversation "slow" for 1 s; the modules start to change meanwhile.
+    let call = d.registry.call("test_echo_poke", json!({"account": "test-echo:a", "conversation": "slow"}));
+    let meanwhile = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        d.accounts.module_writes().block()
+    };
+    let (result, _block) = tokio::join!(call, meanwhile);
+    assert!(is_changing(&result), "{result:?}");
+    assert!(d.registry.pending().unwrap().waiting().is_empty());
+}
+
 #[tokio::test]
 async fn an_approval_runs_only_the_tool_it_showed() {
     let d = daemon(&[ECHO]).await;

@@ -292,6 +292,11 @@ impl Pending {
         }
         let handle = module(&self.accounts, &account)?;
         let target = within(&account.module, handle.describe_target(&account.module_account, conversation, None)).await?;
+        // The modules may have started to change while the module described the target: from then
+        // on no action is made (a swap meanwhile is refused by `insert` too).
+        if self.accounts.module_writes().blocked() {
+            return Err(ToolError::Failed(MODULES_CHANGING.into()));
+        }
         let kind = Kind::ModuleTool(name.into());
         let fingerprint = tool_fingerprint(conversation, &target, decl);
         let action = self.insert(&account, conversation, &kind, &args, &fingerprint, State::Waiting, Some(&handle))?;

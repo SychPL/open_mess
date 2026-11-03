@@ -16,7 +16,8 @@
 //! (a platform error) or "slow" (recorded, then busy until the call limit). `describe-target`
 //! returns the target the tool `set-target` stored for `{"conversation"}` (`{"participants"}` as
 //! `[id, name]` pairs, `{"text"}` for any message, `{"title"}`), else participant "p1" (Pat),
-//! "message <id>" and the title "Echo <conversation>".
+//! "message <id>" and the title "Echo <conversation>"; for conversation "slow" it is busy for 1 s
+//! first.
 //! The `restore` export succeeds only for account "known"; the `sign-in` export shows a device code,
 //! then opens the page `https://login.example.com/start` with the redirect prefix
 //! `https://login.example.com/done` and signs in the account named by the redirect's `account=`
@@ -429,6 +430,12 @@ mod guest {
         }
 
         fn describe_target(_account: String, conversation: String, message: Option<String>) -> Result<types::Target, types::ModuleError> {
+            if conversation == "slow" {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(1) {
+                    std::hint::spin_loop();
+                }
+            }
             let target = stored(&format!("target:{conversation}"));
             let participant = |pair: &Value| {
                 let (id, name) = (pair.get(0)?.as_str()?, pair.get(1)?.as_str()?);
