@@ -85,8 +85,8 @@ Whisper (large-v3-turbo) on the CPU. It is off until you turn it on in the confi
 - **What is recorded**: from the moment a Teams call starts until Teams lets go of its audio,
   about three minutes after you hang up, everything the device Teams plays the call on plays (the
   other participants, but also notifications and other apps), and your microphone only while it is
-  on in Teams. A toast and the tray show each recording and
-  can stop it; a stopped call is not recorded again.
+  on in Teams. A toast and the tray show each recording and can stop it; a stopped call is not
+  recorded again.
 - **Where it stays**: `%LOCALAPPDATA%\open_mess\recordings`, never in a roaming profile, never in
   logs, and open_mess sends it nowhere; an agent you let read the transcripts passes them on to
   its model provider, as with messages. The audio is deleted once it is transcribed (or after 7 days if it

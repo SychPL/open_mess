@@ -94,9 +94,9 @@ struct Inner {
     works: bool,
     /// `skip.json` was looked at with the first read.
     checked: bool,
-    /// The device whose capture could not be opened in the call going on: no new recording
-    /// starts while Teams stays on it (4.2).
-    lost: Option<String>,
+    /// The devices whose capture could not be opened in the call going on: no new recording
+    /// starts while Teams stays on them (4.2).
+    lost: Option<Targets>,
 }
 
 pub struct Recorder {
@@ -202,13 +202,13 @@ impl Recorder {
                 if let Some(active) = active {
                     // No track left open: the recording ends without skipping the call (4.2), and
                     // starts again once Teams moves to another device.
-                    let tracks_lost = reason == Some(Reason::CaptureFailed);
+                    let lost = (reason == Some(Reason::CaptureFailed)).then(|| active.control.targets());
                     let reason = self.end(active, reason, false, None);
                     // Only while the call goes on: one that ended with this read leaves nothing to skip.
                     let going_on = seen.call && !seen.ended;
                     let mut inner = self.locked();
-                    if going_on && tracks_lost {
-                        inner.lost = seen.speaker.clone();
+                    if going_on && lost.is_some() {
+                        inner.lost = lost;
                     } else if going_on && matches!(reason, Some(Reason::TooLong | Reason::CaptureFailed | Reason::WriteFailed)) {
                         // Six hours, a capture that panicked or a write that failed end it as a
                         // stop does: the rest of the call is not recorded, no new recording every
@@ -251,9 +251,9 @@ impl Recorder {
             // Ended by itself: a write failed or the capture panicked; `end` tells which.
             return Some(None);
         }
-        *active.control.targets.lock().unwrap_or_else(PoisonError::into_inner) =
-            Targets { speaker: seen.speaker.clone(), microphone: seen.microphone.clone().filter(|_| active.microphone) };
-        let (others, microphone) = active.control.dead();
+        let targets = targets(seen, active.microphone);
+        let (others, microphone) = active.control.dead(&targets);
+        *active.control.targets.lock().unwrap_or_else(PoisonError::into_inner) = targets;
         if others && (!active.microphone || microphone) {
             return Some(Some(Reason::CaptureFailed));
         }
@@ -267,8 +267,9 @@ impl Recorder {
     }
 
     fn start(&self, inner: &mut Inner, seen: &Observation, now: Instant) -> Result<(), &'static str> {
-        // Teams moved to no other device since the capture could not open this one in this call.
-        if inner.lost.is_some() && inner.lost == seen.speaker {
+        let microphone = (self.hooks.settings)().microphone;
+        // Teams moved to no other device since the capture could not open these in this call.
+        if inner.lost.as_ref() == Some(&targets(seen, microphone)) {
             return Err("nie da się otworzyć urządzenia rozmowy");
         }
         if !self.ui_ready.load(Ordering::SeqCst) {
@@ -284,7 +285,6 @@ impl Recorder {
                 Refusal::TranscriptLimit => "limit transkrypcji",
             });
         }
-        let microphone = (self.hooks.settings)().microphone;
         // The daemon is about to end for an update; the rest of the call is recorded after it (4.1).
         if !self.link.start_recording() {
             return Err("trwa aktualizacja");
@@ -300,8 +300,7 @@ impl Recorder {
             let others = Track::create(&path.join("others.wav"))?;
             let me = if microphone { Some(Track::create(&path.join("me.wav"))?) } else { None };
             let control = Arc::new(Control::default());
-            *control.targets.lock().unwrap_or_else(PoisonError::into_inner) =
-                Targets { speaker: seen.speaker.clone(), microphone: seen.microphone.clone().filter(|_| microphone) };
+            *control.targets.lock().unwrap_or_else(PoisonError::into_inner) = targets(seen, microphone);
             Ok(((self.hooks.capture)(others, me, Arc::clone(&control))?, control))
         });
         let (capture, control) = match started {
@@ -428,6 +427,11 @@ impl Recorder {
             "reason": reason.or(queue.reason),
         })
     }
+}
+
+/// The devices of Teams' call that `seen` shows, the microphone only when it is recorded.
+fn targets(seen: &Observation, microphone: bool) -> Targets {
+    Targets { speaker: seen.speaker.clone(), microphone: seen.microphone.clone().filter(|_| microphone) }
 }
 
 /// Free bytes on the disk that holds `path`; unknown counts as enough.
@@ -559,7 +563,7 @@ mod tests {
                 Box::new(move |others, me, control| {
                     let panics = Arc::clone(&panics);
                     if no_device.load(Ordering::SeqCst) {
-                        *control.dead.lock().unwrap() = (true, true);
+                        *control.dead.lock().unwrap() = ((true, true), control.targets());
                     }
                     std::thread::Builder::new().spawn(move || {
                         while !control.stop.load(Ordering::SeqCst) {
@@ -765,8 +769,17 @@ mod tests {
         // Teams stays on that device: nothing new starts.
         setup.recorder.observe(&on(true), Instant::now());
         assert!(setup.recorder.active().is_none() && !setup.recorder.skip_file().exists());
-        // Teams moves to another one: the call is recorded again.
-        setup.no_device.store(false, Ordering::SeqCst);
+        // Teams moves to another microphone: the call is recorded again.
+        setup.recorder.observe(&Observation { microphone: Some("mic 2".into()), ..on(true) }, Instant::now());
+        assert!(setup.recorder.active().is_some());
+    }
+
+    #[test]
+    fn a_device_lost_before_teams_moved_does_not_block_the_new_one() {
+        let setup = setup();
+        setup.no_device.store(true, Ordering::SeqCst);
+        setup.recorder.observe(&on(true), Instant::now());
+        // Teams moves to other speakers before the capture tried them: nothing is lost yet.
         setup.recorder.observe(&Observation { speaker: Some("speakers".into()), ..on(true) }, Instant::now());
         assert!(setup.recorder.active().is_some());
     }

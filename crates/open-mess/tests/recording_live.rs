@@ -2,7 +2,9 @@
 //! with the owner in a Teams call: the real detection, capture and toasts, in a temporary folder
 //! instead of the daemon's, so a running daemon is not touched. It prints only, every second, the
 //! Teams sessions' states and the two tracks' levels; no audio, text, name or device id. The
-//! recording is deleted at the end.
+//! recording is deleted at the end, and a run killed before it is cleaned up by the next one.
+//! Run it while the daemon does not record calls: the toasts share its app id, so the end of this
+//! run clears the daemon's toasts too.
 //!
 //! `OPEN_MESS_LIVE_SECONDS=600 cargo test -p open-mess --test recording_live -- --ignored --nocapture`
 
@@ -19,6 +21,9 @@ use open_mess::recording::queue::Queue;
 use open_mess::recording::recorder::{self, By, Settings};
 use open_mess::recording::stt::SttError;
 use open_mess::recording::{Transcript, detect, wav};
+
+/// The temporary folders of this check.
+const PREFIX: &str = "open_mess-live-call";
 
 /// RMS of each second of a track.
 fn levels(path: &Path) -> Vec<u32> {
@@ -40,7 +45,12 @@ fn levels(path: &Path) -> Vec<u32> {
 #[allow(clippy::print_stdout)]
 fn live_call() {
     let seconds: u64 = std::env::var("OPEN_MESS_LIVE_SECONDS").ok().and_then(|value| value.parse().ok()).unwrap_or(300);
-    let local = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(PREFIX) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    let local = tempfile::Builder::new().prefix(PREFIX).tempdir().unwrap();
     // Nothing is transcribed here: the queue is held.
     let engine = Arc::new(|_: &Path, _: Option<&str>, _: &AtomicBool, _: &AtomicU8| -> Result<Transcript, SttError> { Err(SttError::Cancelled) });
     let queue = Arc::new(Queue::start(local.path(), engine, Arc::new(|| Err("live check")), Arc::new(|| None)).unwrap());

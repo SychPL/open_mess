@@ -108,8 +108,9 @@ pub struct Targets {
 pub struct Control {
     pub targets: Mutex<Targets>,
     pub stop: AtomicBool,
-    /// Tracks that could not be opened and stay silent: the other side, the microphone.
-    pub dead: Mutex<(bool, bool)>,
+    /// Tracks that could not be opened and stay silent (the other side, the microphone), with the
+    /// devices the capture last read.
+    pub dead: Mutex<((bool, bool), Targets)>,
 }
 
 impl Control {
@@ -117,8 +118,10 @@ impl Control {
         self.targets.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    pub fn dead(&self) -> (bool, bool) {
-        *self.dead.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Which tracks are lost on `targets`: none until the capture has moved to them.
+    pub fn dead(&self, targets: &Targets) -> (bool, bool) {
+        let dead = self.dead.lock().unwrap_or_else(PoisonError::into_inner);
+        if dead.1 == *targets { dead.0 } else { (false, false) }
     }
 }
 
@@ -198,7 +201,8 @@ pub fn run(
             feed.track.feed(now, &samples, open)?;
         }
         if let [Some(others), me] = &feeds {
-            *control.dead.lock().unwrap_or_else(PoisonError::into_inner) = (others.dead, me.as_ref().is_some_and(|me| me.dead));
+            let read = Targets { speaker: others.device.clone(), microphone: me.as_ref().and_then(|me| me.device.clone()) };
+            *control.dead.lock().unwrap_or_else(PoisonError::into_inner) = ((others.dead, me.as_ref().is_some_and(|me| me.dead)), read);
         }
         pause();
     }
@@ -439,7 +443,7 @@ mod tests {
         assert_eq!(audio.opened, ["a", "b"]);
         assert_eq!(others.len(), 64_000);
         assert_eq!(others.last(), Some(&2));
-        assert_eq!(control.dead(), (false, false));
+        assert_eq!(control.dead(&control.targets()), (false, false));
     }
 
     #[test]
@@ -512,7 +516,7 @@ mod tests {
             }
         };
         run(&mut Failing, Track::create(&dir.path().join("o.wav")).unwrap(), None, &control, &clock, &mut pause).unwrap();
-        assert_eq!(control.dead(), (true, false));
+        assert_eq!(control.dead(&control.targets()), (true, false));
     }
 
     #[test]
@@ -523,7 +527,7 @@ mod tests {
         // 2 minutes: tries at 0 s, 20 s and 40 s, then no more.
         let (others, me) = capture(&mut audio, true, &control, 1200, |_, control| *control.targets.lock().unwrap() = targets("gone", "mic"));
         assert_eq!(audio.opened.iter().filter(|device| *device == "gone").count(), 3);
-        assert_eq!(control.dead(), (true, false));
+        assert_eq!(control.dead(&control.targets()), (true, false));
         assert!(others.iter().all(|sample| *sample == 0) && others.len() == me.len());
 
         // Teams moves to a device that works: the track comes back.
@@ -533,7 +537,7 @@ mod tests {
             let speaker = if tick < 600 { "gone" } else { "good" };
             control.targets.lock().unwrap().speaker = Some(speaker.into());
         });
-        assert_eq!(control.dead(), (false, false));
+        assert_eq!(control.dead(&control.targets()), (false, false));
         assert!(others.get(610 * 1600..690 * 1600).unwrap().iter().all(|sample| *sample == 5));
     }
 }
