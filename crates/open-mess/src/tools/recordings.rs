@@ -16,14 +16,24 @@ pub const STOP: &str = "stop_recording";
 /// The most cues of one page, and the bounds of a page's size.
 const MAX_PAGE_CUES: usize = 2000;
 const MAX_BYTES: (u64, u64, u64) = (4096, 786_432, 131_072);
+/// How an agent adds a meeting's chat to the transcript: by time, since a recording does not know
+/// its meeting (spec 4.5, the owner's decision of 2026-11-03).
+const CHAT: &str = "A transcript has no chat. For a Teams meeting, if teams_list_meetings is offered, it gives from \
+                    an hour before the recording's start to its end (or now) the meeting that overlaps it most; \
+                    read_messages of that meeting's conversation, newest first and paged with before, up to the \
+                    recording's end, is its chat: all of it for a single meeting (an agenda sent before it too), \
+                    and back to the end of the previous occurrence for a recurring one, whose series shares one chat. \
+                    Without teams_list_meetings, list_conversations and search find the meeting's chat like any \
+                    conversation.";
 
 pub fn tools() -> Vec<ToolInfo> {
     vec![
         ToolInfo {
             name: LIST.into(),
-            description: "Calls recorded on this computer and transcribed locally, newest first, with their state. Their \
-                          transcripts come from get_recording_transcript."
-                .into(),
+            description: format!(
+                "Calls recorded on this computer and transcribed locally, newest first, with their state. Their \
+                 transcripts come from get_recording_transcript. {CHAT}"
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -36,9 +46,10 @@ pub fn tools() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: TRANSCRIPT.into(),
-            description: "The local transcript of one recording, a page at a time: pieces of speech with times from the \
-                          recording's start and the side that spoke (me: the user's microphone, others: what the call played)."
-                .into(),
+            description: format!(
+                "The local transcript of one recording, a page at a time: pieces of speech with times from the \
+                 recording's start and the side that spoke (me: the user's microphone, others: what the call played). {CHAT}"
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -232,6 +243,15 @@ mod tests {
 
     fn yes() -> Result<bool, ToolError> {
         Ok(true)
+    }
+
+    #[test]
+    fn the_descriptions_say_where_a_meetings_chat_is() {
+        for tool in tools().iter().filter(|tool| tool.name != STOP) {
+            let description = &tool.description;
+            let ways = ["teams_list_meetings", "read_messages", "list_conversations", "search"];
+            assert!(ways.iter().all(|way| description.contains(way)), "{}", tool.name);
+        }
     }
 
     #[test]

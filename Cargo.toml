@@ -27,3 +27,7 @@ indexing_slicing = "deny"
 # println!/eprintln! panic when stdout/stderr is closed; write with writeln! and ignore the error.
 print_stdout = "deny"
 print_stderr = "deny"
+
+# No profile sets `panic = "abort"`: the daemon catches a panic of the transcription and capture
+# threads when it joins them, while abort would end it with every account at once
+# (spec 2026-10-28-local-transcription, 4.3).
