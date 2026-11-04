@@ -9,6 +9,7 @@
 mod common;
 mod fake;
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,7 +45,7 @@ impl Teams {
     async fn start() -> Teams {
         let data = tempfile::tempdir().unwrap();
         let (fake, wam) = (Fake::start().await, Wam::new());
-        let (module, events) = load(&fake, &wam, data.path(), None).await;
+        let (module, events) = load(&fake, &wam, data.path(), None, None).await;
         Teams { module, events, fake, wam, _data: data }
     }
 
@@ -52,7 +53,7 @@ impl Teams {
     async fn polling() -> Teams {
         let data = tempfile::tempdir().unwrap();
         let (fake, wam) = (Fake::start().await, Wam::new());
-        let (module, events) = load(&fake, &wam, data.path(), Some(POLL)).await;
+        let (module, events) = load(&fake, &wam, data.path(), Some(POLL), None).await;
         module.sign_in().await.unwrap();
         Teams { module, events, fake, wam, _data: data }
     }
@@ -82,12 +83,24 @@ fn conversations_page(items: Vec<Value>) -> impl Fn(&fake::Seen) -> Option<Reply
 /// The longest a module timer waits in the polling tests, in milliseconds.
 const POLL: u32 = 300;
 
-async fn load(fake: &Fake, wam: &Wam, data_dir: &Path, timer_cap: Option<u32>) -> (ModuleHandle, mpsc::Receiver<HostEvent>) {
-    let mut engine = Engine::with_limits(limits::for_tests()).unwrap().with_fake_wam(wam.hook());
+async fn load(
+    fake: &Fake,
+    wam: &Wam,
+    data_dir: &Path,
+    timer_cap: Option<u32>,
+    trouter: Option<SocketAddr>,
+) -> (ModuleHandle, mpsc::Receiver<HostEvent>) {
+    // Live captions wait for the call store within the module's budget, as in the daemon: the
+    // host's own call limit, not the tests' shorter one.
+    let calls = if trouter.is_some() { limits::Limits { call_timeout: limits::CALL_TIMEOUT, ..limits::for_tests() } } else { limits::for_tests() };
+    let mut engine = Engine::with_limits(calls).unwrap().with_fake_wam(wam.hook());
     if let Some(cap) = timer_cap {
         engine = engine.with_timer_cap(cap);
     }
-    let net = Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests()).serving_hosts_from(fake.addr);
+    let mut net = Net::with_limits(AddressPolicy::AllowLoopbackForTests, limits::for_tests()).serving_hosts_from(fake.addr);
+    if let Some(trouter) = trouter {
+        net = net.serving_websockets_from(trouter);
+    }
     let (events, receiver) = mpsc::channel(64);
     // Signs in through the fake WAM: no prompt reaches a window.
     let sign_in = SignInPrompts::new(mpsc::channel(1).0);
@@ -1204,7 +1217,7 @@ async fn restart_does_not_replay_old_messages() {
     let list = listed.clone();
     fake.on(move |s| (s.path == CHAT_PATH).then(|| Reply::json(page("conversations", list.lock().unwrap().clone(), None))));
     {
-        let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL)).await;
+        let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL), None).await;
         module.sign_in().await.unwrap();
         // Sent after the sign-in, which starts the count, however long loading the module took.
         let old = conversation(GROUP, None, Some(message("1900000000005", GROUP, OTHER, "<p>old</p>", now_ms() + 1000)));
@@ -1212,7 +1225,7 @@ async fn restart_does_not_replay_old_messages() {
         assert_eq!(next_message(&mut events, &fake).await.map(|m| m.message).as_deref(), Some("1900000000005"));
     }
     // A new instance, as after a crash or a daemon restart: the same storage, nothing in memory.
-    let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL)).await;
+    let (module, mut events) = load(&fake, &wam, data.path(), Some(POLL), None).await;
     module.restore(ME_OID).await.unwrap();
     assert_eq!(next_message(&mut events, &fake).await, None);
     let new = conversation(GROUP, None, Some(message("1900000000006", GROUP, OTHER, "<p>new</p>", now_ms() + 61_000)));
@@ -1549,4 +1562,241 @@ async fn sharepoint_refusals_are_answers_not_a_lost_sign_in() {
     // The account is still signed in.
     teams.fake.on(transcript_server(unchanged, same_list));
     teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
+}
+
+// Live captions (spec 2026-10-29-live-captions, 4): the Teams side of a call against the fake
+// server, a fake Trouter and a WebRTC peer on loopback standing in for Teams' media processor.
+
+const CONTROLLER: &str = "https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv.synthetic/conv/c1";
+const CONTROLLER_PATH: &str = "/api/v2/ep/conv.synthetic/conv/c1";
+const CALL_STORE_PATH: &str = "/api/v2/ep/api.userstore.skype.com/api/v1/user/8:orgid:00000000-0000-0000-0000-000000000001/conversations";
+const REGISTRAR_PATH: &str = "/registrar/prod/V2/registrations";
+
+impl Teams {
+    /// Signed in, its WebSockets served by a fake Trouter.
+    async fn live() -> (Teams, fake::Trouter) {
+        let data = tempfile::tempdir().unwrap();
+        let (fake, wam, trouter) = (Fake::start().await, Wam::new(), fake::Trouter::start().await);
+        let (module, events) = load(&fake, &wam, data.path(), None, Some(trouter.addr)).await;
+        module.sign_in().await.unwrap();
+        (Teams { module, events, fake, wam, _data: data }, trouter)
+    }
+}
+
+/// The conversation as the service answers the join and reads of it: the leave link, and a roster
+/// with the user's endpoints and the captions bot.
+fn live_conversation(user_endpoints: &Value) -> Value {
+    json!({"links": {"leave": format!("{CONTROLLER}/leave")}, "roster": {"participants": {
+        ME: {"state": "active", "endpoints": user_endpoints},
+        "28:00000000-0000-0000-0000-0000000000bb": {"endpoints": {"bot": {"endpointMetadata": {"processingModes": {"closedCaptions": {"state": "Active"}}}}}},
+    }}})
+}
+
+/// A meeting with captions on, the user in it on the endpoints `user_endpoints` (open_mess's own
+/// is never listed, so any is another device), and the call store's item for it.
+fn meeting_server(user_endpoints: Value, in_call_store: bool) -> impl Fn(&fake::Seen) -> Option<Reply> {
+    move |s| {
+        let path = s.path.as_str();
+        match s.method.as_str() {
+            "GET" if path == CALL_STORE_PATH => {
+                let item = json!({"conversationController": CONTROLLER, "groupContext": {"threadId": MEETING, "messageId": "0"}, "meetingInfo": {"organizerId": ME_OID}});
+                Some(Reply::json(if in_call_store { json!([item]) } else { json!([]) }))
+            }
+            "POST" if path == REGISTRAR_PATH => Some(Reply::status(202)),
+            "DELETE" if path.starts_with(REGISTRAR_PATH) => Some(Reply::status(202)),
+            "GET" | "POST" if path == CONTROLLER_PATH => Some(Reply::json(live_conversation(&user_endpoints))),
+            "POST" if path == format!("{CONTROLLER_PATH}/leave") => Some(Reply::status(204)),
+            "POST" if path == format!("{CONTROLLER_PATH}/ack") => Some(Reply::status(202)),
+            _ => None,
+        }
+    }
+}
+
+async fn wait_for<T>(mut found: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..100 {
+        if let Some(found) = found() {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("not within 10 s");
+}
+
+fn requests(fake: &Fake, method: &str, path: &str) -> Vec<fake::Seen> {
+    fake.seen().into_iter().filter(|s| s.method == method && s.path == path).collect()
+}
+
+/// The module's MS-SDP offer as plain SDP for the test's peer, and the peer's answer as Teams gives
+/// it (docs "Live results" 16 and 18).
+fn plain_offer(ms: &str) -> String {
+    let lines = ms.lines().filter_map(|l| match l.strip_prefix("m=x-data ") {
+        Some(rest) => Some(format!("m=application {} UDP/DTLS/SCTP webrtc-datachannel", rest.split(' ').next().unwrap())),
+        None => (!["a=rtpmap", "a=fmtp", "a=x-", "a=label", "b="].iter().any(|p| l.starts_with(p))).then(|| l.to_string()),
+    });
+    lines.collect::<Vec<_>>().join("\r\n") + "\r\n"
+}
+
+fn ms_answer(plain: &str) -> String {
+    let lines = plain.lines().filter_map(|l| match l.strip_prefix("m=application ") {
+        Some(rest) => Some(format!("m=x-data {} RTP/SAVP 127 126\r\na=x-data-protocol:sctp\r\na=label:data", rest.split(' ').next().unwrap())),
+        None => (!["a=extmap-allow-mixed", "a=msid-semantic", "a=ice-options"].iter().any(|p| l.starts_with(p))).then(|| l.to_string()),
+    });
+    lines.collect::<Vec<_>>().join("\r\n") + "\r\n"
+}
+
+struct MediaPeer {
+    pc: Arc<dyn webrtc::peer_connection::PeerConnection>,
+    channels: mpsc::Receiver<Arc<dyn webrtc::data_channel::DataChannel>>,
+}
+
+struct MediaEvents {
+    channels: mpsc::Sender<Arc<dyn webrtc::data_channel::DataChannel>>,
+    gathered: mpsc::Sender<()>,
+}
+
+#[async_trait::async_trait]
+impl webrtc::peer_connection::PeerConnectionEventHandler for MediaEvents {
+    async fn on_ice_gathering_state_change(&self, state: webrtc::peer_connection::RTCIceGatheringState) {
+        if state == webrtc::peer_connection::RTCIceGatheringState::Complete {
+            self.gathered.try_send(()).ok();
+        }
+    }
+
+    async fn on_data_channel(&self, channel: Arc<dyn webrtc::data_channel::DataChannel>) {
+        self.channels.try_send(channel).ok();
+    }
+}
+
+/// A WebRTC peer on loopback that answers `offer`, as Teams' media processor would.
+async fn media_peer(offer: &str) -> (MediaPeer, String) {
+    use webrtc::peer_connection::{
+        MediaEngine, PeerConnection, PeerConnectionBuilder, RTCConfigurationBuilder, RTCSessionDescription, SettingEngineBuilder,
+    };
+    let (channels_tx, channels) = mpsc::channel(4);
+    let (gathered_tx, mut gathered) = mpsc::channel(1);
+    let pc = PeerConnectionBuilder::new()
+        .with_configuration(RTCConfigurationBuilder::new().build())
+        .with_media_engine(MediaEngine::default())
+        .with_setting_engine(SettingEngineBuilder::new().with_include_loopback_candidate(true).build())
+        .with_handler(Arc::new(MediaEvents { channels: channels_tx, gathered: gathered_tx }))
+        .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+        .build()
+        .await
+        .unwrap();
+    let pc: Arc<dyn PeerConnection> = Arc::new(pc);
+    pc.set_remote_description(RTCSessionDescription::offer(offer.to_string()).unwrap()).await.unwrap();
+    let answer = pc.create_answer(None).await.unwrap();
+    pc.set_local_description(answer).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), gathered.recv()).await.ok();
+    let sdp = pc.local_description().await.unwrap().sdp;
+    (MediaPeer { pc, channels }, sdp)
+}
+
+/// A caption message on the data channel (docs 10.7): the 11-byte header, data id 3, one final
+/// result.
+fn caption_message(text: &str) -> Vec<u8> {
+    let result = json!({"isFinal": true, "text": text, "displayName": "Synthetic Person Two", "spokenLanguage": "en-us", "userId": OTHER});
+    let mut message = vec![0x10, 11, 0x80 | 3, 0, 1, 0, 0, 0, 0, 7, 0];
+    message.extend(json!({"recognitionResults": [result], "events": [], "version": 1}).to_string().as_bytes());
+    message
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_captions_are_joined_read_and_left() {
+    let (teams, trouter) = Teams::live().await;
+    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
+    assert_eq!(teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap(), json!({"state": "joining"}));
+    // Trouter, the registration, then the join with the skype token and no bearer.
+    let join = wait_for(|| requests(&teams.fake, "POST", CONTROLLER_PATH).pop()).await;
+    assert!(trouter.seen().iter().any(|f| f.contains("\"user.authenticate\"")));
+    assert_eq!(requests(&teams.fake, "POST", REGISTRAR_PATH).len(), 1);
+    assert_eq!((join.header("x-skypetoken"), join.header("authorization")), (Some("synthetic-skype-token"), None));
+    let body = join.json();
+    assert_eq!((body["endpointState"]["state"]["isMuted"].as_bool(), &body["callInvitation"]["callModalities"]), (Some(true), &json!([])));
+    assert_eq!(body["groupChat"]["threadId"], MEETING);
+    let offer = body["callInvitation"]["mediaContent"]["blob"].as_str().unwrap();
+    assert!(offer.contains("m=x-data ") && offer.matches("m=").count() == 1, "{offer}");
+    let acceptance = body["callInvitation"]["links"]["acceptance"].as_str().unwrap();
+    assert!(acceptance.starts_with(&format!("{}callAgent/", fake::SURL)) && acceptance.ends_with("/call/acceptance/"));
+    // Teams' media processor answers on Trouter; the data channel opens and a caption comes.
+    let (mut peer, answer) = media_peer(&plain_offer(offer)).await;
+    let accepted =
+        json!({"callAcceptance": {"mediaContent": {"blob": ms_answer(&answer)}, "links": {"acknowledgement": format!("{CONTROLLER}/ack")}}});
+    assert!(trouter.callback(1, acceptance, &accepted));
+    let channel = tokio::time::timeout(Duration::from_secs(10), peer.channels.recv()).await.unwrap().unwrap();
+    while !matches!(
+        tokio::time::timeout(Duration::from_secs(10), channel.poll()).await.unwrap(),
+        Some(webrtc::data_channel::DataChannelEvent::OnOpen)
+    ) {}
+    channel.send(caption_message("Hello from the meeting.").as_slice().into()).await.unwrap();
+    let mut page = Value::Null;
+    for _ in 0..100 {
+        page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
+        if page["untrusted"]["cues"].as_array().is_some_and(|cues| !cues.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!((page["state"].as_str(), page["captions_on"].as_bool(), page["next_cursor"].as_u64()), (Some("live"), Some(true), Some(1)), "{page}");
+    assert_eq!(page["untrusted"]["cues"][0]["speaker"], "Synthetic Person Two");
+    assert_eq!(page["untrusted"]["cues"][0]["text"], "Hello from the meeting.");
+    assert_eq!(page["language"], "en-us");
+    assert_eq!(requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/ack")).len(), 1);
+    assert!(trouter.seen().iter().any(|f| f.starts_with("3:::") && f.contains("\"status\":200")));
+    // Another meeting's read shows nothing of this one.
+    let other = teams.call("read_captions", json!({"conversation": GROUP})).await.unwrap();
+    assert_eq!((other["state"].as_str(), &other["untrusted"]["cues"]), (Some("not_joined"), &json!([])));
+    // Leaving: `leave` as open_mess's endpoint and the registration's removal.
+    assert_eq!(teams.call("leave_captions", json!({"conversation": MEETING})).await.unwrap(), json!({"state": "ended"}));
+    let leave = requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave"));
+    assert_eq!(leave.len(), 1);
+    assert_eq!(leave[0].json()["participants"]["from"]["endpointId"], body["participants"]["from"]["endpointId"]);
+    assert_eq!(teams.fake.seen().iter().filter(|s| s.method == "DELETE" && s.path.starts_with(REGISTRAR_PATH)).count(), 1);
+    let session = page["session"].as_str().unwrap();
+    let after = teams.call("read_captions", json!({"conversation": MEETING, "session": session, "cursor": 0})).await.unwrap();
+    assert_eq!((after["state"].as_str(), after["reason"].as_str(), after["next_cursor"].as_u64()), (Some("ended"), Some("left"), Some(1)));
+    let changed = teams.call("read_captions", json!({"conversation": MEETING, "session": "b3RoZXI", "cursor": 0})).await;
+    assert!(matches!(module_error(changed), ModuleError::InvalidArgs(why) if why.contains("session changed")));
+    peer.pc.close().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_captions_end_at_once_when_the_user_is_not_in_the_meeting() {
+    let (teams, _trouter) = Teams::live().await;
+    // The call store lists the meeting, but the roster has no other endpoint of the user.
+    teams.fake.on(meeting_server(json!({}), true));
+    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    let leave = wait_for(|| requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).pop()).await;
+    assert_eq!(leave.json()["callTransactionEnd"]["phrase"], "LOCAL_USER_INITIATED");
+    let page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!((page["state"].as_str(), page["reason"].as_str()), (Some("failed"), Some("user_not_in_meeting")));
+    // Another session of the account can start again.
+    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn joining_needs_the_meeting_in_the_call_store_and_one_session_an_account() {
+    let (teams, trouter) = Teams::live().await;
+    teams.fake.on(meeting_server(json!({"official-client": {}}), false));
+    let refused = module_error(teams.call("join_captions", json!({"conversation": MEETING})).await);
+    assert!(matches!(&refused, ModuleError::Platform(why) if why.contains("does not list you in this meeting")), "{refused:?}");
+    // Three reads of the call store, and nothing reached the meeting or Trouter.
+    assert_eq!(requests(&teams.fake, "GET", CALL_STORE_PATH).len(), 3);
+    assert!(requests(&teams.fake, "POST", CONTROLLER_PATH).is_empty() && trouter.seen().is_empty());
+    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
+    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    let again = module_error(teams.call("join_captions", json!({"conversation": GROUP})).await);
+    assert!(matches!(&again, ModuleError::Platform(why) if why.contains("leave it first")), "{again:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn end_sessions_leaves_the_meeting() {
+    let (teams, _trouter) = Teams::live().await;
+    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
+    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    wait_for(|| requests(&teams.fake, "POST", CONTROLLER_PATH).pop()).await;
+    teams.module.end_sessions(ME_OID).await.unwrap();
+    assert_eq!(requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).len(), 1);
+    let page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!((page["state"].as_str(), page["reason"].as_str()), (Some("ended"), Some("update")));
 }

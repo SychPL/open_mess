@@ -37,7 +37,12 @@ thread_local! {
 
 /// Starts a call's budget; every export calls it first.
 pub fn begin() {
-    DEADLINE.set(Some(Instant::now() + CALL_BUDGET));
+    begin_within(CALL_BUDGET);
+}
+
+/// Starts a shorter budget, for an export the host limits more (`end-sessions`, 5 s).
+pub fn begin_within(budget: Duration) {
+    DEADLINE.set(Some(Instant::now() + budget));
     BACKGROUND.set(false);
 }
 
@@ -53,7 +58,7 @@ pub fn has_time() -> bool {
 }
 
 /// Waits `ms` if that ends within the budget.
-fn pause(ms: u32) -> bool {
+pub fn wait(ms: u32) -> bool {
     let wait = Duration::from_millis(u64::from(ms));
     if DEADLINE.get().is_some_and(|deadline| Instant::now() + wait > deadline) {
         return false;
@@ -197,13 +202,14 @@ fn establish(token: String, claims: Claims) -> Result<Session, ModuleError> {
     let auth = authorize(&token)?;
     let expires = claims.expires_ms;
     let mut session = Session::new(claims, auth.directory);
+    session.region = auth.region;
     session.keep(AUTHSVC_SCOPE, token, expires);
     session.keep_skype(auth.skype_token, auth.expires_at_ms);
     Ok(session)
 }
 
 fn authorize(token: &str) -> Result<authsvc::Session, ModuleError> {
-    let response = exchange(&authsvc::request(), token, false, false)?;
+    let response = exchange(&authsvc::request(), Some(token), false, false)?;
     match response.status {
         200..=299 => {}
         401 | 403 => return Err(ModuleError::AuthRequired(format!("Teams refused the account (HTTP {})", response.status))),
@@ -216,6 +222,7 @@ fn authorize(token: &str) -> Result<authsvc::Session, ModuleError> {
 fn reauthorize(session: &mut Session, token: &str) -> Result<(), ModuleError> {
     let auth = authorize(token)?;
     session.directory = auth.directory;
+    session.region = auth.region;
     session.keep_skype(auth.skype_token, auth.expires_at_ms);
     Ok(())
 }
@@ -228,22 +235,49 @@ pub fn middle_tier(session: &mut Session, req: &HttpRequest) -> Result<Vec<u8>, 
     if session.skype(now_ms(), true).is_none() {
         reauthorize(session, &token)?;
     }
-    let first = exchange(&with_skype(session, req)?, &token, false, false)?;
+    let first = exchange(&with_skype(session, req)?, Some(&token), false, false)?;
     if first.status != 401 {
         return ok(first);
     }
     let claims = header(&first.headers, "www-authenticate").and_then(session::challenge_claims);
     let token = renew(session, AUTHSVC_SCOPE, claims.as_deref())?;
     reauthorize(session, &token)?;
-    let second = exchange(&with_skype(session, req)?, &token, false, false)?;
+    let second = exchange(&with_skype(session, req)?, Some(&token), false, false)?;
     if second.status == 401 {
         return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
     }
     ok(second)
 }
 
+/// A request to the conversation service of live captions with the skype token and no bearer, as
+/// the probe sent them ("Live results" 14-18). A skype token about to expire is renewed by a new
+/// authsvc exchange first; a 401, which the service did not take, gets one more exchange and one
+/// more try.
+pub fn conversation(session: &mut Session, req: &HttpRequest, write: bool) -> Result<http::Response, ModuleError> {
+    if session.skype(now_ms(), true).is_none() {
+        let token = token(session, AUTHSVC_SCOPE)?;
+        reauthorize(session, &token)?;
+    }
+    let first = exchange(&with_skype(session, req)?, None, false, write)?;
+    if first.status != 401 {
+        return Ok(first);
+    }
+    let token = renew(session, AUTHSVC_SCOPE, None)?;
+    reauthorize(session, &token)?;
+    let second = exchange(&with_skype(session, req)?, None, false, write)?;
+    if second.status == 401 {
+        return Err(ModuleError::AuthRequired("the service refused a new skype token".to_string()));
+    }
+    Ok(second)
+}
+
+/// The IC3 token of Trouter's `user.authenticate`, the chat service's (docs 10.7).
+pub fn chat_token(session: &mut Session) -> Result<String, ModuleError> {
+    token(session, CHAT_SCOPE)
+}
+
 fn with_skype(session: &Session, req: &HttpRequest) -> Result<HttpRequest, ModuleError> {
-    let skype = session.skype(now_ms(), false).ok_or_else(|| ModuleError::NotSupported("no calendar service for this account".to_string()))?;
+    let skype = session.skype(now_ms(), false).ok_or_else(|| ModuleError::NotSupported("Teams gave no skype token for this account".to_string()))?;
     let mut req = req.clone();
     req.headers.push(("x-skypetoken".to_string(), skype.to_string()));
     Ok(req)
@@ -295,13 +329,13 @@ fn renew(session: &mut Session, scope: &str, claims: Option<&str>) -> Result<Str
 /// again: it ends `uncertain` (spec 8.5).
 pub fn send(session: &mut Session, service: Service, req: &HttpRequest, write: bool) -> Result<http::Response, ModuleError> {
     let scope = service.scope();
-    let first = exchange(req, &token(session, scope)?, service == Service::Chat, write)?;
+    let first = exchange(req, Some(&token(session, scope)?), service == Service::Chat, write)?;
     if first.status != 401 {
         return Ok(first);
     }
     let claims = header(&first.headers, "www-authenticate").and_then(session::challenge_claims);
     let token = renew(session, scope, claims.as_deref())?;
-    let second = exchange(req, &token, service == Service::Chat, write)?;
+    let second = exchange(req, Some(&token), service == Service::Chat, write)?;
     if second.status == 401 {
         return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
     }
@@ -314,11 +348,11 @@ pub fn send(session: &mut Session, service: Service, req: &HttpRequest, write: b
 /// 2026-10-28-meetings-transcripts, 4.2).
 pub fn sharepoint(session: &mut Session, origin: &str, req: &HttpRequest) -> Result<Vec<u8>, ModuleError> {
     let scope = format!("{origin}/.default");
-    let mut response = exchange(req, &token(session, &scope)?, false, false)?;
+    let mut response = exchange(req, Some(&token(session, &scope)?), false, false)?;
     if response.status == 401 {
         let claims = header(&response.headers, "www-authenticate").and_then(session::challenge_claims);
         let token = renew(session, &scope, claims.as_deref())?;
-        response = exchange(req, &token, false, false)?;
+        response = exchange(req, Some(&token), false, false)?;
     }
     match response.status {
         401 | 403 => Err(ModuleError::Platform("access to this transcript was refused".to_string())),
@@ -347,9 +381,10 @@ pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
 }
 
 /// One exchange under the chat service's retry policy (docs 8): 429 and 5xx again after the wait,
-/// a write only after a 429, which the service did not take. `redirects`: follow the chat
-/// service's regional redirects, a 404 with `Location` on the same host (docs 3.1).
-fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Result<http::Response, ModuleError> {
+/// a write only after a 429, which the service did not take. `token` goes as the bearer, if any.
+/// `redirects`: follow the chat service's regional redirects, a 404 with `Location` on the same
+/// host (docs 3.1).
+fn exchange(req: &HttpRequest, token: Option<&str>, redirects: bool, write: bool) -> Result<http::Response, ModuleError> {
     let mut url = req.url.clone();
     let (mut attempt, mut hops) = (0u8, 0u8);
     loop {
@@ -360,7 +395,9 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
             return Err(ModuleError::Platform("Teams answers too slowly; try again later".to_string()));
         }
         let mut headers = req.headers.clone();
-        headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        if let Some(token) = token {
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        }
         if BACKGROUND.get() {
             headers.push(("x-ms-request-priority".to_string(), "20".to_string()));
         }
@@ -385,7 +422,7 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
         match retry::decide(status, header(&response.headers, "retry-after"), attempt, now_ms()) {
             Retry::Done => return Ok(response),
             Retry::After(ms) => {
-                if !pause(ms) {
+                if !wait(ms) {
                     return Err(ModuleError::Platform(format!("the service asks to wait {} s; try again later", ms.div_ceil(1000))));
                 }
                 attempt += 1;

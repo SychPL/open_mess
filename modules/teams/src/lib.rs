@@ -27,6 +27,8 @@ mod api;
 #[cfg(target_arch = "wasm32")]
 mod component;
 #[cfg(target_arch = "wasm32")]
+mod live;
+#[cfg(target_arch = "wasm32")]
 mod tools;
 
 /// Why a response could not be decoded or a request was refused.

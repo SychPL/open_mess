@@ -706,6 +706,10 @@ desktop's SlimCore speaks it natively), the calling core `114419-5658b4e2d56443f
 - **CONFIRMED** TURN hosts from configuration: `default.relay.teams.microsoft.com` (UDP 3478, TCP and
   TLS 443), and `tr.teams.microsoft.com` (`TRAPRelayFqdn`); one configuration variant names the address
   `52.113.193.5`. No wildcard host and no published address ranges of media servers are in the bundle.
+- **CONFIRMED** (Microsoft's published list, read 2026-11-04 from "Office 365 URLs and IP address
+  ranges", last updated 2026-08-14): Teams media, ID 11 (`OptimizeRequired`), is `52.112.0.0/14`,
+  `52.122.0.0/15` and `2603:1063::/38` on UDP 3478-3481; every media relay candidate seen live was in
+  52.112.0.0/16 ("Live results" 15-18). These ranges are the module's `media.peers`.
 - **CONFIRMED** credentials: `GET https://teams.microsoft.com/trap/tokens` with `api-version: 2` and
   `X-Skypetoken` (or a bearer under the newer token API); the answer is `{expires, tokens: [{realm,
   username, password}]}` (realm `rtcmedia`); refreshed early from `earlyRefreshMinutes`. ICE servers are

@@ -44,6 +44,9 @@ pub fn call(account: &str, tool: &str, args_json: &str) -> Result<String, Module
         "react" => react,
         "list_meetings" => list_meetings,
         "get_transcript" => get_transcript,
+        "join_captions" => crate::live::join,
+        "read_captions" => crate::live::read,
+        "leave_captions" => crate::live::leave,
         _ => return Err(ModuleError::NotSupported(tool.to_string())),
     };
     api::with_session(account, |session| run(session, &args)).map(|result| result.to_string())
