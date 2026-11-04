@@ -1236,6 +1236,40 @@ token, tenant id, user id or account name.
       registrar request had `X-Ms-Test-User: False`, `Accept: application/json, text/javascript`,
       the IC3 bearer with `X-MS-Migration: True` and, in the body of section 5, `languageId`
       `en-US`, `platform` `edge` and `platformUIVersion` `1415/<client build>`.
+    - What the probe sent to the conversation service in the data-only joins of item 18 (written
+      down from its code on 2026-11-04): every request with `X-Skypetoken`, `Content-Type:
+      application/json`, one `X-Microsoft-Skype-Chain-ID` for the call, a new
+      `X-Microsoft-Skype-Message-ID` each, `X-Microsoft-Skype-Client: SkypeSpaces/1415/<client
+      build>/os=windows; osVer=NT 10.0; deviceType=computer/TsCallingVersion=2026.37.01.11`,
+      `MS-Teams-Ring: general`, and `MS-Teams-Region` / `MS-Teams-Partition` with authz's `region`
+      and `partition`; no bearer. The call store `GET` had only the skype token. The join body:
+      `conversationRequest` (`conversationType` and `subject` null, `suppressDialout: true`,
+      `roster: {type: "Delta", rosterUpdate}`, the four `properties` of item 15, `links`
+      `conversationEnd`, `conversationUpdate`, `localParticipantUpdate`, `addParticipantSuccess`,
+      `addParticipantFailure`, `addModalitySuccess`, `addModalityFailure`, `confirmUnmute`,
+      `receiveMessage`), `groupContext: null`, `groupChat` (`threadId`, `messageId` from the call
+      store item's `groupContext`), `contentSharing: null`, `participants` (`from` = `id` (MRI),
+      `displayName`, `endpointId` (the Trouter `epid`), `participantId` (a random UUID), `languageId:
+      "en-US"`; `to: []`), `meetingData: null`, `meetingPreferences.shouldResurrect: "Resurrect"`,
+      `endpointState` (`endpointStateSequenceNumber: 0`, `state.isMuted: true`), `capabilities`
+      null, `endpointCapabilities: 72935`, `clientEndpointCapabilities` null, `endpointMetadata: {}`,
+      `meetingInfo` copied from the call store item, and `callInvitation` (`callModalities: []`,
+      `replaces`, `transferor`, `clientTransferContext`, `customContext`, `emergencyContent`,
+      `locationContent`, `networkContent`, `areaContent` null, `pstnContent` (`emergencyCallCountry:
+      ""`, `platformName` = the client header, `publicApiCall: false`), `links` `progress`,
+      `mediaAnswer`, `acceptance`, `redirection`, `end`, `clientContentForMediaController`
+      (`controlVideoStreaming`, `csrcInfo`), `mediaContent` (`contentType:
+      "application/sdp-ngc-1.0"`, `blob`, `clientLocation` - the owner's country, `mediaLegId` (32 hex
+      characters))). Every callback link was `<surl>callAgent/<a random session id>/<8 random hex
+      characters>/<path>`. The offer, from webrtc-rs's data-only offer: `b=CT:4000` after `s=-`,
+      `a=msid-semantic: WMS *`, the section `m=x-data <port> RTP/SAVP 127 126` with `c=IN IP4`, port
+      and the single candidate of the first IPv4 UDP host candidate of component 1 (its extensions
+      dropped), `a=ice-options:trickle`, the three lines of item 16, `a=x-data-protocol:sctp`,
+      `a=x-ssrc-range:<n>-<n>`, `a=rtcp-mux`, the offer's `a=setup`, `a=mid`, `a=sendrecv`,
+      `a=sctp-port`, `a=ice-ufrag`, `a=ice-pwd`, `a=max-message-size:262144`, then `a=label:data`
+      and the session's `a=fingerprint`; `a=extmap-allow-mixed` and `a=end-of-candidates` left out.
+      `leave` had the body of section 10.7 with `phrase: "LOCAL_USER_INITIATED"` and code and subCode
+      0.
     - Call store: the items now have the keys `conversationController`, `correlationId`,
       `groupContext` (`messageId`, `threadId`), `meetingInfo` (`organizerId`, `tenantId`) and
       `userJoinTime`, and `groupContext.threadId` is the chat thread of the call - unlike item 11,
