@@ -1800,3 +1800,30 @@ async fn end_sessions_leaves_the_meeting() {
     let page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
     assert_eq!((page["state"].as_str(), page["reason"].as_str()), (Some("ended"), Some("update")));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_leave_is_sent_again_from_the_session_record() {
+    let (teams, _trouter) = Teams::live().await;
+    // `leave` fails until the test lets it through; the rest is the usual meeting.
+    let status = Arc::new(AtomicUsize::new(503));
+    let (meeting, answer) = (meeting_server(json!({"official-client": {}}), true), status.clone());
+    let leave_path = format!("{CONTROLLER_PATH}/leave");
+    teams.fake.on(move |s| if s.path == leave_path { Some(Reply::status(answer.load(Ordering::SeqCst) as u16)) } else { meeting(s) });
+    let leaves = |teams: &Teams| requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).len();
+    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    wait_for(|| requests(&teams.fake, "POST", CONTROLLER_PATH).pop()).await;
+    assert_eq!(teams.call("leave_captions", json!({"conversation": MEETING})).await.unwrap(), json!({"state": "ended"}));
+    assert_eq!(leaves(&teams), 1);
+    // A new instance (after a crash, or the daemon's start) leaves from the record: the
+    // conversation is read for its `leave` link, and the record stays while it fails.
+    let reads = requests(&teams.fake, "GET", CONTROLLER_PATH).len();
+    teams.module.restore(ME_OID).await.unwrap();
+    assert_eq!((leaves(&teams), requests(&teams.fake, "GET", CONTROLLER_PATH).len()), (2, reads + 1));
+    // Signing out tries once more, with no session holding the leg; then the record is gone.
+    status.store(204, Ordering::SeqCst);
+    teams.module.sign_out(ME_OID).await.unwrap();
+    assert_eq!(leaves(&teams), 3);
+    teams.module.sign_in().await.unwrap();
+    teams.module.restore(ME_OID).await.unwrap();
+    assert_eq!(leaves(&teams), 3);
+}

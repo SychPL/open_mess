@@ -64,13 +64,18 @@ fn records(account: &str) -> Vec<Record> {
     storage::get(&records_key(account)).map(|bytes| captions::decode_records(&bytes)).unwrap_or_default()
 }
 
-fn store_records(account: &str, records: &[Record]) {
+/// Whether the records were stored.
+fn store_records(account: &str, records: &[Record]) -> bool {
     let key = records_key(account);
     if records.is_empty() {
         storage::delete(&key);
-    } else if storage::set(&key, &captions::encode_records(records)).is_err() {
+        return true;
+    }
+    let stored = storage::set(&key, &captions::encode_records(records)).is_ok();
+    if !stored {
         host::log(1, "a live-captions session record was not stored");
     }
+    stored
 }
 
 /// open_mess's own endpoint id for the account (spec 5.3): made once, kept in storage, never the
@@ -140,8 +145,12 @@ fn event(account: &str, f: impl FnOnce(&mut Leg, &mut Session, i64)) {
         Ok(())
     });
     if done.is_err() {
-        // No session to send anything with: the connections go, the record stays for `restore`.
+        // No session to send anything with: the connections go, and the record stays for the
+        // retries, a new sign-in or `restore` (GLM review of 7385fdd).
         close(&mut leg);
+        if leg.captions.active() && leg.joined {
+            retry_from(account, now);
+        }
         leg.captions.end(Reason::Protocol, now);
     }
     put(leg, now);
@@ -289,14 +298,15 @@ fn end(leg: &mut Leg, s: &mut Session, reason: Reason, now: i64) {
     }
     leg.captions.end(reason, now);
     close(leg);
-    if leg.registered && api::send(s, Service::Chat, &leg.trouter.unregistration(), false).is_err() {
-        host::log(1, "the live-captions registration was not removed; it lapses by itself");
-    }
+    // `leave` first: what others see goes before what only Trouter knows (Codex review of 7385fdd).
     let record = Record { controller: leg.live.controller.clone(), endpoint: leg.endpoint.clone(), participant: leg.participant.clone(), at_ms: now };
     if !leg.joined || leave_one(s, &record, leg.leave.as_deref()) {
         forget(&leg.account, &leg.participant);
     } else {
         retry_from(&leg.account, now);
+    }
+    if leg.registered && api::has_time() && api::send(s, Service::Chat, &leg.trouter.unregistration(), false).is_err() {
+        host::log(1, "the live-captions registration was not removed; it lapses by itself");
     }
 }
 
@@ -390,12 +400,16 @@ pub fn end_sessions(account: &str) {
     event(account, |leg, s, now| end(leg, s, Reason::Update, now));
 }
 
-/// Before the account goes: the session ends and leaves, with one more try (spec 4.3).
+/// Before the account goes: the session ends and leaves, and every leg still on record gets one
+/// more try (spec 4.3), whether a session holds it or not (Codex review of 7385fdd).
 pub fn sign_out(account: &str) {
-    event(account, |leg, s, now| {
-        end(leg, s, Reason::Left, now);
-        leave_records(s, now);
-    });
+    event(account, |leg, s, now| end(leg, s, Reason::Left, now));
+    if !records(account).is_empty() {
+        let now = api::now_ms();
+        if api::with_session(account, |s| Ok(leave_records(s, now))).is_err() {
+            host::log(1, "the meetings of live-captions sessions were not left before sign-out");
+        }
+    }
     RETRIES.with(|r| r.borrow_mut().remove(account));
     LEGS.with(|legs| legs.borrow_mut().remove(account));
 }
@@ -450,7 +464,8 @@ pub fn timer_fired(id: u32) -> bool {
     if let Some((next, until)) = retry_due
         && now >= next
     {
-        let waiting = api::with_session(&account, |s| Ok(leave_records(s, now))).unwrap_or(false);
+        // Without a session (WAM gives no token now) the records wait, and the retries go on.
+        let waiting = api::with_session(&account, |s| Ok(leave_records(s, now))).unwrap_or(true);
         RETRIES.with(|r| {
             let mut r = r.borrow_mut();
             if waiting && now < until {
@@ -575,9 +590,12 @@ fn call(leg: &mut Leg, s: &mut Session, now: i64) {
         Err(_) => return end(leg, s, Reason::Protocol, now),
     };
     let Some(surl) = leg.trouter.surl().map(str::to_string) else { return end(leg, s, Reason::Protocol, now) };
+    // No join without its record: a crash could not leave it then (Codex review of 7385fdd).
     let mut all = records(&leg.account);
     all.push(Record { controller: leg.live.controller.clone(), endpoint: leg.endpoint.clone(), participant: leg.participant.clone(), at_ms: now });
-    store_records(&leg.account, &all);
+    if !store_records(&leg.account, &all) {
+        return end(leg, s, Reason::Protocol, now);
+    }
     let mri = s.me();
     let links = Links { surl: &surl, session: &leg.callbacks, tag: leg.tag };
     let body = captions::join(&me(s, leg, &mri), &links, &leg.live, &leg.captions.conversation, &offer, &leg.media_leg);

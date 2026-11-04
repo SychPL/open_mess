@@ -43,7 +43,10 @@ impl module::Guest for Teams {
 
     fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
         api::begin();
-        api::sign_in()
+        let info = api::sign_in()?;
+        // Signed in again after a lost session: meetings it could not leave are left now.
+        crate::live::restore(&info.id);
+        Ok(info)
     }
 
     fn restore(account: String) -> Result<(), types::ModuleError> {
