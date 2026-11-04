@@ -246,12 +246,16 @@ pub(crate) struct Wam<'a> {
 impl Wam<'_> {
     /// A token for `scopes` (and `claims`, a CAE challenge). In a sign-in the user picks the
     /// account (once; `pick` keeps it for the rest of the call), or the WAM dialog runs when
-    /// `interactive`; any other call uses the account's stored one, silently. `windows_accounts`
-    /// are the module accounts with a stored Windows account, which an event uses.
+    /// `interactive`; any other call uses the account's stored one, silently. `named` is the module
+    /// account the token is for: a call may name only its own, an event any account of the module
+    /// (spec 2026-10-29-live-captions, 5.2). `windows_accounts` are the module accounts with a
+    /// stored Windows account, which an event that names none uses.
+    #[allow(clippy::too_many_arguments)]
     async fn token(
         &self,
         windows_accounts: &[String],
         caller: &Caller,
+        named: Option<&str>,
         pick: &mut Option<WamAccount>,
         scopes: &[String],
         interactive: bool,
@@ -259,8 +263,12 @@ impl Wam<'_> {
     ) -> Result<String, SignInError> {
         let client_id = allowed(self.identity, self.hosts, scopes)?.client_id.clone();
         let asked = TokenRequest { client_id, scopes: scopes.to_vec(), claims: claims.map(str::to_owned) };
-        let account = match caller {
-            Caller::SignIn => match pick {
+        let account = match (caller, named) {
+            (Caller::SignIn, Some(_)) => return Err(SignInError::Refused("a sign-in names no account".to_string())),
+            (Caller::Account(own), Some(account)) if account != own.as_str() => {
+                return Err(SignInError::Refused("a call may ask for its own account's token only".to_string()));
+            }
+            (Caller::SignIn, None) => match pick {
                 Some(account) if !interactive => account.id.clone(),
                 _ => {
                     let (account, token) = self.choose(&asked, interactive).await?;
@@ -273,9 +281,10 @@ impl Wam<'_> {
                 }
             },
             _ if interactive => return Err(SignInError::Refused(DIALOG_ONLY_IN_SIGN_IN.to_string())),
-            Caller::Account(account) => self.stored(account)?,
-            // An event names no account: the module's only Windows account.
-            Caller::Event => match windows_accounts {
+            (Caller::Account(account), _) => self.stored(account)?,
+            (Caller::Event, Some(account)) => self.stored(account)?,
+            // An event that names no account: the module's only Windows account.
+            (Caller::Event, None) => match windows_accounts {
                 [account] => self.stored(account)?,
                 [] => return Err(SignInError::Refused("no account of this module signed in with Windows".to_string())),
                 _ => return Err(SignInError::Refused("several Windows accounts: ask for a token in a call for one of them".to_string())),
@@ -441,10 +450,17 @@ impl Host for HostState {
     /// A token from Windows for the manifest's identity; `interactive` opens the WAM dialog,
     /// which only a sign-in from the window may do. A silent request that needs the dialog fails
     /// with `refused("interaction required")`.
-    async fn wam_token(&mut self, scopes: Vec<String>, interactive: bool, claims: Option<String>) -> Result<String, SignInError> {
+    async fn wam_token(
+        &mut self,
+        scopes: Vec<String>,
+        interactive: bool,
+        claims: Option<String>,
+        account: Option<String>,
+    ) -> Result<String, SignInError> {
         self.code_done();
-        if scopes.iter().map(String::len).sum::<usize>() > MAX_PROMPT_TEXT || claims.as_ref().is_some_and(|claims| claims.len() > MAX_PROMPT_TEXT) {
-            return Err(SignInError::Refused(format!("the scopes or claims are over {MAX_PROMPT_TEXT} bytes")));
+        let long = |text: &Option<String>| text.as_ref().is_some_and(|text| text.len() > MAX_PROMPT_TEXT);
+        if scopes.iter().map(String::len).sum::<usize>() > MAX_PROMPT_TEXT || long(&claims) || long(&account) {
+            return Err(SignInError::Refused(format!("the scopes, claims or account are over {MAX_PROMPT_TEXT} bytes")));
         }
         // Refused before anything touches Windows (or the tests' fake) or the credential store.
         allowed(self.env.wam.as_ref(), &self.env.hosts, &scopes)?;
@@ -454,8 +470,8 @@ impl Host for HostState {
         }
         self.prompts()?;
         let store = self.secret_store().map_err(SignInError::Refused)?;
-        let windows_accounts = match self.caller {
-            Caller::Event => {
+        let windows_accounts = match (&self.caller, &account) {
+            (Caller::Event, None) => {
                 self.storage().and_then(|storage| storage.secret_accounts(WAM_ACCOUNT)).map_err(|e| SignInError::Refused(format!("{e:?}")))?
             }
             _ => Vec::new(),
@@ -470,7 +486,7 @@ impl Host for HostState {
             store: &*store,
             calls: WINDOWS,
         };
-        let token = wam.token(&windows_accounts, &caller, &mut pick, &scopes, interactive, claims.as_deref()).await;
+        let token = wam.token(&windows_accounts, &caller, account.as_deref(), &mut pick, &scopes, interactive, claims.as_deref()).await;
         self.pick = pick;
         token
     }
@@ -549,8 +565,12 @@ mod tests {
         }
 
         async fn token(&self, caller: &Caller, pick: &mut Option<WamAccount>, interactive: bool) -> Result<String, SignInError> {
+            self.named(caller, None, pick, interactive).await
+        }
+
+        async fn named(&self, caller: &Caller, named: Option<&str>, pick: &mut Option<WamAccount>, interactive: bool) -> Result<String, SignInError> {
             let windows_accounts = self.storage.secret_accounts(WAM_ACCOUNT).unwrap();
-            self.wam(FAKE).token(&windows_accounts, caller, pick, &scopes(), interactive, None).await
+            self.wam(FAKE).token(&windows_accounts, caller, named, pick, &scopes(), interactive, None).await
         }
     }
 
@@ -569,13 +589,13 @@ mod tests {
         // A scope the user did not approve never reaches Windows, nor does a module without a
         // WAM identity.
         for scopes in [vec!["https://graph.example.com/.default".to_string()], vec![SCOPE.into(), "openid".into()], Vec::new()] {
-            assert!(refused(t.wam(no_wam).token(&[], &Caller::SignIn, &mut pick, &scopes, false, None).await).contains("scope"));
+            assert!(refused(t.wam(no_wam).token(&[], &Caller::SignIn, None, &mut pick, &scopes, false, None).await).contains("scope"));
         }
         t.identity.scopes.clear();
-        assert!(t.wam(no_wam).token(&[], &Caller::SignIn, &mut pick, &scopes(), false, None).await.is_err());
+        assert!(t.wam(no_wam).token(&[], &Caller::SignIn, None, &mut pick, &scopes(), false, None).await.is_err());
         let mut wam = t.wam(no_wam);
         wam.identity = None;
-        assert!(refused(wam.token(&[], &Caller::SignIn, &mut pick, &scopes(), false, None).await).contains("no Windows account identity"));
+        assert!(refused(wam.token(&[], &Caller::SignIn, None, &mut pick, &scopes(), false, None).await).contains("no Windows account identity"));
         // The client id is always the manifest's: the module has no way to name another.
         let t = setup();
         assert_eq!(t.token(&Caller::SignIn, &mut pick, false).await.unwrap(), format!("token {CLIENT} {SCOPE} w1"));
@@ -612,9 +632,9 @@ mod tests {
         t.identity.scopes.push("https://*.sharepoint.com/.default".into());
         let site = vec!["https://contoso-my.sharepoint.com/.default".to_string()];
         // A pattern's audience must be on the host list too.
-        assert!(refused(t.wam(FAKE).token(&[], &Caller::SignIn, &mut pick, &site, false, None).await).contains("scope"));
+        assert!(refused(t.wam(FAKE).token(&[], &Caller::SignIn, None, &mut pick, &site, false, None).await).contains("scope"));
         t.hosts = HostList::parse(&["*.sharepoint.com".to_string()]).unwrap();
-        assert!(t.wam(FAKE).token(&[], &Caller::SignIn, &mut pick, &site, false, None).await.is_ok());
+        assert!(t.wam(FAKE).token(&[], &Caller::SignIn, None, &mut pick, &site, false, None).await.is_ok());
     }
 
     #[tokio::test]
@@ -631,6 +651,14 @@ mod tests {
         // With two Windows accounts, an event can't tell which one.
         remember(&*t.store, &mut t.storage, "m", "acct2", &account("w1")).unwrap();
         assert!(refused(t.token(&Caller::Event, &mut None, false).await).contains("several"));
+        // Unless it names one: then that account's token (live captions, spec 5.2).
+        assert_eq!(t.named(&Caller::Event, Some("acct2"), &mut None, false).await.unwrap(), format!("token {CLIENT} {SCOPE} w1"));
+        assert_eq!(t.named(&Caller::Event, Some("acct"), &mut None, false).await.unwrap(), format!("token {CLIENT} {SCOPE} w2"));
+        assert!(refused(t.named(&Caller::Event, Some("other"), &mut None, false).await).contains("sign in again"));
+        // A call names only its own account; a sign-in none.
+        assert_eq!(t.named(&Caller::Account("acct".into()), Some("acct"), &mut None, false).await.unwrap(), format!("token {CLIENT} {SCOPE} w2"));
+        assert!(refused(t.named(&Caller::Account("acct".into()), Some("acct2"), &mut None, false).await).contains("own account"));
+        assert!(refused(t.named(&Caller::SignIn, Some("acct"), &mut None, false).await).contains("names no account"));
     }
 
     #[tokio::test]
@@ -672,7 +700,7 @@ mod tests {
         remember(&*t.store, &mut t.storage, "m", "acct", &account("w2")).unwrap();
         // A CAE challenge: the claims the 401 named go with the silent request for the account.
         let claims = r#"{"access_token":{"nbf":{"essential":true,"value":"1"}}}"#;
-        let token = t.wam(FAKE).token(&[], &Caller::Account("acct".into()), &mut None, &scopes(), false, Some(claims)).await.unwrap();
+        let token = t.wam(FAKE).token(&[], &Caller::Account("acct".into()), None, &mut None, &scopes(), false, Some(claims)).await.unwrap();
         assert_eq!(token, format!("token {CLIENT} {SCOPE} w2 claims {claims}"));
     }
 
@@ -695,7 +723,7 @@ mod tests {
             ..FAKE
         };
         let mut pick = None;
-        let result = t.wam(slow).token(&[], &Caller::SignIn, &mut pick, &scopes(), true, None).await;
+        let result = t.wam(slow).token(&[], &Caller::SignIn, None, &mut pick, &scopes(), true, None).await;
         assert!(matches!(result, Err(SignInError::TimedOut)), "{result:?}");
         assert_eq!(pick, None);
     }

@@ -137,7 +137,7 @@ mod guest {
                 sign_in::show_device_code("ABCD-1234", "https://login.example.com/device");
                 json!({
                     "open-page": describe(sign_in::open_page("https://login.example.com/", "https://login.example.com/done")),
-                    "wam-token": describe(sign_in::wam_token(&["scope".to_string()], true, None)),
+                    "wam-token": describe(sign_in::wam_token(&["scope".to_string()], true, None, None)),
                 })
             }
             "sign-in-with" => {
@@ -147,7 +147,7 @@ mod guest {
             "wam-token" => {
                 let scopes: Vec<String> =
                     args.get("scopes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
-                match sign_in::wam_token(&scopes, false, None) {
+                match sign_in::wam_token(&scopes, false, None, None) {
                     Ok(token) => json!({ "token": token }),
                     Err(e) => json!({ "error": sign_in_error(&e) }),
                 }
@@ -374,7 +374,7 @@ mod guest {
             if how == b"windows" {
                 // The manual check of WAM: only the token's length is logged.
                 let token =
-                    sign_in::wam_token(&[CHAT_SCOPE.to_string()], false, None).map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
+                    sign_in::wam_token(&[CHAT_SCOPE.to_string()], false, None, None).map_err(|e| types::ModuleError::Platform(sign_in_error(&e)))?;
                 host::log(2, &format!("Windows token: {} bytes", token.len()));
                 return Ok(types::AccountInfo { id: "windows".to_string(), display_name: format!("Windows token of {} bytes", token.len()) });
             }

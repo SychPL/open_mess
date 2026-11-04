@@ -187,8 +187,11 @@ interface sign-in {
     open-page: func(url: string, redirect-prefix: string) -> result<string, sign-in-error>;
     // Silent or interactive token from Windows WAM for the manifest's approved identity. `claims`
     // is the JSON of a claims challenge (CAE: a 401 with `WWW-Authenticate: ... claims=`), for a
-    // new token that satisfies it (spec 9.1).
-    wam-token: func(scopes: list<string>, interactive: bool, claims: option<string>) -> result<string, sign-in-error>;
+    // new token that satisfies it (spec 9.1). `account` names the module account the token is for:
+    // a call may name only its own account, an event any of the module's accounts signed in with
+    // Windows; without it a call gets its own account's token and an event the module's only one
+    // (spec 2026-10-29-live-captions, 5.2).
+    wam-token: func(scopes: list<string>, interactive: bool, claims: option<string>, account: option<string>) -> result<string, sign-in-error>;
 }
 
 interface host {

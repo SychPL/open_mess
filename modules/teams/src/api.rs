@@ -110,9 +110,11 @@ pub fn uuid() -> String {
     format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a >> 32, (a >> 16) & 0xffff, a & 0xffff, b >> 48, b & 0xffff_ffff_ffff)
 }
 
-/// A token for `scope` from WAM, and its claims. Only sign-in may ask the user.
-fn wam(scope: &str, interactive: bool, claims: Option<&str>) -> Result<(String, Claims), ModuleError> {
-    let token = sign_in::wam_token(&[scope.to_string()], interactive, claims).map_err(|e| {
+/// A token for `scope` from WAM, and its claims. Only sign-in may ask the user. `account` names
+/// the module account, so an event (a timer, a socket frame) gets that account's token when there
+/// are several (spec 2026-10-29-live-captions, 5.2); a sign-in names none.
+fn wam(scope: &str, interactive: bool, claims: Option<&str>, account: Option<&str>) -> Result<(String, Claims), ModuleError> {
+    let token = sign_in::wam_token(&[scope.to_string()], interactive, claims, account).map_err(|e| {
         ModuleError::AuthRequired(match e {
             sign_in::SignInError::Cancelled => "sign-in was cancelled".to_string(),
             sign_in::SignInError::TimedOut => "sign-in timed out".to_string(),
@@ -125,7 +127,7 @@ fn wam(scope: &str, interactive: bool, claims: Option<&str>) -> Result<(String, 
 
 /// Signs in through WAM, interactively, and checks the account with Teams.
 pub fn sign_in() -> Result<AccountInfo, ModuleError> {
-    let (token, claims) = wam(AUTHSVC_SCOPE, true, None)?;
+    let (token, claims) = wam(AUTHSVC_SCOPE, true, None, None)?;
     // The user's time in the WAM dialog does not count against the host's limit (spec 8.3, R4),
     // so it does not count against the budget either.
     begin();
@@ -182,7 +184,7 @@ pub fn polling_again() {
 }
 
 fn open(account: &str) -> Result<Session, ModuleError> {
-    let (token, claims) = wam(AUTHSVC_SCOPE, false, None)?;
+    let (token, claims) = wam(AUTHSVC_SCOPE, false, None, Some(account))?;
     if claims.oid != account {
         return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
     }
@@ -279,7 +281,7 @@ fn token(session: &mut Session, scope: &str) -> Result<String, ModuleError> {
 
 /// A new token from WAM, silently, for the session's own account only.
 fn renew(session: &mut Session, scope: &str, claims: Option<&str>) -> Result<String, ModuleError> {
-    let (token, c) = wam(scope, false, claims)?;
+    let (token, c) = wam(scope, false, claims, Some(&session.account))?;
     if c.oid != session.account {
         return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
     }

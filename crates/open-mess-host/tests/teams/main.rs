@@ -414,6 +414,21 @@ async fn read_messages_pages_backwards() {
 }
 
 #[tokio::test]
+async fn read_messages_never_returns_a_list_cut_short() {
+    let teams = Teams::signed_in().await;
+    // Every page holds only a call event and points at an older one: the walk reaches its page
+    // limit before any text message, the limit or `since`.
+    let path = messages_path(MEETING);
+    let older = format!("{CHAT}/v1/users/ME/conversations/{MEETING}/messages?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=older");
+    let mut event = numbered(101, MEETING, OTHER, "");
+    event["messagetype"] = "Event/Call".into();
+    teams.fake.on(move |s| (s.path == path).then(|| Reply::json(page("messages", vec![event.clone()], Some(older.as_str())))));
+    let cut = teams.call("read_messages", json!({"conversation": MEETING, "since": "2027-01-15T07:00:00Z"})).await;
+    assert!(matches!(module_error(cut), ModuleError::Platform(why) if why.contains("that far back")));
+    assert_eq!(teams.fake.requests(&messages_path(MEETING)).len(), 20);
+}
+
+#[tokio::test]
 async fn foreign_backward_link_is_refused() {
     let teams = Teams::signed_in().await;
     let path = messages_path(GROUP);
