@@ -327,11 +327,13 @@ pub struct Session {
     /// A roster showed the user's other endpoint.
     roster_seen: bool,
     captions_on: Option<bool>,
-    /// Captions were on at least once, and since when they are off.
-    captions_seen: bool,
+    /// Captions were on 30 s after the data channel opened (spec 4.1), and since when they are off.
+    checked: bool,
     off_since: Option<i64>,
     /// Since Trouter went down or lost a message: cues are dropped until a roster is read again.
     paused: bool,
+    /// Trouter is down: the roster is read every 10 s until it is back (spec 5.3, Codex R24).
+    down: bool,
     roster_at: Option<i64>,
     buffer: Buffer,
     feed: Feed,
@@ -351,9 +353,10 @@ impl Session {
             channel_at: None,
             roster_seen: false,
             captions_on: None,
-            captions_seen: false,
+            checked: false,
             off_since: None,
             paused: false,
+            down: false,
             roster_at: None,
             buffer: Buffer::default(),
             feed: Feed::default(),
@@ -390,24 +393,39 @@ impl Session {
         }
     }
 
-    /// Trouter went down or lost a message: the roster may have changed unseen (spec 5.3).
+    /// Trouter lost a message: the roster may have changed unseen (spec 5.3).
     pub fn pause(&mut self, now: i64) {
         self.paused = true;
         self.captions_on = None;
         self.roster_at.get_or_insert(now.saturating_add(ROSTER_POLL_MS));
     }
 
-    /// A roster read: the reason to end the session, if the user is not in the meeting.
+    /// Trouter went down: no callback arrives until it is back.
+    pub fn down(&mut self, now: i64) {
+        self.down = true;
+        self.pause(now);
+    }
+
+    /// Trouter is back; the next roster read lets captions in again.
+    pub fn up(&mut self) {
+        self.down = false;
+    }
+
+    /// A roster read: the reason to end the session, if the user is not in the meeting. While
+    /// Trouter is down it only checks that; captions wait for Trouter (spec 5.3).
     pub fn roster(&mut self, roster: &Roster, now: i64) -> Option<Reason> {
         if !roster.user_elsewhere {
             return Some(if self.roster_seen { Reason::UserLeft } else { Reason::UserNotInMeeting });
         }
         self.roster_seen = true;
+        if self.down {
+            self.roster_at = Some(now.saturating_add(ROSTER_POLL_MS));
+            return None;
+        }
         self.paused = false;
         self.roster_at = None;
         self.captions_on = Some(roster.captions);
         if roster.captions {
-            self.captions_seen = true;
             self.off_since = None;
         } else {
             self.off_since.get_or_insert(now);
@@ -435,8 +453,9 @@ impl Session {
         None
     }
 
-    /// What is due at `now`, the most urgent first.
-    pub fn due(&self, now: i64) -> Option<Due> {
+    /// What is due at `now`, the most urgent first. Notes that captions were on 30 s after the data
+    /// channel opened, once they were.
+    pub fn due(&mut self, now: i64) -> Option<Due> {
         if !self.active() {
             return self.ended.is_some_and(|at| now >= at.saturating_add(KEEP_MS)).then_some(Due::Forget);
         }
@@ -450,16 +469,25 @@ impl Session {
         if self.state == State::Joining && past(self.started, JOIN_MS) {
             return Some(Due::End(if self.answered { Reason::MediaFailed } else { Reason::Protocol }));
         }
-        if !self.captions_seen && self.channel_at.is_some_and(|at| past(at, CAPTIONS_WAIT_MS)) {
-            return Some(Due::End(Reason::NoCaptions));
+        // Nobody had captions on 30 s after the channel opened; a gap decides at the next roster read.
+        if !self.checked && !self.paused && self.channel_at.is_some_and(|at| past(at, CAPTIONS_WAIT_MS)) {
+            if self.captions_on != Some(true) {
+                return Some(Due::End(Reason::NoCaptions));
+            }
+            self.checked = true;
         }
-        if self.off_since.is_some_and(|at| past(at, CAPTIONS_OFF_MS)) {
+        if self.checked && self.off_since.is_some_and(|at| past(at, CAPTIONS_OFF_MS)) {
             return Some(Due::End(Reason::NoCaptions));
         }
         if self.roster_at.is_some_and(|at| now >= at) {
             return Some(Due::Roster);
         }
         None
+    }
+
+    /// Whether an ended session's cues are gone.
+    pub fn gone(&self, now: i64) -> bool {
+        self.ended.is_some_and(|at| now >= at.saturating_add(KEEP_MS))
     }
 
     /// A roster read is done (or failed): the next one during a gap.
@@ -478,10 +506,12 @@ impl Session {
         if self.state == State::Joining {
             times.push(self.started.saturating_add(JOIN_MS));
         }
-        if !self.captions_seen {
+        if !self.checked && !self.paused {
             times.extend(self.channel_at.map(|at| at.saturating_add(CAPTIONS_WAIT_MS)));
         }
-        times.extend(self.off_since.map(|at| at.saturating_add(CAPTIONS_OFF_MS)));
+        if self.checked {
+            times.extend(self.off_since.map(|at| at.saturating_add(CAPTIONS_OFF_MS)));
+        }
         times.extend(self.roster_at);
         times.into_iter().min()
     }
@@ -832,6 +862,7 @@ mod tests {
         s.answered();
         s.channel_open(now);
         assert_eq!(s.roster(&Roster { user_elsewhere: true, captions: true }, now), None);
+        assert_eq!(s.due(now + CAPTIONS_WAIT_MS), None);
         s
     }
 
@@ -926,7 +957,7 @@ mod tests {
     #[test]
     fn deadlines_end_the_session_with_their_reasons() {
         // No answer within the join budget, then no data channel after it.
-        let s = Session::new(THREAD, "t", 0);
+        let mut s = Session::new(THREAD, "t", 0);
         assert_eq!((s.due(JOIN_MS - 1), s.due(JOIN_MS)), (None, Some(Due::End(Reason::Protocol))));
         let mut s = Session::new(THREAD, "t", 0);
         s.answered();
@@ -937,13 +968,23 @@ mod tests {
         s.roster(&Roster { user_elsewhere: true, captions: false }, 1000);
         assert_eq!(s.next_at(), Some(1000 + CAPTIONS_WAIT_MS));
         assert_eq!(s.due(1000 + CAPTIONS_WAIT_MS), Some(Due::End(Reason::NoCaptions)));
-        // Captions turned off during the session: 5 minutes, then the end.
+        // On when joining but off before the 30 s were up: the end at 30 s (Codex review of 96070fd).
+        let mut s = Session::new(THREAD, "t", 0);
+        s.roster(&Roster { user_elsewhere: true, captions: true }, 0);
+        s.channel_open(1000);
+        s.roster(&Roster { user_elsewhere: true, captions: false }, 2000);
+        assert_eq!(s.due(1000 + CAPTIONS_WAIT_MS), Some(Due::End(Reason::NoCaptions)));
+        // Captions turned off later in the session: 5 minutes, then the end.
         let mut s = live(0);
-        s.roster(&Roster { user_elsewhere: true, captions: false }, 10_000);
-        assert_eq!(s.read(None, None, 4096, 10_000).unwrap()["captions_on"], false);
-        assert_eq!(s.due(10_000 + CAPTIONS_OFF_MS - 1), None);
+        s.roster(&Roster { user_elsewhere: true, captions: false }, 40_000);
+        assert_eq!(s.read(None, None, 4096, 40_000).unwrap()["captions_on"], false);
+        assert_eq!(s.next_at(), Some(40_000 + CAPTIONS_OFF_MS));
+        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS - 1), None);
         s.roster(&Roster { user_elsewhere: true, captions: true }, 200_000);
-        assert_eq!(s.due(10_000 + CAPTIONS_OFF_MS), None);
+        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS), None);
+        let mut s = live(0);
+        s.roster(&Roster { user_elsewhere: true, captions: false }, 40_000);
+        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS), Some(Due::End(Reason::NoCaptions)));
         // Silence keeps the session; not reading it for 10 minutes ends it, and 3 hours do.
         let mut s = live(0);
         s.read(None, None, 4096, 9 * 60_000).unwrap();
@@ -975,6 +1016,26 @@ mod tests {
         let mut failed = Session::new(THREAD, "t", 0);
         failed.end(Reason::UserNotInMeeting, 1);
         assert_eq!(failed.state(), State::Failed);
+    }
+
+    #[test]
+    fn while_trouter_is_down_the_roster_is_read_every_10_s() {
+        let mut s = live(0);
+        s.down(1000);
+        // A read that finds the user keeps the reads going and the captions out (Codex review of 96070fd).
+        assert_eq!(s.roster(&Roster { user_elsewhere: true, captions: true }, 11_000), None);
+        assert_eq!(s.due(21_000), Some(Due::Roster));
+        s.data(&[caption("lost", true)], 0, 21_000);
+        assert_eq!(s.read(None, None, 4096, 21_000).unwrap()["missed"], 1);
+        assert_eq!(s.roster(&Roster { user_elsewhere: false, captions: true }, 21_000), Some(Reason::UserLeft));
+        // Back up: the next read lets captions in again.
+        let mut s = live(0);
+        s.down(1000);
+        s.up();
+        assert_eq!(s.roster(&Roster { user_elsewhere: true, captions: true }, 2000), None);
+        s.data(&[caption("kept", true)], 0, 2000);
+        assert_eq!(s.read(None, None, 4096, 2000).unwrap()["untrusted"]["cues"][0]["text"], "kept");
+        assert_eq!(s.next_at(), Some(2000 + IDLE_MS));
     }
 
     #[test]

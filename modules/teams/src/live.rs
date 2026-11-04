@@ -109,7 +109,7 @@ fn take(account: &str) -> Option<Leg> {
 /// Puts a leg back, or forgets it once its cues are gone, and sets its timer.
 fn put(leg: Leg, now: i64) {
     let account = leg.account.clone();
-    if leg.captions.due(now) != Some(Due::Forget) {
+    if !leg.captions.gone(now) {
         LEGS.with(|legs| legs.borrow_mut().insert(account.clone(), leg));
     }
     schedule(&account, now);
@@ -411,7 +411,7 @@ pub fn ws_closed(conn: u32) {
         event(&account, |leg, _, now| {
             leg.ws = None;
             leg.trouter.lost(now);
-            leg.captions.pause(now);
+            leg.captions.down(now);
         });
     }
 }
@@ -473,7 +473,10 @@ fn tick(leg: &mut Leg, s: &mut Session, now: i64) {
         match leg.trouter.tick(now) {
             Some(Tick::Connect) => match websocket::open(&leg.trouter.url(&api::uuid()), &[]) {
                 Ok(conn) => leg.ws = Some(conn),
-                Err(_) => leg.trouter.lost(now),
+                Err(_) => {
+                    leg.trouter.lost(now);
+                    leg.captions.down(now);
+                }
             },
             Some(Tick::Send(frame)) => send(leg, &frame, now),
             Some(Tick::Register) => register(leg, s, now),
@@ -495,7 +498,7 @@ fn send(leg: &mut Leg, frame: &str, now: i64) {
         websocket::close(conn);
         leg.ws = None;
         leg.trouter.lost(now);
-        leg.captions.pause(now);
+        leg.captions.down(now);
     }
 }
 
@@ -532,7 +535,10 @@ fn frame(leg: &mut Leg, s: &mut Session, text: &str, now: i64) {
             call(leg, s, now);
         }
         Incoming::Connected { same_surl: false, .. } => end(leg, s, Reason::Protocol, now),
-        Incoming::Connected { .. } => roster(leg, s, now),
+        Incoming::Connected { .. } => {
+            leg.captions.up();
+            roster(leg, s, now);
+        }
         Incoming::Callback(callback) => match captions::callback(&callback.url, &callback.body, &leg.callbacks) {
             Ok(Call::Acceptance { answer, acknowledgement }) => accept(leg, s, &answer, acknowledgement.as_deref(), now),
             Ok(Call::Roster) => roster(leg, s, now),
@@ -549,7 +555,7 @@ fn frame(leg: &mut Leg, s: &mut Session, text: &str, now: i64) {
                 websocket::close(conn);
             }
             leg.trouter.lost(now);
-            leg.captions.pause(now);
+            leg.captions.down(now);
         }
         Incoming::Nothing => {}
     }
