@@ -84,10 +84,16 @@ async fn prompts_are_shown_in_the_window() {
     let url = "https://login.example.com/start?client=1".into();
     offer(SignInRequest::OpenPage { module: "m".into(), url, redirect_prefix: "https://login.example.com/done".into() });
     let shown = commands::sign_in_request(&state).unwrap();
-    // The window names the page's host; the page itself opens in its own window.
+    // The window names the page's host; the page itself opens in its own window. A front end
+    // without one gets the whole address to open in a browser.
     assert_eq!((shown.kind, shown.url.as_deref()), ("page", Some("login.example.com")));
-    // The window can't make up the page's answer, only cancel it.
-    assert!(commands::sign_in_answer(&state, shown.id, AnswerDto::Done(Some("https://login.example.com/done".into()))).is_err());
+    assert_eq!(shown.open_url.as_deref(), Some("https://login.example.com/start?client=1"));
+    // On Windows nothing but the page answers it; elsewhere only the address the sign-in ended on
+    // does (tests/admin.rs). An address off the redirect prefix is refused everywhere.
+    assert!(commands::sign_in_answer(&state, shown.id, AnswerDto::Done(Some("https://evil.example/done".into()))).is_err());
+    if cfg!(windows) {
+        assert!(commands::sign_in_answer(&state, shown.id, AnswerDto::Done(Some("https://login.example.com/done".into()))).is_err());
+    }
     assert!(commands::sign_in_open_link(&state, shown.id).is_err());
 
     // Another module's prompt is refused.
