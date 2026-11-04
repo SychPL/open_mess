@@ -545,14 +545,17 @@ fn frame(leg: &mut Leg, s: &mut Session, text: &str, now: i64) {
             }
             Err(_) => end(leg, s, Reason::Protocol, now),
         },
-        Incoming::Connected { first: true, .. } => {
-            register(leg, s, now);
-            call(leg, s, now);
-        }
         Incoming::Connected { same_surl: false, .. } => end(leg, s, Reason::Protocol, now),
-        Incoming::Connected { .. } => {
+        // Up again, also when the first socket fell before its `trouter.connected` (Codex review of
+        // 263a526).
+        Incoming::Connected { first, .. } => {
             leg.captions.up();
-            roster(leg, s, now);
+            if first {
+                register(leg, s, now);
+                call(leg, s, now);
+            } else {
+                roster(leg, s, now);
+            }
         }
         Incoming::Callback(callback) => match captions::callback(&callback.url, &callback.body, &leg.callbacks) {
             Ok(Call::Acceptance { answer, acknowledgement }) => accept(leg, s, &answer, acknowledgement.as_deref(), now),

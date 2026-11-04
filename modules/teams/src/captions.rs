@@ -418,6 +418,12 @@ impl Session {
             return Some(if self.roster_seen { Reason::UserLeft } else { Reason::UserNotInMeeting });
         }
         self.roster_seen = true;
+        // Whether captions are on counts even while Trouter is down (Codex review of 263a526).
+        if roster.captions {
+            self.off_since = None;
+        } else {
+            self.off_since.get_or_insert(now);
+        }
         if self.down {
             self.roster_at = Some(now.saturating_add(ROSTER_POLL_MS));
             return None;
@@ -425,11 +431,6 @@ impl Session {
         self.paused = false;
         self.roster_at = None;
         self.captions_on = Some(roster.captions);
-        if roster.captions {
-            self.off_since = None;
-        } else {
-            self.off_since.get_or_insert(now);
-        }
         None
     }
 
@@ -1028,6 +1029,13 @@ mod tests {
         s.data(&[caption("lost", true)], 0, 21_000);
         assert_eq!(s.read(None, None, 4096, 21_000).unwrap()["missed"], 1);
         assert_eq!(s.roster(&Roster { user_elsewhere: false, captions: true }, 21_000), Some(Reason::UserLeft));
+        // Captions back on during the gap: the 5 minutes of captions off stop counting.
+        let mut s = live(0);
+        s.roster(&Roster { user_elsewhere: true, captions: false }, 40_000);
+        s.down(50_000);
+        s.roster(&Roster { user_elsewhere: true, captions: true }, 60_000);
+        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS), Some(Due::Roster));
+        assert_eq!(s.read(None, None, 4096, 60_000).unwrap()["captions_on"], Value::Null);
         // Back up: the next read lets captions in again.
         let mut s = live(0);
         s.down(1000);
