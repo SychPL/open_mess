@@ -120,8 +120,8 @@ pub fn tools() -> Vec<ToolInfo> {
         tool(
             "send",
             "Sends a message to a conversation, or a reply to one of its messages. The agent permissions the user set decide: it is \
-             sent at once, waits for the user's approval in a Windows notification, or is refused. Returns the action and its \
-             state; the pending tool follows it.",
+             sent at once, waits for the user's approval outside the agent's reach (a Windows notification or the open_mess \
+             page in Paperclip), or is refused. Returns the action and its state; the pending tool follows it.",
             json!({
                 "account": account,
                 "conversation": string("Conversation id."),

@@ -1,12 +1,14 @@
 //! open_mess: the daemon, its local API and the `om` CLI.
 
 pub mod accounts;
+pub mod admin;
 pub mod api;
 pub mod approval;
 pub mod bridge;
 pub mod cli;
 pub mod daemon;
 pub mod events;
+pub mod file_store;
 pub mod i18n;
 pub mod instance;
 pub mod modules;
@@ -35,10 +37,13 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error("port {0} is already in use - change it in the configuration window or set another port")]
     PortInUse(u16),
-    #[error("cannot listen on 127.0.0.1:{port}: {source}")]
-    Listen { port: u16, source: std::io::Error },
+    #[error("cannot listen on {addr}: {source}")]
+    Listen { addr: std::net::SocketAddr, source: std::io::Error },
     #[error("Credential Manager: {0}")]
     Secrets(#[from] keyring_core::Error),
+    /// The secrets file outside Windows (file_store.rs) can't be used.
+    #[error("secrets file: {0}")]
+    SecretsFile(String),
     #[error("cannot generate a random token: {0}")]
     Random(String),
     #[error("{0}")]

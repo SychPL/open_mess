@@ -20,7 +20,7 @@ use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use futures_core::Stream;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ContentBlock, Implementation, ListToolsResult,
@@ -37,13 +37,18 @@ use tokio::net::TcpListener;
 use crate::Error;
 use crate::tools::{Registry, ToolError, ToolInfo};
 use crate::triggers::channel;
-use crate::ui::Opener;
+use crate::ui::{Opener, UiState};
 
 /// Binds `127.0.0.1:<port>`. A taken port is [`Error::PortInUse`]; there is no fallback port.
 pub async fn bind(port: u16) -> Result<TcpListener, Error> {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await.map_err(|source| match source.kind() {
+    bind_on(Ipv4Addr::LOCALHOST, port).await
+}
+
+/// Binds `<ip>:<port>`: loopback, or every interface of a server container (daemon.rs, `listen_ip`).
+pub async fn bind_on(ip: Ipv4Addr, port: u16) -> Result<TcpListener, Error> {
+    TcpListener::bind((ip, port)).await.map_err(|source| match source.kind() {
         std::io::ErrorKind::AddrInUse => Error::PortInUse(port),
-        _ => Error::Listen { port, source },
+        _ => Error::Listen { addr: (ip, port).into(), source },
     })
 }
 
@@ -51,6 +56,26 @@ pub async fn bind(port: u16) -> Result<TcpListener, Error> {
 pub async fn serve(
     listener: TcpListener,
     token: String,
+    registry: Arc<Registry>,
+    window: Opener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), Error> {
+    serve_with_admin(listener, token, None, registry, window, shutdown).await
+}
+
+/// The administrative API of a server daemon (admin.rs): its token, never the agents', and the
+/// state the window's commands work on.
+pub struct Admin {
+    pub token: String,
+    pub ui: Arc<UiState>,
+}
+
+/// [`serve`], and with `admin` also `/admin/{command}`. Without it, as on Windows, every `/admin/`
+/// path is 404 whatever token it brings.
+pub async fn serve_with_admin(
+    listener: TcpListener,
+    token: String,
+    admin: Option<Admin>,
     registry: Arc<Registry>,
     window: Opener,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -80,6 +105,13 @@ pub async fn serve(
         )
         .route_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(Arc::new(token), require_token));
+    // Each token opens only its own routes: the agents' token is 401 on /admin, the administrative
+    // one 401 everywhere else.
+    let admin = match admin {
+        Some(Admin { token, ui }) => crate::admin::router(ui).layer(middleware::from_fn_with_state(Arc::new(token), require_token)),
+        None => Router::new().route("/admin/{*command}", any(|| async { StatusCode::NOT_FOUND })),
+    };
+    let app = app.merge(admin);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown.await;

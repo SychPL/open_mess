@@ -10,8 +10,8 @@ use url::Url;
 use super::sign_in::SignIns;
 use crate::accounts::Accounts;
 use crate::{i18n, modules};
-use open_mess_host::SignInReply;
 use open_mess_host::hosts::HostList;
+use open_mess_host::{SignInReply, SignInRequest};
 
 /// What the sign-in window does with a navigation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +58,37 @@ pub fn check_page(url: &str, redirect_prefix: &str, approved: &[String]) -> Resu
         )
         .into()),
     }
+}
+
+/// May a module's sign-in page be shown? Its start page and redirect prefix must pass
+/// [`check_page`] with the module's approved sign-in hosts, before any front end shows it: the
+/// window, or the administrative API, whose `open_url` the user opens in a real browser (spec
+/// 2026-11-03-paperclip-plugin, 5.4). Other prompts pass.
+pub fn page_allowed(accounts: &Accounts, request: &SignInRequest) -> Result<(), String> {
+    let SignInRequest::OpenPage { module, url, redirect_prefix } = request else {
+        return Ok(());
+    };
+    let manifest = accounts.modules().handle(module).and_then(|handle| handle.manifest().ok()).ok_or_else(|| crate::accounts::not_running(module))?;
+    let approved = modules::approved_sign_in_hosts(&accounts.store(), &manifest).map_err(|err| err.to_string())?;
+    check_page(url, redirect_prefix, &approved).map(drop)
+}
+
+/// The longest address a user may paste: the host's limit for a prompt's texts.
+const MAX_PASTED: usize = 8 * 1024;
+
+/// The address the browser ended on, pasted by the user who signed in on another computer: a
+/// server has no window to catch the redirect (spec 2026-11-03-paperclip-plugin, 5.4). White space
+/// a copy adds is dropped; the rest must be HTTPS under the prompt's redirect prefix.
+pub fn check_pasted(pasted: &str, redirect_prefix: &str) -> Result<String, String> {
+    let url: String = pasted.chars().filter(|c| !c.is_whitespace()).collect();
+    if url.len() <= MAX_PASTED && url.starts_with("https://") && url.starts_with(redirect_prefix) {
+        return Ok(url);
+    }
+    Err(i18n::pick(
+        "to nie jest adres, na którym skończyło się logowanie - skopiuj cały adres z paska przeglądarki",
+        "this is not the address the sign-in ended on - copy the whole address from the browser's address bar",
+    )
+    .into())
 }
 
 /// The sign-in page of prompt `page` went on to `host`, which is not approved: the window asks.
@@ -257,6 +288,30 @@ mod tests {
         for page in ["http://login.microsoftonline.com/", "file:///C:/Windows/win.ini", "javascript:alert(1)", "data:text/html,hi", "ms-settings:"] {
             assert_eq!(go(page), Navigation::Block, "{page}");
         }
+    }
+
+    #[test]
+    fn a_pasted_address_must_be_the_redirect() {
+        let pasted = "https://login.microsoftonline.com/common/oauth2/nativeclient?code=abc&state=1";
+        assert_eq!(check_pasted(pasted, PREFIX).unwrap(), pasted);
+        // What a copy from the address bar or a chat window adds is dropped.
+        assert_eq!(check_pasted(&format!("  {pasted}\r\n"), PREFIX).unwrap(), pasted);
+        assert_eq!(
+            check_pasted("https://login.microsoftonline.com/common/oauth2/native\nclient?code=abc", PREFIX).unwrap(),
+            format!("{PREFIX}?code=abc")
+        );
+        for wrong in [
+            "",
+            "abc",
+            "https://evil.example/common/oauth2/nativeclient?code=abc",
+            "https://login.microsoftonline.com/common/oauth2/native?code=abc",
+            "http://login.microsoftonline.com/common/oauth2/nativeclient?code=abc",
+        ] {
+            assert!(check_pasted(wrong, PREFIX).is_err(), "{wrong}");
+        }
+        assert!(check_pasted(&format!("{PREFIX}?code={}", "a".repeat(MAX_PASTED)), PREFIX).is_err());
+        // Never a prefix that is not HTTPS, whatever the module asked for.
+        assert!(check_pasted("http://login.example.com/done?account=a", "http://login.example.com/done").is_err());
     }
 
     #[test]

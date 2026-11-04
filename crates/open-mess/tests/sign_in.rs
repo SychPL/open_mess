@@ -436,3 +436,37 @@ async fn prompts_outside_the_window_are_refused() {
     assert_eq!(NO_WINDOW, "the configuration window is not open");
     assert!(d.sign_ins.shown().is_none());
 }
+
+/// A sign-in page off the module's approved sign-in hosts never reaches a front end: the window,
+/// or the administrative API's `open_url`, which the user opens in a real browser (spec
+/// 2026-11-03-paperclip-plugin, 5.4). The module gets the refusal and may try another way.
+#[tokio::test]
+async fn a_page_off_the_approved_hosts_is_refused_before_it_shows() {
+    let d = daemon(&[ECHO]).await;
+    let page =
+        |url: &str| SignInRequest::OpenPage { module: "test-echo".into(), url: url.into(), redirect_prefix: "https://login.example.com/done".into() };
+    assert!(sign_in_page::page_allowed(&d.accounts, &page("https://login.example.com/start")).is_ok());
+    assert!(sign_in_page::page_allowed(&d.accounts, &page("https://evil.example/start")).is_err());
+    let other = SignInRequest::DeviceCode { module: "test-echo".into(), code: "ABCD".into(), url: "https://login.example.com/device".into() };
+    assert!(sign_in_page::page_allowed(&d.accounts, &other).is_ok());
+
+    let sign_ins = open_mess::ui::sign_in::SignIns::default();
+    let (prompts, requests) = tokio::sync::mpsc::channel(8);
+    let accounts = Arc::clone(&d.accounts);
+    tokio::spawn(sign_ins.clone().forward(requests, move |request| sign_in_page::page_allowed(&accounts, request)));
+    let _active = sign_ins.begin("test-echo").unwrap();
+    let (reply, answer) = oneshot::channel();
+    prompts.send((page("https://evil.example/start"), reply)).await.unwrap();
+    assert!(matches!(answer.await, Ok(SignInReply::Refused(_))));
+    assert!(sign_ins.shown().is_none());
+    // An approved page still shows.
+    let (reply, _answer) = oneshot::channel();
+    prompts.send((page("https://login.example.com/start"), reply)).await.unwrap();
+    for _ in 0..100 {
+        if sign_ins.shown().is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the approved page never showed");
+}
