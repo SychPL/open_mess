@@ -5,6 +5,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, PoisonError};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -154,10 +155,9 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
 /// names. Each only where it exists.
 fn relabel<R: tauri::Runtime>(app: &AppHandle<R>, lang: Lang) {
     // ponytail: a menu or title that fails to change keeps the old language until the next change.
-    let recording = recording(app);
-    if let (Some(tray), Ok(menu)) = (app.tray_by_id(TRAY), tray_menu(app, lang, recording)) {
-        let _ = tray.set_menu(Some(menu));
-        let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
+    {
+        let recording = TRAY_RECORDING.lock().unwrap_or_else(PoisonError::into_inner);
+        show_tray(app, lang, *recording);
     }
     if let Some(window) = app.get_webview_window(LABEL) {
         let _ = window.set_title(title(lang));
@@ -421,9 +421,17 @@ fn tray_tooltip(lang: Lang, recording: bool) -> &'static str {
     if recording { lang.pick("open_mess - nagrywanie", "open_mess - recording") } else { "open_mess" }
 }
 
-/// Whether a call is recorded now. Never from inside the recorder's indicator, which holds its lock.
-fn recording<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
-    app.try_state::<UiState>().and_then(|state| state.recorder.as_ref().map(|recorder| recorder.active().is_some())).unwrap_or(false)
+/// Whether the tray shows a recording. Held while the tray's menu and tooltip change, so a change of
+/// language never puts back the state from before a recording started or ended.
+static TRAY_RECORDING: Mutex<bool> = Mutex::new(false);
+
+/// Shows the tray in `lang`, `recording` or not; the caller holds [`TRAY_RECORDING`].
+fn show_tray<R: tauri::Runtime>(app: &AppHandle<R>, lang: Lang, recording: bool) {
+    // ponytail: a menu or tooltip that fails to change keeps the old one until the next change.
+    if let (Some(tray), Ok(menu)) = (app.tray_by_id(TRAY), tray_menu(app, lang, recording)) {
+        let _ = tray.set_menu(Some(menu));
+        let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
+    }
 }
 
 fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
@@ -457,13 +465,9 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
     if let Some(recorder) = &app.state::<UiState>().recorder {
         let handle = app.handle().clone();
         recorder.set_indicator(Box::new(move |recording| {
-            if let Some(tray) = handle.tray_by_id(TRAY) {
-                let lang = i18n::current();
-                let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
-                if let Ok(menu) = tray_menu(&handle, lang, recording) {
-                    let _ = tray.set_menu(Some(menu));
-                }
-            }
+            let mut shown = TRAY_RECORDING.lock().unwrap_or_else(PoisonError::into_inner);
+            *shown = recording;
+            show_tray(&handle, i18n::current(), recording);
         }));
     }
     Ok(())

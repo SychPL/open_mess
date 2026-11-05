@@ -870,7 +870,7 @@ fn recorder(state: &UiState) -> Result<&Arc<Recorder>, String> {
 }
 
 fn unknown() -> String {
-    "nieznane nagranie".into()
+    i18n::pick("nieznane nagranie", "unknown recording").into()
 }
 
 /// One recording on the window's list.
@@ -962,9 +962,10 @@ pub fn show_transcript(state: &UiState, id: &str) -> Result<Vec<CueDto>, String>
     }
     let meta = recorder.recordings().meta(id).map_err(|_| unknown())?;
     if meta.state != State::Done {
-        return Err("transkrypcja nie jest gotowa".into());
+        return Err(i18n::pick("transkrypcja nie jest gotowa", "the transcript is not ready").into());
     }
-    let transcript = recorder.recordings().transcript(id).map_err(|_| "transkrypcja jest uszkodzona".to_owned())?;
+    let transcript =
+        recorder.recordings().transcript(id).map_err(|_| i18n::pick("transkrypcja jest uszkodzona", "the transcript is damaged").to_owned())?;
     Ok(transcript.cues.into_iter().map(|cue| CueDto { start_ms: cue.start_ms, speaker: cue.speaker, text: cue.text }).collect())
 }
 

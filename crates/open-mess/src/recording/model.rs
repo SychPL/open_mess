@@ -218,7 +218,7 @@ impl Models {
     /// "Pobierz model": the newest revision, in the background, from `source`'s hosts; one
     /// download at a time.
     pub fn start_download(&self, source: Source) -> Result<(), String> {
-        self.start(REVISIONS.first().ok_or("brak modelu do pobrania")?, source)
+        self.start(REVISIONS.first().ok_or(i18n::pick("brak modelu do pobrania", "no model to download"))?, source)
     }
 
     fn start(&self, revision: &'static Revision, source: Source) -> Result<(), String> {
