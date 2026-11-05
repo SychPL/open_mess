@@ -20,20 +20,23 @@ fn normalize(name: &str) -> Result<String, HostError> {
     Ok(host.trim_end_matches('.').to_string())
 }
 
+/// The base of a `*.<base>` pattern, normalized; it must sit below a registrable domain of the
+/// public suffix list, so `*.com`, `*.co.uk` or `*.github.io` are refused (spec 8.3, R7).
+pub(crate) fn pattern_base(pattern: &str, base: &str) -> Result<String, HostError> {
+    let base = normalize(base)?;
+    if psl::domain_str(&base).is_none() {
+        return Err(HostError::Load(format!("pattern {pattern:?} is not below a registrable domain")));
+    }
+    Ok(base)
+}
+
 impl HostList {
-    /// Parses a manifest's host list. A `*.` pattern must sit below a registrable domain of the
-    /// public suffix list, so `*.com`, `*.co.uk` or `*.github.io` are refused (spec 8.3, R7).
+    /// Parses a manifest's host list: exact names and `*.` patterns ([`pattern_base`]).
     pub fn parse(patterns: &[String]) -> Result<HostList, HostError> {
         let mut list = HostList::default();
         for pattern in patterns {
             match pattern.strip_prefix("*.") {
-                Some(base) => {
-                    let base = normalize(base)?;
-                    if psl::domain_str(&base).is_none() {
-                        return Err(HostError::Load(format!("host pattern {pattern:?} is not below a registrable domain")));
-                    }
-                    list.suffixes.push(format!(".{base}"));
-                }
+                Some(base) => list.suffixes.push(format!(".{}", pattern_base(pattern, base)?)),
                 None => list.exact.push(normalize(pattern)?),
             }
         }

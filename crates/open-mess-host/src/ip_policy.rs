@@ -61,6 +61,22 @@ fn in_v6(ip: Ipv6Addr, net: Ipv6Addr, len: u32) -> bool {
     u128::from(ip) & mask == u128::from(net)
 }
 
+/// Whether the range `net/len` holds any address [`is_allowed`] refuses under the strict policy,
+/// so a manifest's media range cannot name a private or special network (spec
+/// 2026-10-29-live-captions, 5.2).
+pub(crate) fn range_has_special(net: IpAddr, len: u32) -> bool {
+    match net {
+        IpAddr::V4(v4) => V4_DENIED.iter().any(|&(denied, dlen)| in_v4(v4, denied, dlen.min(len)) || in_v4(denied, v4, len.min(dlen))),
+        IpAddr::V6(v6) => {
+            // Outside 2000::/3 (this covers mapped, compatible and NAT64 addresses), or touching
+            // one of its special parts.
+            len < 3
+                || !in_v6(v6, GLOBAL_UNICAST, 3)
+                || V6_DENIED.iter().any(|&(denied, dlen)| in_v6(v6, denied, dlen.min(len)) || in_v6(denied, v6, len.min(dlen)))
+        }
+    }
+}
+
 fn is_global(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => !V4_DENIED.iter().any(|&(net, len)| in_v4(v4, net, len)),
@@ -125,6 +141,16 @@ mod tests {
         for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::8.8.8.8"] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_allowed(ip, AddressPolicy::Strict), "{ip} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ranges_touching_special_networks_are_found() {
+        for (net, len) in [("10.0.0.0", 8), ("100.0.0.0", 8), ("192.0.0.0", 8), ("2000::", 3), ("2001:db8::", 32), ("fc00::", 16), ("::", 16)] {
+            assert!(range_has_special(net.parse().unwrap(), len), "{net}/{len}");
+        }
+        for (net, len) in [("52.112.0.0", 14), ("8.0.0.0", 8), ("2603:1000::", 25)] {
+            assert!(!range_has_special(net.parse().unwrap(), len), "{net}/{len}");
         }
     }
 

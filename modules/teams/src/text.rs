@@ -135,7 +135,7 @@ fn attr(attrs: &str, name: &str) -> Option<String> {
 }
 
 /// Appends text with its entities decoded; unknown or malformed entities stay as they are.
-fn push_text(out: &mut String, text: &str) {
+pub(crate) fn push_text(out: &mut String, text: &str) {
     let mut rest = text;
     while let Some(i) = rest.find('&') {
         let (before, tail) = rest.split_at(i);
@@ -168,6 +168,8 @@ fn entity(name: &str) -> Option<char> {
         "apos" => '\'',
         // A plain space; agents don't need the no-break kind.
         "nbsp" => ' ',
+        "lrm" => '\u{200e}',
+        "rlm" => '\u{200f}',
         _ => {
             let number = name.strip_prefix('#')?;
             let code = match number.strip_prefix(['x', 'X']) {

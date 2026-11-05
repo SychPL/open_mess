@@ -26,6 +26,8 @@ pub const APP_ID: &str = "open_mess.daemon";
 pub const UPDATE_APP_ID: &str = "open_mess.update";
 /// Participants a toast names; the others are counted.
 const NAMED_PARTICIPANTS: usize = 5;
+/// The most of a module tool's description a title shows: its first sentence.
+const TITLE_SENTENCE: usize = 100;
 /// Windows shows at most four lines of a toast's two text elements (the title has its own two).
 /// Counted at 24 narrow characters a line (see [`lines`]), which holds even for the widest letters
 /// at the default text size, so what a toast can approve is never cut off.
@@ -61,10 +63,13 @@ pub struct Prompt {
     pub conversation: String,
     /// Every participant's name; none for a channel.
     pub participants: Vec<String>,
-    /// The text; an edit's text before and after; a reaction and the message it is under.
+    /// The text; an edit's text before and after; a reaction and the message it is under; a module
+    /// tool's description and arguments.
     pub content: String,
     /// The language of the toast and the dialog.
     pub lang: Lang,
+    /// What comes before the participants.
+    with: &'static str,
 }
 
 /// What a toast shows.
@@ -80,19 +85,22 @@ pub struct ToastText {
 
 impl Prompt {
     pub fn new(preview: &Preview, lang: Lang) -> Prompt {
-        let title = match (preview.kind, lang) {
-            (Kind::Send, Lang::Pl) => "open_mess: zatwierdź wysłanie",
-            (Kind::Edit, Lang::Pl) => "open_mess: zatwierdź edycję",
-            (Kind::React, Lang::Pl) => "open_mess: zatwierdź reakcję",
-            (Kind::Send, Lang::En) => "open_mess: approve send",
-            (Kind::Edit, Lang::En) => "open_mess: approve edit",
-            (Kind::React, Lang::En) => "open_mess: approve reaction",
+        let field = |text: &Option<String>| clean(text.as_deref().unwrap_or_default());
+        let title = match (&preview.kind, lang) {
+            (Kind::Send, Lang::Pl) => "open_mess: zatwierdź wysłanie".into(),
+            (Kind::Edit, Lang::Pl) => "open_mess: zatwierdź edycję".into(),
+            (Kind::React, Lang::Pl) => "open_mess: zatwierdź reakcję".into(),
+            (Kind::Send, Lang::En) => "open_mess: approve send".into(),
+            (Kind::Edit, Lang::En) => "open_mess: approve edit".into(),
+            (Kind::React, Lang::En) => "open_mess: approve reaction".into(),
+            (Kind::ModuleTool(_), _) => {
+                format!("open_mess: {} - {}", lang.pick("zatwierdź", "approve"), first_sentence(&field(&preview.description)))
+            }
         };
         let conversation = format!("{} - {}", clean(&preview.account), clean(&preview.conversation_title));
         let participants = preview.participants.iter().map(|name| clean(name)).collect();
-        let field = |text: &Option<String>| clean(text.as_deref().unwrap_or_default());
         let (text, target, reaction) = (field(&preview.text), field(&preview.target_text), field(&preview.reaction));
-        let content = match (preview.kind, &preview.target_text, lang) {
+        let content = match (&preview.kind, &preview.target_text, lang) {
             (Kind::Send, None, _) => text,
             (Kind::Send, Some(_), Lang::Pl) => format!("{text}\n\nW odpowiedzi na: {target}"),
             (Kind::Send, Some(_), Lang::En) => format!("{text}\n\nIn reply to: {target}"),
@@ -100,15 +108,36 @@ impl Prompt {
             (Kind::Edit, _, Lang::En) => format!("Before: {target}\nAfter: {text}"),
             (Kind::React, _, Lang::Pl) => format!("{reaction} pod: {target}"),
             (Kind::React, _, Lang::En) => format!("{reaction} on: {target}"),
+            (Kind::ModuleTool(_), _, _) => {
+                let mut content = field(&preview.description);
+                if !preview.arguments.is_empty() {
+                    content.push('\n');
+                }
+                for argument in &preview.arguments {
+                    content.push_str("\n- ");
+                    content.push_str(&clean(argument));
+                }
+                // The participants are only those in the conversation now (spec
+                // 2026-10-29-live-captions, 5.1, R6).
+                content.push_str(lang.pick(
+                    "\n\nZgoda dotyczy rozmowy, nie tylko osób, które są w niej teraz.",
+                    "\n\nThe approval is for the conversation, not only for the people in it now.",
+                ));
+                content
+            }
         };
-        Prompt { title: title.into(), conversation, participants, content, lang }
+        let with = match preview.kind {
+            Kind::ModuleTool(_) => lang.pick("\nTeraz w rozmowie: ", "\nIn it now: "),
+            _ => lang.pick("\nZ: ", "\nWith "),
+        };
+        Prompt { title, conversation, participants, content, lang, with }
     }
 
     /// The conversation and the first `named` participants.
     fn context(&self, named: usize) -> String {
         let mut context = self.conversation.clone();
         if !self.participants.is_empty() {
-            context.push_str(self.lang.pick("\nZ: ", "\nWith "));
+            context.push_str(self.with);
             context.push_str(&participants(&self.participants, named));
         }
         context
@@ -165,6 +194,14 @@ pub fn participants(names: &[String], named: usize) -> String {
         shown.push(&more);
     }
     shown.join(", ")
+}
+
+/// A module tool's description up to its first full stop, at most [`TITLE_SENTENCE`] characters.
+fn first_sentence(description: &str) -> String {
+    let sentence = description.split_once(". ").map_or(description, |(first, _)| first);
+    let sentence = sentence.trim_end_matches('.');
+    let cut: String = sentence.chars().take(TITLE_SENTENCE).collect();
+    if cut.len() < sentence.len() { format!("{cut}...") } else { cut }
 }
 
 /// About how many lines `text` takes at `width` narrow characters a line, on the safe side: the font
@@ -494,7 +531,37 @@ mod tests {
             reaction: None,
             target_text: None,
             target_cut: false,
+            description: None,
+            arguments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn module_tool_prompts_show_the_description_and_arguments() {
+        let mut join = preview("a1", Kind::ModuleTool("teams_join_captions".into()));
+        join.text = None;
+        join.description = Some("Join the meeting for its live captions. open_mess joins as a second device of your account.".into());
+        let prompt = Prompt::new(&join, Lang::En);
+        assert_eq!(prompt.title, "open_mess: approve - Join the meeting for its live captions");
+        assert_eq!(
+            prompt.content,
+            "Join the meeting for its live captions. open_mess joins as a second device of your account.\n\nThe approval is for the conversation, not only for the people in it now."
+        );
+        // The participants are those in it now; long content goes to the dialog.
+        assert_eq!(prompt.toast().context, "Ann (teams:ann) - Project\nIn it now: Pat, Sam");
+        assert_eq!(prompt.toast().buttons, show_all(Lang::En));
+        assert!(prompt.dialog().unwrap().ends_with(&prompt.content));
+        // Every argument, in full.
+        join.arguments = vec!["language: pl-pl".into(), "limit: 5".into()];
+        let prompt = Prompt::new(&join, Lang::Pl);
+        assert_eq!(prompt.title, "open_mess: zatwierdź - Join the meeting for its live captions");
+        assert!(
+            prompt.content.contains("account.\n\n- language: pl-pl\n- limit: 5\n\nZgoda dotyczy rozmowy, nie tylko osób, które są w niej teraz.")
+        );
+        assert_eq!(prompt.toast().context, "Ann (teams:ann) - Project\nTeraz w rozmowie: Pat, Sam");
+        // A title shows one sentence, at most 100 characters.
+        join.description = Some(format!("{}.", "x".repeat(150)));
+        assert_eq!(Prompt::new(&join, Lang::En).title, format!("open_mess: approve - {}...", "x".repeat(100)));
     }
 
     #[test]

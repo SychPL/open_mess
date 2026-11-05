@@ -148,6 +148,8 @@ pub struct ModuleDto {
     pub detail: String,
     pub hosts: Vec<String>,
     pub sign_in_hosts: Vec<String>,
+    /// The address ranges of the module's media connections; empty without media access.
+    pub media: Vec<String>,
     pub wam: Option<WamDto>,
     /// The module's own tools.
     pub tools: Vec<ToolDto>,
@@ -178,7 +180,7 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
             info.state,
             ModuleState::PendingReplacement | ModuleState::AwaitingApproval { reason: ApprovalReason::ManifestChanged | ApprovalReason::FileChanged }
         );
-        let Manifest { hosts, sign_in_hosts, wam, extra_tools, .. } = info.manifest.clone().unwrap_or_else(|| empty_manifest(info));
+        let Manifest { hosts, sign_in_hosts, wam, extra_tools, media, .. } = info.manifest.clone().unwrap_or_else(|| empty_manifest(info));
         dtos.push(ModuleDto {
             name: info.name.clone(),
             file: info.file.clone(),
@@ -188,7 +190,9 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
             detail: describe(&info.state, i18n::current()),
             hosts,
             sign_in_hosts,
-            wam: wam.map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes }),
+            media: media.map(|media| media.peers).unwrap_or_default(),
+            wam: wam
+                .map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes.iter().map(|scope| scope_text(scope, i18n::current())).collect() }),
             tools: extra_tools.into_iter().map(|tool| ToolDto { name: tool.name, writes: tool.writes }).collect(),
             file_sha256: info.file_sha256.clone(),
             manifest_sha256: info.manifest_sha256.clone(),
@@ -197,6 +201,20 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
         });
     }
     Ok(dtos)
+}
+
+/// A WAM scope as the approval shows it: a pattern says what it hands over (spec
+/// 2026-10-28-meetings-transcripts, 5.2; spec 15 asks to name the trust given).
+fn scope_text(scope: &str, lang: Lang) -> String {
+    let what = match scope {
+        "https://*.sharepoint.com/.default" => lang.pick(
+            "token do dowolnej witryny SharePoint/OneDrive Twojej organizacji, z pełnymi uprawnieniami (także zapis i usuwanie plików, Sites.FullControl.All)",
+            "a token for any SharePoint/OneDrive site of your organization, with full permissions (writing and deleting files too, Sites.FullControl.All)",
+        ),
+        _ if scope.contains('*') => lang.pick("token do dowolnej usługi pasującej do wzorca", "a token for any service that matches the pattern"),
+        _ => return scope.to_string(),
+    };
+    format!("{scope} - {what}")
 }
 
 fn empty_manifest(info: &ModuleInfo) -> Manifest {
@@ -208,6 +226,7 @@ fn empty_manifest(info: &ModuleInfo) -> Manifest {
         sign_in_hosts: Vec::new(),
         wam: None,
         extra_tools: Vec::new(),
+        media: None,
     }
 }
 
@@ -259,6 +278,8 @@ fn changes(new: &Value, old: &Value, lang: Lang) -> Vec<String> {
     let (new_host, removed_host) =
         (lang.pick("nowy host logowania", "new sign-in host"), lang.pick("usunięty host logowania", "removed sign-in host"));
     list_changes(&mut changes, new_host, removed_host, field(new, "sign_in_hosts"), field(old, "sign_in_hosts"));
+    let (new_range, removed_range) = (lang.pick("nowy zakres mediów", "new media range"), lang.pick("usunięty zakres mediów", "removed media range"));
+    list_changes(&mut changes, new_range, removed_range, field(field(new, "media"), "peers"), field(field(old, "media"), "peers"));
     if field(new, "wam") != field(old, "wam") {
         let wam = |manifest: &Value| match field(manifest, "wam") {
             wam @ Value::Object(_) => format!("{} ({})", text_of(field(wam, "client_id")), strings(field(wam, "scopes")).join(", ")),
@@ -459,8 +480,8 @@ pub fn clear_permission_override(state: &UiState, account: &str, conversation: &
 #[derive(Clone, Debug, Serialize)]
 pub struct PreviewDto {
     pub action: String,
-    /// `send`, `edit` or `react`.
-    pub kind: &'static str,
+    /// `send`, `edit` or `react`, or a module write tool's full name.
+    pub kind: String,
     /// The account's name and id.
     pub account: String,
     pub conversation: String,
@@ -473,6 +494,10 @@ pub struct PreviewDto {
     pub target_text: Option<String>,
     /// That message is longer than shown: the action can only be rejected.
     pub target_cut: bool,
+    /// A module write tool's description, from its approved manifest.
+    pub description: Option<String>,
+    /// A module write tool's arguments but `conversation`, each as `key: value`.
+    pub arguments: Vec<String>,
 }
 
 /// Why an action whose target message could not be shown in full is not approved.
@@ -493,7 +518,7 @@ pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
         .iter()
         .map(|preview| PreviewDto {
             action: preview.action.clone(),
-            kind: preview.kind.name(),
+            kind: preview.kind.name().to_string(),
             account: approval::clean(&preview.account),
             conversation: approval::clean(&preview.conversation_title),
             participants: preview.participants.iter().map(|name| approval::clean(name)).collect(),
@@ -501,6 +526,8 @@ pub fn waiting(state: &UiState) -> Vec<PreviewDto> {
             reaction: clean(&preview.reaction),
             target_text: clean(&preview.target_text),
             target_cut: preview.target_cut,
+            description: clean(&preview.description),
+            arguments: preview.arguments.iter().map(|argument| approval::clean(argument)).collect(),
         })
         .collect()
 }
@@ -899,6 +926,19 @@ mod tests {
     }
 
     #[test]
+    fn wam_scopes_in_both_languages() {
+        let sharepoint = "https://*.sharepoint.com/.default";
+        assert!(scope_text(sharepoint, Lang::Pl).starts_with(&format!("{sharepoint} - token do dowolnej witryny SharePoint/OneDrive")));
+        assert!(scope_text(sharepoint, Lang::En).starts_with(&format!("{sharepoint} - a token for any SharePoint/OneDrive site")));
+        assert!(scope_text(sharepoint, Lang::En).ends_with("Sites.FullControl.All)"));
+        assert_eq!(
+            scope_text("https://*.example.com/.default", Lang::En),
+            "https://*.example.com/.default - a token for any service that matches the pattern"
+        );
+        assert_eq!(scope_text("https://graph.microsoft.com/.default", Lang::Pl), "https://graph.microsoft.com/.default");
+    }
+
+    #[test]
     fn manifest_changes_in_both_languages() {
         let old = serde_json::json!({
             "version": "1.0.0", "platform": "teams", "hosts": ["a.example", "b.example"], "sign_in_hosts": ["login.example"],
@@ -947,6 +987,15 @@ mod tests {
     fn autonomous_rule_quotes_the_window_in_its_language() {
         assert!(autonomous_rule(Lang::Pl).contains("\"samodzielnie\""));
         assert!(autonomous_rule(Lang::En).contains("\"autonomously\""));
+    }
+
+    #[test]
+    fn a_media_range_is_a_change_to_approve() {
+        let old = serde_json::json!({"hosts": []});
+        let new = serde_json::json!({"hosts": [], "media": {"peers": ["52.112.0.0/14"]}});
+        assert_eq!(changes(&new, &old, Lang::Pl), ["nowy zakres mediów: 52.112.0.0/14"]);
+        assert_eq!(changes(&new, &old, Lang::En), ["new media range: 52.112.0.0/14"]);
+        assert_eq!(changes(&old, &new, Lang::En), ["removed media range: 52.112.0.0/14"]);
     }
 
     #[test]

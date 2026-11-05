@@ -64,6 +64,9 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
 # Sign-in pages' URLs (ui/sign_in_page.rs); the version the module host builds.
 url = "2.5.8"
+# OPEN_MESS_LOG: the daemon's and modules' logs on stderr, for diagnostics (daemon.rs); test-echo
+# logs the timer events tests read (tests/update_quiesce.rs).
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 # The `Show all` dialog of an approval.
@@ -95,8 +98,6 @@ minisign = "0.10.0"
 open-mess-host = { path = "../open-mess-host", features = ["test-support"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["sync", "test-util"] }
-# The module logs a test reads: test-echo logs the timer events it gets (tests/update_quiesce.rs).
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [lints]
 workspace = true

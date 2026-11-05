@@ -16,7 +16,7 @@ use crate::component::bindings::open_mess::module::{http, sign_in, storage};
 use crate::http::HttpRequest;
 use crate::poll;
 use crate::retry::{self, GiveUpReason, Retry};
-use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, SEARCH_SCOPE, Session};
+use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, MCPS_SCOPE, SEARCH_SCOPE, Session};
 
 /// The part of the host's call limit (30 s) the module plans with: no wait starts that would end
 /// past it, so a slow service ends a call with an error, not a timeout that unloads the module.
@@ -37,7 +37,12 @@ thread_local! {
 
 /// Starts a call's budget; every export calls it first.
 pub fn begin() {
-    DEADLINE.set(Some(Instant::now() + CALL_BUDGET));
+    begin_within(CALL_BUDGET);
+}
+
+/// Starts a shorter budget, for an export the host limits more (`end-sessions`, 5 s).
+pub fn begin_within(budget: Duration) {
+    DEADLINE.set(Some(Instant::now() + budget));
     BACKGROUND.set(false);
 }
 
@@ -53,7 +58,7 @@ pub fn has_time() -> bool {
 }
 
 /// Waits `ms` if that ends within the budget.
-fn pause(ms: u32) -> bool {
+pub fn wait(ms: u32) -> bool {
     let wait = Duration::from_millis(u64::from(ms));
     if DEADLINE.get().is_some_and(|deadline| Instant::now() + wait > deadline) {
         return false;
@@ -81,6 +86,8 @@ pub enum Service {
     /// AMS images, with the chat service's token (docs 7; which token AMS takes is to be
     /// confirmed live).
     Media,
+    /// A meeting's artifacts (docs 9.3).
+    Mcps,
 }
 
 impl Service {
@@ -88,6 +95,7 @@ impl Service {
         match self {
             Service::Chat | Service::Media => CHAT_SCOPE,
             Service::Search => SEARCH_SCOPE,
+            Service::Mcps => MCPS_SCOPE,
         }
     }
 }
@@ -107,9 +115,11 @@ pub fn uuid() -> String {
     format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a >> 32, (a >> 16) & 0xffff, a & 0xffff, b >> 48, b & 0xffff_ffff_ffff)
 }
 
-/// A token for `scope` from WAM, and its claims. Only sign-in may ask the user.
-fn wam(scope: &str, interactive: bool, claims: Option<&str>) -> Result<(String, Claims), ModuleError> {
-    let token = sign_in::wam_token(&[scope.to_string()], interactive, claims).map_err(|e| {
+/// A token for `scope` from WAM, and its claims. Only sign-in may ask the user. `account` names
+/// the module account, so an event (a timer, a socket frame) gets that account's token when there
+/// are several (spec 2026-10-29-live-captions, 5.2); a sign-in names none.
+fn wam(scope: &str, interactive: bool, claims: Option<&str>, account: Option<&str>) -> Result<(String, Claims), ModuleError> {
+    let token = sign_in::wam_token(&[scope.to_string()], interactive, claims, account).map_err(|e| {
         ModuleError::AuthRequired(match e {
             sign_in::SignInError::Cancelled => "sign-in was cancelled".to_string(),
             sign_in::SignInError::TimedOut => "sign-in timed out".to_string(),
@@ -122,7 +132,7 @@ fn wam(scope: &str, interactive: bool, claims: Option<&str>) -> Result<(String, 
 
 /// Signs in through WAM, interactively, and checks the account with Teams.
 pub fn sign_in() -> Result<AccountInfo, ModuleError> {
-    let (token, claims) = wam(AUTHSVC_SCOPE, true, None)?;
+    let (token, claims) = wam(AUTHSVC_SCOPE, true, None, None)?;
     // The user's time in the WAM dialog does not count against the host's limit (spec 8.3, R4),
     // so it does not count against the budget either.
     begin();
@@ -179,7 +189,7 @@ pub fn polling_again() {
 }
 
 fn open(account: &str) -> Result<Session, ModuleError> {
-    let (token, claims) = wam(AUTHSVC_SCOPE, false, None)?;
+    let (token, claims) = wam(AUTHSVC_SCOPE, false, None, Some(account))?;
     if claims.oid != account {
         return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
     }
@@ -189,17 +199,88 @@ fn open(account: &str) -> Result<Session, ModuleError> {
 /// The authsvc exchange: Teams accepts the account and names its services (docs 2). Its 404 is
 /// an answer, not a regional redirect.
 fn establish(token: String, claims: Claims) -> Result<Session, ModuleError> {
-    let response = exchange(&authsvc::request(), &token, false, false)?;
+    let auth = authorize(&token)?;
+    let expires = claims.expires_ms;
+    let mut session = Session::new(claims, auth.directory);
+    session.region = auth.region;
+    session.keep(AUTHSVC_SCOPE, token, expires);
+    session.keep_skype(auth.skype_token, auth.expires_at_ms);
+    Ok(session)
+}
+
+fn authorize(token: &str) -> Result<authsvc::Session, ModuleError> {
+    let response = exchange(&authsvc::request(), Some(token), false, false)?;
     match response.status {
         200..=299 => {}
         401 | 403 => return Err(ModuleError::AuthRequired(format!("Teams refused the account (HTTP {})", response.status))),
         status => return Err(ModuleError::Platform(format!("Teams sign-in failed (HTTP {status})"))),
     }
-    let auth = authsvc::decode(&response.body, now_ms()).map_err(proto)?;
-    let expires = claims.expires_ms;
-    let mut session = Session::new(claims, auth.directory);
-    session.keep(AUTHSVC_SCOPE, token, expires);
-    Ok(session)
+    authsvc::decode(&response.body, now_ms()).map_err(proto)
+}
+
+/// A new authsvc exchange for the session: a new skype token and service directory.
+fn reauthorize(session: &mut Session, token: &str) -> Result<(), ModuleError> {
+    let auth = authorize(token)?;
+    session.directory = auth.directory;
+    session.region = auth.region;
+    session.keep_skype(auth.skype_token, auth.expires_at_ms);
+    Ok(())
+}
+
+/// A read from the middle tier (docs 9.1): the authsvc audience's token and the skype token. A
+/// skype token about to expire is renewed by a new authsvc exchange first; a 401 gets a new token,
+/// one more exchange and one more try (spec 2026-10-28-meetings-transcripts, 5.3).
+pub fn middle_tier(session: &mut Session, req: &HttpRequest) -> Result<Vec<u8>, ModuleError> {
+    let token = token(session, AUTHSVC_SCOPE)?;
+    if session.skype(now_ms(), true).is_none() {
+        reauthorize(session, &token)?;
+    }
+    let first = exchange(&with_skype(session, req)?, Some(&token), false, false)?;
+    if first.status != 401 {
+        return ok(first);
+    }
+    let claims = header(&first.headers, "www-authenticate").and_then(session::challenge_claims);
+    let token = renew(session, AUTHSVC_SCOPE, claims.as_deref())?;
+    reauthorize(session, &token)?;
+    let second = exchange(&with_skype(session, req)?, Some(&token), false, false)?;
+    if second.status == 401 {
+        return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
+    }
+    ok(second)
+}
+
+/// A request to the conversation service of live captions with the skype token and no bearer, as
+/// the probe sent them ("Live results" 14-18). A skype token about to expire is renewed by a new
+/// authsvc exchange first; a 401, which the service did not take, gets one more exchange and one
+/// more try.
+pub fn conversation(session: &mut Session, req: &HttpRequest, write: bool) -> Result<http::Response, ModuleError> {
+    if session.skype(now_ms(), true).is_none() {
+        let token = token(session, AUTHSVC_SCOPE)?;
+        reauthorize(session, &token)?;
+    }
+    let first = exchange(&with_skype(session, req)?, None, false, write)?;
+    if first.status != 401 {
+        return Ok(first);
+    }
+    let token = renew(session, AUTHSVC_SCOPE, None)?;
+    reauthorize(session, &token)?;
+    let second = exchange(&with_skype(session, req)?, None, false, write)?;
+    if second.status == 401 {
+        return Err(ModuleError::AuthRequired("the service refused a new skype token".to_string()));
+    }
+    Ok(second)
+}
+
+/// The IC3 token of Trouter's `user.authenticate`, the chat service's (docs 10.7).
+pub fn chat_token(session: &mut Session) -> Result<String, ModuleError> {
+    token(session, CHAT_SCOPE)
+}
+
+fn with_skype(session: &Session, req: &HttpRequest) -> Result<HttpRequest, ModuleError> {
+    let skype = session.skype(now_ms(), false).ok_or_else(|| ModuleError::NotSupported("Teams gave no skype token for this account".to_string()))?;
+    let mut req = req.clone();
+    req.headers.push(("x-skypetoken".to_string(), skype.to_string()));
+    Ok(req)
 }
 
 /// Runs `f` with the account's session, opened silently if this instance has none yet (after a
@@ -225,7 +306,7 @@ pub fn with_session<T>(account: &str, f: impl FnOnce(&mut Session) -> Result<T, 
 }
 
 /// A token for `scope` that is not about to expire.
-fn token(session: &mut Session, scope: &'static str) -> Result<String, ModuleError> {
+fn token(session: &mut Session, scope: &str) -> Result<String, ModuleError> {
     match session.token(scope, now_ms()) {
         Some(token) => Ok(token.to_string()),
         None => renew(session, scope, None),
@@ -233,8 +314,8 @@ fn token(session: &mut Session, scope: &'static str) -> Result<String, ModuleErr
 }
 
 /// A new token from WAM, silently, for the session's own account only.
-fn renew(session: &mut Session, scope: &'static str, claims: Option<&str>) -> Result<String, ModuleError> {
-    let (token, c) = wam(scope, false, claims)?;
+fn renew(session: &mut Session, scope: &str, claims: Option<&str>) -> Result<String, ModuleError> {
+    let (token, c) = wam(scope, false, claims, Some(&session.account))?;
     if c.oid != session.account {
         return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
     }
@@ -248,17 +329,36 @@ fn renew(session: &mut Session, scope: &'static str, claims: Option<&str>) -> Re
 /// again: it ends `uncertain` (spec 8.5).
 pub fn send(session: &mut Session, service: Service, req: &HttpRequest, write: bool) -> Result<http::Response, ModuleError> {
     let scope = service.scope();
-    let first = exchange(req, &token(session, scope)?, service == Service::Chat, write)?;
+    let first = exchange(req, Some(&token(session, scope)?), service == Service::Chat, write)?;
     if first.status != 401 {
         return Ok(first);
     }
     let claims = header(&first.headers, "www-authenticate").and_then(session::challenge_claims);
     let token = renew(session, scope, claims.as_deref())?;
-    let second = exchange(req, &token, service == Service::Chat, write)?;
+    let second = exchange(req, Some(&token), service == Service::Chat, write)?;
     if second.status == 401 {
         return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
     }
     Ok(second)
+}
+
+/// A read from the organization's SharePoint or OneDrive at `origin`, with a token for that
+/// origin. A 401 gets one silent refresh, as in [`send`]; a refusal after that, or a 403, is the
+/// platform's answer about this transcript, not a sign-in the account needs (spec
+/// 2026-10-28-meetings-transcripts, 4.2).
+pub fn sharepoint(session: &mut Session, origin: &str, req: &HttpRequest) -> Result<Vec<u8>, ModuleError> {
+    let scope = format!("{origin}/.default");
+    let mut response = exchange(req, Some(&token(session, &scope)?), false, false)?;
+    if response.status == 401 {
+        let claims = header(&response.headers, "www-authenticate").and_then(session::challenge_claims);
+        let token = renew(session, &scope, claims.as_deref())?;
+        response = exchange(req, Some(&token), false, false)?;
+    }
+    match response.status {
+        401 | 403 => Err(ModuleError::Platform("access to this transcript was refused".to_string())),
+        404 => Err(ModuleError::Platform("transcript not found".to_string())),
+        _ => ok(response),
+    }
 }
 
 /// [`send`] for a read: the body of a 2xx answer, any other status an error.
@@ -281,9 +381,10 @@ pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
 }
 
 /// One exchange under the chat service's retry policy (docs 8): 429 and 5xx again after the wait,
-/// a write only after a 429, which the service did not take. `redirects`: follow the chat
-/// service's regional redirects, a 404 with `Location` on the same host (docs 3.1).
-fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Result<http::Response, ModuleError> {
+/// a write only after a 429, which the service did not take. `token` goes as the bearer, if any.
+/// `redirects`: follow the chat service's regional redirects, a 404 with `Location` on the same
+/// host (docs 3.1).
+fn exchange(req: &HttpRequest, token: Option<&str>, redirects: bool, write: bool) -> Result<http::Response, ModuleError> {
     let mut url = req.url.clone();
     let (mut attempt, mut hops) = (0u8, 0u8);
     loop {
@@ -294,7 +395,9 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
             return Err(ModuleError::Platform("Teams answers too slowly; try again later".to_string()));
         }
         let mut headers = req.headers.clone();
-        headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        if let Some(token) = token {
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        }
         if BACKGROUND.get() {
             headers.push(("x-ms-request-priority".to_string(), "20".to_string()));
         }
@@ -319,7 +422,7 @@ fn exchange(req: &HttpRequest, token: &str, redirects: bool, write: bool) -> Res
         match retry::decide(status, header(&response.headers, "retry-after"), attempt, now_ms()) {
             Retry::Done => return Ok(response),
             Retry::After(ms) => {
-                if !pause(ms) {
+                if !wait(ms) {
                     return Err(ModuleError::Platform(format!("the service asks to wait {} s; try again later", ms.div_ceil(1000))));
                 }
                 attempt += 1;

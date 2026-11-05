@@ -8,7 +8,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::info;
@@ -40,6 +40,8 @@ const TOKEN: &str = "t0ken";
 struct Session {
     declares: bool,
     got: mpsc::UnboundedSender<Value>,
+    /// The `notifications/tools/list_changed` it got.
+    tools_changed: Arc<AtomicUsize>,
 }
 
 impl ClientHandler for Session {
@@ -55,6 +57,10 @@ impl ClientHandler for Session {
     async fn on_custom_notification(&self, notification: CustomNotification, _context: NotificationContext<RoleClient>) {
         assert_eq!(notification.method, channel::METHOD);
         let _ = self.got.send(notification.params.unwrap_or_default());
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.tools_changed.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -81,7 +87,7 @@ async fn connect(port: u16, declares: bool) -> (Client, mpsc::UnboundedReceiver<
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp")).auth_header(TOKEN),
     );
-    (Session { declares, got }.serve(transport).await.unwrap(), notifications)
+    (Session { declares, got, tools_changed: Arc::default() }.serve(transport).await.unwrap(), notifications)
 }
 
 async fn wait_for(what: &str, condition: impl Fn() -> bool) {
@@ -219,7 +225,7 @@ async fn bridged(locate: Locate) -> (Client, mpsc::UnboundedReceiver<Value>) {
     tokio::spawn(bridge::serve(bridge_end, locate));
     let (got, notifications) = mpsc::unbounded_channel();
     // Claude Code takes channel notifications without declaring anything itself.
-    (Session { declares: false, got }.serve(claude_code).await.unwrap(), notifications)
+    (Session { declares: false, got, tools_changed: Arc::default() }.serve(claude_code).await.unwrap(), notifications)
 }
 
 fn locate(port: u16) -> Locate {
@@ -256,7 +262,7 @@ async fn bridge_refuses_the_sessionless_protocol() {
     tokio::spawn(bridge::serve(bridge_end, locate(port)));
     let probe = ClientLifecycleMode::Auto { preferred_versions: vec![ProtocolVersion::V_2026_07_28], legacy_version: None };
     let (got, _notifications) = mpsc::unbounded_channel();
-    let session = Session { declares: false, got }.serve_with_lifecycle(claude_code, probe).await.unwrap();
+    let session = Session { declares: false, got, tools_changed: Arc::default() }.serve_with_lifecycle(claude_code, probe).await.unwrap();
     assert_ne!(session.peer_info().unwrap().protocol_version, ProtocolVersion::V_2026_07_28);
     assert!(session.peer_info().unwrap().capabilities.experimental.as_ref().unwrap().contains_key(channel::CAPABILITY));
 }
@@ -315,7 +321,7 @@ async fn bridge_never_sends_the_token_without_a_daemon_holding_the_lock() {
     let mut child = mcp_stdio(other_program.local_addr().unwrap().port(), data.path());
     let pipes = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
     let (got, _got) = mpsc::unbounded_channel();
-    let session = Session { declares: false, got }.serve(pipes).await.unwrap();
+    let session = Session { declares: false, got, tools_changed: Arc::default() }.serve(pipes).await.unwrap();
     let result = session.call_tool(CallToolRequestParams::new("status")).await.unwrap();
     assert_eq!(result.is_error, Some(true));
     assert!(format!("{:?}", result.content).contains(UNAVAILABLE));
@@ -333,7 +339,7 @@ async fn killed_bridge_is_skipped() {
     let mut child = mcp_stdio(port, data.path());
     let pipes = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
     let (got, _killed_got) = mpsc::unbounded_channel();
-    let killed = Session { declares: false, got }.serve(pipes).await.unwrap();
+    let killed = Session { declares: false, got, tools_changed: Arc::default() }.serve(pipes).await.unwrap();
     wait_for("the first bridge", || registry.channel_sessions().len() == 1).await;
     let (_alive, mut alive_got) = bridged(locate(port)).await;
     wait_for("the second bridge", || registry.channel_sessions().len() == 2).await;
@@ -403,4 +409,61 @@ async fn initialized_twice_registers_once() {
     session.send_notification(ClientNotification::InitializedNotification(InitializedNotification::default())).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(registry.channel_sessions().len(), 1);
+}
+
+/// The API of a daemon with test-echo, announcing its tools as the daemon does.
+async fn serve_daemon(registry: &Arc<Registry>) -> u16 {
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let listener = open_mess::api::bind(0).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), Arc::clone(registry), open_mess::ui::Opener::default(), std::future::pending()));
+    tokio::spawn(Arc::clone(registry).watch_tools());
+    port
+}
+
+fn tools_changed(session: &Client) -> usize {
+    session.service().tools_changed.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn sessions_hear_when_module_tools_go() {
+    let d = common::daemon(&[common::ECHO]).await;
+    let registry = Arc::new(d.registry);
+    let port = serve_daemon(&registry).await;
+    let (direct, _) = connect(port, false).await;
+    let (via_bridge, _) = bridged(locate(port)).await;
+    wait_for("the bridge to connect", || registry.channel_sessions().len() == 1).await;
+    let peek = |tools: Vec<rmcp::model::Tool>| tools.iter().any(|tool| tool.name == "test_echo_peek");
+    assert!(peek(direct.list_all_tools().await.unwrap()));
+    assert!(peek(via_bridge.list_all_tools().await.unwrap()));
+    // The bridge tells its session once it is connected; that is not counted here.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let counts = || [&direct, &via_bridge].map(tools_changed);
+    let before = counts();
+    // The user turns the module off: both sessions are told, and its tools are gone.
+    open_mess::modules::set_enabled(&common::store(d.dir.path()), "test-echo", false).unwrap();
+    d.accounts.rescan_modules(None).await.unwrap();
+    wait_for("both sessions to hear", || counts() == before.map(|count| count + 1)).await;
+    assert!(!peek(direct.list_all_tools().await.unwrap()));
+    assert!(!peek(via_bridge.list_all_tools().await.unwrap()));
+    // Reading the folder again without a change tells nobody.
+    d.accounts.rescan_modules(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(counts(), before.map(|count| count + 1));
+}
+
+#[tokio::test]
+async fn sessions_hear_when_a_module_stops_after_crashes() {
+    let d = common::daemon(&[common::ECHO]).await;
+    let registry = Arc::new(d.registry);
+    let port = serve_daemon(&registry).await;
+    let (session, _) = connect(port, false).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The host stops test-echo after crashes in a row, with no scan.
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    for _ in 0..open_mess_host::limits::MAX_CRASHES {
+        assert!(echo.call("a", "trap", "{}").await.is_err());
+    }
+    wait_for("the session to hear", || tools_changed(&session) == 1).await;
+    assert!(!session.list_all_tools().await.unwrap().iter().any(|tool| tool.name == "test_echo_peek"));
 }

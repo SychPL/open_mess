@@ -358,12 +358,15 @@ impl McpServer {
 
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_experimental_with(channel::capability()).enable_tools().build())
+        let capabilities =
+            ServerCapabilities::builder().enable_experimental_with(channel::capability()).enable_tools().enable_tool_list_changed().build();
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("open_mess", env!("CARGO_PKG_VERSION")))
             .with_instructions(channel::INSTRUCTIONS)
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.registry.add_mcp_session(context.peer.clone());
         let declared = context
             .peer
             .peer_info()

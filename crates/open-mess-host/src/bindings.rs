@@ -8,7 +8,9 @@ use keyring_core::api::CredentialStore;
 use crate::error::ModuleError;
 use crate::limits;
 use crate::net;
-use crate::runtime::{AccountInfo, Attachment, HostEvent, HostState, Manifest, NewMessage, Participant, SessionState, Target, ToolDecl, WamIdentity};
+use crate::runtime::{
+    AccountInfo, Attachment, HostEvent, HostState, Manifest, MediaAccess, NewMessage, Participant, SessionState, Target, ToolDecl, WamIdentity,
+};
 use crate::storage::{Storage, StorageError};
 
 wasmtime::component::bindgen!({
@@ -20,7 +22,7 @@ wasmtime::component::bindgen!({
     exports: { default: async },
 });
 
-use open_mess::module::{host, http, secrets, storage, types, websocket};
+use open_mess::module::{host, http, rtc, secrets, storage, types, websocket};
 
 impl HostState {
     /// The module's storage, opened on first use. Not while the manifest is read at load: the
@@ -74,6 +76,20 @@ impl websocket::Host for HostState {
 
     async fn close(&mut self, conn: u32) {
         self.sockets.close(conn);
+    }
+}
+
+impl rtc::Host for HostState {
+    async fn open(&mut self, label: String) -> Result<(u32, String), http::HttpError> {
+        Ok(self.rtc.open(self.env.media.as_ref(), &label, &self.guest_events).await?)
+    }
+
+    async fn accept(&mut self, conn: u32, answer: String) -> Result<(), http::HttpError> {
+        Ok(self.rtc.accept(conn, &answer).await?)
+    }
+
+    async fn close(&mut self, conn: u32) {
+        self.rtc.close(conn);
     }
 }
 
@@ -203,6 +219,7 @@ impl From<types::Manifest> for Manifest {
                 .into_iter()
                 .map(|t| ToolDecl { name: t.name, description: t.description, input_schema: t.input_schema, writes: t.writes })
                 .collect(),
+            media: m.media.map(|media| MediaAccess { peers: media.peers }),
         }
     }
 }

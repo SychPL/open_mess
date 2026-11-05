@@ -252,6 +252,10 @@ async function renderModules() {
         [tr("Platforma", "Platform"), module.platform || "-"],
         [tr("Hosty", "Hosts"), list(module.hosts)],
         [tr("Hosty logowania", "Sign-in hosts"), list(module.sign_in_hosts)],
+        [
+          tr("Połączenie mediów (bez dźwięku i obrazu, poza proxy)", "Media connection (no sound or video, not through a proxy)"),
+          module.media.length > 0 ? list(module.media) : tr("brak", "none"),
+        ],
         [tr("Konto Windows (WAM)", "Windows account (WAM)"), wam],
         [tr("Własne narzędzia", "Own tools"), list(tools)],
         [tr("SHA-256 pliku", "File SHA-256"), el("code", module.file_sha256 || "-")],
@@ -563,7 +567,7 @@ async function renderPermissions() {
   root.append(
     el(
       "p",
-      tr("Te same uprawnienia dotyczą każdego agenta i polecenia om. Ustawienie rozmowy ma pierwszeństwo przed ustawieniem konta. Z potwierdzeniem: każde wysłanie, edycja i reakcja czeka na Twoją decyzję w powiadomieniu albo w sekcji Do zatwierdzenia.", "The same permissions apply to every agent and to the om command. A conversation's setting comes before the account's. With confirmation: every send, edit and reaction waits for your decision in a notification or in the Waiting for approval section."),
+      tr("Te same uprawnienia dotyczą każdego agenta i polecenia om. Ustawienie rozmowy ma pierwszeństwo przed ustawieniem konta. Z potwierdzeniem: każde wysłanie, edycja i reakcja czeka na Twoją decyzję w powiadomieniu albo w sekcji Do zatwierdzenia. Narzędzia piszące modułów (np. dołączenie do spotkania dla napisów) czekają na nią zawsze, także przy zapisie samodzielnym.", "The same permissions apply to every agent and to the om command. A conversation's setting comes before the account's. With confirmation: every send, edit and reaction waits for your decision in a notification or in the Waiting for approval section. A module's write tools (such as joining a meeting for its captions) always wait for it, even when writing on its own is allowed."),
       "muted",
     ),
   );
@@ -624,7 +628,7 @@ function outcomes() {
     done: tr("Wykonano.", "Done."),
     rejected: tr("Odrzucono.", "Rejected."),
     expired: tr("Wygasło - nic nie wysłano.", "Expired - nothing was sent."),
-    voided: tr("Uczestnicy, wiadomość albo prawo zapisu zmieniły się od pokazania - nic nie wysłano.", "The participants, the message or the write permission changed since it was shown - nothing was sent."),
+    voided: tr("Uczestnicy, tytuł rozmowy, wiadomość albo prawo zapisu zmieniły się od pokazania - nic nie wysłano.", "The participants, the conversation's title, the message or the write permission changed since it was shown - nothing was sent."),
     uncertain: tr("Mogło dotrzeć - sprawdź rozmowę, zanim spróbujesz ponownie.", "It may have arrived - check the conversation before you try again."),
     failed: tr("Nie udało się - nic nie wysłano.", "It failed - nothing was sent."),
   };
@@ -638,15 +642,21 @@ function waitingCard(preview) {
   const card = el("div", null, "card");
   card.append(el("strong", kinds()[preview.kind] || preview.kind));
   const participants = preview.participants.length > 0 ? preview.participants.join(", ") : tr("brak (kanał)", "none (channel)");
+  // A module tool's approval is for the conversation: who is in it now is shown, not approved.
+  const tool = preview.description !== null;
   card.append(
     details([
       [tr("Konto", "Account"), preview.account],
       [tr("Rozmowa", "Conversation"), preview.conversation],
-      [tr("Uczestnicy", "Participants"), participants],
+      [tool ? tr("Teraz w rozmowie", "In it now") : tr("Uczestnicy", "Participants"), participants],
     ]),
   );
   const block = (label, text) => card.append(el("h2", label), el("div", text, "content-text"));
-  if (preview.kind === "send") {
+  if (tool) {
+    block(tr("Co zrobi narzędzie modułu", "What the module's tool does"), preview.description);
+    if (preview.arguments.length > 0) block(tr("Argumenty", "Arguments"), preview.arguments.join("\n"));
+    card.append(el("p", tr("Zgoda dotyczy rozmowy, nie tylko osób, które są w niej teraz.", "The approval is for the conversation, not only for the people in it now."), "muted"));
+  } else if (preview.kind === "send") {
     block(tr("Treść", "Text"), preview.text);
     if (preview.target_text !== null) block(tr("W odpowiedzi na", "In reply to"), preview.target_text);
   } else if (preview.kind === "edit") {

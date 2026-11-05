@@ -5,15 +5,19 @@
 //! of `wit/module.wit` when built for wasm32-wasip2. Protocol facts: `docs/protocols/teams.md`.
 
 pub mod authsvc;
+pub mod captions;
 pub mod chat;
 pub mod http;
 pub mod manifest;
+pub mod meetings;
 pub mod poll;
 pub mod retry;
+pub mod sdp;
 pub mod search;
 pub mod session;
 pub mod text;
 pub mod time;
+pub mod trouter;
 pub mod unread;
 pub mod writing;
 
@@ -22,6 +26,8 @@ pub mod writing;
 mod api;
 #[cfg(target_arch = "wasm32")]
 mod component;
+#[cfg(target_arch = "wasm32")]
+mod live;
 #[cfg(target_arch = "wasm32")]
 mod tools;
 

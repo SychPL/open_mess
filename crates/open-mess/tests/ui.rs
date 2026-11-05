@@ -99,9 +99,17 @@ async fn module_dto_lists_hosts_and_identity() {
     assert_eq!((teams.name.as_str(), teams.status, teams.detail.as_str()), ("teams", "awaiting-approval", "czeka na zatwierdzenie: nowy moduł"));
     assert!(teams.hosts.contains(&"*.sharepoint.com".to_string()), "{:?}", teams.hosts);
     assert_eq!(teams.sign_in_hosts, ["login.microsoftonline.com"]);
+    // Live captions' media peers are part of what the user approves (spec 2026-10-29-live-captions, 5.2).
+    assert_eq!(teams.media, ["52.112.0.0/14", "52.122.0.0/15", "2603:1063::/38"]);
     let wam = teams.wam.as_ref().unwrap();
     assert_eq!(wam.client_id, "1fec8e78-bce4-4aaf-ab1b-5451cc387264");
-    assert_eq!(wam.scopes.len(), 3);
+    assert_eq!(wam.scopes.len(), 5);
+    // The SharePoint pattern is shown with the trust it hands over (spec 2026-10-28-meetings-transcripts, 5.2).
+    assert!(
+        wam.scopes.iter().any(|s| s.starts_with("https://*.sharepoint.com/.default - ") && s.contains("Sites.FullControl.All")),
+        "{:?}",
+        wam.scopes
+    );
     assert_eq!(teams.file_sha256.len(), 64);
     assert_eq!(teams.manifest_sha256.len(), 64);
     // A new module takes over nothing.
@@ -150,12 +158,12 @@ async fn rescan_keeps_running_version_until_approved() {
     install(d.dir.path(), "echo.wasm", &echo_with_another_host());
     commands::rescan_modules(&state).await.unwrap();
     let running = d.accounts.modules().handle("test-echo").unwrap();
-    assert_eq!(running.manifest().unwrap().hosts, ["localhost"]);
+    assert_eq!(running.manifest().unwrap().hosts, ["localhost", "*.sharepoint.com"]);
     let list = modules(&state);
     assert_eq!(list.len(), 2);
-    assert_eq!(module(&list, "active").hosts, ["localhost"]);
+    assert_eq!(module(&list, "active").hosts, ["localhost", "*.sharepoint.com"]);
     let replacement = module(&list, "replacement").clone();
-    assert_eq!(replacement.hosts, ["localhost", "extra.example.com"]);
+    assert_eq!(replacement.hosts, ["localhost", "extra.example.com", "*.sharepoint.com"]);
     assert_eq!(replacement.changes, ["nowy host: extra.example.com"]);
     assert!(replacement.takes_over);
     // The account and its waiting action are untouched.
@@ -170,7 +178,7 @@ async fn rescan_keeps_running_version_until_approved() {
     let list = modules(&state);
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].status, "active");
-    assert_eq!(d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap().hosts, ["localhost", "extra.example.com"]);
+    assert_eq!(d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap().hosts, ["localhost", "extra.example.com", "*.sharepoint.com"]);
     assert_eq!(state.pending.state(&waiting.action).unwrap(), State::Expired);
     assert!(state.pending.waiting().is_empty());
     // test-echo restores only its "known" account; the account was asked again.
@@ -263,7 +271,7 @@ async fn decide_from_window_updates_state() {
     let waiting = commands::waiting(&state);
     assert_eq!(waiting.len(), 1);
     let preview = &waiting[0];
-    assert_eq!((preview.action.as_str(), preview.kind), (action.as_str(), "send"));
+    assert_eq!((preview.action.as_str(), preview.kind.as_str()), (action.as_str(), "send"));
     assert_eq!(preview.account, "User a (test-echo:a)");
     assert_eq!(preview.conversation, "Echo c1");
     assert_eq!(preview.participants, ["Pat"]);
@@ -278,6 +286,24 @@ async fn decide_from_window_updates_state() {
     let rejected = d.registry.call("send", json!({"account": "test-echo:a", "conversation": "c1", "text": "no"})).await.unwrap();
     assert_eq!(commands::decide(&state, rejected["action"].as_str().unwrap(), false).await.unwrap(), "rejected");
     assert!(commands::decide(&state, "nope", true).await.is_err());
+}
+
+#[tokio::test]
+async fn module_write_with_many_participants_is_approved_in_the_window() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    let state = state(&d);
+    // A meeting of 60: too many for a toast or the dialog, all of them in the window.
+    let people: Vec<Value> = (1..=60).map(|n| json!([format!("p{n}"), format!("Person {n}")])).collect();
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    echo.call("a", "set-target", &json!({"conversation": "c1", "participants": people}).to_string()).await.unwrap();
+    let poked = d.registry.call("test_echo_poke", json!({"account": "test-echo:a", "conversation": "c1", "text": "hi"})).await.unwrap();
+    let action = poked["action"].as_str().unwrap();
+    let preview = &commands::waiting(&state)[0];
+    assert_eq!((preview.kind.as_str(), preview.participants.len(), preview.target_cut), ("test_echo_poke", 60, false));
+    assert_eq!(preview.description.as_deref(), Some("Pokes the conversation. It records its arguments as a write."));
+    assert_eq!(preview.arguments, ["text: hi"]);
+    assert_eq!(commands::decide(&state, action, true).await.unwrap(), "done");
 }
 
 #[tokio::test]
