@@ -115,6 +115,9 @@ pub struct Net {
     /// Test support: the loopback server that serves every allowed host over plain HTTP.
     #[cfg(any(test, feature = "test-support"))]
     fake_server: Option<SocketAddr>,
+    /// Test support: the loopback server that takes every module WebSocket, over plain ws.
+    #[cfg(any(test, feature = "test-support"))]
+    fake_sockets: Option<SocketAddr>,
 }
 
 impl Net {
@@ -137,17 +140,36 @@ impl Net {
             limits,
             #[cfg(any(test, feature = "test-support"))]
             fake_server: None,
+            #[cfg(any(test, feature = "test-support"))]
+            fake_sockets: None,
         }
+    }
+
+    pub(crate) fn policy(&self) -> AddressPolicy {
+        self.policy
     }
 
     /// Test support: every host on a module's list is served by the loopback server at `addr`,
     /// over plain HTTP, with the request's own host in its `Host` header. The host list is still
     /// checked, and nothing is resolved, so a module under test never reaches the real host.
-    /// HTTP only; WebSockets are not redirected.
+    /// HTTP only; [`Net::serving_websockets_from`] does the same for WebSockets.
     #[cfg(any(test, feature = "test-support"))]
     pub fn serving_hosts_from(mut self, addr: SocketAddr) -> Net {
         self.fake_server = Some(addr);
         self
+    }
+
+    /// Test support: every WebSocket to a host on a module's list goes to the loopback server at
+    /// `addr`, over plain ws, with the URL's own host in `Host` and its path and query unchanged.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn serving_websockets_from(mut self, addr: SocketAddr) -> Net {
+        self.fake_sockets = Some(addr);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn fake_sockets(&self) -> Option<SocketAddr> {
+        self.fake_sockets
     }
 
     /// Checks the URL's host against the module's list, resolves it once and checks every

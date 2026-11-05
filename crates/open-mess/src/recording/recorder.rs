@@ -19,6 +19,7 @@ use super::capture::{Control, Targets, Track};
 use super::detect::Observation;
 use super::queue::Queue;
 use super::{MIN_FREE_DISK, Meta, Reason, Recordings, Refusal, State, UpdateLink, millis};
+use crate::i18n;
 
 /// The longest recording (4.2).
 const LONGEST: Duration = Duration::from_secs(6 * 60 * 60);
@@ -270,30 +271,30 @@ impl Recorder {
         let microphone = (self.hooks.settings)().microphone;
         // Teams moved to no other device since the capture could not open these in this call.
         if inner.lost.as_ref() == Some(&targets(seen, microphone)) {
-            return Err("nie da się otworzyć urządzenia rozmowy");
+            return Err("cannot open the call's devices");
         }
         if !self.ui_ready.load(Ordering::SeqCst) {
-            return Err("brak ikony w zasobniku");
+            return Err("no tray icon");
         }
         if (self.hooks.model)() != "ready" {
-            return Err("brak modelu");
+            return Err("no model");
         }
         if let Some(refusal) = self.recordings.refusal((self.hooks.free_disk)()) {
             return Err(match refusal {
-                Refusal::DiskFull => "mało miejsca na dysku",
-                Refusal::AudioLimit => "limit dźwięku",
-                Refusal::TranscriptLimit => "limit transkrypcji",
+                Refusal::DiskFull => "low disk",
+                Refusal::AudioLimit => "audio limit",
+                Refusal::TranscriptLimit => "text limit",
             });
         }
         // The daemon is about to end for an update; the rest of the call is recorded after it (4.1).
         if !self.link.start_recording() {
-            return Err("trwa aktualizacja");
+            return Err("update in progress");
         }
         let id = match self.recordings.create(millis(SystemTime::now())) {
             Ok(id) => id,
             Err(_) => {
                 self.link.end_recording();
-                return Err("błąd tworzenia nagrania");
+                return Err("cannot create the recording");
             }
         };
         let started = self.recordings.path(&id).ok_or(io::ErrorKind::NotFound).map_err(io::Error::from).and_then(|path| {
@@ -308,7 +309,7 @@ impl Recorder {
             Err(_) => {
                 let _ = self.recordings.delete(&id);
                 self.link.end_recording();
-                return Err("błąd tworzenia nagrania");
+                return Err("cannot create the recording");
             }
         };
         self.queue.recording(Some(&id));
@@ -387,7 +388,7 @@ impl Recorder {
     pub fn without_work<T>(&self, work: impl FnOnce() -> T) -> Result<T, &'static str> {
         let inner = self.locked();
         if inner.active.is_some() || self.queue.view().running.is_some() {
-            return Err("trwa nagrywanie albo transkrypcja");
+            return Err(i18n::pick("trwa nagrywanie albo transkrypcja", "a call is being recorded or transcribed"));
         }
         Ok(work())
     }
@@ -703,12 +704,12 @@ mod tests {
         setup.model.store(false, Ordering::SeqCst);
         setup.recorder.observe(&on(true), Instant::now());
         setup.recorder.observe(&on(true), Instant::now());
-        assert_eq!(setup.told.take(), ["not recording: brak modelu"]);
-        assert_eq!(setup.recorder.status()["reason"], "brak modelu");
+        assert_eq!(setup.told.take(), ["not recording: no model"]);
+        assert_eq!(setup.recorder.status()["reason"], "no model");
         // The next call is told again.
         setup.recorder.observe(&ended(), Instant::now());
         setup.recorder.observe(&on(true), Instant::now());
-        assert_eq!(setup.told.take(), ["not recording: brak modelu"]);
+        assert_eq!(setup.told.take(), ["not recording: no model"]);
     }
 
     #[test]
@@ -809,7 +810,7 @@ mod tests {
         assert!(link.start_handover());
         setup.recorder.observe(&on(true), Instant::now());
         assert!(setup.recorder.active().is_none());
-        assert_eq!(setup.told.take(), ["not recording: trwa aktualizacja"]);
+        assert_eq!(setup.told.take(), ["not recording: update in progress"]);
     }
 
     #[test]

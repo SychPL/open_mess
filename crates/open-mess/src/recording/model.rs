@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use url::Url;
 
+use crate::i18n;
 use crate::update::UpdateError;
 use crate::update::fetch::{self, Source};
 
@@ -224,7 +225,7 @@ impl Models {
         {
             let mut state = locked(&self.download);
             if matches!(*state, Download::Running { .. }) {
-                return Err("model już się pobiera".into());
+                return Err(i18n::pick("model już się pobiera", "the model is already downloading").into());
             }
             *state = Download::Running { done: 0, total: revision.files.iter().map(|file| file.size).sum() };
         }
@@ -247,7 +248,7 @@ impl Models {
     /// it while a call is recorded or transcribed too.
     pub fn delete(&self) -> Result<(), String> {
         if matches!(*locked(&self.download), Download::Running { .. }) {
-            return Err("model się pobiera".into());
+            return Err(i18n::pick("model się pobiera", "the model is downloading").into());
         }
         match fs::remove_dir_all(self.local.join("models")) {
             Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err.to_string()),

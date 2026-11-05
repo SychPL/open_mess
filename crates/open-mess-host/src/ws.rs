@@ -110,6 +110,10 @@ async fn connect(net: &Net, hosts: &HostList, url: &str, headers: &[(String, Str
         .map_err(|e| network(format!("TLS setup: {e}")))?
         .with_no_client_auth();
     let config = WebSocketConfig::default().max_message_size(Some(limits::MAX_WS_MESSAGE)).max_frame_size(Some(limits::MAX_WS_MESSAGE));
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(addr) = net.fake_sockets() {
+        return fake(addr, request, config).await;
+    }
     let handshake = async {
         let stream = tcp(&url, &addrs).await?;
         let connector = Connector::Rustls(Arc::new(tls));
@@ -117,6 +121,17 @@ async fn connect(net: &Net, hosts: &HostList, url: &str, headers: &[(String, Str
         Ok(ws)
     };
     tokio::time::timeout(net.limits.connect_timeout, handshake).await.map_err(|_| HttpError::Timeout)?
+}
+
+/// Test support: the handshake with the loopback server at `addr` over plain ws; the request
+/// keeps its `Host` and path (`Net::serving_websockets_from`).
+#[cfg(any(test, feature = "test-support"))]
+async fn fake(addr: SocketAddr, mut request: tungstenite::handshake::client::Request, config: WebSocketConfig) -> Result<Stream, HttpError> {
+    let path = request.uri().path_and_query().map_or("/", |p| p.as_str()).to_string();
+    *request.uri_mut() = format!("ws://{addr}{path}").parse().map_err(network)?;
+    let stream = TcpStream::connect(addr).await.map_err(network)?;
+    let (ws, _) = tokio_tungstenite::client_async_with_config(request, MaybeTlsStream::Plain(stream), Some(config)).await.map_err(network)?;
+    Ok(ws)
 }
 
 /// Moves frames between one connection and the module until either side ends it.

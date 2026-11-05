@@ -14,10 +14,13 @@ use tokio::runtime::Runtime;
 use open_mess_host::{SignInReply, SignInRequest};
 
 use super::{Opener, UiState, sign_in_page};
-use crate::Error;
+use crate::i18n::{self, Lang};
+use crate::{Error, approval};
 
 /// The window's label; the capability file grants its commands to this label only.
 const LABEL: &str = "main";
+/// The tray icon's id.
+const TRAY: &str = "open_mess";
 
 pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl Future<Output = ()> + Send + 'static) -> Result<(), Error> {
     // Commands and Tauri's own tasks run on the daemon's runtime.
@@ -57,6 +60,8 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::install_update,
             ipc::cancel_update,
             ipc::set_auto_install,
+            ipc::language,
+            ipc::set_language,
             ipc::model_status,
             ipc::download_model,
             ipc::delete_model,
@@ -144,6 +149,29 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
     Ok(())
 }
 
+/// What shows the language once it changed (spec 2026-10-30-ui-languages, 4.5): the tray menu, the
+/// titles of the open windows, the page (it reloads on `language-changed`) and the notifications'
+/// names. Each only where it exists.
+fn relabel<R: tauri::Runtime>(app: &AppHandle<R>, lang: Lang) {
+    // ponytail: a menu or title that fails to change keeps the old language until the next change.
+    let recording = recording(app);
+    if let (Some(tray), Ok(menu)) = (app.tray_by_id(TRAY), tray_menu(app, lang, recording)) {
+        let _ = tray.set_menu(Some(menu));
+        let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
+    }
+    if let Some(window) = app.get_webview_window(LABEL) {
+        let _ = window.set_title(title(lang));
+    }
+    sign_in_page::retitle(app, lang);
+    dispatch(app, "language-changed");
+    approval::rename(lang);
+}
+
+/// The window's title.
+fn title(lang: Lang) -> &'static str {
+    lang.pick("open_mess - ustawienia", "open_mess - settings")
+}
+
 /// Sends an event to the page, if the window is open.
 fn dispatch<R: tauri::Runtime>(app: &AppHandle<R>, event: &str) {
     if let Some(window) = app.get_webview_window(LABEL) {
@@ -162,12 +190,12 @@ mod ipc {
     // The glue `tauri::command` generates uses unreachable!; nothing written here does.
     #![allow(clippy::unreachable)]
 
-    use tauri::State;
+    use tauri::{AppHandle, State};
 
     use crate::ui::UiState;
     use crate::ui::commands::{
-        self, AccountDto, AnswerDto, ChannelSetupDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, RuleDto, RuleViewDto, SignInPromptDto,
-        StatusDto,
+        self, AccountDto, AnswerDto, ChannelSetupDto, LanguageDto, McpCommandsDto, ModuleDto, PermissionsDto, PreviewDto, RuleDto, RuleViewDto,
+        SignInPromptDto, StatusDto,
     };
     use crate::update::service::UpdateView;
 
@@ -362,22 +390,48 @@ mod ipc {
     pub async fn set_auto_install(state: State<'_, UiState>, on: bool) -> Result<(), String> {
         commands::set_auto_install(&state, on)
     }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn language(state: State<'_, UiState>) -> Result<LanguageDto, String> {
+        Ok(commands::language(&state))
+    }
+
+    /// Returns the language now, `pl` or `en`; the page reloads in it.
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn set_language(app: AppHandle, state: State<'_, UiState>, setting: String) -> Result<&'static str, String> {
+        let (lang, changed) = commands::set_language(&state, &setting)?;
+        if changed {
+            super::relabel(&app, lang);
+        }
+        Ok(lang.code())
+    }
 }
 
-/// The tray's menu; while a call is recorded it can stop it (spec 2026-10-28-local-transcription, 4.2).
-fn menu<R: tauri::Runtime, M: tauri::Manager<R>>(app: &M, recording: bool) -> tauri::Result<Menu<R>> {
-    let open = MenuItem::with_id(app, "open", "Otwórz ustawienia", true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop_recording", "Zatrzymaj nagrywanie", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Zakończ", true, None::<&str>)?;
-    if recording { Menu::with_items(app, &[&open, &stop, &quit]) } else { Menu::with_items(app, &[&open, &quit]) }
+/// The tray menu in `lang`; while a call is recorded it can stop it (spec
+/// 2026-10-28-local-transcription, 4.2). Its items are told apart by id, never by label.
+fn tray_menu<R: tauri::Runtime, M: Manager<R>>(manager: &M, lang: Lang, recording: bool) -> tauri::Result<Menu<R>> {
+    let open = MenuItem::with_id(manager, "open", lang.pick("Otwórz ustawienia", "Open settings"), true, None::<&str>)?;
+    let stop = MenuItem::with_id(manager, "stop_recording", lang.pick("Zatrzymaj nagrywanie", "Stop recording"), true, None::<&str>)?;
+    let quit = MenuItem::with_id(manager, "quit", lang.pick("Zakończ", "Quit"), true, None::<&str>)?;
+    if recording { Menu::with_items(manager, &[&open, &stop, &quit]) } else { Menu::with_items(manager, &[&open, &quit]) }
+}
+
+/// The tray's tooltip, which says while a call is recorded.
+fn tray_tooltip(lang: Lang, recording: bool) -> &'static str {
+    if recording { lang.pick("open_mess - nagrywanie", "open_mess - recording") } else { "open_mess" }
+}
+
+/// Whether a call is recorded now. Never from inside the recorder's indicator, which holds its lock.
+fn recording<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    app.try_state::<UiState>().and_then(|state| state.recorder.as_ref().map(|recorder| recorder.active().is_some())).unwrap_or(false)
 }
 
 fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
-    let items = menu(app, false)?;
+    let menu = tray_menu(app, i18n::current(), false)?;
     let on_click = profile.clone();
-    let mut tray = TrayIconBuilder::with_id("open_mess")
+    let mut tray = TrayIconBuilder::with_id(TRAY)
         .tooltip("open_mess")
-        .menu(&items)
+        .menu(&menu)
         .show_menu_on_left_click(false)
         // ponytail: a window the tray fails to open is reported once a log sink exists; `om config`
         // reports it now.
@@ -403,9 +457,10 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
     if let Some(recorder) = &app.state::<UiState>().recorder {
         let handle = app.handle().clone();
         recorder.set_indicator(Box::new(move |recording| {
-            if let Some(tray) = handle.tray_by_id("open_mess") {
-                let _ = tray.set_tooltip(Some(if recording { "open_mess - nagrywanie" } else { "open_mess" }));
-                if let Ok(menu) = menu(&handle, recording) {
+            if let Some(tray) = handle.tray_by_id(TRAY) {
+                let lang = i18n::current();
+                let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
+                if let Ok(menu) = tray_menu(&handle, lang, recording) {
                     let _ = tray.set_menu(Some(menu));
                 }
             }
@@ -419,6 +474,17 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
 /// Opens the window, or raises the open one; `waiting`: on the list of actions waiting for
 /// approval. (A new window starts on that list anyway while any wait.)
 fn open_window<R: tauri::Runtime>(app: &AppHandle<R>, profile: &Path, waiting: bool) -> Result<(), String> {
+    // Windows's language may have changed since the daemon started (spec 2026-10-30-ui-languages, 4.5).
+    let lang = match app.try_state::<UiState>() {
+        Some(state) => {
+            let (lang, changed) = i18n::apply_language(&state.accounts.store());
+            if changed {
+                relabel(app, lang);
+            }
+            lang
+        }
+        None => i18n::current(),
+    };
     if let Some(window) = app.get_webview_window(LABEL) {
         // A window that cannot be raised is still open.
         let _ = window.unminimize();
@@ -430,7 +496,7 @@ fn open_window<R: tauri::Runtime>(app: &AppHandle<R>, profile: &Path, waiting: b
         return Ok(());
     }
     let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
-        .title("open_mess - ustawienia")
+        .title(title(lang))
         .inner_size(960.0, 680.0)
         .min_inner_size(640.0, 420.0)
         .data_directory(profile.to_path_buf())
@@ -466,6 +532,30 @@ mod tests {
         open_window(app.handle(), profile.path(), true).unwrap();
         assert_eq!(app.webview_windows().len(), 1);
         assert!(app.get_webview_window(LABEL).is_some());
+    }
+
+    #[test]
+    fn tray_and_window_follow_the_language() {
+        let app = tauri::test::mock_app();
+        for (lang, open, quit) in [(Lang::Pl, "Otwórz ustawienia", "Zakończ"), (Lang::En, "Open settings", "Quit")] {
+            let menu = tray_menu(app.handle(), lang, false).unwrap();
+            let items: Vec<(String, String)> =
+                menu.items().unwrap().iter().filter_map(|item| item.as_menuitem().map(|item| (item.id().0.clone(), item.text().unwrap()))).collect();
+            assert_eq!(items, [("open".to_string(), open.to_string()), ("quit".to_string(), quit.to_string())]);
+        }
+        // While a call is recorded the menu can stop it, in the language too.
+        for (lang, stop) in [(Lang::Pl, "Zatrzymaj nagrywanie"), (Lang::En, "Stop recording")] {
+            let menu = tray_menu(app.handle(), lang, true).unwrap();
+            let items: Vec<String> = menu.items().unwrap().iter().filter_map(|item| item.as_menuitem().map(|item| item.text().unwrap())).collect();
+            assert_eq!(items.get(1).map(String::as_str), Some(stop));
+        }
+        assert_eq!((tray_tooltip(Lang::Pl, true), tray_tooltip(Lang::En, true)), ("open_mess - nagrywanie", "open_mess - recording"));
+        assert_eq!((title(Lang::Pl), title(Lang::En)), ("open_mess - ustawienia", "open_mess - settings"));
+        // With the window open (no tray in the mock): its title and its page are told.
+        let profile = tempfile::tempdir().unwrap();
+        open_window(app.handle(), profile.path(), false).unwrap();
+        relabel(app.handle(), Lang::En);
+        assert_eq!(app.webview_windows().len(), 1);
     }
 
     #[test]

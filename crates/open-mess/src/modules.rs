@@ -19,7 +19,7 @@ use open_mess_host::{Engine, Manifest, ModuleContext, ModuleHandle, Net, SignInP
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::Error;
 use crate::store::Store;
@@ -111,6 +111,8 @@ pub struct Modules {
     dir: PathBuf,
     /// The context for loading a file, by file name.
     ctx: Box<dyn Fn(&str) -> ModuleContext + Send + Sync>,
+    /// Touched whenever what runs may have changed: a scan adopted, a module crashed or stopped.
+    changes: watch::Sender<()>,
 }
 
 /// A file that loaded as a module.
@@ -140,7 +142,17 @@ impl Modules {
     ) -> Result<Modules, Error> {
         let found = load(engine, dir, &ctx).await?;
         let entries = decide(store, found)?;
-        Ok(Modules { entries: RwLock::new(entries), engine: engine.clone(), dir: dir.to_path_buf(), ctx: Box::new(ctx) })
+        let changes = watch::Sender::new(());
+        for handle in entries.iter().filter_map(|entry| entry.handle.as_ref()) {
+            forward_state(handle, &changes);
+        }
+        Ok(Modules { entries: RwLock::new(entries), engine: engine.clone(), dir: dir.to_path_buf(), ctx: Box::new(ctx), changes })
+    }
+
+    /// Changes when what runs may have changed (spec 2026-10-28-meetings-transcripts, 5.1): after
+    /// [`Modules::adopt`], and when the host marks a module crashed or stopped.
+    pub fn changes(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Vec<Entry>> {
@@ -187,12 +199,15 @@ impl Modules {
     /// until the user turns it off or approves a file that replaces it: a new file waiting for
     /// approval, a file that is gone or one that does not load (still being written, say) leave it
     /// running (spec 8.3). A module stopped after repeated crashes starts again only when `restart`
-    /// names it. Returns the modules that stopped, started or were replaced.
-    pub(crate) fn adopt(&self, store: &Store, found: Found, restart: Option<&str>) -> Result<Vec<String>, Error> {
+    /// names it. Returns the modules that stopped, started or were replaced, and the handles of the
+    /// loaded versions that stopped: the caller ends their sessions before it drops them (spec
+    /// 2026-10-29-live-captions, 4.3).
+    pub(crate) fn adopt(&self, store: &Store, found: Found, restart: Option<&str>) -> Result<(Vec<String>, Vec<ModuleHandle>), Error> {
         let mut fresh = decide(store, found)?;
         let mut entries = self.write();
         let mut changed = BTreeSet::new();
         let mut kept = BTreeSet::new();
+        let mut stopped = Vec::new();
         for old in entries.drain(..).filter(|old| old.handle.is_some()) {
             let name = old.info.name.clone();
             let enabled = Row::get(store.conn(), &name)?.is_some_and(|row| row.enabled);
@@ -210,6 +225,7 @@ impl Modules {
             };
             if !keep {
                 changed.insert(name);
+                stopped.extend(old.handle);
                 continue;
             }
             kept.insert(name);
@@ -225,10 +241,25 @@ impl Modules {
         }
         for entry in fresh.iter().filter(|entry| entry.info.state == ModuleState::Active && !kept.contains(&entry.info.name)) {
             changed.insert(entry.info.name.clone());
+            if let Some(handle) = &entry.handle {
+                forward_state(handle, &self.changes);
+            }
         }
         *entries = fresh;
-        Ok(changed.into_iter().collect())
+        drop(entries);
+        self.changes.send_replace(());
+        Ok((changed.into_iter().collect(), stopped))
     }
+}
+
+/// Touches `changes` whenever the host changes the module's state, until the module is gone.
+fn forward_state(handle: &ModuleHandle, changes: &watch::Sender<()>) {
+    let (mut state, changes) = (handle.state_changes(), changes.clone());
+    tokio::spawn(async move {
+        while state.changed().await.is_ok() {
+            changes.send_replace(());
+        }
+    });
 }
 
 /// Loads every `.wasm` file in `dir`, reading each module's manifest.
@@ -302,16 +333,36 @@ pub(crate) async fn inspect(engine: &Engine, path: &Path) -> Result<Inspected, E
     Ok(Inspected { manifest_sha256: manifest_sha256(&manifest), file_sha256, manifest })
 }
 
-/// Whether two manifests differ at most in `version` (spec 2026-10-27-self-update, 7.4).
-pub(crate) fn version_only_change(a: &Manifest, b: &Manifest) -> bool {
-    let without_version = |manifest: &Manifest| {
-        let mut json = canonical(manifest);
+/// Whether two manifests, as [`canonical`] gives them, differ at most in `version` (spec
+/// 2026-10-27-self-update, 7.4).
+pub(crate) fn version_only_change(a: &Value, b: &Value) -> bool {
+    let without_version = |json: &Value| {
+        let mut json = json.clone();
         if let Some(fields) = json.as_object_mut() {
             fields.remove("version");
         }
         json
     };
     without_version(a) == without_version(b)
+}
+
+/// The module whose approved file is the one at `path`, and the manifest approved with it (as
+/// [`canonical`] gives it), without loading the file: for a file this daemon's host cannot load,
+/// one built for an older module contract (spec 2026-10-27-self-update, 7.4). None unless the file
+/// is a module's approved file and its approved manifest was remembered.
+pub(crate) fn approved_file(conn: &Connection, path: &Path) -> Result<Option<(String, Value)>, Error> {
+    let Ok(bytes) = read_capped(path) else { return Ok(None) };
+    let approved = conn
+        .query_row("SELECT name, approved_manifest_sha256 FROM modules WHERE approved_file_sha256 = ?1", [sha256_hex(&bytes)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .optional()?;
+    let Some((name, Some(manifest_sha256))) = approved else { return Ok(None) };
+    let remembered: Option<String> =
+        conn.query_row("SELECT value FROM config WHERE key = ?1", [approved_manifest_key(&name)], |row| row.get(0)).optional()?;
+    // The remembered manifest is the approved one only when its hash is the approved hash.
+    let manifest = remembered.filter(|json| sha256_hex(json.as_bytes()) == manifest_sha256).and_then(|json| serde_json::from_str(&json).ok());
+    Ok(manifest.map(|manifest| (name, manifest)))
 }
 
 /// Whether this is the file and manifest the user approved for its module.
@@ -474,7 +525,7 @@ pub fn canonical(manifest: &Manifest) -> Value {
         .iter()
         .map(|tool| json!({"description": tool.description, "input_schema": tool.input_schema, "name": tool.name, "writes": tool.writes}))
         .collect();
-    json!({
+    let mut canonical = json!({
         "extra_tools": tools,
         "hosts": manifest.hosts,
         "name": manifest.name,
@@ -482,7 +533,13 @@ pub fn canonical(manifest: &Manifest) -> Value {
         "sign_in_hosts": manifest.sign_in_hosts,
         "version": manifest.version,
         "wam": manifest.wam.as_ref().map(|wam| json!({"client_id": wam.client_id, "scopes": wam.scopes})),
-    })
+    });
+    // Only when present, so the hash of a manifest without media access stays what the user
+    // approved before modules could ask for it.
+    if let (Some(media), Some(object)) = (&manifest.media, canonical.as_object_mut()) {
+        object.insert("media".to_string(), json!({"peers": media.peers}));
+    }
+    canonical
 }
 
 fn approved_manifest_key(name: &str) -> String {
@@ -543,5 +600,24 @@ mod tests {
         assert!(read_capped(&path).unwrap_err().contains("larger than 64 MiB"));
         std::fs::File::create(&path).unwrap().set_len(16).unwrap();
         assert_eq!(read_capped(&path).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn media_access_is_approved_with_the_manifest_only_when_present() {
+        let without = Manifest {
+            name: "m".into(),
+            version: "1".into(),
+            platform: "test".into(),
+            hosts: Vec::new(),
+            sign_in_hosts: Vec::new(),
+            wam: None,
+            extra_tools: Vec::new(),
+            media: None,
+        };
+        // A manifest without media access hashes as it did before modules could ask for it.
+        assert!(canonical(&without).get("media").is_none());
+        let with = Manifest { media: Some(open_mess_host::MediaAccess { peers: vec!["52.112.0.0/14".into()] }), ..without.clone() };
+        assert_eq!(canonical(&with)["media"]["peers"][0], "52.112.0.0/14");
+        assert!(!version_only_change(&canonical(&with), &canonical(&without)));
     }
 }

@@ -16,6 +16,9 @@ pub struct Session {
     pub skype_token: Option<SecretString>,
     pub expires_at_ms: Option<i64>,
     pub directory: ServiceDirectory,
+    /// `region` and `partition`, which live-captions requests carry as `MS-Teams-Region` and
+    /// `MS-Teams-Partition` ("Live results" 14); left out unless short plain names.
+    pub region: Option<(String, String)>,
 }
 
 /// Base URLs of the services, from `regionGtms`. Only https URLs are accepted.
@@ -35,6 +38,8 @@ pub struct ServiceDirectory {
     pub middle_tier: Option<Url>,
     /// `search` (the live response has no `searchService`).
     pub search: Option<Url>,
+    /// `mcpService`, a meeting's artifacts (docs 9.3).
+    pub mcp_service: Option<Url>,
 }
 
 /// The authz request with the headers the live check sent (docs/protocols/teams.md "Live
@@ -69,6 +74,7 @@ pub fn decode(body: &[u8], now_ms: i64) -> Result<Session, ProtoError> {
         },
         middle_tier: url("middleTier")?,
         search: url("search")?,
+        mcp_service: url("mcpService")?,
     };
 
     let (skype_token, expires_at_ms) = match v.get("tokens") {
@@ -82,7 +88,13 @@ pub fn decode(body: &[u8], now_ms: i64) -> Result<Session, ProtoError> {
             (Some(SecretString::new(token.to_string())), expires_in.map(|secs| now_ms.saturating_add(secs.saturating_mul(1000))))
         }
     };
-    Ok(Session { skype_token, expires_at_ms, directory })
+    let name = |key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .filter(|n| (1..=32).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+            .map(str::to_string)
+    };
+    Ok(Session { skype_token, expires_at_ms, directory, region: name("region").zip(name("partition")) })
 }
 
 #[cfg(test)]

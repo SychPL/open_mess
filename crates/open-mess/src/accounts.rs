@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use keyring_core::api::CredentialStore;
-use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, SessionState};
+use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, ModuleHandle, SessionState};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::Error;
+use crate::i18n::{self, Lang};
 use crate::modules::{ModuleState, Modules};
 use crate::store::Store;
 use crate::tools::{ToolError, shared};
@@ -23,8 +25,22 @@ const MAX_DISPLAY_NAME: usize = 256;
 /// The state of an account being removed: no tool reaches it, no module report changes it, and a
 /// removal cut short (the daemon stopped) can be run again.
 pub const REMOVING: &str = "removing";
-/// Why signing in an account again with another one is refused.
-pub const OTHER_ACCOUNT: &str = "to jest inne konto - zaloguj się kontem, które ponownie logujesz, albo najpierw usuń stare konto i dodaj nowe";
+/// Why signing in an account again with another one is refused. The texts of a sign-in go to the
+/// window only (spec 8.8): they are in its language, the one it had when the sign-in started.
+pub fn other_account(lang: Lang) -> &'static str {
+    lang.pick(
+        "to jest inne konto - zaloguj się kontem, które ponownie logujesz, albo najpierw usuń stare konto i dodaj nowe",
+        "this is another account - sign in with the account you are signing in again, or remove the old account first and add the new one",
+    )
+}
+
+/// Why a module's sign-in can't start: the module does not run.
+pub fn not_running(module: &str) -> String {
+    match i18n::current() {
+        Lang::Pl => format!("moduł {module} nie działa"),
+        Lang::En => format!("module {module} is not running"),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
@@ -54,11 +70,95 @@ pub struct Accounts {
     /// Held while an attachment is saved and while a removed account's attachments are deleted, so
     /// a download that ends during a removal leaves no file behind.
     attachments: Mutex<()>,
+    module_writes: ModuleWrites,
+    /// Held for a whole scan of the modules folder: scans run one after the other.
+    scans: tokio::sync::Mutex<()>,
+}
+
+/// The block on the modules' write tools (spec 2026-10-29-live-captions, 4.3). While an update's
+/// phase A or a scan of the modules folder holds one, no module write tool makes an action and no
+/// approved one calls its module; the holder waits for the module calls already running before it
+/// ends the modules' sessions, so no join gets in after them.
+pub struct ModuleWrites(watch::Sender<WriteCounts>);
+
+#[derive(Clone, Copy, Default)]
+struct WriteCounts {
+    /// The blocks held: the tools work again only when every holder lifted its own.
+    blocks: usize,
+    /// Module calls of approved actions running.
+    running: usize,
+}
+
+impl Default for ModuleWrites {
+    fn default() -> ModuleWrites {
+        ModuleWrites(watch::Sender::new(WriteCounts::default()))
+    }
+}
+
+impl ModuleWrites {
+    pub fn blocked(&self) -> bool {
+        self.0.borrow().blocks > 0
+    }
+
+    /// Blocks the module write tools until the guard is dropped.
+    pub fn block(&self) -> WriteBlock<'_> {
+        self.0.send_modify(|counts| counts.blocks += 1);
+        WriteBlock(self)
+    }
+
+    /// Returns once no module call of an approved action runs.
+    pub async fn finished(&self) {
+        let _ = self.0.subscribe().wait_for(|counts| counts.running == 0).await;
+    }
+
+    /// A module call of an approved action, counted while the guard lives; None while blocked.
+    pub(crate) fn start(&self) -> Option<RunningWrite<'_>> {
+        let mut started = false;
+        self.0.send_if_modified(|counts| {
+            started = counts.blocks == 0;
+            if started {
+                counts.running += 1;
+            }
+            started
+        });
+        started.then_some(RunningWrite(self))
+    }
+}
+
+/// A block of the module write tools; lifted when dropped.
+pub struct WriteBlock<'a>(&'a ModuleWrites);
+
+impl Drop for WriteBlock<'_> {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|counts| counts.blocks = counts.blocks.saturating_sub(1));
+    }
+}
+
+/// A module call of an approved action that [`ModuleWrites::start`] let in.
+pub(crate) struct RunningWrite<'a>(&'a ModuleWrites);
+
+impl Drop for RunningWrite<'_> {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|counts| counts.running = counts.running.saturating_sub(1));
+    }
 }
 
 impl Accounts {
     pub fn new(store: Store, modules: Modules, data_dir: PathBuf, credentials: Arc<CredentialStore>) -> Accounts {
-        Accounts { store: Mutex::new(store), modules, data_dir, credentials, attachments: Mutex::new(()) }
+        Accounts {
+            store: Mutex::new(store),
+            modules,
+            data_dir,
+            credentials,
+            attachments: Mutex::new(()),
+            module_writes: ModuleWrites::default(),
+            scans: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The block on the modules' write tools.
+    pub fn module_writes(&self) -> &ModuleWrites {
+        &self.module_writes
     }
 
     /// Never held across an await.
@@ -110,7 +210,10 @@ impl Accounts {
             [&account.id, &account.module, &account.module_account, &account.display_name, &account.state, REMOVING],
         )?;
         if changed == 0 {
-            return Err(Error::Account(format!("konto {} jest usuwane", account.id)));
+            return Err(Error::Account(match i18n::current() {
+                Lang::Pl => format!("konto {} jest usuwane", account.id),
+                Lang::En => format!("account {} is being removed", account.id),
+            }));
         }
         Ok(account)
     }
@@ -120,30 +223,49 @@ impl Accounts {
     /// that same account, else nothing changes. A failed sign-in adds nothing. The configuration
     /// window calls it; no tool starts a sign-in (spec 8.8).
     pub async fn sign_in(&self, module: &str, again: Option<&str>) -> Result<Account, Error> {
-        let handle = self.modules.handle(module).ok_or_else(|| Error::Account(format!("moduł {module} nie działa")))?;
+        let lang = i18n::current();
+        let handle = self.modules.handle(module).ok_or_else(|| Error::Account(not_running(module)))?;
         let expected = match again {
             Some(id) => match self.get(id)? {
                 Some(account) if account.module == module && account.state != REMOVING => Some(account),
-                _ => return Err(Error::Account(format!("nie ma konta {id} w module {module}"))),
+                _ => {
+                    return Err(Error::Account(match lang {
+                        Lang::Pl => format!("nie ma konta {id} w module {module}"),
+                        Lang::En => format!("no account {id} in module {module}"),
+                    }));
+                }
             },
             None => None,
         };
-        let info = handle.sign_in().await.map_err(|err| Error::Account(format!("logowanie nie powiodło się: {err}")))?;
+        let info = handle.sign_in().await.map_err(|err| {
+            Error::Account(match lang {
+                Lang::Pl => format!("logowanie nie powiodło się: {err}"),
+                Lang::En => format!("sign-in failed: {err}"),
+            })
+        })?;
+        let removed = |id: &str| match lang {
+            Lang::Pl => format!("konto {id} usunięto w trakcie logowania"),
+            Lang::En => format!("account {id} was removed during the sign-in"),
+        };
+        let other_account = other_account(lang);
         // The sign-in took a while: the module may have been turned off or replaced meanwhile, and
         // the account signed in again may have been removed.
         // An account signed in again is only updated, never inserted: one removed meanwhile does
         // not come back.
         let refusal = if !self.modules.handle(module).is_some_and(|current| current.same(&handle)) {
-            format!("moduł {module} wyłączono albo podmieniono w trakcie logowania")
+            match lang {
+                Lang::Pl => format!("moduł {module} wyłączono albo podmieniono w trakcie logowania"),
+                Lang::En => format!("module {module} was turned off or replaced during the sign-in"),
+            }
         } else if let Some(expected) = &expected {
             if info.id == expected.module_account {
                 if self.renew(&expected.id, &info.display_name)? {
                     let renewed = self.get(&expected.id)?.filter(|account| account.state != REMOVING);
-                    return renewed.ok_or_else(|| Error::Account(format!("konto {} usunięto w trakcie logowania", expected.id)));
+                    return renewed.ok_or_else(|| Error::Account(removed(&expected.id)));
                 }
-                format!("konto {} usunięto w trakcie logowania", expected.id)
+                removed(&expected.id)
             } else {
-                OTHER_ACCOUNT.to_owned()
+                other_account.to_owned()
             }
         } else {
             return self.add(module, info);
@@ -151,9 +273,12 @@ impl Accounts {
         match self.get(&format!("{module}:{}", info.id))? {
             // Another account open_mess has: the module now holds its session, so it is online
             // (unless it is being removed).
-            Some(other) if refusal == OTHER_ACCOUNT => {
+            Some(other) if refusal == other_account => {
                 self.renew(&other.id, &info.display_name)?;
-                return Err(Error::Account(format!("{OTHER_ACCOUNT} (zalogowano ponownie konto {})", other.id)));
+                return Err(Error::Account(match lang {
+                    Lang::Pl => format!("{other_account} (zalogowano ponownie konto {})", other.id),
+                    Lang::En => format!("{other_account} (signed in account {} again)", other.id),
+                }));
             }
             Some(_) => {}
             // One open_mess does not have: its session and the secrets the module kept go.
@@ -167,7 +292,10 @@ impl Accounts {
                 // Said, so the user knows something of that account stayed in Credential Manager
                 // (under open_mess/module/<module>).
                 if let Err(why) = deleted {
-                    return Err(Error::Account(format!("{refusal} (sekretów tamtego konta nie udało się usunąć: {why})")));
+                    return Err(Error::Account(match lang {
+                        Lang::Pl => format!("{refusal} (sekretów tamtego konta nie udało się usunąć: {why})"),
+                        Lang::En => format!("{refusal} (that account's secrets could not be deleted: {why})"),
+                    }));
                 }
             }
         }
@@ -213,12 +341,18 @@ impl Accounts {
     /// restarts the module `restart` if it was stopped after repeated crashes. Returns the modules
     /// that stopped, started or were replaced. Their accounts' waiting actions expire in the same
     /// step, before any of them can be approved and run on another module than the one that
-    /// described them; their sessions are then restored, or marked offline.
+    /// described them; their sessions are then restored, or marked offline. From before the swap
+    /// until the versions that stopped ended their sessions, the module write tools are blocked, so
+    /// a new version takes no join before the old one has left (spec 2026-10-29-live-captions, 4.3).
     pub async fn rescan_modules(&self, restart: Option<&str>) -> Result<Vec<String>, Error> {
+        // A second scan waits for this one's end, and so never lifts its block.
+        let _scan = self.scans.lock().await;
         let found = self.modules.load().await?;
-        let changed = {
+        let block = self.module_writes.block();
+        self.module_writes.finished().await;
+        let (changed, stopped) = {
             let store = self.store();
-            let changed = self.modules.adopt(&store, found, restart)?;
+            let (changed, stopped) = self.modules.adopt(&store, found, restart)?;
             for module in &changed {
                 store.conn().execute(
                     "UPDATE pending SET state = 'expired', args = '', detail = 'its module stopped or was replaced before it was approved'
@@ -226,10 +360,59 @@ impl Accounts {
                     [module],
                 )?;
             }
-            changed
+            (changed, stopped)
         };
+        // The versions that stopped leave what others see before they go (spec
+        // 2026-10-29-live-captions, 4.3).
+        self.end_sessions(&stopped).await;
+        drop(stopped);
+        drop(block);
         self.restore_where(|module| changed.iter().any(|name| name == module)).await?;
         Ok(changed)
+    }
+
+    /// Asks each module to end now what other people see of its accounts' sessions (live
+    /// captions): `end-sessions` for every account of the module, one at a time, each limited by
+    /// the host (spec 2026-10-29-live-captions, 4.3). Before the daemon stops, an update pauses the
+    /// modules' events, or a scan drops a module. A module that fails is passed over.
+    pub async fn end_sessions(&self, handles: &[ModuleHandle]) {
+        let Ok(accounts) = self.list() else { return };
+        for handle in handles {
+            let Ok(manifest) = handle.manifest() else { continue };
+            for account in accounts.iter().filter(|account| account.module == manifest.name) {
+                let _ = handle.end_sessions(&account.module_account).await;
+            }
+        }
+    }
+
+    /// Restores the accounts of a module the moment it crashes, so that a new instance starts at
+    /// once and ends the sessions the crashed one left (spec 2026-10-29-live-captions, 4.3, R3);
+    /// the host otherwise starts one only at the module's next call. Runs while the modules do.
+    pub async fn restore_after_crashes(self: Arc<Self>) {
+        let mut changes = self.modules.changes();
+        // Each loaded module and the crashes seen of it.
+        let mut seen: Vec<(ModuleHandle, u32)> = Vec::new();
+        while changes.changed().await.is_ok() {
+            let handles = self.modules.handles();
+            seen.retain(|(old, _)| handles.iter().any(|handle| handle.same(old)));
+            for handle in handles {
+                let crashes = handle.crashes_since_load();
+                let before = match seen.iter_mut().find(|(old, _)| old.same(&handle)) {
+                    Some((_, count)) => std::mem::replace(count, crashes),
+                    None => {
+                        seen.push((handle.clone(), crashes));
+                        0
+                    }
+                };
+                if crashes > before
+                    && handle.state() != open_mess_host::ModuleState::Disabled
+                    && let Ok(manifest) = handle.manifest()
+                {
+                    // ponytail: a failed restore leaves the stored states, as at the daemon's start.
+                    let _ = self.restore_where(|module| module == manifest.name).await;
+                }
+            }
+        }
     }
 
     /// Restores the sessions of the accounts of the modules `module` picks.

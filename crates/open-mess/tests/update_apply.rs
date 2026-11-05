@@ -257,16 +257,16 @@ fn started_without_consent_aborts_and_starts_daemon() {
     // Clicked, but the daemon never launched the helper for it: say, an agent ran `om apply-update`.
     consent::record_click(s.store().conn(), RELEASE, &s.manifest_sha256, NOW).unwrap();
     let machine = Machine::new(false, Health::Healthy);
-    assert_eq!(s.run(&machine), Outcome::Aborted("brak ważnej zgody".into()));
+    assert_eq!(s.run(&machine), Outcome::Aborted("no valid consent".into()));
     assert_eq!(machine.log(), ["wait", "start"]);
     assert!(!s.paths.pending_file().exists());
-    assert_eq!(s.last_result().as_deref(), Some("przerwano: brak ważnej zgody\n"));
+    assert_eq!(s.last_result().as_deref(), Some("aborted: no valid consent\n"));
     s.assert_untouched();
 
     // A daemon that runs is neither stopped nor started.
     state::write(&s.paths.pending_file(), &PendingFile { stage: Stage::Started, ..pending_of(&s) }).unwrap();
     let machine = Machine::new(true, Health::Healthy);
-    assert_eq!(s.run(&machine), Outcome::Aborted("brak ważnej zgody".into()));
+    assert_eq!(s.run(&machine), Outcome::Aborted("no valid consent".into()));
     assert_eq!(machine.log(), ["wait"]);
     s.assert_untouched();
 }
@@ -305,7 +305,7 @@ fn install_swaps_exe_and_approves_version_only_module() {
     assert_eq!(s.run(&machine), Outcome::Installed);
     assert_eq!(machine.log(), ["wait", "start", "health"]);
     assert!(!s.paths.pending_file().exists());
-    assert_eq!(s.last_result().as_deref(), Some("zainstalowano\n"));
+    assert_eq!(s.last_result().as_deref(), Some("installed\n"));
     assert!(!s.consent_valid(), "the consent is spent");
 
     assert_eq!(s.om(), NEW_OM);
@@ -322,6 +322,26 @@ fn install_swaps_exe_and_approves_version_only_module() {
     assert!(!s.backup().exists());
     assert_eq!(std::fs::read(s.kept_backup().join("bin").join("om.exe")).unwrap(), OLD_OM);
     assert_eq!(std::fs::read(s.kept_backup().join("data").join("modules").join("echo.wasm")).unwrap(), common::echo());
+}
+
+#[test]
+fn a_module_built_for_an_older_contract_is_still_the_predecessor() {
+    let new_echo = common::echo_with_version("9.9.9");
+    let s = Setup::new(&echo_installed(), &[("echo.wasm", new_echo.clone())]);
+    // The approved module as a daemon with an older module contract approved it: a file this
+    // release's host cannot load, its approval and remembered manifest still in the database.
+    let manifest = s.modules()[0].manifest.clone().unwrap();
+    let old = b"a module built for an older contract".to_vec();
+    std::fs::write(s.module("echo.wasm"), &old).unwrap();
+    let store = s.store();
+    modules::approve(store.conn(), "test-echo", &sha(&old), &sha(modules::canonical(&manifest).to_string().as_bytes())).unwrap();
+    modules::remember_approved(store.conn(), &manifest).unwrap();
+    assert_eq!(s.run(&Machine::new(false, Health::Healthy)), Outcome::Installed);
+    // Replaced and approved as for a version-only change, not left waiting next to it.
+    assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), new_echo);
+    let modules = s.modules();
+    assert_eq!(modules.len(), 1, "{modules:?}");
+    assert_eq!((modules[0].state.clone(), modules[0].version.as_str()), (ModuleState::Active, "9.9.9"));
 }
 
 #[test]
@@ -379,7 +399,7 @@ fn failed_health_rolls_back_everything() {
     machine.meanwhile = Box::new(move || common::store(&data).set_config("written_by", "the new daemon").unwrap());
     assert_eq!(s.run(&machine), Outcome::RolledBack("module test-echo crashed".into()));
     assert_eq!(machine.log(), ["wait", "start", "health", "stop", "wait", "start"]);
-    assert_eq!(s.last_result().as_deref(), Some("przywrócono: module test-echo crashed\n"));
+    assert_eq!(s.last_result().as_deref(), Some("rolled back: module test-echo crashed\n"));
     assert!(!s.paths.pending_file().exists());
 
     assert_eq!(s.om(), OLD_OM);
@@ -438,7 +458,7 @@ fn rollback_waits_for_the_daemon_to_let_go() {
     let machine = Machine { stop_fails: true, ..Machine::new(true, Health::Healthy) };
     let Outcome::Postponed(why) = s.run(&machine) else { panic!("rolled back under a running daemon") };
     assert!(why.contains("tried again"), "{why}");
-    assert!(s.last_result().unwrap().starts_with("wycofanie odłożone: "));
+    assert!(s.last_result().unwrap().starts_with("rollback deferred: "));
     assert_eq!(machine.log(), ["stop", "wait", "stop", "wait"], "nothing restored, nothing started");
     assert_eq!(s.pending().stage, Stage::RollingBack);
     assert_eq!(s.om(), NEW_OM);
@@ -464,7 +484,7 @@ fn rollback_that_cannot_write_its_stage_touches_nothing() {
     let machine = Machine::new(true, Health::Healthy);
     let Outcome::Postponed(why) = s.run(&machine) else { panic!("rolled back without writing its stage") };
     assert!(why.contains("tried again"), "{why}");
-    assert!(s.last_result().unwrap().starts_with("wycofanie odłożone: "), "not a failed rollback");
+    assert!(s.last_result().unwrap().starts_with("rollback deferred: "), "not a failed rollback");
     assert!(machine.log().is_empty(), "nothing stopped, nothing started: {:?}", machine.log());
     assert_eq!(s.pending().stage, Stage::Installed);
     assert_eq!(s.om(), NEW_OM);
@@ -502,11 +522,11 @@ fn failed_rollback_keeps_and_names_the_backup() {
     std::fs::remove_file(s.backup().join("bin").join("om.exe")).unwrap();
     let machine = Machine::new(false, Health::Healthy);
     let Outcome::RollbackFailed(why) = s.run(&machine) else { panic!("rolled back without om.exe in the backup") };
-    assert!(why.contains(&format!("kopia zapasowa: {}", s.backup().display())), "{why}");
+    assert!(why.ends_with(&format!("; backup: {}", s.backup().display())), "{why}");
     assert_eq!(machine.log(), ["stop", "wait", "start"], "started all the same");
     assert!(!s.paths.pending_file().exists(), "not tried again at every logon");
     assert!(s.backup().join("data").join("state.sqlite3").exists(), "the backup is kept");
-    assert!(s.last_result().unwrap().starts_with("wycofanie nieudane: "));
+    assert!(s.last_result().unwrap().starts_with("rollback failed: "));
     // The rest is restored all the same.
     assert_eq!(std::fs::read(s.module("echo.wasm")).unwrap(), common::echo());
     assert!(!s.rolled_back());

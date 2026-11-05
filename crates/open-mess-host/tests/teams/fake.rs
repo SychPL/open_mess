@@ -158,6 +158,7 @@ pub fn authz() -> Value {
             "middleTier": "https://teams.microsoft.com/api/mt/emea",
             "amsV2": "https://eu-prod.asyncgw.teams.microsoft.com",
             "search": "https://teams.microsoft.com/api/search/emea",
+            "mcpService": "https://teams.microsoft.com/api/mcps/eu",
         },
         "tokens": {"skypeToken": "synthetic-skype-token", "expiresIn": 4500, "tokenType": "SkypeToken"},
     })
@@ -191,6 +192,74 @@ pub fn message(id: &str, conversation: &str, from: &str, html: &str, ms: i64) ->
         "originalarrivaltime": ms,
         "properties": {},
     })
+}
+
+/// The callback base the fake Trouter gives (`surl`).
+pub const SURL: &str = "https://pub-ent-synthetic-t.trouter.teams.microsoft.com/v4/f/c3ludGhldGlj/";
+
+/// A fake Trouter (docs 5 and 10.7): takes the module's sockets, answers `user.authenticate` with
+/// `trouter.connected`, keeps what the module sends and passes the test's frames on.
+#[derive(Clone)]
+pub struct Trouter {
+    pub addr: SocketAddr,
+    to_module: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    from_module: Arc<Mutex<Vec<String>>>,
+}
+
+impl Trouter {
+    pub async fn start() -> Trouter {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trouter = Trouter { addr: listener.local_addr().unwrap(), to_module: Arc::default(), from_module: Arc::default() };
+        let server = trouter.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(server.clone().serve(stream));
+            }
+        });
+        trouter
+    }
+
+    async fn serve(self, stream: tokio::net::TcpStream) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
+        let (to_module, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        *self.to_module.lock().unwrap() = Some(to_module);
+        ws.send(Message::text("1::")).await.ok();
+        loop {
+            tokio::select! {
+                frame = ws.next() => match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        let text = text.to_string();
+                        if text.contains("\"user.authenticate\"") {
+                            let connected = json!({"name": "trouter.connected", "args": [{"surl": SURL, "connectparams": {"sr": "c3ludGhldGlj"}, "ttl": "604800"}]});
+                            ws.send(Message::text(format!("5:::{connected}"))).await.ok();
+                        }
+                        self.from_module.lock().unwrap().push(text);
+                    }
+                    Some(Ok(_)) => {}
+                    _ => break,
+                },
+                frame = frames.recv() => match frame {
+                    Some(frame) => {
+                        ws.send(Message::text(frame)).await.ok();
+                    }
+                    None => break,
+                },
+            }
+        }
+    }
+
+    /// A downstream request to the module, as Trouter delivers a call callback.
+    pub fn callback(&self, id: u64, url: &str, body: &Value) -> bool {
+        let frame = format!("3:::{}", json!({"id": id, "method": "POST", "url": url, "headers": {}, "body": body.to_string()}));
+        self.to_module.lock().unwrap().as_ref().is_some_and(|socket| socket.send(frame).is_ok())
+    }
+
+    /// The frames the module sent.
+    pub fn seen(&self) -> Vec<String> {
+        self.from_module.lock().unwrap().clone()
+    }
 }
 
 fn default_reply(seen: &Seen) -> Reply {

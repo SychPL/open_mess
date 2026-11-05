@@ -76,7 +76,7 @@ async fn confirm_waits_then_runs_on_approve() {
     let waiting = pending.waiting();
     assert_eq!(waiting.len(), 1);
     let preview = &waiting[0];
-    assert_eq!((preview.action.as_str(), preview.kind), (outcome.action.as_str(), Kind::Send));
+    assert_eq!((preview.action.as_str(), &preview.kind), (outcome.action.as_str(), &Kind::Send));
     assert_eq!(preview.account, "User a (test-echo:a)");
     assert_eq!(preview.conversation_title, "Echo c1");
     assert_eq!(preview.participants, ["Pat"]);
@@ -251,6 +251,24 @@ async fn never_is_refused() {
     assert_eq!(writes(&d).await.len(), 1);
     // An unknown or removed account is not written to.
     assert!(matches!(pending.create(Kind::Send, "test-echo:b", "c1", send("hi")).await, Err(ToolError::InvalidArgs(_))));
+}
+
+#[tokio::test]
+async fn never_set_while_waiting_voids_the_approval() {
+    let (d, pending) = setup(Write::Confirm).await;
+    let store = || common::store(d.dir.path());
+    let account = pending.create(Kind::Send, "test-echo:a", "c1", send("account")).await.unwrap();
+    let conversation = pending.create(Kind::Send, "test-echo:a", "c2", json!({"conversation": "c2", "text": "conversation"})).await.unwrap();
+    // The user turns writing off for the account, then approves what is still on screen.
+    permissions::set(&store(), "test-echo:a", None, true, Write::Never).unwrap();
+    assert_eq!(pending.decide(&account.action, true).await.unwrap(), State::Voided);
+    // The same for one conversation.
+    permissions::set(&store(), "test-echo:a", None, true, Write::Confirm).unwrap();
+    permissions::set(&store(), "test-echo:a", Some("c2"), true, Write::Never).unwrap();
+    assert_eq!(pending.decide(&conversation.action, true).await.unwrap(), State::Voided);
+    assert!(writes(&d).await.is_empty());
+    let listed = pending.list(None, Some(State::Voided), 10).unwrap();
+    assert!(listed["items"].as_array().unwrap().iter().all(|item| item["detail"].as_str().unwrap().contains("not allowed")), "{listed}");
 }
 
 #[tokio::test]

@@ -31,6 +31,8 @@ const COMMANDS: &[&str] = &[
     "install_update",
     "cancel_update",
     "set_auto_install",
+    "language",
+    "set_language",
     "model_status",
     "download_model",
     "delete_model",

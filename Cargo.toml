@@ -28,6 +28,28 @@ indexing_slicing = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
 
+# Debug builds and tests compile every module with Cranelift, and unoptimized that took 15-30 s
+# per test daemon. The tests starting beside it starved, and their timed module calls ran out
+# (flaky Windows CI). Optimizing the compiler's own crates makes a daemon start about ten times
+# faster.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3
+
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+
 # No profile sets `panic = "abort"`: the daemon catches a panic of the transcription and capture
 # threads when it joins them, while abort would end it with every account at once
 # (spec 2026-10-28-local-transcription, 4.3).

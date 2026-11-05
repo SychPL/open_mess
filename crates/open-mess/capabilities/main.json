@@ -30,6 +30,8 @@
     "allow-install-update",
     "allow-cancel-update",
     "allow-set-auto-install",
+    "allow-language",
+    "allow-set-language",
     "allow-model-status",
     "allow-download-model",
     "allow-delete-model",

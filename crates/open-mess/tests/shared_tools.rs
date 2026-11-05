@@ -259,3 +259,107 @@ async fn status_reports_restore_and_crashes() {
     assert_eq!((&status["modules"][0]["state"], &status["modules"][0]["crashes_since_load"]), (&json!("active"), &json!(1)));
     assert_eq!((&status["ui_ready"], &status["accounts_restored"]), (&json!(true), &json!(true)));
 }
+
+/// test-echo with accounts `ids`, all readable.
+async fn peeking(ids: &[&str]) -> common::Daemon {
+    let d = common::daemon(&[common::ECHO]).await;
+    for id in ids {
+        d.accounts.add("test-echo", common::info(id)).unwrap();
+    }
+    d
+}
+
+fn conversations(result: &Value) -> Vec<&str> {
+    result["items"].as_array().unwrap().iter().map(|item| item["conversation"].as_str().unwrap_or("-")).collect()
+}
+
+#[tokio::test]
+async fn module_read_tools_are_listed_with_account() {
+    let d = peeking(&[]).await;
+    let listed: Vec<_> = d.registry.list().into_iter().filter(|tool| tool.name.starts_with("test_echo_")).collect();
+    assert_eq!(listed.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), ["test_echo_peek", "test_echo_poke"]);
+    let schema = &listed[0].input_schema;
+    assert_eq!((&schema["properties"]["account"]["type"], &schema["additionalProperties"]), (&json!("string"), &json!(false)));
+    // The others say why they are not listed.
+    let status = d.registry.call("status", json!({})).await.unwrap();
+    let not_listed = status["modules"][0]["tools_not_listed"].as_array().unwrap();
+    let reason = |name: &str| not_listed.iter().find(|tool| tool["tool"] == name).map(|tool| tool["reason"].as_str().unwrap().to_string());
+    assert_eq!(reason("test_echo_nudge").as_deref(), Some("a module write tool must name its conversation"));
+    assert!(reason("test_echo_Bad-Name").unwrap().contains("a-z"));
+    assert!(reason("test_echo_with_account").unwrap().contains("account"));
+    assert!(reason("test_echo_loose").unwrap().contains("other properties"));
+    assert!(reason("test_echo_twin").unwrap().contains("more than once"));
+    assert_eq!(not_listed.len(), 6);
+}
+
+#[tokio::test]
+async fn module_tool_runs_under_the_read_permissions() {
+    let d = peeking(&["a"]).await;
+    let peek = |args: Value| d.registry.call("test_echo_peek", args);
+    let all = peek(json!({})).await.unwrap();
+    // The only account, labelled; content under untrusted, with the notice.
+    assert_eq!(conversations(&all), ["c1", "c2", "-"]);
+    assert!(all["items"].as_array().unwrap().iter().all(|item| item["account"] == "test-echo:a"));
+    assert_eq!((&all["untrusted"]["text"], &all["untrusted_notice"]), (&json!("peeked at a"), &json!(UNTRUSTED_NOTICE)));
+    // Reading only c1: the other items go, the one with no conversation too.
+    let store = common::store(d.dir.path());
+    permissions::set(&store, "test-echo:a", None, false, Write::Never).unwrap();
+    permissions::set(&store, "test-echo:a", Some("c1"), true, Write::Never).unwrap();
+    assert_eq!(conversations(&peek(json!({"account": "test-echo:a"})).await.unwrap()), ["c1"]);
+    let refused = peek(json!({"conversation": "c2"})).await;
+    assert!(matches!(&refused, Err(ToolError::NotAllowed(why)) if why == "reading this conversation is not allowed"), "{refused:?}");
+    permissions::set(&store, "test-echo:a", Some("c1"), false, Write::Never).unwrap();
+    assert!(matches!(peek(json!({})).await, Err(ToolError::NotAllowed(_))));
+}
+
+#[tokio::test]
+async fn module_tool_arguments_and_results_are_checked() {
+    let d = peeking(&["a", "b"]).await;
+    let peek = |args: Value| d.registry.call("test_echo_peek", args);
+    let error = |result: Result<Value, ToolError>| result.unwrap_err().to_string();
+    assert!(error(peek(json!({"account": "test-echo:a", "path": "x"})).await).contains("unknown parameter"));
+    assert!(error(peek(json!({"account": "test-echo:a", "conversation": 1})).await).contains("conversation must be text"));
+    // Two readable accounts: the call names one.
+    assert!(error(peek(json!({})).await).contains("name the account: test-echo:a, test-echo:b"));
+    // An account of another module is not this module's.
+    d.accounts.add("other", common::info("x")).unwrap();
+    assert!(error(peek(json!({"account": "other:x"})).await).contains("is not a test-echo account"));
+    for (answer, why) in [("big", "over 1 MiB"), ("list", "invalid result")] {
+        let result = peek(json!({"account": "test-echo:a", "answer": answer})).await;
+        assert!(matches!(&result, Err(ToolError::Module(message)) if message.contains(why)), "{answer}: {result:?}");
+    }
+    // The daemon goes on.
+    assert!(peek(json!({"account": "test-echo:b"})).await.is_ok());
+}
+
+#[tokio::test]
+async fn read_permission_taken_back_during_a_call_stops_its_result() {
+    let d = peeking(&["a", "b"]).await;
+    let store = common::store(d.dir.path());
+    // Only a is readable, so a call naming no account goes to a.
+    permissions::set(&store, "test-echo:b", None, false, Write::Never).unwrap();
+    let call = d.registry.call("test_echo_peek", json!({"conversation": "c1", "answer": "slow"}));
+    let meanwhile = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // While the module works, a is taken back and b given.
+        permissions::set(&store, "test-echo:a", None, false, Write::Never).unwrap();
+        permissions::set(&store, "test-echo:b", None, true, Write::Never).unwrap();
+    };
+    let (result, ()) = tokio::join!(call, meanwhile);
+    assert!(matches!(&result, Err(ToolError::NotAllowed(_))), "{result:?}");
+    // The module did run: the check after it refused the result.
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    assert_eq!(echo.call("a", "peeks", "{}").await.unwrap(), r#"{"count":1}"#);
+}
+
+#[tokio::test]
+async fn module_tool_of_a_disabled_module_says_so() {
+    let d = peeking(&["a"]).await;
+    open_mess::modules::set_enabled(&common::store(d.dir.path()), "test-echo", false).unwrap();
+    d.accounts.rescan_modules(None).await.unwrap();
+    assert!(!d.registry.list().iter().any(|tool| tool.name == "test_echo_peek"));
+    let result = d.registry.call("test_echo_peek", json!({})).await;
+    assert!(matches!(&result, Err(ToolError::Module(why)) if why == "module test-echo is disabled"), "{result:?}");
+    assert!(matches!(d.registry.call("test_echo_poke", json!({})).await, Err(ToolError::Module(_))));
+    assert!(matches!(d.registry.call("test_echo_nope", json!({})).await, Err(ToolError::UnknownTool(_))));
+}

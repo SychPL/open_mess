@@ -36,7 +36,10 @@ const MAX_MANIFEST: u64 = 64 * 1024;
 const MAX_NUMBERED: u32 = 100;
 /// The backup's folder, in the update folder.
 const BACKUP: &str = "backup";
-const NO_CONSENT: &str = "brak ważnej zgody";
+/// Before the backup's folder in the reason of a failed rollback; the window finds it there to put
+/// it in its language (service.rs).
+pub const BACKUP_MARK: &str = "; backup: ";
+const NO_CONSENT: &str = "no valid consent";
 const UNREADABLE: &str = "update-pending.json is unreadable";
 
 /// What the helper needs from Windows; tests fake it.
@@ -57,7 +60,9 @@ pub enum Health {
     Failed(String),
 }
 
-/// How a run ended. All but `Nothing` go to `last-update.txt`, for the window.
+/// How a run ended. All but `Nothing` go to `last-update.txt`, for the window, in a fixed English
+/// form: the helper and a new daemon write it without knowing the window's language, which puts it
+/// in its own when it reads it (spec 2026-10-30-ui-languages, 6). The logs get the same text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// No update to install or to finish, or another helper's turn: nothing was touched.
@@ -77,11 +82,11 @@ impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Outcome::Nothing => Ok(()),
-            Outcome::Installed => f.write_str("zainstalowano"),
-            Outcome::RolledBack(why) => write!(f, "przywrócono: {why}"),
-            Outcome::Aborted(why) => write!(f, "przerwano: {why}"),
-            Outcome::RollbackFailed(why) => write!(f, "wycofanie nieudane: {why}"),
-            Outcome::Postponed(why) => write!(f, "wycofanie odłożone: {why}"),
+            Outcome::Installed => f.write_str("installed"),
+            Outcome::RolledBack(why) => write!(f, "rolled back: {why}"),
+            Outcome::Aborted(why) => write!(f, "aborted: {why}"),
+            Outcome::RollbackFailed(why) => write!(f, "rollback failed: {why}"),
+            Outcome::Postponed(why) => write!(f, "rollback deferred: {why}"),
         }
     }
 }
@@ -157,7 +162,7 @@ pub fn run(paths: &Paths, system: &dyn System, public_key: &str, now: fn() -> i6
         // Never finished forwards (spec 7.6).
         Read::Found(pending) => roll_back(paths, system, pending, "the update was interrupted".into(), now),
     };
-    state::record_result(paths, &outcome.to_string());
+    state::record_result(paths, &outcome);
     outcome
 }
 
@@ -344,7 +349,7 @@ fn roll_back(paths: &Paths, system: &dyn System, mut pending: PendingFile, why: 
         }
         Err(failed) => {
             let _ = remove_stage_file(paths);
-            Outcome::RollbackFailed(start(system, format!("{why}; {failed}; kopia zapasowa: {}", backup.display())))
+            Outcome::RollbackFailed(start(system, format!("{why}; {failed}{BACKUP_MARK}{}", backup.display())))
         }
     }
 }
@@ -575,13 +580,23 @@ fn place_modules(paths: &Paths, pending: &mut PendingFile, manifest: &Manifest) 
     // Reading a manifest runs the module under the host, which needs a runtime.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
+        // Each approved file: its module's name and approved manifest.
         let mut approved = Vec::new();
         for path in modules::module_files(&dir)? {
-            // A file that is no module, or not the approved one, is nobody's predecessor.
-            if let Ok(found) = modules::inspect(&engine, &path).await
-                && modules::is_approved(&conn, &found).map_err(other)?
-            {
-                approved.push((path, found));
+            match modules::inspect(&engine, &path).await {
+                // A file that is no module, or not the approved one, is nobody's predecessor.
+                Ok(found) => {
+                    if modules::is_approved(&conn, &found).map_err(other)? {
+                        approved.push((path, found.manifest.name.clone(), modules::canonical(&found.manifest)));
+                    }
+                }
+                // One this release's host cannot load, built for an older module contract, is
+                // known by its approval.
+                Err(_) => {
+                    if let Some((name, manifest)) = modules::approved_file(&conn, &path).map_err(other)? {
+                        approved.push((path, name, manifest));
+                    }
+                }
             }
         }
         for entry in entries {
@@ -591,8 +606,9 @@ fn place_modules(paths: &Paths, pending: &mut PendingFile, manifest: &Manifest) 
             if new.file_sha256 != entry.sha256 {
                 return Err(UpdateError::Rejected(format!("{} does not match the release manifest", entry.name)));
             }
-            let predecessor = approved.iter().find(|(_, old)| old.manifest.name == new.manifest.name);
-            if let Some((path, _)) = predecessor.filter(|(_, old)| modules::version_only_change(&old.manifest, &new.manifest)) {
+            let predecessor = approved.iter().find(|(_, name, _)| *name == new.manifest.name);
+            let new_manifest = modules::canonical(&new.manifest);
+            if let Some((path, _, _)) = predecessor.filter(|(_, _, old)| modules::version_only_change(old, &new_manifest)) {
                 // Copied next to it and renamed over it: atomic within the folder.
                 pending.replaced.push(path.clone());
                 let temp = with_suffix(path, ".new");

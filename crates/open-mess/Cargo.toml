@@ -76,6 +76,9 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
 # Sign-in pages' URLs (ui/sign_in_page.rs); the version the module host builds.
 url = "2.5.8"
+# OPEN_MESS_LOG: the daemon's and modules' logs on stderr, for diagnostics (daemon.rs); test-echo
+# logs the timer events tests read (tests/update_quiesce.rs).
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 # The `Show all` dialog of an approval.
@@ -86,9 +89,9 @@ rfd = { version = "0.17.2", default-features = false }
 tauri = { version = "2.11.6", default-features = false, features = ["wry", "tray-icon", "custom-protocol"] }
 # Approval toasts with buttons, activated in this process.
 tauri-winrt-notification = "0.8.1"
-# Takes a toast off the screen once its action is decided elsewhere; the version
-# tauri-winrt-notification already builds.
-windows = { version = "0.62.2", features = ["UI_Notifications"] }
+# Takes a toast off the screen once its action is decided elsewhere, and reads Windows's preferred
+# languages (i18n.rs); the version tauri-winrt-notification already builds.
+windows = { version = "0.62.2", features = ["System_UserProfile", "UI_Notifications"] }
 windows-native-keyring-store = "1.1.0"
 # The audio sessions that tell a Teams call (recording/detect.rs) and the call's capture
 # (spec 2026-10-28-local-transcription, 4.1 and 4.2); safe functions over WASAPI.
@@ -110,8 +113,6 @@ minisign = "0.10.0"
 open-mess-host = { path = "../open-mess-host", features = ["test-support"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["sync", "test-util"] }
-# The module logs a test reads: test-echo logs the timer events it gets (tests/update_quiesce.rs).
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [lints]
 workspace = true

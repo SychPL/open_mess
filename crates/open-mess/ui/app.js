@@ -4,6 +4,29 @@
 // come from other people or from modules (names, titles, messages, manifests) goes into the page
 // only through `el`, which sets textContent: never innerHTML.
 
+/** The window's language, `pl` or `en`, as the daemon says before anything is drawn; Polish if it can't. */
+let lang = "pl";
+/** The language setting: `auto` (Windows's language), `pl` or `en`. */
+let languageSetting = "auto";
+
+/** The text in the window's language: every text of the window has both versions side by side. */
+function tr(pl, en) {
+  return lang === "en" ? en : pl;
+}
+
+/** The form for `n`: Polish forms are `{ one, few, many }`, English ones `{ one, other }`. */
+function plural(n, pl, en) {
+  const form = new Intl.PluralRules(lang).select(n);
+  if (lang === "en") return form === "one" ? en.one : en.other;
+  return pl[form] || pl.many;
+}
+
+/** The page's own texts in English: `data-en` and `data-en-aria-label` come only from index.html. */
+function translatePage() {
+  for (const node of document.querySelectorAll("[data-en]")) node.textContent = node.dataset.en;
+  for (const node of document.querySelectorAll("[data-en-aria-label]")) node.setAttribute("aria-label", node.dataset.enAriaLabel);
+}
+
 /** A new element with `text` as its text (never parsed as HTML) and the given class. */
 function el(tag, text, className) {
   const node = document.createElement(tag);
@@ -49,7 +72,7 @@ function call(command, args) {
 
 function showError(err) {
   const node = document.getElementById("error");
-  node.textContent = "Błąd: " + String(err);
+  node.textContent = tr("Błąd: ", "Error: ") + String(err);
   node.hidden = false;
 }
 
@@ -61,15 +84,17 @@ function content(section) {
   return document.querySelector("#" + section + " .content");
 }
 
-const ACCOUNT_STATES = {
-  online: ["połączone", "ok"],
-  offline: ["rozłączone", "bad"],
-  "auth-required": ["wymaga ponownego logowania", "warn"],
-  removing: ["usuwanie", "warn"],
-};
+function accountStates() {
+  return {
+    online: [tr("połączone", "connected"), "ok"],
+    offline: [tr("rozłączone", "disconnected"), "bad"],
+    "auth-required": [tr("wymaga ponownego logowania", "needs signing in again"), "warn"],
+    removing: [tr("usuwanie", "removing"), "warn"],
+  };
+}
 
 function stateDot(state) {
-  const [label, kind] = ACCOUNT_STATES[state] || [state, ""];
+  const [label, kind] = accountStates()[state] || [state, ""];
   const node = el("span", null, "row");
   node.append(el("span", null, "dot " + kind), el("span", label));
   return node;
@@ -100,9 +125,9 @@ async function renderAccounts() {
   root.replaceChildren();
   const top = el("div", null, "row");
   if (signingIn) {
-    top.append(el("span", "Trwa logowanie w module " + signingIn + "...", "muted"));
+    top.append(el("span", tr("Trwa logowanie w module ", "Signing in with module ") + signingIn + "...", "muted"));
   } else if (modules.length === 0) {
-    top.append(el("span", "Żeby dodać konto, zatwierdź i włącz moduł w sekcji Moduły.", "muted"));
+    top.append(el("span", tr("Żeby dodać konto, zatwierdź i włącz moduł w sekcji Moduły.", "To add an account, approve and turn on a module in the Modules section."), "muted"));
   } else {
     const pick = el("select");
     for (const module of modules) {
@@ -110,25 +135,27 @@ async function renderAccounts() {
       option.value = module.name;
       pick.append(option);
     }
-    top.append(button("Dodaj konto", () => signIn(pick.value), "primary"));
+    top.append(button(tr("Dodaj konto", "Add account"), () => signIn(pick.value), "primary"));
     if (modules.length > 1) top.append(pick);
   }
   root.append(top);
-  if (accounts.length === 0) root.append(el("p", "Nie ma jeszcze żadnego konta.", "muted"));
+  if (accounts.length === 0) root.append(el("p", tr("Nie ma jeszcze żadnego konta.", "No accounts yet."), "muted"));
   for (const account of accounts) {
     const card = el("div", null, "card row");
     const who = el("div", null, "grow");
     who.append(el("strong", account.display_name), el("div", (account.platform || account.module) + " - " + account.id, "muted"));
     card.append(who, stateDot(account.state));
     if (!signingIn && account.state !== "removing" && modules.some((module) => module.name === account.module)) {
-      card.append(button("Zaloguj ponownie", () => signIn(account.module, account.id)));
+      card.append(button(tr("Zaloguj ponownie", "Sign in again"), () => signIn(account.module, account.id)));
     }
     // Not while a sign-in runs: it might be signing in this very account.
     if (!signingIn) {
       card.append(
-        button("Usuń", async () => {
+        button(tr("Usuń", "Remove"), async () => {
           const sure = confirm(
-            "Usunąć konto " + account.display_name + "?\n\nZnikną jego sekrety, uprawnienia, akcje czekające na zatwierdzenie i pobrane załączniki.",
+            tr("Usunąć konto ", "Remove the account ") +
+              account.display_name +
+              tr("?\n\nZnikną jego sekrety, uprawnienia, akcje czekające na zatwierdzenie i pobrane załączniki.", "?\n\nIts secrets, permissions, actions waiting for approval and downloaded attachments go with it."),
           );
           if (!sure) return;
           await call("remove_account", { id: account.id });
@@ -141,7 +168,7 @@ async function renderAccounts() {
 }
 
 function list(items, empty) {
-  if (!items || items.length === 0) return el("span", empty || "brak", "muted");
+  if (!items || items.length === 0) return el("span", empty || tr("brak", "none"), "muted");
   const node = el("ul");
   for (const item of items) node.append(el("li", item));
   return node;
@@ -154,21 +181,21 @@ async function renderModules() {
   root.replaceChildren();
   const top = el("div", null, "row");
   top.append(
-    button("Odśwież folder modułów", async () => {
+    button(tr("Odśwież folder modułów", "Refresh the modules folder"), async () => {
       await call("rescan_modules");
       await renderModules();
     }),
-    el("span", "Moduły to pliki .wasm w " + status.data_dir + "\\modules", "muted"),
+    el("span", tr("Moduły to pliki .wasm w ", "Modules are .wasm files in ") + status.data_dir + "\\modules", "muted"),
   );
   root.append(top);
   root.append(
     el(
       "p",
-      "Zatwierdzenie modułu to zaufanie do jego kodu, jak instalacja aplikacji: moduł z kontem i dostępem do hostów platformy może zrobić na tym koncie wszystko. Przy aktywnym proxy systemowym ochrona sieci lokalnej zależy od proxy.",
+      tr("Zatwierdzenie modułu to zaufanie do jego kodu, jak instalacja aplikacji: moduł z kontem i dostępem do hostów platformy może zrobić na tym koncie wszystko. Przy aktywnym proxy systemowym ochrona sieci lokalnej zależy od proxy.", "Approving a module means trusting its code, like installing an app: a module with an account and access to the platform's hosts can do anything on that account. With a system proxy on, the protection of the local network depends on the proxy."),
       "muted",
     ),
   );
-  if (modules.length === 0) root.append(el("p", "W folderze nie ma modułów.", "muted"));
+  if (modules.length === 0) root.append(el("p", tr("W folderze nie ma modułów.", "There are no modules in the folder."), "muted"));
   for (const module of modules) {
     const card = el("div", null, "card");
     const head = el("div", null, "row");
@@ -177,9 +204,11 @@ async function renderModules() {
     head.append(title);
     if (module.status === "awaiting-approval" || module.status === "replacement") {
       head.append(
-        button("Zatwierdź", async () => {
-          let question = "Zatwierdzić moduł " + module.name + " z pliku " + module.file + "?";
-          if (module.takes_over) question += "\n\nNowy plik przejmie konta i sekrety poprzedniej wersji.";
+        button(tr("Zatwierdź", "Approve"), async () => {
+          let question = tr("Zatwierdzić moduł ", "Approve the module ") + module.name + tr(" z pliku ", " from the file ") + module.file + "?";
+          if (module.takes_over) {
+            question += tr("\n\nNowy plik przejmie konta i sekrety poprzedniej wersji.", "\n\nThe new file takes over the accounts and secrets of the previous version.");
+          }
           if (!confirm(question)) return;
           await call("approve_module", { name: module.name, file_sha256: module.file_sha256, manifest_sha256: module.manifest_sha256 });
           await renderModules();
@@ -188,7 +217,7 @@ async function renderModules() {
     }
     if (module.status === "active") {
       head.append(
-        button("Wyłącz", async () => {
+        button(tr("Wyłącz", "Turn off"), async () => {
           await call("set_module_enabled", { name: module.name, enabled: false });
           await renderModules();
         }),
@@ -196,7 +225,7 @@ async function renderModules() {
     }
     if (module.status === "disabled" || module.status === "crashed") {
       head.append(
-        button(module.status === "disabled" ? "Włącz" : "Uruchom ponownie", async () => {
+        button(module.status === "disabled" ? tr("Włącz", "Turn on") : tr("Uruchom ponownie", "Restart"), async () => {
           await call("set_module_enabled", { name: module.name, enabled: true });
           await renderModules();
         }),
@@ -204,23 +233,33 @@ async function renderModules() {
     }
     card.append(head);
     if (module.takes_over) {
-      card.append(el("p", "Po zatwierdzeniu ten plik przejmie konta i sekrety poprzedniej wersji modułu.", "error"));
+      card.append(
+        el(
+          "p",
+          tr("Po zatwierdzeniu ten plik przejmie konta i sekrety poprzedniej wersji modułu.", "Once approved, this file takes over the accounts and secrets of the module's previous version."),
+          "error",
+        ),
+      );
     }
     if (module.changes.length > 0) {
-      card.append(el("h2", "Zmiany względem działającej wersji"), list(module.changes));
+      card.append(el("h2", tr("Zmiany względem działającej wersji", "Changes from the running version")), list(module.changes));
     }
-    const wam = module.wam ? module.wam.client_id + " (" + module.wam.scopes.join(", ") + ")" : "brak";
-    const tools = module.tools.map((tool) => tool.name + (tool.writes ? " (pisze)" : " (czyta)"));
+    const wam = module.wam ? module.wam.client_id + " (" + module.wam.scopes.join(", ") + ")" : tr("brak", "none");
+    const tools = module.tools.map((tool) => tool.name + (tool.writes ? tr(" (pisze)", " (writes)") : tr(" (czyta)", " (reads)")));
     card.append(
       details([
-        ["Plik", module.file],
-        ["Platforma", module.platform || "-"],
-        ["Hosty", list(module.hosts)],
-        ["Hosty logowania", list(module.sign_in_hosts)],
-        ["Konto Windows (WAM)", wam],
-        ["Własne narzędzia", list(tools)],
-        ["SHA-256 pliku", el("code", module.file_sha256 || "-")],
-        ["SHA-256 manifestu", el("code", module.manifest_sha256 || "-")],
+        [tr("Plik", "File"), module.file],
+        [tr("Platforma", "Platform"), module.platform || "-"],
+        [tr("Hosty", "Hosts"), list(module.hosts)],
+        [tr("Hosty logowania", "Sign-in hosts"), list(module.sign_in_hosts)],
+        [
+          tr("Połączenie mediów (bez dźwięku i obrazu, poza proxy)", "Media connection (no sound or video, not through a proxy)"),
+          module.media.length > 0 ? list(module.media) : tr("brak", "none"),
+        ],
+        [tr("Konto Windows (WAM)", "Windows account (WAM)"), wam],
+        [tr("Własne narzędzia", "Own tools"), list(tools)],
+        [tr("SHA-256 pliku", "File SHA-256"), el("code", module.file_sha256 || "-")],
+        [tr("SHA-256 manifestu", "Manifest SHA-256"), el("code", module.manifest_sha256 || "-")],
       ]),
     );
     root.append(card);
@@ -231,29 +270,46 @@ async function renderIntegrations() {
   const status = await call("status");
   const root = content("integrations");
   root.replaceChildren();
-  root.append(el("h2", "Claude Code i Codex (MCP)"));
-  root.append(el("p", "Polecenia zawierają token lokalnego API: każdy, kto go zna, może używać open_mess jak agent.", "muted"));
+  root.append(el("h2", tr("Claude Code i Codex (MCP)", "Claude Code and Codex (MCP)")));
+  root.append(
+    el(
+      "p",
+      tr("Polecenia zawierają token lokalnego API: każdy, kto go zna, może używać open_mess jak agent.", "The commands contain the local API token: anyone who knows it can use open_mess as an agent."),
+      "muted",
+    ),
+  );
   const shown = el("div");
   shown.append(
-    button("Pokaż polecenie", async () => {
+    button(tr("Pokaż polecenie", "Show the command"), async () => {
       const commands = await call("mcp_command");
       shown.replaceChildren();
-      for (const [label, command] of [["Claude Code", commands.claude], ["Codex (do pliku config.toml)", commands.codex]]) {
-        shown.append(el("h2", label), el("pre", command, "content-text"), button("Kopiuj", () => navigator.clipboard.writeText(command)));
+      for (const [label, command] of [["Claude Code", commands.claude], [tr("Codex (do pliku config.toml)", "Codex (for the config.toml file)"), commands.codex]]) {
+        shown.append(el("h2", label), el("pre", command, "content-text"), button(tr("Kopiuj", "Copy"), () => navigator.clipboard.writeText(command)));
       }
       shown.append(
         el(
           "p",
-          "Codex: wklej to do pliku %USERPROFILE%\\.codex\\config.toml (albo config.toml w folderze z CODEX_HOME). Nie podawaj tokenu w zmiennej środowiskowej (setx, $env:): Codex przekazuje zmienne do poleceń, które uruchamia, a każdy program je dziedziczy.",
+          tr("Codex: wklej to do pliku %USERPROFILE%\\.codex\\config.toml (albo config.toml w folderze z CODEX_HOME). Nie podawaj tokenu w zmiennej środowiskowej (setx, $env:): Codex przekazuje zmienne do poleceń, które uruchamia, a każdy program je dziedziczy.", "Codex: paste this into %USERPROFILE%\\.codex\\config.toml (or config.toml in the CODEX_HOME folder). Don't put the token in an environment variable (setx, $env:): Codex hands variables on to the commands it runs, and every program inherits them."),
           "muted",
         ),
       );
     }),
   );
   root.append(shown);
-  root.append(el("h2", "Wiersz poleceń"));
-  root.append(details([["Ścieżka do om", el("code", status.cli)], ["Adres MCP", el("code", "http://127.0.0.1:" + status.port + "/mcp")]]));
-  root.append(el("p", "Bez tokenu w zmiennej OPEN_MESS_TOKEN polecenie om czyta go samo z Menedżera poświadczeń.", "muted"));
+  root.append(el("h2", tr("Wiersz poleceń", "Command line")));
+  root.append(
+    details([
+      [tr("Ścieżka do om", "Path to om"), el("code", status.cli)],
+      [tr("Adres MCP", "MCP address"), el("code", "http://127.0.0.1:" + status.port + "/mcp")],
+    ]),
+  );
+  root.append(
+    el(
+      "p",
+      tr("Bez tokenu w zmiennej OPEN_MESS_TOKEN polecenie om czyta go samo z Menedżera poświadczeń.", "Without the token in OPEN_MESS_TOKEN, the om command reads it from Credential Manager itself."),
+      "muted",
+    ),
+  );
 }
 
 function duration(seconds) {
@@ -262,79 +318,107 @@ function duration(seconds) {
   return (h > 0 ? h + " h " : "") + m + " min";
 }
 
+/** The language of the window, the tray and the notifications; the window reloads in it. */
+function languagePicker() {
+  const options = [["auto", tr("Automatycznie (język Windows)", "Automatic (Windows language)")], ["pl", "Polski"], ["en", "English"]];
+  const pick = select(options, languageSetting);
+  pick.classList.add("saves");
+  pick.addEventListener("change", async () => {
+    pick.disabled = true;
+    try {
+      await call("set_language", { setting: pick.value });
+      location.reload();
+    } catch (err) {
+      pick.value = languageSetting;
+      pick.disabled = updateHeld;
+      showError(err);
+    }
+  });
+  return field(tr("Język:", "Language:"), pick);
+}
+
 async function renderDaemon() {
   const status = await call("status");
   const root = content("daemon");
   root.replaceChildren();
   root.append(
     details([
-      ["Wersja", status.version],
-      ["Działa od", duration(status.uptime_seconds)],
-      ["Port lokalnego API", status.port],
-      ["Folder danych", el("code", status.data_dir)],
-      ["Konta", status.accounts_online + " z " + status.accounts + " połączonych"],
-      ["Moduły", status.modules_active + " z " + status.modules + " działa"],
-      ["Akcje do zatwierdzenia", status.waiting],
+      [tr("Wersja", "Version"), status.version],
+      [tr("Działa od", "Running for"), duration(status.uptime_seconds)],
+      [tr("Port lokalnego API", "Local API port"), status.port],
+      [tr("Folder danych", "Data folder"), el("code", status.data_dir)],
+      [tr("Konta", "Accounts"), status.accounts_online + tr(" z ", " of ") + status.accounts + tr(" połączonych", " connected")],
+      [tr("Moduły", "Modules"), status.modules_active + tr(" z ", " of ") + status.modules + tr(" działa", " running")],
+      [tr("Akcje do zatwierdzenia", "Actions waiting for approval"), status.waiting],
     ]),
   );
+  root.append(languagePicker());
   await renderUpdates(root);
-  root.append(el("h2", "Ostatnie błędy"));
-  root.append(list(status.problems, "Brak błędów modułów. (Dziennik demona pojawi się w następnej wersji.)"));
+  root.append(el("h2", tr("Ostatnie błędy", "Recent errors")));
+  root.append(list(status.problems, tr("Brak błędów modułów. (Dziennik demona pojawi się w następnej wersji.)", "No module errors. (The daemon's log comes in a later version.)")));
 }
 
-const UPDATE_STATES = {
-  idle: "nie ma nowszej wersji",
-  checking: "sprawdzanie...",
-  downloading: "pobieranie i sprawdzanie podpisu...",
-  ready: "gotowa do instalacji",
-};
+function updateStates() {
+  return {
+    idle: tr("nie ma nowszej wersji", "no newer version"),
+    checking: tr("sprawdzanie...", "checking..."),
+    downloading: tr("pobieranie i sprawdzanie podpisu...", "downloading and checking the signature..."),
+    ready: tr("gotowa do instalacji", "ready to install"),
+  };
+}
 
-const UPDATE_PHASES = {
-  a: "instalacja, faza A: agenci i wyzwalacze kończą pracę (najdłużej 30 minut)",
-  b: "instalacja, faza B: kończą się trwające wywołania narzędzi, nowe czekają",
-  launching: "uruchamianie pomocnika aktualizacji",
-};
+function updatePhases() {
+  return {
+    a: tr("instalacja, faza A: agenci i wyzwalacze kończą pracę (najdłużej 30 minut)", "installing, phase A: agents and triggers finish their work (30 minutes at most)"),
+    b: tr("instalacja, faza B: kończą się trwające wywołania narzędzi, nowe czekają", "installing, phase B: tool calls in progress finish, new ones wait"),
+    launching: tr("uruchamianie pomocnika aktualizacji", "starting the update helper"),
+  };
+}
 
 function updateStateText(update) {
-  if (update.probation) return "aktualizacja w toku: nowa wersja jest sprawdzana";
+  if (update.probation) return tr("aktualizacja w toku: nowa wersja jest sprawdzana", "update in progress: the new version is being checked");
   const state = update.state;
-  if (state.kind === "error") return "błąd: " + state.detail;
-  if (state.kind === "phase") return UPDATE_PHASES[state.detail] || state.detail;
-  return UPDATE_STATES[state.kind] || state.kind;
+  if (state.kind === "error") return tr("błąd: ", "error: ") + state.detail;
+  if (state.kind === "phase") return updatePhases()[state.detail] || state.detail;
+  return updateStates()[state.kind] || state.kind;
 }
 
 /** The Aktualizacje block of Demon i logi (spec 2026-10-27-self-update, 6 and 7). */
 async function renderUpdates(root) {
   const update = await call("update_status").catch(() => null);
   if (!update) return;
-  root.append(el("h2", "Aktualizacje"));
-  let found = "brak";
+  root.append(el("h2", tr("Aktualizacje", "Updates")));
+  let found = tr("brak", "none");
   if (update.found) {
     found = update.found.version;
-    if (update.found.rolled_back) found += " (wycofane: jej instalacja została cofnięta, więc nie instaluje się sama)";
+    if (update.found.rolled_back) {
+      found += tr(" (wycofane: jej instalacja została cofnięta, więc nie instaluje się sama)", " (rolled back: its installation was undone, so it does not install itself)");
+    }
   }
   root.append(
     details([
-      ["Bieżąca wersja", update.current],
-      ["Znaleziona wersja", found],
-      ["Stan", updateStateText(update)],
-      ["Ostatni wynik", update.last_result || "brak"],
+      [tr("Bieżąca wersja", "Current version"), update.current],
+      [tr("Znaleziona wersja", "Found version"), found],
+      [tr("Stan", "State"), updateStateText(update)],
+      [tr("Ostatni wynik", "Last result"), update.last_result || tr("brak", "none")],
     ]),
   );
   const row = el("div", null, "row");
   const phase = update.state.kind === "phase";
   if (!phase) {
     row.append(
-      button("Sprawdź teraz", async () => {
+      button(tr("Sprawdź teraz", "Check now"), async () => {
         await call("check_update");
         watchUpdate();
       }),
     );
   }
   if (update.state.kind === "ready" && !update.not_installable) {
-    const install = button("Zainstaluj", async () => {
+    const install = button(tr("Zainstaluj", "Install"), async () => {
       const sure = confirm(
-        "Zainstalować open_mess " + update.found.version + "?\n\nDemon poczeka, aż agenci skończą pracę, i uruchomi się ponownie w nowej wersji.",
+        tr("Zainstalować open_mess ", "Install open_mess ") +
+          update.found.version +
+          tr("?\n\nDemon poczeka, aż agenci skończą pracę, i uruchomi się ponownie w nowej wersji.", "?\n\nThe daemon waits for the agents to finish their work and starts again in the new version."),
       );
       if (!sure) return;
       await call("install_update");
@@ -344,7 +428,7 @@ async function renderUpdates(root) {
   }
   if (phase && update.state.detail !== "launching") {
     row.append(
-      button("Anuluj", async () => {
+      button(tr("Anuluj", "Cancel"), async () => {
         await call("cancel_update");
         await renderDaemon();
       }, "danger"),
@@ -366,13 +450,17 @@ async function renderUpdates(root) {
     }
   });
   const auto = el("label", null, "row");
-  auto.append(box, el("span", "Instaluj aktualizacje automatycznie"));
+  auto.append(box, el("span", tr("Instaluj aktualizacje automatycznie", "Install updates automatically")));
   root.append(auto);
   if (update.not_installable) {
     root.append(el("p", update.not_installable, "muted"));
   } else {
     root.append(
-      el("p", "Sama instaluje się tylko wtedy, gdy nic nie czeka na zatwierdzenie, żaden agent nie pracuje i żadna reguła nie doręcza.", "muted"),
+      el(
+        "p",
+        tr("Sama instaluje się tylko wtedy, gdy nic nie czeka na zatwierdzenie, żaden agent nie pracuje i żadna reguła nie doręcza.", "An update installs itself only when nothing waits for approval, no agent is working and no rule is delivering."),
+        "muted",
+      ),
     );
   }
   holdSaves(update.probation);
@@ -403,8 +491,13 @@ function watchUpdate() {
 
 async function renderFooter() {
   const status = await call("status");
+  const connected = plural(
+    status.accounts,
+    { one: "konto połączone", few: "konta połączone", many: "kont połączonych" },
+    { one: "account connected", other: "accounts connected" },
+  );
   document.getElementById("daemon-state").textContent =
-    "Demon działa - port " + status.port + "\n" + status.accounts_online + "/" + status.accounts + " kont połączonych";
+    tr("Demon działa - port ", "Daemon running - port ") + status.port + "\n" + status.accounts_online + "/" + status.accounts + " " + connected;
   const badge = document.getElementById("waiting-count");
   badge.textContent = String(status.waiting);
   badge.hidden = status.waiting === 0;
@@ -413,11 +506,14 @@ async function renderFooter() {
   if (update && (update.probation || ["checking", "downloading", "phase"].includes(update.state.kind))) watchUpdate();
 }
 
-const WRITE_OPTIONS = [
-  ["never", "nigdy"],
-  ["confirm", "z potwierdzeniem"],
-  ["autonomous", "samodzielnie"],
-];
+/** The write permission's labels; autonomous_rule() in commands.rs quotes two of them. */
+function writeOptions() {
+  return [
+    ["never", tr("nigdy", "never")],
+    ["confirm", tr("z potwierdzeniem", "with confirmation")],
+    ["autonomous", tr("samodzielnie", "autonomously")],
+  ];
+}
 
 /**
  * The read box and write list for one account (conversation null) or conversation, saving both
@@ -429,9 +525,9 @@ function permissionControls(account, conversation, current) {
   box.type = "checkbox";
   box.checked = current.read;
   const read = el("label", null, "row");
-  read.append(box, el("span", "czytanie"));
+  read.append(box, el("span", tr("czytanie", "reading")));
   const write = el("select");
-  for (const [value, label] of WRITE_OPTIONS) {
+  for (const [value, label] of writeOptions()) {
     const option = el("option", label);
     option.value = value;
     write.append(option);
@@ -439,7 +535,7 @@ function permissionControls(account, conversation, current) {
   write.value = current.write;
   const save = async () => {
     if (write.value === "autonomous" && current.write !== "autonomous") {
-      const sure = confirm("Samodzielnie: agent wyśle, poprawi i zareaguje bez pytania. Ustawić?");
+      const sure = confirm(tr("Samodzielnie: agent wyśle, poprawi i zareaguje bez pytania. Ustawić?", "Autonomously: the agent sends, edits and reacts without asking. Set it?"));
       if (!sure) {
         write.value = current.write;
         return;
@@ -460,7 +556,7 @@ function permissionControls(account, conversation, current) {
   box.addEventListener("change", save);
   write.addEventListener("change", save);
   const writeLabel = el("label", null, "row");
-  writeLabel.append(el("span", "pisanie:"), write);
+  writeLabel.append(el("span", tr("pisanie:", "writing:")), write);
   return [read, writeLabel];
 }
 
@@ -471,18 +567,18 @@ async function renderPermissions() {
   root.append(
     el(
       "p",
-      "Te same uprawnienia dotyczą każdego agenta i polecenia om. Ustawienie rozmowy ma pierwszeństwo przed ustawieniem konta. Z potwierdzeniem: każde wysłanie, edycja i reakcja czeka na Twoją decyzję w powiadomieniu albo w sekcji Do zatwierdzenia.",
+      tr("Te same uprawnienia dotyczą każdego agenta i polecenia om. Ustawienie rozmowy ma pierwszeństwo przed ustawieniem konta. Z potwierdzeniem: każde wysłanie, edycja i reakcja czeka na Twoją decyzję w powiadomieniu albo w sekcji Do zatwierdzenia. Narzędzia piszące modułów (np. dołączenie do spotkania dla napisów) czekają na nią zawsze, także przy zapisie samodzielnym.", "The same permissions apply to every agent and to the om command. A conversation's setting comes before the account's. With confirmation: every send, edit and reaction waits for your decision in a notification or in the Waiting for approval section. A module's write tools (such as joining a meeting for its captions) always wait for it, even when writing on its own is allowed."),
       "muted",
     ),
   );
-  if (accounts.length === 0) root.append(el("p", "Nie ma jeszcze żadnego konta.", "muted"));
+  if (accounts.length === 0) root.append(el("p", tr("Nie ma jeszcze żadnego konta.", "No accounts yet."), "muted"));
   for (const account of accounts) {
     const permissions = await call("permissions", { account: account.id });
     const card = el("div", null, "card");
     card.append(el("strong", account.display_name), el("div", account.id, "muted"));
     const own = el("div", null, "row");
-    own.append(el("span", "Całe konto:"), ...permissionControls(account.id, null, permissions));
-    card.append(own, el("h2", "Rozmowy z własnymi uprawnieniami"));
+    own.append(el("span", tr("Całe konto:", "Whole account:")), ...permissionControls(account.id, null, permissions));
+    card.append(own, el("h2", tr("Rozmowy z własnymi uprawnieniami", "Conversations with their own permissions")));
     const table = el("table");
     for (const item of permissions.overrides) {
       const row = el("tr");
@@ -492,7 +588,7 @@ async function renderPermissions() {
       controls.append(...permissionControls(account.id, item.conversation, item));
       const remove = el("td");
       remove.append(
-        button("Usuń", async () => {
+        button(tr("Usuń", "Remove"), async () => {
           await call("clear_permission_override", { account: account.id, conversation: item.conversation });
           await renderPermissions();
         }, "danger"),
@@ -500,15 +596,16 @@ async function renderPermissions() {
       row.append(id, controls, remove);
       table.append(row);
     }
-    if (permissions.overrides.length === 0) card.append(el("p", "Brak - wszystkie rozmowy mają ustawienia konta.", "muted"));
-    else card.append(table);
+    if (permissions.overrides.length === 0) {
+      card.append(el("p", tr("Brak - wszystkie rozmowy mają ustawienia konta.", "None - every conversation has the account's settings."), "muted"));
+    } else card.append(table);
     const add = el("div", null, "row");
     const id = el("input");
     id.type = "text";
-    id.placeholder = "identyfikator rozmowy";
+    id.placeholder = tr("identyfikator rozmowy", "conversation id");
     add.append(
       id,
-      button("Dodaj rozmowę", async () => {
+      button(tr("Dodaj rozmowę", "Add conversation"), async () => {
         if (!id.value.trim()) return;
         // A new conversation starts with the account's permissions as they are now (they may have
         // changed since this section was drawn); change them in its row.
@@ -525,8 +622,12 @@ async function renderPermissions() {
   const local = await call("permissions", { account: "local" });
   const card = el("div", null, "card");
   card.append(
-    el("strong", "Nagrania lokalne"),
-    el("div", "Transkrypcje rozmów nagranych na tym komputerze. Niezależne od uprawnień kont: agent z tym prawem czyta każde nagranie.", "muted"),
+    el("strong", tr("Nagrania lokalne", "Local recordings")),
+    el(
+      "div",
+      tr("Transkrypcje rozmów nagranych na tym komputerze. Niezależne od uprawnień kont: agent z tym prawem czyta każde nagranie.", "Transcripts of the calls recorded on this computer. Apart from the accounts' permissions: an agent with this right reads every recording."),
+      "muted",
+    ),
   );
   const row = el("div", null, "row");
   row.append(permissionControls("local", null, local)[0]);
@@ -534,16 +635,20 @@ async function renderPermissions() {
   root.append(card);
 }
 
-const KINDS = { send: "Wysłanie", edit: "Edycja", react: "Reakcja" };
+function kinds() {
+  return { send: tr("Wysłanie", "Send"), edit: tr("Edycja", "Edit"), react: tr("Reakcja", "Reaction") };
+}
 
-const OUTCOMES = {
-  done: "Wykonano.",
-  rejected: "Odrzucono.",
-  expired: "Wygasło - nic nie wysłano.",
-  voided: "Uczestnicy albo wiadomość zmienili się od pokazania - nic nie wysłano.",
-  uncertain: "Mogło dotrzeć - sprawdź rozmowę, zanim spróbujesz ponownie.",
-  failed: "Nie udało się - nic nie wysłano.",
-};
+function outcomes() {
+  return {
+    done: tr("Wykonano.", "Done."),
+    rejected: tr("Odrzucono.", "Rejected."),
+    expired: tr("Wygasło - nic nie wysłano.", "Expired - nothing was sent."),
+    voided: tr("Uczestnicy, tytuł rozmowy, wiadomość albo prawo zapisu zmieniły się od pokazania - nic nie wysłano.", "The participants, the conversation's title, the message or the write permission changed since it was shown - nothing was sent."),
+    uncertain: tr("Mogło dotrzeć - sprawdź rozmowę, zanim spróbujesz ponownie.", "It may have arrived - check the conversation before you try again."),
+    failed: tr("Nie udało się - nic nie wysłano.", "It failed - nothing was sent."),
+  };
+}
 
 /** The cards on screen by action, so a new or decided action leaves the others (and where they are scrolled) alone. */
 const waitingCards = new Map();
@@ -551,33 +656,51 @@ const waitingCards = new Map();
 /** One waiting action with everything it would do, in full; long content scrolls. */
 function waitingCard(preview) {
   const card = el("div", null, "card");
-  card.append(el("strong", KINDS[preview.kind] || preview.kind));
-  const participants = preview.participants.length > 0 ? preview.participants.join(", ") : "brak (kanał)";
-  card.append(details([["Konto", preview.account], ["Rozmowa", preview.conversation], ["Uczestnicy", participants]]));
+  card.append(el("strong", kinds()[preview.kind] || preview.kind));
+  const participants = preview.participants.length > 0 ? preview.participants.join(", ") : tr("brak (kanał)", "none (channel)");
+  // A module tool's approval is for the conversation: who is in it now is shown, not approved.
+  const tool = preview.description !== null;
+  card.append(
+    details([
+      [tr("Konto", "Account"), preview.account],
+      [tr("Rozmowa", "Conversation"), preview.conversation],
+      [tool ? tr("Teraz w rozmowie", "In it now") : tr("Uczestnicy", "Participants"), participants],
+    ]),
+  );
   const block = (label, text) => card.append(el("h2", label), el("div", text, "content-text"));
-  if (preview.kind === "send") {
-    block("Treść", preview.text);
-    if (preview.target_text !== null) block("W odpowiedzi na", preview.target_text);
+  if (tool) {
+    block(tr("Co zrobi narzędzie modułu", "What the module's tool does"), preview.description);
+    if (preview.arguments.length > 0) block(tr("Argumenty", "Arguments"), preview.arguments.join("\n"));
+    card.append(el("p", tr("Zgoda dotyczy rozmowy, nie tylko osób, które są w niej teraz.", "The approval is for the conversation, not only for the people in it now."), "muted"));
+  } else if (preview.kind === "send") {
+    block(tr("Treść", "Text"), preview.text);
+    if (preview.target_text !== null) block(tr("W odpowiedzi na", "In reply to"), preview.target_text);
   } else if (preview.kind === "edit") {
-    block("Przed", preview.target_text);
-    block("Po", preview.text);
+    block(tr("Przed", "Before"), preview.target_text);
+    block(tr("Po", "After"), preview.text);
   } else {
-    block("Reakcja", preview.reaction);
-    block("Pod wiadomością", preview.target_text);
+    block(tr("Reakcja", "Reaction"), preview.reaction);
+    block(tr("Pod wiadomością", "Under the message"), preview.target_text);
   }
   const decide = (approve) => async () => {
     const outcome = await call("decide", { action: preview.action, approve });
-    document.getElementById("waiting-outcome").textContent = OUTCOMES[outcome] || outcome;
+    document.getElementById("waiting-outcome").textContent = outcomes()[outcome] || outcome;
     await renderWaiting();
   };
   const row = el("div", null, "row");
-  const approve = button("Zatwierdź", decide(true), "primary");
+  const approve = button(tr("Zatwierdź", "Approve"), decide(true), "primary");
   if (preview.target_cut) {
     // Nothing is approved that is not on screen in full.
     approve.disabled = true;
-    card.append(el("p", "Wiadomość, której dotyczy akcja, jest za długa, by pokazać ją w całości - akcję można tylko odrzucić.", "error"));
+    card.append(
+      el(
+        "p",
+        tr("Wiadomość, której dotyczy akcja, jest za długa, by pokazać ją w całości - akcję można tylko odrzucić.", "The message this action is about is too long to show in full - the action can only be rejected."),
+        "error",
+      ),
+    );
   }
-  row.append(approve, button("Odrzuć", decide(false), "danger"));
+  row.append(approve, button(tr("Odrzuć", "Reject"), decide(false), "danger"));
   card.append(row);
   return card;
 }
@@ -596,7 +719,7 @@ async function refreshWaiting() {
   if (!document.getElementById("waiting-outcome")) {
     const outcome = el("p", null, "muted");
     outcome.id = "waiting-outcome";
-    root.append(outcome, el("p", "Nic nie czeka na zatwierdzenie.", "muted empty"));
+    root.append(outcome, el("p", tr("Nic nie czeka na zatwierdzenie.", "Nothing is waiting for approval."), "muted empty"));
   }
   const ids = new Set(waiting.map((preview) => preview.action));
   for (const [action, card] of waitingCards) {
@@ -623,50 +746,67 @@ async function refreshSignIn() {
   dialog.replaceChildren();
   overlay.hidden = !prompt;
   if (!prompt) return;
-  dialog.append(el("h1", "Logowanie - " + prompt.module));
+  dialog.append(el("h1", tr("Logowanie - ", "Sign in - ") + prompt.module));
   if (prompt.kind === "device-code") {
-    dialog.append(el("p", "Otwórz stronę logowania w przeglądarce i wpisz ten kod:"), el("div", prompt.code, "code"), el("p", prompt.url, "muted"));
-    dialog.append(button("Otwórz stronę w przeglądarce", () => call("sign_in_open_link", { request_id: prompt.id })));
+    dialog.append(
+      el("p", tr("Otwórz stronę logowania w przeglądarce i wpisz ten kod:", "Open the sign-in page in your browser and enter this code:")),
+      el("div", prompt.code, "code"),
+      el("p", prompt.url, "muted"),
+    );
+    dialog.append(button(tr("Otwórz stronę w przeglądarce", "Open the page in the browser"), () => call("sign_in_open_link", { request_id: prompt.id })));
   } else if (prompt.kind === "qr") {
-    dialog.append(el("p", "Zeskanuj ten kod telefonem:"));
+    dialog.append(el("p", tr("Zeskanuj ten kod telefonem:", "Scan this code with your phone:")));
     if (prompt.qr_svg) {
       const image = el("img");
-      image.alt = "kod QR";
+      image.alt = tr("kod QR", "QR code");
       // An image, so nothing in it runs.
       image.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(prompt.qr_svg);
       dialog.append(image);
     } else {
-      dialog.append(el("p", "Kod jest za długi, żeby go pokazać.", "error"));
+      dialog.append(el("p", tr("Kod jest za długi, żeby go pokazać.", "The code is too long to show."), "error"));
     }
   } else if (prompt.kind === "page") {
-    dialog.append(el("p", "Zaloguj się w osobnym oknie strony logowania (" + prompt.url + "). Hasło wpisujesz tylko tam."));
-  } else if (prompt.kind === "ask-host") {
-    dialog.append(el("p", "Strona logowania przechodzi na " + prompt.url + ". Zezwolić?"));
     dialog.append(
-      el("p", "Zgoda doda ten host do zatwierdzonych hostów logowania modułu (np. firmowy serwer logowania). Odmowa przerwie logowanie.", "muted"),
+      el(
+        "p",
+        tr("Zaloguj się w osobnym oknie strony logowania (", "Sign in in the sign-in page's own window (") +
+          prompt.url +
+          tr("). Hasło wpisujesz tylko tam.", "). You enter your password only there."),
+      ),
+    );
+  } else if (prompt.kind === "ask-host") {
+    dialog.append(el("p", tr("Strona logowania przechodzi na ", "The sign-in page goes on to ") + prompt.url + tr(". Zezwolić?", ". Allow it?")));
+    dialog.append(
+      el(
+        "p",
+        tr("Zgoda doda ten host do zatwierdzonych hostów logowania modułu (np. firmowy serwer logowania). Odmowa przerwie logowanie.", "Allowing adds this host to the module's approved sign-in hosts (a company sign-in server, say). Refusing ends the sign-in."),
+        "muted",
+      ),
     );
     const row = el("div", null, "row");
     row.append(
-      button("Zezwól", () => call("sign_in_answer", { request_id: prompt.id, reply: { done: "allow" } }), "primary"),
-      button("Nie zezwalaj", () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"),
+      button(tr("Zezwól", "Allow"), () => call("sign_in_answer", { request_id: prompt.id, reply: { done: "allow" } }), "primary"),
+      button(tr("Nie zezwalaj", "Don't allow"), () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"),
     );
     dialog.append(row);
     return;
   } else if (prompt.kind === "wam-pick") {
     const answer = (done) => () => call("sign_in_answer", { request_id: prompt.id, reply: { done } });
-    dialog.append(el("p", "Wybierz konto Windows, którym moduł ma się zalogować:"));
-    if (prompt.accounts.length === 0) dialog.append(el("p", "Windows nie zna jeszcze żadnego konta służbowego dla tego modułu.", "muted"));
+    dialog.append(el("p", tr("Wybierz konto Windows, którym moduł ma się zalogować:", "Choose the Windows account the module signs in with:")));
+    if (prompt.accounts.length === 0) {
+      dialog.append(el("p", tr("Windows nie zna jeszcze żadnego konta służbowego dla tego modułu.", "Windows knows no work account for this module yet."), "muted"));
+    }
     // The same name in several organizations (as a guest, say) shows the organization's id.
     const total = new Map();
     for (const account of prompt.accounts) total.set(account.user_name, (total.get(account.user_name) || 0) + 1);
     for (const account of prompt.accounts) {
-      const label = account.user_name + (total.get(account.user_name) > 1 ? " (organizacja " + (account.tenant || "?") + ")" : "");
+      const label = account.user_name + (total.get(account.user_name) > 1 ? tr(" (organizacja ", " (organization ") + (account.tenant || "?") + ")" : "");
       dialog.append(button(label, answer(account.id), "choice"));
     }
-    dialog.append(button("Inne konto Windows...", answer(null), "choice"));
+    dialog.append(button(tr("Inne konto Windows...", "Another Windows account..."), answer(null), "choice"));
   }
   const row = el("div", null, "row");
-  row.append(button("Anuluj", () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"));
+  row.append(button(tr("Anuluj", "Cancel"), () => call("sign_in_answer", { request_id: prompt.id, reply: "cancelled" }), "danger"));
   dialog.append(row);
 }
 
@@ -681,35 +821,43 @@ function renderSignIn() {
 // Sent by the daemon whenever the sign-in prompt changes.
 window.addEventListener("sign-in-request", () => renderSignIn().catch(showError));
 
-const CONDITIONS = [
-  ["direct", "wiadomość prywatna (DM)"],
-  ["mention", "wzmianka o mnie"],
-  ["conversation", "nowa wiadomość w wybranej rozmowie"],
-  ["from", "wiadomość od wybranych osób"],
-];
+function conditions() {
+  return [
+    ["direct", tr("wiadomość prywatna (DM)", "a direct message (DM)")],
+    ["mention", tr("wzmianka o mnie", "a mention of me")],
+    ["conversation", tr("nowa wiadomość w wybranej rozmowie", "a new message in a chosen conversation")],
+    ["from", tr("wiadomość od wybranych osób", "a message from chosen people")],
+  ];
+}
 
-const DROPS = [
-  ["dropped_rate", "ponad limit na godzinę"],
-  ["dropped_quiet_hours", "w ciszy nocnej"],
-  ["dropped_queue", "wypchnięte z kolejki"],
-  ["dropped_no_session", "bez sesji i programu"],
-];
+function drops() {
+  return [
+    ["dropped_rate", tr("ponad limit na godzinę", "over the hourly limit")],
+    ["dropped_quiet_hours", tr("w ciszy nocnej", "in quiet hours")],
+    ["dropped_queue", tr("wypchnięte z kolejki", "pushed out of the queue")],
+    ["dropped_no_session", tr("bez sesji i programu", "no session and no program")],
+  ];
+}
 
 function conditionText(condition) {
-  const [, label] = CONDITIONS.find(([type]) => type === condition.type) || [condition.type, condition.type];
+  const [, label] = conditions().find(([type]) => type === condition.type) || [condition.type, condition.type];
   if (condition.type === "conversation") return label + ": " + condition.id;
   if (condition.type === "from") return label + ": " + condition.senders.join(", ");
   return label;
 }
 
 function spawnText(spawn) {
-  return [spawn.program, ...spawn.args].join(" ") + (spawn.working_dir ? " (w " + spawn.working_dir + ")" : "");
+  return [spawn.program, ...spawn.args].join(" ") + (spawn.working_dir ? tr(" (w ", " (in ") + spawn.working_dir + ")" : "");
+}
+
+function channelText() {
+  return tr("wpis do otwartej sesji Claude Code (kanał)", "a message to an open Claude Code session (channel)");
 }
 
 function actionText(action) {
-  if (action.type === "spawn") return "uruchom program: " + spawnText(action);
-  const fallback = action.fallback_spawn ? "; bez sesji uruchom: " + spawnText(action.fallback_spawn) : "";
-  return "wpis do otwartej sesji Claude Code (kanał)" + fallback;
+  if (action.type === "spawn") return tr("uruchom program: ", "start a program: ") + spawnText(action);
+  const fallback = action.fallback_spawn ? tr("; bez sesji uruchom: ", "; without a session start: ") + spawnText(action.fallback_spawn) : "";
+  return channelText() + fallback;
 }
 
 /** A labelled form field. */
@@ -741,8 +889,8 @@ function select(options, value) {
 function spawnFields(spawn) {
   const program = input("text", spawn ? spawn.program : "");
   program.readOnly = true;
-  program.placeholder = "wybierz program";
-  const pick = button("Wybierz program...", async () => {
+  program.placeholder = tr("wybierz program", "choose a program");
+  const pick = button(tr("Wybierz program...", "Choose a program..."), async () => {
     const picked = await call("pick_program");
     if (picked) program.value = picked;
   });
@@ -750,15 +898,21 @@ function spawnFields(spawn) {
   args.rows = 3;
   args.value = spawn ? spawn.args.join("\n") : "";
   const dir = input("text", spawn ? spawn.working_dir : "");
-  dir.placeholder = "pełna ścieżka, opcjonalnie";
+  dir.placeholder = tr("pełna ścieżka, opcjonalnie", "full path, optional");
   const node = el("div");
   const programRow = el("div", null, "row");
-  const clear = button("Bez programu", () => {
+  const clear = button(tr("Bez programu", "No program"), () => {
     program.value = "";
   });
   programRow.append(el("span", "Program:"), program, pick, clear);
-  node.append(programRow, field("Argumenty (stałe, po jednym w wierszu):", args), field("Folder roboczy:", dir));
-  node.append(el("p", "Treść wiadomości nigdy nie trafia do argumentów: program dostaje ją na wejściu jako dane niezaufane.", "muted"));
+  node.append(programRow, field(tr("Argumenty (stałe, po jednym w wierszu):", "Arguments (fixed, one per line):"), args), field(tr("Folder roboczy:", "Working folder:"), dir));
+  node.append(
+    el(
+      "p",
+      tr("Treść wiadomości nigdy nie trafia do argumentów: program dostaje ją na wejściu jako dane niezaufane.", "Message text never goes into the arguments: the program gets it on its input as untrusted data."),
+      "muted",
+    ),
+  );
   const read = () => {
     if (!program.value) return null;
     return { program: program.value, args: args.value.split("\n").filter((line) => line !== ""), working_dir: dir.value.trim() || null };
@@ -781,22 +935,26 @@ function ruleForm(accounts, existing, done) {
     max_delay_ms: 300000,
   };
   const card = el("div", null, "card");
-  card.append(el("h2", existing ? "Zmień regułę" : "Nowa reguła"));
+  card.append(el("h2", existing ? tr("Zmień regułę", "Change the rule") : tr("Nowa reguła", "New rule")));
   const account = select(accounts.map((item) => [item.id, item.display_name + " (" + item.id + ")"]), rule.account);
-  const condition = select(CONDITIONS, rule.condition.type);
+  const condition = select(conditions(), rule.condition.type);
   const conditionValue = input("text", rule.condition.id || (rule.condition.senders || []).join(", "));
   const conditionRow = field("", conditionValue);
   const showCondition = () => {
     conditionRow.hidden = condition.value !== "conversation" && condition.value !== "from";
     conditionRow.firstChild.textContent =
-      condition.value === "conversation" ? "Identyfikator rozmowy:" : "Identyfikatory osób (po przecinku):";
+      condition.value === "conversation" ? tr("Identyfikator rozmowy:", "Conversation id:") : tr("Identyfikatory osób (po przecinku):", "People's ids (comma-separated):");
   };
   condition.addEventListener("change", showCondition);
   showCondition();
 
-  const action = select([["channel", "wpis do otwartej sesji Claude Code (kanał)"], ["spawn", "uruchom program"]], rule.action.type);
+  const action = select([["channel", channelText()], ["spawn", tr("uruchom program", "start a program")]], rule.action.type);
   const spawn = spawnFields(rule.action.type === "spawn" ? rule.action : rule.action.fallback_spawn);
-  const fallbackNote = el("p", "Gdy nie ma otwartej sesji z kanałami, reguła uruchomi program poniżej (zostaw pusty, żeby nic nie robić).", "muted");
+  const fallbackNote = el(
+    "p",
+    tr("Gdy nie ma otwartej sesji z kanałami, reguła uruchomi program poniżej (zostaw pusty, żeby nic nie robić).", "When no session with channels is open, the rule starts the program below (leave it empty to do nothing)."),
+    "muted",
+  );
   const showAction = () => {
     fallbackNote.hidden = action.value !== "channel";
   };
@@ -808,7 +966,7 @@ function ruleForm(accounts, existing, done) {
   const quietFrom = input("time", rule.quiet_hours ? rule.quiet_hours[0].slice(0, 5) : "22:00");
   const quietTo = input("time", rule.quiet_hours ? rule.quiet_hours[1].slice(0, 5) : "07:00");
   const quietRow = el("div", null, "row");
-  quietRow.append(quiet, el("span", "Cisza nocna od"), quietFrom, el("span", "do"), quietTo);
+  quietRow.append(quiet, el("span", tr("Cisza nocna od", "Quiet hours from")), quietFrom, el("span", tr("do", "to")), quietTo);
   const perHour = input("number", rule.max_per_hour);
   const quietSeconds = input("number", rule.quiet_ms / 1000);
   const delaySeconds = input("number", rule.max_delay_ms / 1000);
@@ -816,22 +974,22 @@ function ruleForm(accounts, existing, done) {
   enabled.checked = rule.enabled;
 
   card.append(
-    field("Konto:", account),
-    field("Gdy przyjdzie:", condition),
+    field(tr("Konto:", "Account:"), account),
+    field(tr("Gdy przyjdzie:", "When there is:"), condition),
     conditionRow,
-    field("Akcja:", action),
+    field(tr("Akcja:", "Action:"), action),
     fallbackNote,
     spawn.node,
     quietRow,
-    field("Najwyżej pobudek na godzinę:", perHour),
-    field("Wyślij po tylu sekundach ciszy w rozmowie:", quietSeconds),
-    field("...ale najpóźniej po tylu sekundach:", delaySeconds),
-    field("Włączona:", enabled),
+    field(tr("Najwyżej pobudek na godzinę:", "Wake-ups per hour, at most:"), perHour),
+    field(tr("Wyślij po tylu sekundach ciszy w rozmowie:", "Send after this many seconds of quiet in the conversation:"), quietSeconds),
+    field(tr("...ale najpóźniej po tylu sekundach:", "...but at the latest after this many seconds:"), delaySeconds),
+    field(tr("Włączona:", "On:"), enabled),
   );
   const row = el("div", null, "row");
   row.append(
-    button("Zapisz", async () => {
-      if (quiet.checked && (!quietFrom.value || !quietTo.value)) throw "podaj obie godziny ciszy nocnej";
+    button(tr("Zapisz", "Save"), async () => {
+      if (quiet.checked && (!quietFrom.value || !quietTo.value)) throw tr("podaj obie godziny ciszy nocnej", "enter both quiet hours");
       const values = conditionValue.value.split(",").map((value) => value.trim()).filter((value) => value !== "");
       const conditionDto =
         condition.value === "conversation"
@@ -857,7 +1015,7 @@ function ruleForm(accounts, existing, done) {
       if (warning) alert(warning);
       await done();
     }, "primary"),
-    button("Anuluj", done),
+    button(tr("Anuluj", "Cancel"), done),
   );
   card.append(row);
   return card;
@@ -870,19 +1028,19 @@ async function renderTriggers() {
   root.append(
     el(
       "p",
-      "Reguła budzi agenta, gdy ktoś napisze do Ciebie: wpisem do otwartej sesji Claude Code albo uruchomieniem programu. Twoje własne wiadomości nigdy jej nie uruchamiają, a rozmowy, których agent nie może czytać, są pomijane. Treść od innych osób agent dostaje jako dane niezaufane.",
+      tr("Reguła budzi agenta, gdy ktoś napisze do Ciebie: wpisem do otwartej sesji Claude Code albo uruchomieniem programu. Twoje własne wiadomości nigdy jej nie uruchamiają, a rozmowy, których agent nie może czytać, są pomijane. Treść od innych osób agent dostaje jako dane niezaufane.", "A rule wakes an agent when someone writes to you: with a message to an open Claude Code session or by starting a program. Your own messages never set it off, and conversations the agent may not read are skipped. The agent gets what other people wrote as untrusted data."),
       "muted",
     ),
   );
   const editor = el("div");
   const close = async () => renderTriggers();
   if (accounts.length === 0) {
-    root.append(el("p", "Reguły należą do kont: najpierw dodaj konto.", "muted"));
+    root.append(el("p", tr("Reguły należą do kont: najpierw dodaj konto.", "Rules belong to accounts: add an account first."), "muted"));
   } else {
-    root.append(button("Dodaj regułę", () => editor.replaceChildren(ruleForm(accounts, null, close)), "primary"));
+    root.append(button(tr("Dodaj regułę", "Add rule"), () => editor.replaceChildren(ruleForm(accounts, null, close)), "primary"));
   }
   root.append(editor);
-  if (rules.length === 0) root.append(el("p", "Nie ma jeszcze żadnej reguły.", "muted"));
+  if (rules.length === 0) root.append(el("p", tr("Nie ma jeszcze żadnej reguły.", "No rules yet."), "muted"));
   for (const rule of rules) {
     const card = el("div", null, "card");
     const head = el("div", null, "row");
@@ -890,56 +1048,74 @@ async function renderTriggers() {
     const owner = accounts.find((account) => account.id === rule.account);
     title.append(
       el("strong", conditionText(rule.condition)),
-      el("div", (owner ? owner.display_name + " - " : "") + rule.account + (rule.enabled ? "" : " (wyłączona)"), "muted"),
+      el("div", (owner ? owner.display_name + " - " : "") + rule.account + (rule.enabled ? "" : tr(" (wyłączona)", " (off)")), "muted"),
     );
     head.append(
       title,
-      button("Zmień", () => editor.replaceChildren(ruleForm(accounts, rule, close))),
-      button("Usuń", async () => {
-        if (!confirm("Usunąć regułę?")) return;
+      button(tr("Zmień", "Change"), () => editor.replaceChildren(ruleForm(accounts, rule, close))),
+      button(tr("Usuń", "Remove"), async () => {
+        if (!confirm(tr("Usunąć regułę?", "Remove the rule?"))) return;
         await call("delete_rule", { id: rule.id });
         await renderTriggers();
       }, "danger"),
     );
     card.append(head);
-    const quiet = rule.quiet_hours ? rule.quiet_hours[0].slice(0, 5) + "-" + rule.quiet_hours[1].slice(0, 5) : "brak";
+    const quiet = rule.quiet_hours ? rule.quiet_hours[0].slice(0, 5) + "-" + rule.quiet_hours[1].slice(0, 5) : tr("brak", "none");
     const counters = rule.counters;
-    const dropped = DROPS.filter(([key]) => counters[key] > 0).map(([key, label]) => label + ": " + counters[key]);
+    const dropped = drops()
+      .filter(([key]) => counters[key] > 0)
+      .map(([key, label]) => label + ": " + counters[key]);
+    const limits =
+      rule.max_per_hour +
+      tr(" na godzinę; po ", " per hour; after ") +
+      rule.quiet_ms / 1000 +
+      tr(" s ciszy, najpóźniej po ", " s of quiet, at the latest after ") +
+      rule.max_delay_ms / 1000 +
+      " s";
     card.append(
       details([
-        ["Akcja", actionText(rule.action)],
-        ["Cisza nocna", quiet],
-        ["Limity", rule.max_per_hour + " na godzinę; po " + rule.quiet_ms / 1000 + " s ciszy, najpóźniej po " + rule.max_delay_ms / 1000 + " s"],
-        ["Od startu demona", "dostarczone: " + counters.delivered + (dropped.length ? "; pominięte - " + dropped.join(", ") : "")],
+        [tr("Akcja", "Action"), actionText(rule.action)],
+        [tr("Cisza nocna", "Quiet hours"), quiet],
+        [tr("Limity", "Limits"), limits],
+        [tr("Od startu demona", "Since the daemon started"), tr("dostarczone: ", "delivered: ") + counters.delivered + (dropped.length ? tr("; pominięte - ", "; dropped - ") + dropped.join(", ") : "")],
       ]),
     );
     if (counters.failed_to_start > 0) {
+      const times = plural(counters.failed_to_start, { one: "raz", few: "razy", many: "razy" }, { one: "time", other: "times" });
       card.append(
-        el("p", "Program nie uruchomił się " + counters.failed_to_start + " raz(y) - sprawdź, czy nadal jest pod tą ścieżką, i wybierz go ponownie.", "error"),
+        el(
+          "p",
+          tr("Program nie uruchomił się ", "The program failed to start ") +
+            counters.failed_to_start +
+            " " +
+            times +
+            tr(" - sprawdź, czy nadal jest pod tą ścieżką, i wybierz go ponownie.", " - check that it is still at that path, and choose it again."),
+          "error",
+        ),
       );
     }
     root.append(card);
   }
 
-  root.append(el("h2", "Sesja Claude Code z kanałami"));
+  root.append(el("h2", tr("Sesja Claude Code z kanałami", "Claude Code session with channels")));
   root.append(
     el(
       "p",
-      "Wpis do sesji działa w sesjach Claude Code uruchomionych z kanałem open_mess. Polecenie om mcp-stdio należy tylko do takich sesji: nie dodawaj go do zwykłej konfiguracji MCP (tam open_mess działa przez adres z sekcji Integracje).",
+      tr("Wpis do sesji działa w sesjach Claude Code uruchomionych z kanałem open_mess. Polecenie om mcp-stdio należy tylko do takich sesji: nie dodawaj go do zwykłej konfiguracji MCP (tam open_mess działa przez adres z sekcji Integracje).", "A message to a session works in Claude Code sessions started with the open_mess channel. The om mcp-stdio command belongs only in such sessions: don't add it to your usual MCP configuration (there open_mess works through the address in the Integrations section)."),
       "muted",
     ),
   );
   const setup = el("div");
   setup.append(
-    button("Pokaż konfigurację kanału", async () => {
+    button(tr("Pokaż konfigurację kanału", "Show the channel configuration"), async () => {
       const channel = await call("channel_setup");
       setup.replaceChildren(
-        el("p", "Konfiguracja MCP (zapisana w " + channel.file + "):", "muted"),
+        el("p", tr("Konfiguracja MCP (zapisana w ", "MCP configuration (saved in ") + channel.file + "):", "muted"),
         el("pre", channel.json, "content-text"),
-        el("p", "Uruchom Claude Code tak:", "muted"),
+        el("p", tr("Uruchom Claude Code tak:", "Start Claude Code like this:"), "muted"),
         el("pre", channel.command, "content-text"),
-        button("Kopiuj polecenie", () => navigator.clipboard.writeText(channel.command)),
-        el("p", "Otwarte sesje z kanałem: " + channel.sessions + ".", "muted"),
+        button(tr("Kopiuj polecenie", "Copy the command"), () => navigator.clipboard.writeText(channel.command)),
+        el("p", tr("Otwarte sesje z kanałem: ", "Open sessions with the channel: ") + channel.sessions + ".", "muted"),
       );
     }),
   );
@@ -947,26 +1123,65 @@ async function renderTriggers() {
 }
 
 function megabytes(bytes) {
-  return Math.round(bytes / (1024 * 1024)).toLocaleString("pl-PL") + " MB";
+  return Math.round(bytes / (1024 * 1024)).toLocaleString(locale()) + " MB";
 }
 
-const RECORDING_STATES = {
-  recording: "nagrywanie",
-  waiting: "czeka na transkrypcję",
-  transcribing: "transkrypcja",
-  done: "gotowe",
-  failed: "nieudane",
-};
-const SPEAKERS = { me: "ja", others: "rozmówcy" };
-const LANGUAGES = [
-  ["auto", "wykryj sam"],
-  ["pl", "polski"],
-  ["en", "angielski"],
-  ["de", "niemiecki"],
-  ["uk", "ukraiński"],
-  ["fr", "francuski"],
-  ["es", "hiszpański"],
-];
+/** The locale dates and numbers are written in. */
+function locale() {
+  return tr("pl-PL", "en-GB");
+}
+
+function recordingStates() {
+  return {
+    recording: tr("nagrywanie", "recording"),
+    waiting: tr("czeka na transkrypcję", "waiting for transcription"),
+    transcribing: tr("transkrypcja", "transcribing"),
+    done: tr("gotowe", "done"),
+    failed: tr("nieudane", "failed"),
+  };
+}
+
+/** A reason the daemon gives in English (a recording's, the queue's, the recorder's), as shown. */
+function recordingReason(reason) {
+  const texts = {
+    interrupted: tr("przerwane", "interrupted"),
+    expired: tr("dźwięk wygasł", "expired"),
+    damaged: tr("uszkodzone", "damaged"),
+    failed: tr("błąd", "failed"),
+    "capture failed": tr("błąd przechwytu", "capture failed"),
+    "write failed": tr("błąd zapisu", "write failed"),
+    "detect failed": tr("utrata wykrywania", "detect failed"),
+    "too long": tr("za długie", "too long"),
+    "low disk": tr("mało miejsca na dysku", "low disk"),
+    recording: tr("trwa nagrywanie", "a call is being recorded"),
+    "no model": tr("brak modelu", "no model"),
+    "model damaged": tr("model uszkodzony", "model damaged"),
+    "low memory": tr("za mało pamięci", "low memory"),
+    "cannot open the call's devices": tr("nie da się otworzyć urządzeń rozmowy", "cannot open the call's devices"),
+    "no tray icon": tr("brak ikony w zasobniku", "no tray icon"),
+    "audio limit": tr("limit dźwięku", "audio limit"),
+    "text limit": tr("limit transkrypcji", "text limit"),
+    "update in progress": tr("trwa aktualizacja", "update in progress"),
+    "cannot create the recording": tr("błąd tworzenia nagrania", "cannot create the recording"),
+  };
+  return texts[reason] || reason;
+}
+
+function speakers() {
+  return { me: tr("ja", "me"), others: tr("rozmówcy", "others") };
+}
+
+function recordingLanguages() {
+  return [
+    ["auto", tr("wykryj sam", "detect")],
+    ["pl", tr("polski", "Polish")],
+    ["en", tr("angielski", "English")],
+    ["de", tr("niemiecki", "German")],
+    ["uk", tr("ukraiński", "Ukrainian")],
+    ["fr", tr("francuski", "French")],
+    ["es", tr("hiszpański", "Spanish")],
+  ];
+}
 
 /** HH:MM:SS of `ms`. */
 function clock(ms) {
@@ -974,10 +1189,10 @@ function clock(ms) {
   return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map((part) => String(part).padStart(2, "0")).join(":");
 }
 
-/** The recording whose transcript "Pokaż" shows, and its pieces. */
+/** The recording whose transcript the show button shows, and its pieces. */
 let shownRecording = null;
 
-// Nagrywanie rozmów (spec 2026-10-28-local-transcription, 4.6): the settings, the model and the
+// Call recording (spec 2026-10-28-local-transcription, 4.6): the settings, the model and the
 // recordings. A transcript is other people's speech: it goes in through `el` only.
 async function renderRecording() {
   const [model, recording] = await Promise.all([call("model_status"), call("recordings")]);
@@ -987,20 +1202,20 @@ async function renderRecording() {
   root.append(
     el(
       "p",
-      "Rozmowy są zamieniane na tekst na tym komputerze, modelem Whisper (large-v3-turbo, licencja MIT). Model pobiera się raz, z Hugging Face; każdy plik jest sprawdzany sumą kontrolną.",
+      tr("Rozmowy są zamieniane na tekst na tym komputerze, modelem Whisper (large-v3-turbo, licencja MIT). Model pobiera się raz, z Hugging Face; każdy plik jest sprawdzany sumą kontrolną.", "Calls are turned into text on this computer, with the Whisper model (large-v3-turbo, MIT licence). The model is downloaded once, from Hugging Face; every file is checked against its checksum."),
       "muted",
     ),
   );
   const download = model.download;
-  let state = model.installed ? "pobrany" : "nie pobrany";
-  if (model.newer) state += " - dostępny nowszy model";
-  if (download.state === "running") state = "pobieranie: " + megabytes(download.done) + " z " + megabytes(download.total);
-  if (download.state === "failed") state = "pobieranie nie udało się: " + download.reason;
-  root.append(details([["Model", state]]));
+  let state = model.installed ? tr("pobrany", "downloaded") : tr("nie pobrany", "not downloaded");
+  if (model.newer) state += tr(" - dostępny nowszy model", " - a newer model is available");
+  if (download.state === "running") state = tr("pobieranie: ", "downloading: ") + megabytes(download.done) + tr(" z ", " of ") + megabytes(download.total);
+  if (download.state === "failed") state = tr("pobieranie nie udało się: ", "the download failed: ") + download.reason;
+  root.append(details([[tr("Model", "Model"), state]]));
   const buttons = el("div", null, "row");
   if (download.state !== "running" && (!model.installed || model.newer)) {
     buttons.append(
-      button("Pobierz model (" + megabytes(model.size) + ")", async () => {
+      button(tr("Pobierz model (", "Download the model (") + megabytes(model.size) + ")", async () => {
         await call("download_model");
         await renderRecording();
       }),
@@ -1008,8 +1223,8 @@ async function renderRecording() {
   }
   if (model.installed && download.state !== "running") {
     buttons.append(
-      button("Usuń model", async () => {
-        if (!confirm("Usunąć model? Bez niego rozmowy nie będą zamieniane na tekst.")) return;
+      button(tr("Usuń model", "Delete the model"), async () => {
+        if (!confirm(tr("Usunąć model? Bez niego rozmowy nie będą zamieniane na tekst.", "Delete the model? Without it calls are not turned into text."))) return;
         await call("delete_model");
         await renderRecording();
       }, "danger"),
@@ -1031,12 +1246,12 @@ function renderRecordingSettings(root, recording) {
   auto.type = "checkbox";
   auto.checked = recording.auto;
   const autoLabel = el("label", null, "row");
-  autoLabel.append(auto, el("span", "Nagrywaj rozmowy Teams automatycznie"));
+  autoLabel.append(auto, el("span", tr("Nagrywaj rozmowy Teams automatycznie", "Record Teams calls automatically")));
   root.append(
     autoLabel,
     el(
       "p",
-      "Gdy jest włączone, każda rozmowa Teams jest nagrywana bez pytania: wszystko, co gra urządzenie rozmowy (także powiadomienia i inne aplikacje) przez cały czas rozmowy, oraz Twój mikrofon, tylko gdy jest włączony w Teams. Nagrania leżą w %LOCALAPPDATA%\\open_mess\\recordings na tym komputerze; dźwięk znika po transkrypcji, tekst zostaje, dopóki go nie usuniesz. Uczestników informujesz Ty.",
+      tr("Gdy jest włączone, każda rozmowa Teams jest nagrywana bez pytania: wszystko, co gra urządzenie rozmowy (także powiadomienia i inne aplikacje) przez cały czas rozmowy, oraz Twój mikrofon, tylko gdy jest włączony w Teams. Nagrania leżą w %LOCALAPPDATA%\\open_mess\\recordings na tym komputerze; dźwięk znika po transkrypcji, tekst zostaje, dopóki go nie usuniesz. Uczestników informujesz Ty.", "When on, every Teams call is recorded without asking: everything the call's device plays (notifications and other apps too) for the whole call, and your microphone only while it is on in Teams. Recordings stay in %LOCALAPPDATA%\\open_mess\\recordings on this computer; the audio goes once transcribed, the text stays until you delete it. Telling the participants is up to you."),
       "muted",
     ),
   );
@@ -1044,16 +1259,17 @@ function renderRecordingSettings(root, recording) {
   microphone.type = "checkbox";
   microphone.checked = recording.microphone;
   const microphoneLabel = el("label", null, "row");
-  microphoneLabel.append(microphone, el("span", "Nagrywaj mój mikrofon"));
-  const known = LANGUAGES.some(([code]) => code === recording.language);
-  const language = select(known ? LANGUAGES : [...LANGUAGES, [recording.language, recording.language]], recording.language);
+  microphoneLabel.append(microphone, el("span", tr("Nagrywaj mój mikrofon", "Record my microphone")));
+  const languages = recordingLanguages();
+  const known = languages.some(([code]) => code === recording.language);
+  const language = select(known ? languages : [...languages, [recording.language, recording.language]], recording.language);
   const languageLabel = el("label", null, "row");
-  languageLabel.append(el("span", "Język rozmów"), language);
+  languageLabel.append(el("span", tr("Język rozmów", "Language of the calls")), language);
   root.append(
     microphoneLabel,
     languageLabel,
-    button("Zapisz ustawienia", async () => {
-      if (auto.checked && !recording.auto && !confirm("Nagrywać automatycznie każdą rozmowę Teams na tym komputerze?")) return;
+    button(tr("Zapisz ustawienia", "Save settings"), async () => {
+      if (auto.checked && !recording.auto && !confirm(tr("Nagrywać automatycznie każdą rozmowę Teams na tym komputerze?", "Record every Teams call on this computer automatically?"))) return;
       await call("set_recording_settings", { auto: auto.checked, microphone: microphone.checked, language: language.value });
       await renderRecording();
     }),
@@ -1061,8 +1277,8 @@ function renderRecordingSettings(root, recording) {
   if (recording.active) {
     const row = el("div", null, "row");
     row.append(
-      el("strong", "Trwa nagrywanie rozmowy."),
-      button("Zatrzymaj", async () => {
+      el("strong", tr("Trwa nagrywanie rozmowy.", "A call is being recorded.")),
+      button(tr("Zatrzymaj", "Stop"), async () => {
         await call("stop_recording");
         await renderRecording();
       }),
@@ -1070,30 +1286,31 @@ function renderRecordingSettings(root, recording) {
     root.append(row);
   }
   const status = recording.status || {};
-  if (status.detect === "unavailable") root.append(el("p", "Nie można wykryć rozmów Teams.", "muted"));
-  if (status.reason) root.append(el("p", "Czeka: " + status.reason, "muted"));
+  if (status.detect === "unavailable") root.append(el("p", tr("Nie można wykryć rozmów Teams.", "Teams calls cannot be detected."), "muted"));
+  if (status.reason) root.append(el("p", tr("Czeka: ", "Waiting: ") + recordingReason(status.reason), "muted"));
 }
 
 function renderRecordings(root, recording) {
-  root.append(el("h2", "Nagrania"));
+  root.append(el("h2", tr("Nagrania", "Recordings")));
   if (recording.recordings.length === 0) {
-    root.append(el("p", "Brak nagrań.", "muted"));
+    root.append(el("p", tr("Brak nagrań.", "No recordings."), "muted"));
     return;
   }
   const table = el("table");
   const head = el("tr");
-  for (const label of ["Data", "Długość", "Stan", ""]) head.append(el("th", label));
+  for (const label of [tr("Data", "Date"), tr("Długość", "Length"), tr("Stan", "State"), ""]) head.append(el("th", label));
   table.append(head);
+  const states = recordingStates();
   for (const item of recording.recordings) {
     const row = el("tr");
     const length = item.end_ms ? clock(item.end_ms - item.start_ms) : "";
-    let state = RECORDING_STATES[item.state] || item.state;
+    let state = states[item.state] || item.state;
     if (item.progress !== null && item.progress !== undefined) state += " " + item.progress + "%";
-    if (item.reason) state += " (" + item.reason + ")";
+    if (item.reason) state += " (" + recordingReason(item.reason) + ")";
     const actions = el("td", null, "row");
     if (item.state === "done") {
       actions.append(
-        button("Pokaż", async () => {
+        button(tr("Pokaż", "Show"), async () => {
           shownRecording = { id: item.id, cues: await call("show_transcript", { id: item.id }) };
           await renderRecording();
         }),
@@ -1101,7 +1318,7 @@ function renderRecordings(root, recording) {
     }
     if (item.state === "failed" && item.audio) {
       actions.append(
-        button("Ponów", async () => {
+        button(tr("Ponów", "Retry"), async () => {
           await call("retry_recording", { id: item.id });
           await renderRecording();
         }),
@@ -1109,9 +1326,9 @@ function renderRecordings(root, recording) {
     }
     actions.append(
       button(
-        "Usuń",
+        tr("Usuń", "Delete"),
         async () => {
-          if (!confirm("Usunąć to nagranie i jego tekst?")) return;
+          if (!confirm(tr("Usunąć to nagranie i jego tekst?", "Delete this recording and its text?"))) return;
           await call("delete_recording", { id: item.id });
           if (shownRecording && shownRecording.id === item.id) shownRecording = null;
           await renderRecording();
@@ -1119,15 +1336,15 @@ function renderRecordings(root, recording) {
         "danger",
       ),
     );
-    row.append(el("td", new Date(item.start_ms).toLocaleString("pl-PL")), el("td", length), el("td", state), actions);
+    row.append(el("td", new Date(item.start_ms).toLocaleString(locale())), el("td", length), el("td", state), actions);
     table.append(row);
   }
   root.append(
     table,
     button(
-      "Usuń wszystkie",
+      tr("Usuń wszystkie", "Delete all"),
       async () => {
-        if (!confirm("Usunąć wszystkie nagrania i ich teksty?")) return;
+        if (!confirm(tr("Usunąć wszystkie nagrania i ich teksty?", "Delete all recordings and their texts?"))) return;
         shownRecording = null;
         await call("delete_all_recordings");
         await renderRecording();
@@ -1136,12 +1353,13 @@ function renderRecordings(root, recording) {
     ),
   );
   if (shownRecording && recording.recordings.some((item) => item.id === shownRecording.id)) {
-    root.append(el("h2", "Transkrypcja"));
+    root.append(el("h2", tr("Transkrypcja", "Transcript")));
     const text = el("div", null, "transcript");
+    const names = speakers();
     for (const cue of shownRecording.cues) {
-      text.append(el("p", "[" + clock(cue.start_ms) + "] " + (SPEAKERS[cue.speaker] || cue.speaker) + ": " + cue.text));
+      text.append(el("p", "[" + clock(cue.start_ms) + "] " + (names[cue.speaker] || cue.speaker) + ": " + cue.text));
     }
-    root.append(text, button("Zamknij", async () => {
+    root.append(text, button(tr("Zamknij", "Close"), async () => {
       shownRecording = null;
       await renderRecording();
     }));
@@ -1165,6 +1383,9 @@ window.addEventListener("pending-changed", () => {
   renderFooter().catch(showError);
 });
 
+// Sent by the daemon when the language changed (the setting, or Windows's): the page starts again in it.
+window.addEventListener("language-changed", () => location.reload());
+
 let current = null;
 
 async function show(section) {
@@ -1186,16 +1407,31 @@ async function show(section) {
   }
 }
 
-for (const node of document.querySelectorAll("#menu button")) {
-  node.addEventListener("click", () => show(node.dataset.section));
+/**
+ * The language first, then the sections: none is drawn before the language is known. The first is
+ * the actions waiting for approval, otherwise the accounts, unless the user picked one meanwhile.
+ */
+async function start() {
+  let failed = null;
+  try {
+    const language = await call("language");
+    lang = language.lang === "en" ? "en" : "pl";
+    languageSetting = language.setting;
+  } catch (err) {
+    // The window works in Polish, as it did before it had a language, and says why.
+    failed = err;
+  }
+  document.documentElement.lang = lang;
+  if (lang === "en") translatePage();
+  for (const node of document.querySelectorAll("#menu button")) {
+    node.addEventListener("click", () => show(node.dataset.section));
+  }
+  // Asked for by the notice that several actions wait, on an open window.
+  window.addEventListener("show-waiting", () => show("waiting"));
+  const waiting = await call("waiting").catch(() => []);
+  if (current === null) await show(waiting.length > 0 ? "waiting" : "accounts");
+  renderSignIn().catch(showError);
+  if (failed) showError(failed);
 }
 
-// Asked for by the notice that several actions wait, on an open window.
-window.addEventListener("show-waiting", () => show("waiting"));
-
-// Actions waiting for approval come first; otherwise the accounts. Not over a section the user
-// picked meanwhile.
-call("waiting")
-  .then((waiting) => current === null && show(waiting.length > 0 ? "waiting" : "accounts"))
-  .catch(() => current === null && show("accounts"));
-renderSignIn().catch(showError);
+start().catch(showError);
