@@ -5,7 +5,7 @@
 //! Unix only: that is where the server runs; Windows keeps Credential Manager and its window.
 #![cfg(unix)]
 // Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
