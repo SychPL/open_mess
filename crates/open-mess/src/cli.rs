@@ -43,6 +43,10 @@ enum Action {
     McpStdio,
     /// Open the configuration window of the running daemon (Windows).
     Config,
+    /// Print the agents' and the administrative token of a server daemon, for the open_mess plugin
+    /// in Paperclip (outside Windows).
+    #[cfg(not(windows))]
+    ServerTokens,
     /// The update helper, run as `om.update.exe` by the scheduled task `open_mess-update`: installs
     /// the update the user accepted, or finishes an interrupted one. Without either it does nothing.
     #[command(hide = true)]
@@ -113,6 +117,8 @@ pub fn run() -> ExitCode {
         Action::McpCommand => mcp_command(),
         Action::McpStdio => mcp_stdio(),
         Action::Config => open_config(),
+        #[cfg(not(windows))]
+        Action::ServerTokens => server_tokens(),
         Action::ApplyUpdate { data_dir } => apply_update(data_dir),
         Action::Tool(args) => run_tool(&args),
     };
@@ -196,8 +202,33 @@ fn token() -> Result<String, Failure> {
     if let Ok(token) = std::env::var("OPEN_MESS_TOKEN") {
         return Ok(token);
     }
+    secrets_store()?;
     // No token means the daemon has never started.
     secrets::stored_local_api_token().map_err(|err| failed(err.to_string()))?.ok_or_else(not_running)
+}
+
+/// Outside Windows the daemon's tokens are in the data folder's secrets file (spec
+/// 2026-11-03-paperclip-plugin, 5.2); the CLI only reads it.
+fn secrets_store() -> Result<(), Failure> {
+    let dir = paths::data_dir().map_err(|err| failed(err.to_string()))?;
+    secrets::install_platform_store(&dir).map_err(|err| failed(err.to_string()))
+}
+
+/// `om server-tokens`: the tokens to put into Paperclip's secrets (spec 2026-11-03-paperclip-plugin,
+/// 5.3). Only who may run commands in the daemon's container can run it.
+#[cfg(not(windows))]
+fn server_tokens() -> Result<(), Failure> {
+    secrets_store()?;
+    let agents = secrets::stored_local_api_token().map_err(|err| failed(err.to_string()))?;
+    let admin = secrets::stored_admin_api_token().map_err(|err| failed(err.to_string()))?;
+    match (agents, admin) {
+        (Some(agents), Some(admin)) => written(writeln!(
+            std::io::stdout(),
+            "agents: {agents}
+admin: {admin}"
+        )),
+        _ => Err(failed("no tokens yet - start the daemon first: om daemon")),
+    }
 }
 
 /// The arguments of one tool call, from what follows the tool name.

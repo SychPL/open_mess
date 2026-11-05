@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::UiState;
+use super::sign_in::Active;
 use crate::accounts::Account;
 use crate::i18n::{self, Lang};
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
@@ -580,6 +581,9 @@ pub struct SignInPromptDto {
     pub qr_svg: Option<String>,
     /// The Windows accounts to pick from.
     pub accounts: Vec<WamAccountDto>,
+    /// The whole address of a sign-in page, for a front end without a webview to open in a
+    /// browser: the open_mess plugin in Paperclip (spec 2026-11-03-paperclip-plugin, 5.4).
+    pub open_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -602,8 +606,20 @@ pub enum AnswerDto {
 /// Signs in an account of `module` (`Dodaj konto`), or `account` again (`Zaloguj ponownie`), from
 /// the window only (spec 8.8); the module's prompts reach the window meanwhile. Returns the account.
 pub async fn sign_in_start(state: &UiState, module: &str, account: Option<&str>) -> Result<AccountDto, String> {
+    let _active = sign_in_begin(state, module)?;
+    sign_in_run(state, module, account).await
+}
+
+/// The first step of a sign-in, refused at once while an update or another sign-in runs. The
+/// sign-in lasts as long as the returned guard; the administrative API keeps it in a task of its
+/// own (spec 2026-11-03-paperclip-plugin, 5.4).
+pub fn sign_in_begin(state: &UiState, module: &str) -> Result<Active, String> {
     changes_allowed(state)?;
-    let _active = state.sign_ins.begin(module)?;
+    state.sign_ins.begin(module)
+}
+
+/// The second step: the module signs in, its prompts reaching the front end meanwhile.
+pub async fn sign_in_run(state: &UiState, module: &str, account: Option<&str>) -> Result<AccountDto, String> {
     let account = state.accounts.sign_in(module, account).await.map_err(text)?;
     Ok(account_dto(state, &state.accounts.modules().list(), account))
 }
@@ -614,13 +630,22 @@ pub fn sign_in_request(state: &UiState) -> Option<SignInPromptDto> {
     let module = request.module().to_owned();
     // The sign-in page went on to a host that is not approved: the window asks first.
     if let Some((id, host)) = state.sign_ins.question() {
-        return Some(SignInPromptDto { id, kind: "ask-host", module, code: None, url: Some(host), qr_svg: None, accounts: Vec::new() });
+        return Some(SignInPromptDto {
+            id,
+            kind: "ask-host",
+            module,
+            code: None,
+            url: Some(host),
+            qr_svg: None,
+            accounts: Vec::new(),
+            open_url: None,
+        });
     }
-    let dto = |kind| SignInPromptDto { id, kind, module, code: None, url: None, qr_svg: None, accounts: Vec::new() };
+    let dto = |kind| SignInPromptDto { id, kind, module, code: None, url: None, qr_svg: None, accounts: Vec::new(), open_url: None };
     Some(match request {
         SignInRequest::DeviceCode { code, url, .. } => SignInPromptDto { code: Some(code), url: Some(url), ..dto("device-code") },
         SignInRequest::Qr { data, .. } => SignInPromptDto { qr_svg: qr_svg(&data), ..dto("qr") },
-        SignInRequest::OpenPage { url, .. } => SignInPromptDto { url: Some(host_of(&url)), ..dto("page") },
+        SignInRequest::OpenPage { url, .. } => SignInPromptDto { url: Some(host_of(&url)), open_url: Some(url), ..dto("page") },
         SignInRequest::WamPick { accounts, .. } => SignInPromptDto {
             accounts: accounts
                 .into_iter()
@@ -645,17 +670,30 @@ fn host_of(url: &str) -> String {
     rest.split(['/', '?', '#']).next().unwrap_or(rest).to_owned()
 }
 
-/// The user's answer to sign-in prompt `id`. A sign-in page is answered only by the page itself
-/// (its redirect); the window can only cancel it.
+/// The user's answer to sign-in prompt `id`. On Windows a sign-in page is answered only by the page
+/// itself (its redirect); the window can only cancel it. Elsewhere there is no window: the answer
+/// is the address the user's browser ended on, pasted (spec 2026-11-03-paperclip-plugin, 5.4).
 pub fn sign_in_answer(state: &UiState, id: u64, answer: AnswerDto) -> Result<(), String> {
-    let reply = match answer {
-        AnswerDto::Cancelled => SignInReply::Cancelled,
-        AnswerDto::Done(_) if matches!(state.sign_ins.shown(), Some((shown, SignInRequest::OpenPage { .. })) if shown == id) => {
-            return Err(i18n::pick("stronę logowania można tylko anulować", "a sign-in page can only be cancelled").into());
-        }
-        AnswerDto::Done(value) => SignInReply::Done(value),
+    let page = match state.sign_ins.shown() {
+        Some((shown, SignInRequest::OpenPage { redirect_prefix, .. })) if shown == id => Some(redirect_prefix),
+        _ => None,
+    };
+    let reply = match (answer, page) {
+        (AnswerDto::Cancelled, _) => SignInReply::Cancelled,
+        (AnswerDto::Done(pasted), Some(redirect_prefix)) => SignInReply::Done(Some(pasted_page(pasted.as_deref(), &redirect_prefix)?)),
+        (AnswerDto::Done(value), None) => SignInReply::Done(value),
     };
     state.sign_ins.answer(id, reply)
+}
+
+#[cfg(windows)]
+fn pasted_page(_pasted: Option<&str>, _redirect_prefix: &str) -> Result<String, String> {
+    Err(i18n::pick("stronę logowania można tylko anulować", "a sign-in page can only be cancelled").into())
+}
+
+#[cfg(not(windows))]
+fn pasted_page(pasted: Option<&str>, redirect_prefix: &str) -> Result<String, String> {
+    super::sign_in_page::check_pasted(pasted.unwrap_or_default(), redirect_prefix)
 }
 
 /// Opens the verification page of device-code prompt `id` in the default browser. Only that

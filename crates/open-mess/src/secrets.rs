@@ -1,8 +1,10 @@
-//! Secrets in Windows Credential Manager.
+//! Secrets in Windows Credential Manager, and outside Windows in the data folder's secrets file
+//! (file_store.rs; spec 2026-11-03-paperclip-plugin, 5.2).
 
 #[cfg(windows)]
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use keyring_core::Entry;
 #[cfg(windows)]
@@ -12,10 +14,33 @@ use crate::Error;
 
 const SERVICE: &str = "open_mess";
 const LOCAL_API_USER: &str = "local-api";
+const ADMIN_API_USER: &str = "admin-api";
 
 /// The bearer token of the local API. Generated and stored at the first call.
 pub fn local_api_token() -> Result<String, Error> {
-    if let Some(token) = stored_local_api_token()? {
+    token(LOCAL_API_USER)
+}
+
+/// The stored bearer token, if the daemon has created one. Never creates it, so a CLI call can't
+/// race the daemon's first start with a token of its own.
+pub fn stored_local_api_token() -> Result<Option<String>, Error> {
+    stored(LOCAL_API_USER)
+}
+
+/// The bearer token of the administrative API outside Windows (spec 2026-11-03-paperclip-plugin,
+/// 5.3). Generated and stored at the first call, like the local API's.
+pub fn admin_api_token() -> Result<String, Error> {
+    token(ADMIN_API_USER)
+}
+
+/// The stored administrative token, if the daemon has created one; never creates it.
+pub fn stored_admin_api_token() -> Result<Option<String>, Error> {
+    stored(ADMIN_API_USER)
+}
+
+/// The stored token of `user`, else 32 random bytes in hex, stored.
+fn token(user: &str) -> Result<String, Error> {
+    if let Some(token) = stored(user)? {
         return Ok(token);
     }
     let mut bytes = [0u8; 32];
@@ -24,25 +49,36 @@ pub fn local_api_token() -> Result<String, Error> {
         let _ = write!(hex, "{byte:02x}");
         hex
     });
-    local_api_entry()?.set_password(&token)?;
+    entry(user)?.set_password(&token)?;
     Ok(token)
 }
 
-/// The stored bearer token, if the daemon has created one. Never creates it, so a CLI call can't
-/// race the daemon's first start with a token of its own.
-pub fn stored_local_api_token() -> Result<Option<String>, Error> {
-    match local_api_entry()?.get_password() {
+fn stored(user: &str) -> Result<Option<String>, Error> {
+    match entry(user)?.get_password() {
         Ok(token) => Ok(Some(token)),
         Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(err) => Err(err.into()),
     }
 }
 
-fn local_api_entry() -> Result<Entry, Error> {
+/// Outside Windows, makes the secrets file of data folder `dir` keyring-core's default store, for
+/// the daemon and the CLI alike, before either touches a secret. Windows keeps Credential Manager.
+#[cfg(not(windows))]
+pub fn install_platform_store(dir: &Path) -> Result<(), Error> {
+    keyring_core::set_default_store(std::sync::Arc::new(crate::file_store::FileStore::open(dir)?));
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn install_platform_store(_dir: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
+fn entry(user: &str) -> Result<Entry, Error> {
     match keyring_core::get_default_store() {
-        // Only tests install a default store (the mock one).
-        Some(store) => Ok(store.build(SERVICE, LOCAL_API_USER, None)?),
-        None => credential_manager_entry(SERVICE, LOCAL_API_USER),
+        // The secrets file outside Windows, or the tests' mock store.
+        Some(store) => Ok(store.build(SERVICE, user, None)?),
+        None => credential_manager_entry(SERVICE, user),
     }
 }
 
@@ -71,7 +107,13 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(local_api_token().unwrap(), first);
-        assert_eq!(stored_local_api_token().unwrap(), Some(first));
+        assert_eq!(stored_local_api_token().unwrap(), Some(first.clone()));
+        // The administrative token is a token of its own.
+        assert_eq!(stored_admin_api_token().unwrap(), None);
+        let admin = admin_api_token().unwrap();
+        assert_ne!(admin, first);
+        assert_eq!(admin_api_token().unwrap(), admin);
+        assert_eq!(stored_admin_api_token().unwrap(), Some(admin));
     }
 
     #[cfg(windows)]

@@ -124,10 +124,17 @@ impl SignIns {
         Ok(Active(self.clone()))
     }
 
-    /// Takes the modules' prompts until every module context is gone.
-    pub async fn forward(self, mut prompts: mpsc::Receiver<Prompt>) {
+    /// Takes the modules' prompts until every module context is gone. A prompt `allowed` refuses
+    /// (a sign-in page off the approved hosts: sign_in_page.rs, `page_allowed`) is never shown: its
+    /// module gets the refusal, and may try another way.
+    pub async fn forward(self, mut prompts: mpsc::Receiver<Prompt>, allowed: impl Fn(&SignInRequest) -> Result<(), String>) {
         while let Some((request, reply)) = prompts.recv().await {
-            self.offer(request, reply);
+            match allowed(&request) {
+                Ok(()) => self.offer(request, reply),
+                Err(why) => {
+                    let _ = reply.send(SignInReply::Refused(why));
+                }
+            }
         }
     }
 

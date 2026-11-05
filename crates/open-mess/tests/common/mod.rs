@@ -15,6 +15,7 @@ use open_mess::modules::{self, Modules};
 use open_mess::store::Store;
 use open_mess::tools::Registry;
 use open_mess::ui::sign_in::SignIns;
+use open_mess::ui::sign_in_page;
 use open_mess_host::ip_policy::AddressPolicy;
 use open_mess_host::{AccountInfo, Engine, HostEvent, ModuleContext, Net, SignInPrompts, limits};
 use tempfile::TempDir;
@@ -152,13 +153,14 @@ pub async fn daemon_in(files: &[(&str, &str)], language: &str) -> Daemon {
     let (sender, events) = mpsc::channel(64);
     let (prompts, requests) = mpsc::channel(8);
     let sign_ins = SignIns::default();
-    tokio::spawn(sign_ins.clone().forward(requests));
     let store = store(dir.path());
     set_language(&store, language);
     approve_all(&store, &scan(&store, &engine, dir.path()).await);
     let modules = scan_prompting(&store, &engine, dir.path(), sender, SignInPrompts::with_budget(prompts, SIGN_IN_BUDGET)).await;
     let credentials: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
     let accounts = accounts(dir.path(), modules, Arc::clone(&credentials));
+    let page_accounts = Arc::clone(&accounts);
+    tokio::spawn(sign_ins.clone().forward(requests, move |request| sign_in_page::page_allowed(&page_accounts, request)));
     let registry = Registry::new(Instant::now(), Arc::clone(&accounts));
     Daemon { dir, accounts, registry, events, credentials, sign_ins }
 }

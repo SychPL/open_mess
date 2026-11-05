@@ -2,6 +2,7 @@
 //! configuration window on Windows.
 
 use std::io::Write as _;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -84,7 +85,8 @@ pub fn run() -> Result<(), Error> {
     // A second daemon fails here and leaves the running one's error file alone.
     let _lock = acquire_lock(&dir)?;
     let window = Opener::default();
-    let (runtime, listener, registry, ui) = start(&dir, started, &window, probation, update.clone()).inspect_err(|err| record(&err.to_string()))?;
+    let (runtime, listener, registry, ui, admin_token) =
+        start(&dir, started, &window, probation, update.clone()).inspect_err(|err| record(&err.to_string()))?;
     let _ = std::fs::remove_file(&error_file);
     let exit = Arc::clone(&ui.exit);
     let registry = Arc::new(registry);
@@ -107,9 +109,16 @@ pub fn run() -> Result<(), Error> {
         });
     }
     // Never println!: it panics when the launcher has closed stdout.
-    let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://127.0.0.1:{}/mcp", listener.local_addr()?.port());
+    let _ = writeln!(std::io::stdout(), "open_mess daemon listening on http://{}/mcp", listener.local_addr()?);
     let (stop, stopped) = oneshot::channel::<()>();
-    let serve = api::serve(listener, ui.token.clone(), registry, window.clone(), async {
+    let token = ui.token.clone();
+    // A server has no window: the window's state goes to the administrative API instead (spec
+    // 2026-11-03-paperclip-plugin, 5.4).
+    let (window_state, admin) = match admin_token {
+        Some(token) => (None, Some(api::Admin { token, ui: Arc::new(ui) })),
+        None => (Some(ui), None),
+    };
+    let serve = api::serve_with_admin(listener, token, admin, registry, window.clone(), async {
         let _ = stopped.await;
     });
     // The API ending on its own ends the daemon too, tray and all.
@@ -122,7 +131,15 @@ pub fn run() -> Result<(), Error> {
             served
         }
     });
-    if let Err(err) = ui::run(&runtime, ui, window.clone(), until_stopped(Arc::clone(&ended), Arc::clone(&exit))) {
+    let quit = until_stopped(Arc::clone(&ended), Arc::clone(&exit));
+    let shown = match window_state {
+        Some(ui) => ui::run(&runtime, ui, window.clone(), quit),
+        None => {
+            runtime.block_on(quit);
+            Ok(())
+        }
+    };
+    if let Err(err) = shown {
         // Without the tray and the window the daemon still serves its agents; `om config` says so.
         let _ = writeln!(std::io::stderr(), "{err}");
         runtime.block_on(window.close());
@@ -135,12 +152,26 @@ pub fn run() -> Result<(), Error> {
     runtime.block_on(server).map_err(|err| Error::Io(std::io::Error::other(err)))?
 }
 
-/// Ctrl+C, the API ended, or `exit` was notified.
+/// Ctrl+C, SIGTERM (`docker stop`, Unix), the API ended, or `exit` was notified.
 async fn until_stopped(ended: Arc<Notify>, exit: Arc<Notify>) {
     tokio::select! {
         () = ctrl_c() => {}
+        () = terminate() => {}
         () = ended.notified() => {}
         () = exit.notified() => {}
+    }
+}
+
+/// The address the API listens on: 127.0.0.1, or with `OPEN_MESS_LISTEN=0.0.0.0` every interface
+/// of a server container (spec 2026-11-03-paperclip-plugin, 5.1). Nothing else: the CLI always
+/// calls 127.0.0.1, which 0.0.0.0 covers and an interface's own address would not. Windows listens
+/// on 127.0.0.1 only, whatever the variable says (spec 8.1).
+pub fn listen_ip(listen: Option<&str>, windows: bool) -> Result<Ipv4Addr, Error> {
+    match listen {
+        _ if windows => Ok(Ipv4Addr::LOCALHOST),
+        None => Ok(Ipv4Addr::LOCALHOST),
+        Some("0.0.0.0") => Ok(Ipv4Addr::UNSPECIFIED),
+        Some(other) => Err(Error::BadConfig(format!("OPEN_MESS_LISTEN must be 0.0.0.0 or unset, not {other:?}"))),
     }
 }
 
@@ -187,14 +218,19 @@ fn start(
     window: &Opener,
     probation: bool,
     update: Option<Update>,
-) -> Result<(Runtime, TcpListener, Registry, UiState), Error> {
+) -> Result<(Runtime, TcpListener, Registry, UiState, Option<String>), Error> {
+    // Before any secret: outside Windows they live in the data folder.
+    secrets::install_platform_store(dir)?;
     let store = Store::open(&dir.join("state.sqlite3"))?;
     // Before anything shows a text: the tray, the toasts, the window.
     i18n::apply_language(&store);
     let port = store.port()?;
+    let ip = listen_ip(std::env::var("OPEN_MESS_LISTEN").ok().as_deref(), cfg!(windows))?;
     let token = secrets::local_api_token()?;
+    // The administrative API exists only where there is no window (spec 2026-11-03-paperclip-plugin, 5.3).
+    let admin_token = if cfg!(windows) { None } else { Some(secrets::admin_api_token()?) };
     let runtime = Runtime::new()?;
-    let listener = runtime.block_on(api::bind(port))?;
+    let listener = runtime.block_on(api::bind_on(ip, port))?;
     // One engine for the process; the modules keep it for loading files again.
     let engine = Engine::new()?;
     let (events, host_events) = mpsc::channel(EVENT_QUEUE);
@@ -233,7 +269,9 @@ fn start(
     };
     runtime.spawn(bus.forward(host_events, Arc::clone(&accounts), Arc::clone(&activity)));
     let sign_ins = SignIns::default();
-    runtime.spawn(sign_ins.clone().forward(sign_in_prompts));
+    // A sign-in page off the module's approved hosts is refused before any front end shows it.
+    let page_accounts = Arc::clone(&accounts);
+    runtime.spawn(sign_ins.clone().forward(sign_in_prompts, move |request| ui::sign_in_page::page_allowed(&page_accounts, request)));
     // Sessions come back in the background; the tools answer meanwhile.
     runtime.spawn({
         let (accounts, restored) = (Arc::clone(&accounts), Arc::clone(registry.accounts_restored()));
@@ -293,13 +331,29 @@ fn start(
         exit,
         update,
     };
-    Ok((runtime, listener, registry, ui))
+    Ok((runtime, listener, registry, ui, admin_token))
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.
 const EVENT_QUEUE: usize = 256;
 /// Sign-in prompts waiting for the window's side; only one module signs in at a time.
 const SIGN_IN_QUEUE: usize = 8;
+
+#[cfg(unix)]
+async fn terminate() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            let _ = sigterm.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate() {
+    std::future::pending::<()>().await;
+}
 
 async fn ctrl_c() {
     // Without a Ctrl+C handler the daemon runs until it is killed, rather than stopping at once.
@@ -311,6 +365,19 @@ async fn ctrl_c() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_loopback_or_every_interface_is_listened_on() {
+        assert_eq!(listen_ip(None, false).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(listen_ip(Some("0.0.0.0"), false).unwrap(), Ipv4Addr::UNSPECIFIED);
+        // An interface's own address would cut off the CLI, which calls 127.0.0.1.
+        for wrong in ["::", "10.0.0.5", "localhost", "abc", "", "127.0.0.1"] {
+            assert!(listen_ip(Some(wrong), false).is_err(), "{wrong}");
+        }
+        // Windows listens on loopback only, whatever the variable says.
+        assert_eq!(listen_ip(Some("0.0.0.0"), true).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(listen_ip(Some("abc"), true).unwrap(), Ipv4Addr::LOCALHOST);
+    }
 
     #[test]
     fn diagnostics_print_only_open_mess_logs() {

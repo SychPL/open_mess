@@ -14,7 +14,12 @@ use crate::limits;
 use crate::storage::{Storage, StorageError};
 
 /// The platform credential store, set up on first use. It becomes keyring-core's default store.
+/// A default store set before (open_mess's secrets file outside Windows) is kept: keyring's facade
+/// would replace it with a platform store that a server container doesn't have.
 pub fn platform_store() -> Result<Arc<CredentialStore>, String> {
+    if let Some(store) = keyring_core::get_default_store() {
+        return Ok(store);
+    }
     keyring::Entry::store_status().as_ref().map_err(|e| format!("credential store unavailable: {e}"))?;
     keyring_core::get_default_store().ok_or_else(|| "credential store unavailable".to_string())
 }
