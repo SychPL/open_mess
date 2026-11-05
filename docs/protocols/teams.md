@@ -1,6 +1,6 @@
 # Microsoft Teams client protocol
 
-Status: sections 1-8 (2026-10-26) and 9 (2026-10-27) come from static analysis: no account was signed in for them, no
+Status: sections 1-8 (2026-10-26), 9 (2026-10-27) and 10 (2026-10-28) come from static analysis: no account was signed in for them, no
 request was sent to a Microsoft service, and nothing from the official client's user data
 (`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\`) or any browser profile was read. Facts later
 checked on the wire, with the user present, are in "Live results" at the end and override the
@@ -312,6 +312,9 @@ All **CONFIRMED** in `cmd-trouter-3959f9e7ca693a2a.js` (REA `ev_825293a6...`, cl
 3. Connect: Socket.IO 0.9 style over `wss://.../v4/c` (`X()` swaps `/v4/a` and `/v4/c`), query =
    `connectparams` + `v=v4`, `tc=<client info JSON>`, `timeout=40`, `auth=true`, `epid=<endpointId>`,
    optional `userActivity`. Ping 40 s, pong timeout 5 s, connect timeout 20 s.
+   **CONFIRMED** by later analysis (section 10.7): this allocate-then-connect flow is v4a, the
+   fallback; the default is v4c, one WebSocket to `/v4/c` with no allocate step. The frames and the
+   downstream request envelope are given there.
 4. Register: `POST https://teams.microsoft.com/registrar/prod/v2/registrations` (or
    `regionGtms.calling_registrarUrl`) body
    `{"clientDescription":{"appId":"TeamsCDLWebWorker","aesKey":"","languageId":"en-US","platform":"<browser>","templateKey":"TeamsCDLWebWorker_2.6","platformUIVersion":"<ver>","productContext":...},"registrationId":"<endpointId>","nodeId":"","transports":{"TROUTER":[{"context":"","path":"<surl>","ttl":<s>}]}}`.
@@ -509,6 +512,312 @@ MCPS also returns `AISummary` and `callCrux` resources, and the recap reads AI n
 `meetingRecapServiceEndpoint` and `.../api/mcps/prod/meetingcatchup/...`. These are Copilot outputs,
 not transcripts; not analysed further (stage 2 leaves summaries to the agent).
 
+## 10. Live captions (stage 3 question)
+
+**Static analysis, not verified live.** Added 2026-10-28 to answer whether open_mess could receive
+live captions by joining a meeting itself, as the user's second endpoint without audio or video
+(captions exist only for call participants and are never stored; reading them from the official
+client is ruled out by AGENTS.md). Same package and decompressed copy as above; ripgrep over the
+chunks, no REA Evidence id. Main chunks: `114419-5658b4e2d56443ff.js` (8.8 MB, the JS calling core:
+captions, calling bot and data channel services), `calling-electron-c8eaed3906901b6a.js` (the bridge
+to the native calling stack), `calling-pluginless-6f37e714be91fccf.js` (the browser WebRTC stack),
+`523694-597666624a12ca08.js` (enums), `r_data-client-calling-cb8f40176e83d3b8.js` (GraphQL resolvers),
+`services-calling-service-adapters-6bbf4eb6997da139.js`, `calling-locale-en-us-52ee734f3e49b32e.js`.
+
+### 10.1 Calling stack and join
+
+- **CONFIRMED** on the desktop, signaling and media run in the native SlimCore stack outside the web
+  view (`services-calling-service-adapters`: `isSlimCoreRunningOutproc(){return!0}`; JS WebRTC only on
+  VDI / "pluginless"). The bridge is a global `window.SlimCore` that the host injects with
+  `scwv2_bundle.js` (not among the web assets).
+- **CONFIRMED** join (`calling-electron`, `SlimCoreElectronCall._joinOrStartSlimCoreCall`):
+  `joinSignalingSessionWithMeetingData(<meeting data>, shouldResurrect, {conversationUrl,
+  conversationId, conversationType}, mediaPeerType, options)`, options including `threadId`, `messageId`,
+  `meetingInfo`, `endpointMetadata`, `participantLegId`, `audioDirection` (default Bidirectional),
+  `videoDirection` (default ReceiveFromPeer), `screenshareDirection`, `datachannelDirection` (Disabled
+  unless ECS `SkypeCalling.enableDataChannelByDefault`), `muteFlags`, `clientEndpointCapabilities`.
+  Directions: 0 Disabled, 1 ReceiveFromPeer, 2 SendToPeer, 3 Inactive, 4 Bidirectional. With the call
+  already on another endpoint of the user, `mediaPeerType` becomes `EnterpriseMultiParty`.
+- **CONFIRMED** the protocol (seen in the pluginless stack, which speaks it in JS): `JoinConversation`
+  and `JoinConversationWithoutCallModality` to `signalingAgentConfig.conversationServiceUrl`, which ECS
+  gives at run time (the production host is not in the bundle; `config-prod` has only an override key
+  and an on-premises template `https://{appliance_fqdn}:8443/api/v1/conv`). A join with the call
+  modality carries an SDP offer; only a user the server marks as a streaming attendee skips it
+  (`skipOfferGenerationForStreamingUser`).
+- **CONFIRMED** the service calls the client back: every callback link (`/conversation/addModalitySuccess/`,
+  `/conversation/contentSharingUpdate/`, ...) is built on `baseMessagingChannelUrl`, the Trouter URL
+  (section 5), with the broker as fallback. The local participant is `participants.from: {id, displayName,
+  endpointId, participantId, languageId}`. **UNCONFIRMED** whether a registrar registration is required
+  too ("Needs live capture" 17).
+
+### 10.2 Transport of the captions
+
+- **CONFIRMED** captions come from a server-side bot in the call, not from a captions service the
+  client asks. Starting captions (GraphQL `startClosedCaptions(teamsCallId)`) adds the bot (a `28:` MRI,
+  shared with recording and transcription: `addParticipant(getBotDefaultMRI(), ...)` or
+  `addCombinedRecorderBot`) if it is not in the call, else sends it a start command. The command is an
+  HTTP POST to the bot's `commandUrl`, which the client reads from the bot's roster entry
+  (`commandUrl=t.endpointMetadata.commandUrl`), with a skype token and an AAD token: body
+  `{timestamp, participantMri, participantLegId, action: "start", mode: "transcription", processingModes:
+  [ClosedCaptions], actionParameters, participantSkypeToken}`; other actions `setLanguage`, `addLanguage`,
+  `stop`, `userSettingsUpdate`, `setUserToken`.
+- **CONFIRMED** the caption text arrives on the call's **data channel**, a media modality:
+  `initializeDataChannelForDynamicClosedCaptionsTrack` registers `callingBotService().registerDataCallback(call,
+  l, ClosedCaptionsMW, onDataReceived, SourceAndSink)` with `const l=3`, the data id `DATA_ID_TRANSCRIPT=3`
+  (`523694`; real-time text is `DATA_ID_RTT=24`). On the desktop the bytes come from a SlimCore data sink
+  (`calling-electron`: `_slimcoreInstance.createDataSink(dataId)`, `_dataChannel.registerDataSink(...)`,
+  `dataSink.on("data", ...)`, the channel from call property `CallDataChannelObjectId`); in the browser
+  stack from a WebRTC `createDataChannel("main-channel")` on the media peer connection.
+- **CONFIRMED** each message is JSON: `recognitionResults[]` (speech recognition, source `Ai`),
+  `textTracks[]` (`Mt` translation, `Cart`, `Cea708`, `RTT`), `events[]` and others. The UI's
+  `ClosedCaptionsEntry` has `id, text, isFinal, userId, userDisplayName, utteranceId, roomId,
+  spokenLanguage, trackLanguage, source, timestamp, duration, speakerType`.
+- **CONFIRMED** the shipped code has no other path: no captions handler in the Trouter client (`cmd-trouter`), no HTTP or
+  WebSocket subscription for ordinary meetings. Town hall and live-stream attendees poll encrypted
+  caption chunks over HTTP instead (`services-broadcast-captions`, `{cacheUrl, originUrl, aesKey}` from
+  the stream metadata) - not ordinary meetings.
+
+### 10.3 Joining without audio or video
+
+- **CONFIRMED** "Don't use audio" and "Add this device" (companion selection,
+  `adjustIntentForCompanionSelection`: outgoing video, outgoing and incoming audio off, the existing
+  call id) are a normal media call with mute flags; no mapping to `audioDirection` Disabled was found.
+- **CONFIRMED** a signaling-only join exists, "subscribe" (`joinCallWithoutCallModality`, telemetry
+  `JOIN_CONVERSATION_WITHOUT_CALL_MODALITY`, role `joinForRosterOnly`, states `CONNECTED_FOR_ROSTER_ONLY`;
+  SlimCore `subscribeToSignalingSessionWithMeetingData`): roster and events, no media session, so no
+  data channel and no captions.
+- **CONFIRMED** the data channel is its own modality: the client itself joins with
+  `datachannelDirection` Bidirectional while `audioDirection` is Inactive and `videoDirection` Disabled
+  (IP audio/video off, screen-share-only joins), so captions can reach an endpoint that sends and
+  receives no audio or video - but only over a negotiated media session (SDP, ICE, DTLS, SCTP).
+- **UNCONFIRMED** whether `noMediaTimeoutMs` / `NoMediaFlow` ends a call whose only media is the data
+  channel ("Needs live capture" 17).
+
+### 10.4 Language, policy, speakers, side effects
+
+- **CONFIRMED** spoken language: bot command `setLanguage` with `{spokenLanguage}` (per user
+  `{userSpokenLanguage}`, subtitles `{subtitleLanguages}`). Anyone may change it while transcription is
+  off; while it runs, only the organizer or whoever started transcription (`canChangeMeetingSpokenLanguage`,
+  flag `enableSpokenLanguageRestriction`). Every client sees the change through the bot's roster
+  `endpointMetadata.spokenLanguage` and shows "Meeting language was changed to ... This will change for
+  everyone in the meeting." (no name, no chat message). Default `en-us`, or the bot's `defaultLanguage`;
+  automatic detection exists.
+- **CONFIRMED** policy: the user's tenant policy `liveCaptionsEnabledType` from the synced user policy
+  settings (`meetingPolicySettings`), region gating, and the meeting's
+  `meetingDetails.meetingCapability.allowTranscription` from the call's meeting details; bot failures in
+  its `endpointMetadata.runtimeErrors`; "Due to policy, you can't copy captions". **UNCONFIRMED** whether
+  the organizer has an option for captions alone; none was found ("Needs live capture" 19).
+- **CONFIRMED** speakers: each result carries `userId` (an MRI; anonymous ones end in `@local`) and
+  `displayName`, `roomId` for room devices; no media-source mapping through the roster is needed.
+- **CONFIRMED** CART is the same data-channel stream, a text track with `source: "Cart"`.
+- **CONFIRMED** turning captions on adds the bot when it is absent (the client filters `28:` bots out of
+  participant lists); the only captions alert is a local "start failed". Transcription, unlike captions,
+  announces itself (`TranscriptStartedByOthers`) and is stored. **UNCONFIRMED** whether the service keeps
+  anything of captions alone ("Needs live capture" 19).
+
+### 10.5 Visibility of a second endpoint
+
+- **CONFIRMED** the user's own official client notices: `checkForActiveCallOnDifferentEndpoints` ->
+  `activeCallOnDifferentEndpointExists` drives "You're in {{title}} on another device. Want to join on
+  this one?", "How would you like to join on this device?", "Transfer to this device" and "Add this
+  device".
+- **UNCONFIRMED** what other participants see ("Needs live capture" 18): the call model keeps a participant's endpoints as a list
+  (`userEndpointCount` = `endpoints.endpointDetails.length`, GraphQL `...endpointDetailsFields`), which
+  suggests one roster row with two endpoints; the roster rendering, join toast and sound were not checked.
+- **CONFIRMED** blocks on an extra endpoint: end-to-end encrypted meetings take one device
+  (`calling_e2ee_meeting_single_device_limit`), immersive events, overflow streaming. Lobby is decided by
+  the server per identity (`CallJoinAsLobbyUser`, `autoAdmittedUsers`); no client logic sends a second
+  endpoint of an admitted user to the lobby.
+
+### 10.6 Verdict
+
+**Needs media.** Live captions reach a participant only on the data channel of a negotiated media
+session; signaling (and the Trouter push) carries the bot's roster entry and commands, not the text,
+and the signaling-only "subscribe" join gets no data channel. open_mess would have to do what SlimCore
+does: join the conversation service as an endpoint with callback links on its own Trouter connection,
+offer SDP with audio and video inactive or disabled and a data channel, run ICE, DTLS and SCTP to the
+Teams media relays, and parse the JSON messages of data id 3. That is a WebRTC-class transport, far
+beyond the HTTP and WebSocket host imports modules have today (a new host capability, its own spec).
+
+Main risks: the user's own official client shows "You're in this meeting on another device" while
+open_mess is in the call (it disturbs the official client, against AGENTS.md, unless the owner accepts
+it); others probably see one entry but that is unverified; starting captions when no one has them on
+adds the caption bot for everyone; E2EE meetings refuse the second device; a no-media timeout may end
+the call; the conversation-service host and media relay details come from ECS at run time and were not
+seen. A live check of 10.3 and 10.5 would need the owner's consent and a test meeting.
+
+### 10.7 Join, relays and the data channel (step 0a of the live captions spec)
+
+**Static analysis, not verified live.** Added 2026-10-29 for step 0a of
+`.specs/2026-10-29-live-captions.md`: ripgrep over the same chunks, mainly the browser stack
+`calling-pluginless-6f37e714be91fccf.js` (which speaks the conversation-service protocol in JS; the
+desktop's SlimCore speaks it natively), the calling core `114419-5658b4e2d56443ff.js` and `config-prod`.
+
+**Conversation service and join**
+
+- **CONFIRMED** default service URL `https://api.flightproxy.teams.microsoft.com/api/v2/epconv/`
+  (`114419`, `kb.conversationServiceUrl`); ECS namespace `SkypeCalling`, key `conversationServiceUrl`,
+  may override it (ECS host `https://config.teams.microsoft.com/config/v1/Teams/`; its query
+  parameters are not in the bundle). A client can use the default.
+- **CONFIRMED** join = `POST` of JSON to that URL (`startOrJoinCall`, `sendPostRequest`, operation
+  `CallSetup`); a 409 re-joins at the `conversationUrl.Location` it returns. Auth: `X-Skypetoken` by
+  default; with `clientSupportsGenericTokenAPI` the server's `WWW-Authenticate` picks `skype`, `aad` or
+  `cae`, and the AAD forms send `Authorization: Bearer` with the token-migration header. Other headers:
+  `X-Microsoft-Skype-Chain-ID` (correlation), `X-Microsoft-Skype-Client`. **UNCONFIRMED** the AAD
+  audience (probably `callingTokenLogicalUrl`, default `https://calling.teams.microsoft.com`).
+- **CONFIRMED** body (`uw(...)` in the browser stack), keys only:
+  `payload.conversationRequest {conversationType, subject, roster {type: "Delta", rosterUpdate: <link>},
+  properties, links {conversationEnd, conversationUpdate, localParticipantUpdate, addParticipantSuccess,
+  addParticipantFailure, receiveMessage}}`, `groupChat {threadId, messageId}`, `participants.from {id,
+  displayName, endpointId, participantId, languageId, meetingRegistrationId, participantPin}`,
+  `endpointCapabilities`, `clientEndpointCapabilities`, `endpointMetadata`, `meetingInfo`, `meetingData`,
+  `endpointState`, and `callInvitation {links {progress, mediaAnswer, acceptance, redirection, end},
+  mediaContent, callModalities, ...}`. The SDP offer goes in `callInvitation.mediaContent` with content
+  type `application/sdp-ngc-1.0` (the SDP text in `blob`). The roster-only join (`subscribe`) is the same
+  body without `callInvitation`.
+- **CONFIRMED** callback links are `<Trouter URL>callAgent/<session id>/<uuid><path>` (`/callAgent/`
+  matched on the way in), paths `/call/progress/`, `/call/mediaAnswer/`, `/call/acceptance/`,
+  `/call/redirection/`, `/call/end/`, `/conversation/conversationEnd/`, `/conversation/conversationUpdate/`,
+  `/conversation/localParticipantUpdate/`, `/conversation/rosterUpdate/` and others; they arrive as
+  HTTP requests delivered over Trouter, answered `200`. **UNCONFIRMED** the Trouter envelope and whether
+  a registrar registration is needed besides a Trouter connection ("Needs live capture" 5, 7, 17);
+  the broker fallback's address was not found.
+- **CONFIRMED** answer and roster: `/call/mediaAnswer/` carries `mediaAnswer.mediaContent` (the client
+  acknowledges with a `POST` to `mediaAnswer.links.mediaAcknowledgement`); `/call/acceptance/` carries
+  `callAcceptance.mediaContent.blob` (final SDP), `acceptedCallModalities` and `links.callLeg`. The
+  roster comes as deltas on `/conversation/rosterUpdate/`, each participant with
+  `endpoints.endpointDetails[].endpointMetadata`; captions are on when
+  `endpointMetadata.processingModes.closedCaptions.state` is `Active` (other states `Inactive`,
+  `WaitingForMeetingLive`, `Paused`; `getProcessingModeState`).
+- **CONFIRMED** leave = `POST` to `links.leave` from the conversation response, body
+  `{participants: {from: {id, displayName, endpointId, participantId, languageId}}, callTransactionEnd:
+  {code, subCode, phrase}}`; on page close the client sends the same as a beacon. The meeting's end
+  arrives on `/conversation/conversationEnd/` (sub-code `CONVERSATION_END_RECEIVED_FROM_SERVICE` 4100),
+  the leg's on `/call/end/`.
+- **CONFIRMED** presence without joining: the "on another device" check reads the user's call store,
+  `GET https://api.flightproxy.teams.microsoft.com/api/v2/ep/api.userstore.skype.com/api/v1/user/<MRI>/conversations`
+  (`config-prod` `callStore.user.url`; `114419` builds `${url}/user/${mri}/conversations`), with
+  `X-Skypetoken` or an AAD bearer. **UNCONFIRMED** the item fields that name the meeting.
+
+**Relays**
+
+- **CONFIRMED** TURN hosts from configuration: `default.relay.teams.microsoft.com` (UDP 3478, TCP and
+  TLS 443), and `tr.teams.microsoft.com` (`TRAPRelayFqdn`); one configuration variant names the address
+  `52.113.193.5`. No wildcard host and no published address ranges of media servers are in the bundle.
+- **CONFIRMED** credentials: `GET https://teams.microsoft.com/trap/tokens` with `api-version: 2` and
+  `X-Skypetoken` (or a bearer under the newer token API); the answer is `{expires, tokens: [{realm,
+  username, password}]}` (realm `rtcmedia`); refreshed early from `earlyRefreshMinutes`. ICE servers are
+  built as `turn:<host>:3478?transport=udp`, `turn:<host>:443?transport=tcp`, `turns:<host>:443`.
+- **CONFIRMED** ICE: no trickle - the offer is sent after gathering finishes, remote candidates come in
+  the answer SDP (no `addIceCandidate`); `iceTransportPolicy` `all` by default, `bundlePolicy`
+  `max-bundle`, `rtcpMuxPolicy` `require`.
+- **CONFIRMED** offer shape: transceivers start `inactive`; the data channel is
+  `createDataChannel("main-channel")` (`m=application ... webrtc-datachannel`). The official client
+  keeps at least an inactive audio section; **UNCONFIRMED** whether an offer with only the data section
+  is accepted (step 0b).
+
+**Data channel**
+
+- **CONFIRMED** one channel `main-channel`, binary, every message with an 11-byte header, big-endian:
+  byte 0 = version 1 in the high nibble and the top 4 bits of the 12-bit header length, byte 1 = the
+  rest of the header length (11 + 4 per recipient), byte 2 = start-of-message flag `0x80` and data id
+  in bits 0-5, bytes 3-4 = sequence number per data id, byte 5 = fragments that follow, bytes 6-9 =
+  source id, byte 10 = recipient count, then 4 bytes per recipient; the payload follows the header,
+  fragments are reassembled by sequence number (`depacketize`). Captions (data id 3) are UTF-8 JSON.
+- **CONFIRMED** nothing has to be sent on the channel to receive captions: the handler only listens.
+- **CONFIRMED** caption entries (`recognitionResults[]`, `textTracks[]`) carry `id`, `text`, `isFinal`,
+  `userId`, `displayName`, `spokenLanguage`, `source`, `roomId`, `timestampAudioSent`, `duration`.
+  **UNCONFIRMED** the time units.
+
+**Trouter and call signaling, in detail** (added later on 2026-10-29, same method; mainly
+`cmd-trouter-3959f9e7ca693a2a.js` and `calling-pluginless-6f37e714be91fccf.js`; settles the static
+half of "Needs live capture" 7 and narrows 5 and 17)
+
+- **CONFIRMED** protocol choice (`tokenTypeProtocolSelector`): the default is **v4c**, a WebSocket
+  straight to `wss://.../v4/c` with no allocate step. The client falls back to the **v4a** flow of
+  section 5 only when `forceV4aProtocol` is set, when `forceV4aProtocolForSkypetoken` is set and the
+  token is a skype token (unless `scae` is `"1"`), or after a `v4c-websocket-failure`. The values of
+  those flags come from configuration at run time and were not seen.
+- **CONFIRMED** v4c query (`buildV4cUrlParams`): `tc=<client info JSON>`,
+  `timeout=<pingTimeoutMs / 1000>`, `epid=<endpoint id>`, `ccid`, `dom` (if set), `cor_id`,
+  `con_num=<client id>_<attempt>`; no `auth`, no `v`. The auth header goes on the upgrade request:
+  `X-Skypetoken` for a skype token, `Authorization: Bearer` for an AAD or CAE token. The server's
+  `trouter.connected` event then carries what allocate returns in v4a: `surl`, `connectparams`, `ttl`,
+  `ccid`, `id`, `reconnectUrl`, `curlb`.
+- **CONFIRMED** v4a details: allocate is a `POST` with an empty body and `Content-Type: text/plain`,
+  query `cor_id`, `con_num`, `epid`, `tc` (no `auth`, no `timeout`), and the response must be JSON with
+  `socketio` (base URL), `surl`, `ccid`, `id`, `ttl`, `connectparams` and optional `curlb`. The
+  WebSocket is then a standard Socket.IO 0.9 handshake: `GET <socketio>socket.io/1/?<query>&t=<ms>`
+  answers `sid:heartbeat:closeTimeout:transports`, then `wss://<host>/socket.io/1/websocket/<sid>?<query>`,
+  where the query is every `connectparams` key plus `v=v4`, `tc`, `timeout`, `auth=true`, `epid`,
+  `ccid`, `dom`, `cor_id`, `con_num`.
+- **CONFIRMED** frames (Socket.IO 0.9, `type:id[+]:endpoint[:data]`): `1::` connect, `2::` heartbeat
+  (echoed back), `3:::<json>` message, `5:<id>[+]::{"name", "args"}` event (`+` asks for an ack),
+  `6:::<id>` ack. A downstream request is a `3:::` message with `id` (number), `method`, `url`,
+  `headers` (`MS-CV` among them) and `body` (a string). The client answers with a `3:::` message
+  `{"id": <same id>, "status": 200, "headers": {...}, "body": "<string>"}`, the headers being
+  `MS-CV: <received CV>.<n>`, `trouter-client: {"cd": <ms taken>}` and `trouter-request` /
+  `trouter-is-broadcast` echoed when present; an app that does not answer within 5 s gets a 504 from
+  the client library itself. Ping is the event `5:<n>+::{"name":"ping"}`, acked by the server with
+  `6:::<n>`; `pingTimeoutMs` is 40 s. Events from the server: `trouter.connected`, `trouter.reconnect`,
+  `trouter.message_loss`, `audience.subscriptionresult`; from the client: `user.activity` (customary
+  after connecting, not required; open_mess never sends it, item 8 of "Proposed spec changes") and
+  `trouter.processed_message_loss`.
+- **CONFIRMED** compressed callbacks: a downstream request whose header
+  `X-Microsoft-Skype-Content-Encoding` (any case) is `gzip` has a base64 body that inflates (gzip or
+  zlib, auto-detected) to UTF-8 JSON; the client returns 400 when that fails. The server only
+  compresses for an endpoint that set capability bit 128.
+- **CONFIRMED** `endpointCapabilities` bits: 1 group video call joining, 2 cloud screen sharing,
+  4 hostless group calls, 16 broker incoming, 32 auto-join on conflict, 64 always (server mute),
+  128 compressed payload, 512 reinviteless media, 1024 always, 2048 watermark, 4096 audio-only
+  watermark, 8192 batched receive message, 16384 batched send message status, 65536 auto-promotion,
+  131072 prevent screen capture. The minimum is `64 | 1024` = 1088. `clientEndpointCapabilities` is a
+  separate number, 0 by default, sent as `null`.
+- **CONFIRMED** join body values for a meeting: `suppressDialout: true`, `scenario: null`
+  (`"409RedirectJoin"` after a 409), `conversationType: null`; the four `properties` are booleans from
+  configuration (`allowConversationWithoutHost` and the three event-message switches);
+  `groupChat.messageId` is the reply-chain id when known, else `"0"`; `capabilities: null`.
+  `callModalities` is a subset of `["Audio", "Video", "ScreenSharer", "ScreenViewer"]` - **there is no
+  data modality**. `mediaContent` is `{blob, contentType: "application/sdp-ngc-1.0"}`, optionally with
+  `requiredFeatures`, `skipIceReinvite` and `clientLocation`. **UNCONFIRMED** the keys of
+  `meetingInfo` (only `tenantId`, `organizerId` and `replyChainMessageId` are built explicitly; the rest
+  is passed through from the thread's meeting properties), the contents of `endpointMetadata`, the
+  `applicationType` value and whether the Trouter URL gets a path suffix before `callAgent/` (it must
+  end with `/`).
+- **CONFIRMED** the offer as sent: no trickle (sent after gathering), then `toOffer()`, which filters
+  candidates, sets port 9 on bundle-only sections and, unless `disableMsSdp` is set, applies the MS-SDP
+  transform `toMsSdp`: `msid-semantic: WMS *`, profile `RTP/SAVP`, `a=label` per section
+  (`main-audio`, ...), the data section cut down to type, port, protocol, payload `34`, mid and label,
+  `a=x-ssrc-range` (non-multistream), `|2^31` on crypto lines, the session fingerprint copied into each
+  section, candidate and extension rewrites and `rtcp` set to the m-line port. That `disableMsSdp`
+  exists suggests the service also takes plain SDP; **UNCONFIRMED**.
+- **CONFIRMED** callbacks: `/call/mediaAnswer/` body `{"mediaAnswer": {sender, mediaContent {blob,
+  contentType}, noRingBack}}` (provisional answers the service retries are ignored);
+  `/call/acceptance/` body `{"callAcceptance": {links {acknowledgement}, ...}}`, and the client **must**
+  `POST {payload: {callAcceptanceAcknowledgement: {links: {mediaRenegotiation, transfer, replacement,
+  balanceUpdate, retargetCompletion, ...}}}}` to `links.acknowledgement` (its own callback links). The
+  client answers a callback 200 with an empty body; 400 for a missing body, a bad path or a failed
+  decode, 404 for an unknown session.
+- **CONFIRMED** join response (any 2xx; 200 or 201 not settled): `conversationController` (the
+  conversation URL for later requests), `sequenceNumber`, `links` (`leave`, `addModality`,
+  `removeModality`, `mute`, `updateEndpointMetadata`, `getAllParticipants` and others),
+  `subscriptionDetails.selfParticipant`, `selfParticipant` (`enableCaptcha`, `enforceConsentToJoin`,
+  `preMeetingConsentInfo`) and `roster`. The SDP answer is not in it; it comes on `/call/mediaAnswer/`.
+
+**For the spec:** the steps of 5.2-5.3 hold. Presence can be checked before joining (4.1 takes that
+path); the offer should copy the official shape (inactive audio plus the data channel) unless step 0b
+shows a data-only offer works; the manifest needs `api.flightproxy.teams.microsoft.com`,
+`default.relay.teams.microsoft.com` and `tr.teams.microsoft.com`; `media.peers` has no source in the
+client and must come from step 0b (the candidates in the answer) and Microsoft's published ranges.
+The Trouter details above add four things for step 0b: the module needs `go.trouter.teams.microsoft.com`
+(v4c, one WebSocket) and must answer every downstream request within 5 s; a join needs a call
+modality, and since there is no data modality, a data-only join either sends `["Audio"]` with an
+inactive audio section or an empty list - which one the service accepts is step 0b; whether a plain
+(non-MS) SDP offer is accepted is step 0b; and the client must acknowledge `callAcceptance`. Offline
+note from the step 0b probe (two local `webrtc` 0.14 peers, no Teams involved): a data-only offer
+reached ICE `connected` and carried framed messages; an offer with an inactive audio transceiver
+stayed in ICE `checking`, so an inactive audio section may need work in the host's WebRTC stack.
+
 ## Proposed spec changes
 
 Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
@@ -567,7 +876,8 @@ the user present (spec 9.5):
    accept from a non-official client.
 7. Trouter allocate response fields, the downstream request envelope and the `/messaging` payload
    (compression, ack requirements), and which PNH app id/template the registrar accepts for a new
-   client.
+   client. The client side of the envelope, compression and acks is now in section 10.7; what the
+   server sends to a non-official client, and the registrar part, still need a capture.
 8. Whether `PUT v2/users/ME/endpoints/<id>` alone (without `activeendpoint`) is enough to get
    `/messaging` events, and whether an extra endpoint changes push delivery to the user's phone.
 9. Page size limits and `syncState` semantics for conversations and messages, and that the unread
@@ -592,6 +902,14 @@ the user present (spec 9.5):
     analytics, visible to its owner. First reading on someone else's recording in "Live results" 12
     (no change right after the download); the next-day reading and the check on the user's own
     recording are still to be done.
+17. Live captions (section 10), only if stage 3 goes ahead and with the owner's consent and a test
+    meeting: a join with `audioDirection` Inactive, `videoDirection` Disabled and a data channel -
+    accepted, kept alive with no audio flowing (`noMediaTimeoutMs`), and needing a registrar
+    registration or only a Trouter URL.
+18. What other participants and the user's own client show for that second endpoint (roster rows,
+    join notice or sound, the "on another device" banner).
+19. Whether the organizer can turn captions alone off in the meeting options, and whether the
+    service keeps anything of captions that run without transcription (section 10.4).
 
 ## Live results
 
@@ -786,6 +1104,19 @@ token, tenant id, user id or account name.
       `personalSiteUrl`; `personalSiteUrl` is `https://<t>-my.sharepoint.com/personal/...` with a
       lowercase `<t>` (letters only for this tenant), no port.
 
+11. **Call store and relay credentials** (read-only, 2026-10-29, the owner in a real meeting at the time
+    and agreeing in chat to reads only - no join, no Trouter; scratch probe, counts and key names only):
+    - `GET .../api.userstore.skype.com/api/v1/user/<MRI>/conversations` with `X-Skypetoken`: HTTP 200, a
+      JSON array. The first read, right after the owner joined, gave 0 items; the next ones gave 1, with
+      and without `?nocache=<ms>` and with or without `ms-teams-region` / `ms-teams-partition`. Item
+      keys `additionalData` (key `participantList`), `conversationController` (an https URL),
+      `correlationId`, `participants` (an array of 2 strings), `userJoinTime`. No field holds the
+      meeting's `19:meeting_...` thread, so the call store says that the user is in a call, not in
+      which meeting: the live captions spec can check "in a call" before joining, and "in this
+      meeting" only from the roster after joining (spec 4.1, second path). The store may lag a join.
+    - `GET https://teams.microsoft.com/trap/tokens` with `X-Skypetoken` and `api-version: 2`: HTTP 200,
+      top keys `expires` (a number) and `tokens` (one entry, its `realm` a quoted string as 10.7 says).
+
 12. **A transcript download in the owner's organization** (read-only, 2026-10-29, the owner at the
     computer; scratch WAM probe, counts, key names, character classes and lengths only, no transcript
     text, names or ids). This is **not the D3 gate of step 0**: the recording is a colleague's, and the
@@ -841,6 +1172,6 @@ token, tenant id, user id or account name.
       still stands. `@oneDrive.displayNamesOfFileViewers` shows that a counted view would carry the
       viewer's name, which is why D3 matters.
 
-All checks in items 1-4, 7-10 and 12 were read-only: no endpoint registration, no property write, no Trouter
+All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
 status codes, key names, counts, enum values, scope names and service URLs.
