@@ -1619,6 +1619,36 @@ token, tenant id, user id or account name.
       client vanishes - whether it ends when the registration's 900 s TTL runs out, or only with
       the meeting, is not known - and a `leave` sent as that endpoint from another process ends it.
 
+19. **Step 5 of the live captions spec: open_mess itself in a meeting** (2026-11-04, a scheduled
+    team meeting from the owner's calendar, the owner in it in the official client with captions on,
+    their OK in chat for the run; a second open_mess daemon built from the branch, with its own data
+    folder and port, its module logs on stderr (`OPEN_MESS_LOG=info`); only states, codes, counts and
+    timings were printed - no caption text, names or ids). Four joins, each approved by the owner in
+    the configuration window (the toast said the approval was too long to show there, as spec 5.1
+    plans for a meeting's participant list):
+    - **Callbacks come compressed.** The join's `endpointCapabilities` 72935 (from item 14) has bit
+      128, and the callbacks after the join arrived with `X-Microsoft-Skype-Content-Encoding: gzip`
+      and a base64 body; the probe had inflated them without noting it. The module answered them 400,
+      the acceptance never reached it, and about 2 s after the join (HTTP 200) the service ended the
+      leg: `/call/end/` with `callEnd` code 430, sub-code 10067. With the bodies inflated (gzip),
+      `/call/acceptance/` came.
+    - **The data-only answer has RTP stream lines.** Its data section carried `a=ssrc-group` (and
+      stream lines with it), which the strict converter refused; with `a=ssrc`, `a=ssrc-group` and
+      `a=msid` lines dropped the host took the answer.
+    - The working run: registration HTTP 202, join HTTP 200 in 0.7 s, the answer accepted 1.7 s
+      after the join, the data channel open 2.4 s later; the first final caption read 3 s after that.
+      In about 1.5 minutes 19 final cues from 4 speakers, each read 2-3 s after it arrived, `missed`
+      0, `captions_on` true throughout, the spoken language set. A message the owner wrote in the
+      meeting chat came back from `read_messages` with `since` (with the untrusted notice). The
+      roster was read 7 times (callbacks and message losses), each finding the owner's other
+      endpoint and captions on. `teams_leave_captions` ended the session (`left`).
+    - The probe's values went unchanged and were accepted: Trouter `ua: TeamsCDL`, the registrar's
+      `platform: edge`, `clientLocation: PL`; whether Teams takes open_mess's own values was not
+      tried.
+    - **Visibility**: the owner's official client showed nothing about another device, during the
+      session or after it, and did not show them twice in the roster; the other people, asked by the
+      owner, noticed nothing worth mentioning.
+
 All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
 status codes, key names, counts, enum values, scope names and service URLs.

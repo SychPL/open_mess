@@ -40,6 +40,12 @@ pub const LAST_START_ERROR_FILE: &str = "last-start-error.txt";
 /// tray menu. The tray and the configuration window take the main thread; the API runs on the
 /// runtime's threads.
 pub fn run() -> Result<(), Error> {
+    // Diagnostics only: OPEN_MESS_LOG (error, warn, info, debug or trace) prints the daemon's and
+    // the modules' logs to stderr. Logs carry states, codes and counts, never tokens or message
+    // contents (spec 8.4).
+    if let Some(level) = std::env::var("OPEN_MESS_LOG").ok().and_then(|level| level.parse::<tracing_subscriber::filter::LevelFilter>().ok()) {
+        tracing_subscriber::fmt().with_writer(std::io::stderr).with_max_level(level).with_ansi(false).try_init().ok();
+    }
     let started = Instant::now();
     let dir = paths::data_dir()?;
     let error_file = dir.join(LAST_START_ERROR_FILE);

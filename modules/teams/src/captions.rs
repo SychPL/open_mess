@@ -20,7 +20,8 @@ pub const SERVICE_HOST: &str = "api.flightproxy.teams.microsoft.com";
 /// 14 and 18).
 const CLIENT: &str = "SkypeSpaces/1415/26260.1717.5229.7049/os=windows; osVer=NT 10.0; deviceType=computer/TsCallingVersion=2026.37.01.11";
 /// The web client's endpoint capabilities without the broker and reinviteless bits, which the
-/// join at the call store's URL needs ("Live results" 14 and 18).
+/// join at the call store's URL needs ("Live results" 14 and 18). Bit 128 asks for compressed
+/// callbacks, which `trouter.rs` inflates ("Live results" 19).
 const ENDPOINT_CAPABILITIES: u64 = 72935;
 /// ponytail: the probe's `clientLocation`; the client sends the user's country. Take it from the
 /// account if Teams turns out to care (step 5 of the spec).
@@ -739,8 +740,9 @@ pub enum Call {
     Acceptance { answer: String, acknowledgement: Option<String> },
     /// `/conversation/rosterUpdate/`: the roster changed; the module reads it whole.
     Roster,
-    /// `/call/end/` or `/conversation/conversationEnd/`.
-    Ended,
+    /// `/conversation/conversationEnd/` (`meeting`, the meeting is over) or `/call/end/` (the
+    /// service ended open_mess's leg), with the end's code and sub-code for the log (docs 10.7).
+    Ended { meeting: bool, code: Option<i64>, sub_code: Option<i64> },
     /// Anything else, or another session's: not read.
     Other,
 }
@@ -765,7 +767,13 @@ pub fn callback(url: &str, body: &str, session: &str) -> Result<Call, ProtoError
             Ok(Call::Acceptance { answer: answer.to_string(), acknowledgement })
         }
         "/conversation/rosterUpdate/" => Ok(Call::Roster),
-        "/call/end/" | "/conversation/conversationEnd/" => Ok(Call::Ended),
+        "/call/end/" | "/conversation/conversationEnd/" => {
+            let meeting = path == "/conversation/conversationEnd/";
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let end = v.get(if meeting { "conversationEnd" } else { "callEnd" });
+            let number = |key: &str| end.and_then(|end| end.get(key)).and_then(Value::as_i64);
+            Ok(Call::Ended { meeting, code: number("code"), sub_code: number("subCode") })
+        }
         _ => Ok(Call::Other),
     }
 }
@@ -1158,8 +1166,12 @@ mod tests {
         );
         assert!(callback(&format!("{base}/call/acceptance/"), "{}", "s1").is_err());
         assert_eq!(callback(&format!("{base}/conversation/rosterUpdate/"), "{}", "s1"), Ok(Call::Roster));
-        assert_eq!(callback(&format!("{base}/call/end/"), "", "s1"), Ok(Call::Ended));
-        assert_eq!(callback(&format!("{base}/conversation/conversationEnd/"), "", "s1"), Ok(Call::Ended));
+        let ended = json!({"callEnd": {"code": 410, "subCode": 5000, "phrase": "x"}}).to_string();
+        assert_eq!(callback(&format!("{base}/call/end/"), &ended, "s1"), Ok(Call::Ended { meeting: false, code: Some(410), sub_code: Some(5000) }));
+        assert_eq!(
+            callback(&format!("{base}/conversation/conversationEnd/"), "", "s1"),
+            Ok(Call::Ended { meeting: true, code: None, sub_code: None })
+        );
         assert_eq!(callback(&format!("{base}/conversation/receiveMessage/"), "{}", "s1"), Ok(Call::Other));
         assert_eq!(callback(&format!("{base}/call/end/"), "", "s2"), Ok(Call::Other));
         assert_eq!(callback("https://trouter.example/messaging", "{}", "s1"), Ok(Call::Other));

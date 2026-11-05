@@ -3678,6 +3678,7 @@ dependencies = [
 name = "open-mess-teams"
 version = "0.0.0"
 dependencies = [
+ "flate2",
  "serde_json",
  "url",
  "wit-bindgen 0.63.0",

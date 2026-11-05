@@ -25,9 +25,12 @@ fn lines(sdp: &str) -> Result<Vec<&str>, ProtoError> {
 }
 
 /// The attribute name of an `a=` line, for errors: never its value, which may hold addresses.
+fn name(line: &str) -> String {
+    line.split([':', ' ']).next().unwrap_or("").chars().take(32).collect()
+}
+
 fn unknown(line: &str) -> ProtoError {
-    let name = line.split([':', ' ']).next().unwrap_or("").chars().take(32).collect::<String>();
-    incompatible(&format!("sdp: unexpected line {name}"))
+    incompatible(&format!("sdp: unexpected line {}", name(line)))
 }
 
 /// Splits at the `m=` line: the session part and the one media section.
@@ -129,6 +132,8 @@ pub fn to_ms(offer: &str, ssrc: u32) -> Result<String, ProtoError> {
 /// service refused the data channel), an audio or video section, or an unknown line is an error.
 pub fn from_ms(answer: &str) -> Result<String, ProtoError> {
     let lines = lines(answer)?;
+    // Every unknown line at once, so one answer names them all.
+    let mut unknown_lines: Vec<&str> = Vec::new();
     let (session, media, section) = one_section(&lines)?;
     let fields: Vec<&str> = media.split(' ').collect();
     let port = match (fields.first(), fields.get(1), fields.get(2)) {
@@ -161,16 +166,30 @@ pub fn from_ms(answer: &str) -> Result<String, ProtoError> {
                 out.push(l.to_string());
             }
             l if l.starts_with("a=msid-semantic") || l.starts_with("a=ice-options:") || l.starts_with("a=x-") => {}
-            l => return Err(unknown(l)),
+            l => unknown_lines.push(l),
         }
     }
     out.push(format!("m=application {port} UDP/DTLS/SCTP webrtc-datachannel"));
     let mut has_port = false;
     for line in &section {
         match *line {
-            l if ["a=rtpmap:", "a=fmtp:", "a=rtcp:", "a=rtcp-fb:", "a=x-", "a=label:", "a=crypto:", "a=ice-options:"]
-                .iter()
-                .any(|p| l.starts_with(p)) => {}
+            // RTP's lines (the data section's payload types and its stream ids: `a=ssrc` and
+            // `a=ssrc-group` came live, "Live results" 19), which a data channel has no use for.
+            l if [
+                "a=rtpmap:",
+                "a=fmtp:",
+                "a=rtcp:",
+                "a=rtcp-fb:",
+                "a=x-",
+                "a=label:",
+                "a=crypto:",
+                "a=ice-options:",
+                "a=ssrc",
+                "a=msid",
+                "a=rtcp-rsize",
+            ]
+            .iter()
+            .any(|p| l.starts_with(p)) => {}
             l if [
                 "c=",
                 "b=",
@@ -192,8 +211,12 @@ pub fn from_ms(answer: &str) -> Result<String, ProtoError> {
                 has_port |= l.starts_with("a=sctp-port:");
                 out.push(l.to_string());
             }
-            l => return Err(unknown(l)),
+            l => unknown_lines.push(l),
         }
+    }
+    if !unknown_lines.is_empty() {
+        let names: Vec<String> = unknown_lines.iter().map(|l| name(l)).collect();
+        return Err(incompatible(&format!("sdp: unexpected lines {}", names.join(" "))));
     }
     if !has_port {
         out.push(SCTP_PORT.to_string());
@@ -303,8 +326,11 @@ mod tests {
         assert!(from_ms(&audio).is_err());
         assert!(from_ms(&ANSWER.replace("m=x-data 3480", "m=x-data 0")).is_err());
         assert!(from_ms(&ANSWER.replace("m=x-data 3480", "m=audio 3480")).is_err());
-        let ssrc = ANSWER.replace("a=sendrecv", "a=ssrc:1 cname:x");
-        assert_eq!(from_ms(&ssrc), Err(incompatible("sdp: unexpected line a=ssrc")));
+        // RTP's stream lines go; other unknown lines are named, all of them.
+        let ssrc = ANSWER.replace("a=sendrecv", "a=sendrecv\r\na=ssrc:1 cname:x\r\na=ssrc-group:FID 1 2\r\na=msid:x y");
+        assert_eq!(from_ms(&ssrc), from_ms(ANSWER));
+        let odd = ANSWER.replace("a=sendrecv", "a=foo:1\r\na=bar");
+        assert_eq!(from_ms(&odd), Err(incompatible("sdp: unexpected lines a=foo a=bar")));
         assert!(from_ms(&"a=x-y\r\n".repeat(MAX_LINES + 1)).is_err());
         assert!(from_ms(&format!("{ANSWER}{}", "a=x-y\r\n".repeat(MAX_SDP / 6))).is_err());
         assert!(from_ms("v=0\r\n").is_err());

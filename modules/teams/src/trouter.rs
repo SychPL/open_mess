@@ -346,6 +346,24 @@ fn on_host(url: &str, scheme: &str, host: impl Fn(&str) -> bool) -> bool {
     })
 }
 
+/// The most a compressed callback may inflate to.
+const MAX_CALLBACK: u64 = 1024 * 1024;
+
+/// The body of a compressed callback (`X-Microsoft-Skype-Content-Encoding: gzip`): base64 of
+/// gzip, else of zlib, as the probe read them (docs, "Live results" 19).
+fn inflate(body: &str) -> Option<String> {
+    use std::io::Read;
+    let bytes = crate::session::base64_decode(body)?;
+    let read = |reader: Box<dyn Read + '_>| -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        reader.take(MAX_CALLBACK + 1).read_to_end(&mut out).ok()?;
+        (out.len() as u64 <= MAX_CALLBACK).then_some(out)
+    };
+    let out = read(Box::new(flate2::read::GzDecoder::new(bytes.as_slice())))
+        .or_else(|| read(Box::new(flate2::read::ZlibDecoder::new(bytes.as_slice()))))?;
+    String::from_utf8(out).ok()
+}
+
 /// A downstream request (`3:::`): answered 200 (as the probe did, "Live results" 13), and handed
 /// on only when it is a call callback. One that cannot be answered or read may have been a
 /// callback, so it counts as lost.
@@ -360,16 +378,18 @@ fn request(data: &str) -> (Option<String>, Incoming) {
     if !url.contains("/callAgent/") {
         return (Some(response(id, 200)), Incoming::Nothing);
     }
-    // open_mess never asks for compressed callbacks (capability bit 128, docs 10.7); one that
-    // comes anyway is answered as the client answers a body it cannot inflate.
+    // The join's endpoint capabilities ask for compressed callbacks (bit 128, as the web client;
+    // the acceptance comes compressed, "Live results" 19). One that cannot be inflated is answered
+    // as the client answers it.
     let compressed = request.get("headers").and_then(Value::as_object).is_some_and(|headers| {
         headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("X-Microsoft-Skype-Content-Encoding") && value.as_str().is_some_and(|v| v.eq_ignore_ascii_case("gzip"))
         })
     });
-    match request.get("body").and_then(Value::as_str) {
-        Some(body) if !compressed => (Some(response(id, 200)), Incoming::Callback(Callback { url: url.to_string(), body: body.to_string() })),
-        _ => (Some(response(id, 400)), Incoming::Lost),
+    let body = request.get("body").and_then(Value::as_str);
+    match if compressed { body.and_then(inflate) } else { body.map(str::to_string) } {
+        Some(body) => (Some(response(id, 200)), Incoming::Callback(Callback { url: url.to_string(), body })),
+        None => (Some(response(id, 400)), Incoming::Lost),
     }
 }
 
@@ -395,6 +415,19 @@ mod tests {
             args[key] = value.clone();
         }
         format!("5:::{}", json!({"name": "trouter.connected", "args": [args]}))
+    }
+
+    /// Standard base64, for the compressed callbacks.
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..=chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            }
+        }
+        out
     }
 
     /// A Trouter through its first `trouter.connected`.
@@ -576,6 +609,34 @@ mod tests {
         let url = format!("{SURL}callAgent/s/t/conversation/rosterUpdate/");
         let gzip = format!("3:::{}", json!({"id": 1, "url": url, "headers": {"x-microsoft-skype-content-encoding": "GZIP"}, "body": "H4sI"}));
         assert!(matches!(t.handle(&gzip, T0).unwrap(), (Some(r), Incoming::Lost) if r.contains(r#""status":400"#)));
+        // A compressed callback that inflates (gzip or zlib) is read; one past the limit is not.
+        let packed = |bytes: &[u8], gzip: bool| {
+            use std::io::Write;
+            let compressed = if gzip {
+                let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(bytes).unwrap();
+                e.finish().unwrap()
+            } else {
+                let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(bytes).unwrap();
+                e.finish().unwrap()
+            };
+            base64(&compressed)
+        };
+        for gzip in [true, false] {
+            let frame = format!(
+                "3:::{}",
+                json!({"id": 2, "url": url, "headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": packed(b"{\"callAcceptance\":{}}", gzip)})
+            );
+            let (reply, incoming) = t.handle(&frame, T0).unwrap();
+            assert!(reply.unwrap().contains(r#""status":200"#));
+            assert!(matches!(incoming, Incoming::Callback(c) if c.body == "{\"callAcceptance\":{}}"));
+        }
+        let bomb = format!(
+            "3:::{}",
+            json!({"id": 3, "url": url, "headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": packed(&vec![b' '; 2 * 1024 * 1024], true)})
+        );
+        assert!(matches!(t.handle(&bomb, T0).unwrap(), (_, Incoming::Lost)));
         let no_body = format!("3:::{}", json!({"id": 2, "url": url}));
         assert!(matches!(t.handle(&no_body, T0).unwrap(), (Some(r), Incoming::Lost) if r.contains(r#""status":400"#)));
         // Without a numeric id it cannot be answered at all.

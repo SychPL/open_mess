@@ -296,6 +296,7 @@ fn end(leg: &mut Leg, s: &mut Session, reason: Reason, now: i64) {
     if !leg.captions.active() {
         return;
     }
+    host::log(2, &format!("live captions: the session ends ({})", reason.name()));
     leg.captions.end(reason, now);
     close(leg);
     // `leave` first: what others see goes before what only Trouter knows (Codex review of 7385fdd).
@@ -443,7 +444,10 @@ pub fn rtc_data(conn: u32, messages: &[Vec<u8>], dropped: u32) {
 pub fn rtc_state(conn: u32, state: &str) {
     if let Some(account) = account_of(|leg| leg.rtc == Some(conn)) {
         event(&account, |leg, s, now| match state {
-            "connected" => leg.captions.channel_open(now),
+            "connected" => {
+                host::log(2, "live captions: the data channel is open");
+                leg.captions.channel_open(now);
+            }
             "failed" | "closed" => {
                 leg.rtc = None;
                 end(leg, s, Reason::MediaFailed, now);
@@ -520,7 +524,9 @@ fn send(leg: &mut Leg, frame: &str, now: i64) {
 /// The registration with the first connection's `surl` (spec 5.3), with the IC3 token.
 fn register(leg: &mut Leg, s: &mut Session, now: i64) {
     let Some(request) = leg.trouter.registration() else { return };
-    let ok = matches!(api::send(s, Service::Chat, &request, false), Ok(r) if (200..=299).contains(&r.status));
+    let status = api::send(s, Service::Chat, &request, false).map(|r| r.status);
+    host::log(2, &format!("live captions: registration HTTP {}", status.as_ref().map_or_else(|_| "failed".to_string(), u16::to_string)));
+    let ok = matches!(status, Ok(200..=299));
     leg.registered |= ok;
     leg.trouter.registered(ok, now);
 }
@@ -560,7 +566,12 @@ fn frame(leg: &mut Leg, s: &mut Session, text: &str, now: i64) {
         Incoming::Callback(callback) => match captions::callback(&callback.url, &callback.body, &leg.callbacks) {
             Ok(Call::Acceptance { answer, acknowledgement }) => accept(leg, s, &answer, acknowledgement.as_deref(), now),
             Ok(Call::Roster) => roster(leg, s, now),
-            Ok(Call::Ended) => end(leg, s, Reason::MeetingEnded, now),
+            Ok(Call::Ended { meeting, code, sub_code }) => {
+                let what = if meeting { "meeting" } else { "call" };
+                let shown = |c: Option<i64>| c.map_or_else(|| "none".to_string(), |c| c.to_string());
+                host::log(1, &format!("live captions: Teams ended the {what} (code {}, sub-code {})", shown(code), shown(sub_code)));
+                end(leg, s, if meeting { Reason::MeetingEnded } else { Reason::Refused }, now);
+            }
             Ok(Call::Other) => {}
             Err(_) => end(leg, s, Reason::Protocol, now),
         },
@@ -604,7 +615,9 @@ fn call(leg: &mut Leg, s: &mut Session, now: i64) {
     let body = captions::join(&me(s, leg, &mri), &links, &leg.live, &leg.captions.conversation, &offer, &leg.media_leg);
     leg.joined = true;
     let controller = leg.live.controller.clone();
-    match service(s, leg, "POST", &controller, Some(&body), true) {
+    let joined = service(s, leg, "POST", &controller, Some(&body), true);
+    host::log(2, &format!("live captions: join HTTP {}", joined.as_ref().map_or_else(|_| "failed".to_string(), |r| r.status.to_string())));
+    match joined {
         Ok(r) if (200..=299).contains(&r.status) => match captions::conversation(&r.body, &mri, &leg.endpoint) {
             Ok((link, roster)) => {
                 leg.leave = Some(link);
@@ -630,12 +643,21 @@ fn accept(leg: &mut Leg, s: &mut Session, answer: &str, acknowledgement: Option<
     let Some(conn) = leg.rtc else { return };
     let plain = match sdp::from_ms(answer) {
         Ok(plain) => plain,
-        Err(_) => return end(leg, s, Reason::Protocol, now),
+        Err(e) => {
+            host::log(1, &format!("live captions: the SDP answer was not taken: {e:?}"));
+            return end(leg, s, Reason::Protocol, now);
+        }
     };
     match rtc::accept(conn, &plain) {
-        Ok(()) => leg.captions.answered(),
+        Ok(()) => {
+            host::log(2, "live captions: the SDP answer was accepted");
+            leg.captions.answered();
+        }
         Err(HttpError::Blocked(why)) if why.starts_with("proxy:") => return end(leg, s, Reason::Proxy, now),
-        Err(_) => return end(leg, s, Reason::MediaFailed, now),
+        Err(e) => {
+            host::log(1, &format!("live captions: the media connection refused the answer: {}", describe(&e)));
+            return end(leg, s, Reason::MediaFailed, now);
+        }
     }
     if let Some(url) = acknowledgement
         && service(s, leg, "POST", url, Some(&captions::acknowledgement()), false).is_err()
@@ -653,6 +675,9 @@ fn roster(leg: &mut Leg, s: &mut Session, now: i64) {
     match read.map(|r| captions::conversation(&r.body, &mri, &leg.endpoint)) {
         Some(Ok((link, roster))) => {
             leg.leave.get_or_insert(link);
+            if let Some(roster) = &roster {
+                host::log(2, &format!("live captions: roster: the user elsewhere {}, captions {}", roster.user_elsewhere, roster.captions));
+            }
             if let Some(roster) = roster
                 && let Some(reason) = leg.captions.roster(&roster, now)
             {
