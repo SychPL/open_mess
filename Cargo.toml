@@ -49,3 +49,7 @@ opt-level = 3
 
 [profile.dev.package.wasmtime-internal-cranelift]
 opt-level = 3
+
+# No profile sets `panic = "abort"`: the daemon catches a panic of the transcription and capture
+# threads when it joins them, while abort would end it with every account at once
+# (spec 2026-10-28-local-transcription, 4.3).

@@ -617,6 +617,22 @@ async function renderPermissions() {
     card.append(add);
     root.append(card);
   }
+  // The local recordings: one read permission, apart from the accounts' (spec
+  // 2026-10-28-local-transcription, 4.5); only its read box is shown.
+  const local = await call("permissions", { account: "local" });
+  const card = el("div", null, "card");
+  card.append(
+    el("strong", tr("Nagrania lokalne", "Local recordings")),
+    el(
+      "div",
+      tr("Transkrypcje rozmów nagranych na tym komputerze. Niezależne od uprawnień kont: agent z tym prawem czyta każde nagranie.", "Transcripts of the calls recorded on this computer. Apart from the accounts' permissions: an agent with this right reads every recording."),
+      "muted",
+    ),
+  );
+  const row = el("div", null, "row");
+  row.append(permissionControls("local", null, local)[0]);
+  card.append(row);
+  root.append(card);
 }
 
 function kinds() {
@@ -1106,12 +1122,257 @@ async function renderTriggers() {
   root.append(setup);
 }
 
+function megabytes(bytes) {
+  return Math.round(bytes / (1024 * 1024)).toLocaleString(locale()) + " MB";
+}
+
+/** The locale dates and numbers are written in. */
+function locale() {
+  return tr("pl-PL", "en-GB");
+}
+
+function recordingStates() {
+  return {
+    recording: tr("nagrywanie", "recording"),
+    waiting: tr("czeka na transkrypcję", "waiting for transcription"),
+    transcribing: tr("transkrypcja", "transcribing"),
+    done: tr("gotowe", "done"),
+    failed: tr("nieudane", "failed"),
+  };
+}
+
+/** A reason the daemon gives in English (a recording's, the queue's, the recorder's), as shown. */
+function recordingReason(reason) {
+  const texts = {
+    interrupted: tr("przerwane", "interrupted"),
+    expired: tr("dźwięk wygasł", "expired"),
+    damaged: tr("uszkodzone", "damaged"),
+    failed: tr("błąd", "failed"),
+    "capture failed": tr("błąd przechwytu", "capture failed"),
+    "write failed": tr("błąd zapisu", "write failed"),
+    "detect failed": tr("utrata wykrywania", "detect failed"),
+    "too long": tr("za długie", "too long"),
+    "low disk": tr("mało miejsca na dysku", "low disk"),
+    recording: tr("trwa nagrywanie", "a call is being recorded"),
+    "no model": tr("brak modelu", "no model"),
+    "model damaged": tr("model uszkodzony", "model damaged"),
+    "low memory": tr("za mało pamięci", "low memory"),
+    "cannot open the call's devices": tr("nie da się otworzyć urządzeń rozmowy", "cannot open the call's devices"),
+    "no tray icon": tr("brak ikony w zasobniku", "no tray icon"),
+    "audio limit": tr("limit dźwięku", "audio limit"),
+    "text limit": tr("limit transkrypcji", "text limit"),
+    "update in progress": tr("trwa aktualizacja", "update in progress"),
+    "cannot create the recording": tr("błąd tworzenia nagrania", "cannot create the recording"),
+  };
+  return texts[reason] || reason;
+}
+
+function speakers() {
+  return { me: tr("ja", "me"), others: tr("rozmówcy", "others") };
+}
+
+function recordingLanguages() {
+  return [
+    ["auto", tr("wykryj sam", "detect")],
+    ["pl", tr("polski", "Polish")],
+    ["en", tr("angielski", "English")],
+    ["de", tr("niemiecki", "German")],
+    ["uk", tr("ukraiński", "Ukrainian")],
+    ["fr", tr("francuski", "French")],
+    ["es", tr("hiszpański", "Spanish")],
+  ];
+}
+
+/** HH:MM:SS of `ms`. */
+function clock(ms) {
+  const seconds = Math.floor(ms / 1000);
+  return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+/** The recording whose transcript the show button shows, and its pieces. */
+let shownRecording = null;
+
+// Call recording (spec 2026-10-28-local-transcription, 4.6): the settings, the model and the
+// recordings. A transcript is other people's speech: it goes in through `el` only.
+async function renderRecording() {
+  const [model, recording] = await Promise.all([call("model_status"), call("recordings")]);
+  const root = content("recording");
+  root.replaceChildren();
+  renderRecordingSettings(root, recording);
+  root.append(
+    el(
+      "p",
+      tr("Rozmowy są zamieniane na tekst na tym komputerze, modelem Whisper (large-v3-turbo, licencja MIT). Model pobiera się raz, z Hugging Face; każdy plik jest sprawdzany sumą kontrolną.", "Calls are turned into text on this computer, with the Whisper model (large-v3-turbo, MIT licence). The model is downloaded once, from Hugging Face; every file is checked against its checksum."),
+      "muted",
+    ),
+  );
+  const download = model.download;
+  let state = model.installed ? tr("pobrany", "downloaded") : tr("nie pobrany", "not downloaded");
+  if (model.newer) state += tr(" - dostępny nowszy model", " - a newer model is available");
+  if (download.state === "running") state = tr("pobieranie: ", "downloading: ") + megabytes(download.done) + tr(" z ", " of ") + megabytes(download.total);
+  if (download.state === "failed") state = tr("pobieranie nie udało się: ", "the download failed: ") + download.reason;
+  root.append(details([[tr("Model", "Model"), state]]));
+  const buttons = el("div", null, "row");
+  if (download.state !== "running" && (!model.installed || model.newer)) {
+    buttons.append(
+      button(tr("Pobierz model (", "Download the model (") + megabytes(model.size) + ")", async () => {
+        await call("download_model");
+        await renderRecording();
+      }),
+    );
+  }
+  if (model.installed && download.state !== "running") {
+    buttons.append(
+      button(tr("Usuń model", "Delete the model"), async () => {
+        if (!confirm(tr("Usunąć model? Bez niego rozmowy nie będą zamieniane na tekst.", "Delete the model? Without it calls are not turned into text."))) return;
+        await call("delete_model");
+        await renderRecording();
+      }, "danger"),
+    );
+  }
+  root.append(buttons);
+  renderRecordings(root, recording);
+  // Progress while the section is open.
+  const busy = recording.active || recording.recordings.some((item) => item.state === "transcribing" || item.state === "waiting");
+  if (download.state === "running" || busy) {
+    setTimeout(() => {
+      if (current === "recording") renderRecording().catch(showError);
+    }, 2000);
+  }
+}
+
+function renderRecordingSettings(root, recording) {
+  const auto = el("input");
+  auto.type = "checkbox";
+  auto.checked = recording.auto;
+  const autoLabel = el("label", null, "row");
+  autoLabel.append(auto, el("span", tr("Nagrywaj rozmowy Teams automatycznie", "Record Teams calls automatically")));
+  root.append(
+    autoLabel,
+    el(
+      "p",
+      tr("Gdy jest włączone, każda rozmowa Teams jest nagrywana bez pytania: wszystko, co gra urządzenie rozmowy (także powiadomienia i inne aplikacje) przez cały czas rozmowy, oraz Twój mikrofon, tylko gdy jest włączony w Teams. Nagrania leżą w %LOCALAPPDATA%\\open_mess\\recordings na tym komputerze; dźwięk znika po transkrypcji, tekst zostaje, dopóki go nie usuniesz. Uczestników informujesz Ty.", "When on, every Teams call is recorded without asking: everything the call's device plays (notifications and other apps too) for the whole call, and your microphone only while it is on in Teams. Recordings stay in %LOCALAPPDATA%\\open_mess\\recordings on this computer; the audio goes once transcribed, the text stays until you delete it. Telling the participants is up to you."),
+      "muted",
+    ),
+  );
+  const microphone = el("input");
+  microphone.type = "checkbox";
+  microphone.checked = recording.microphone;
+  const microphoneLabel = el("label", null, "row");
+  microphoneLabel.append(microphone, el("span", tr("Nagrywaj mój mikrofon", "Record my microphone")));
+  const languages = recordingLanguages();
+  const known = languages.some(([code]) => code === recording.language);
+  const language = select(known ? languages : [...languages, [recording.language, recording.language]], recording.language);
+  const languageLabel = el("label", null, "row");
+  languageLabel.append(el("span", tr("Język rozmów", "Language of the calls")), language);
+  root.append(
+    microphoneLabel,
+    languageLabel,
+    button(tr("Zapisz ustawienia", "Save settings"), async () => {
+      if (auto.checked && !recording.auto && !confirm(tr("Nagrywać automatycznie każdą rozmowę Teams na tym komputerze?", "Record every Teams call on this computer automatically?"))) return;
+      await call("set_recording_settings", { auto: auto.checked, microphone: microphone.checked, language: language.value });
+      await renderRecording();
+    }),
+  );
+  if (recording.active) {
+    const row = el("div", null, "row");
+    row.append(
+      el("strong", tr("Trwa nagrywanie rozmowy.", "A call is being recorded.")),
+      button(tr("Zatrzymaj", "Stop"), async () => {
+        await call("stop_recording");
+        await renderRecording();
+      }),
+    );
+    root.append(row);
+  }
+  const status = recording.status || {};
+  if (status.detect === "unavailable") root.append(el("p", tr("Nie można wykryć rozmów Teams.", "Teams calls cannot be detected."), "muted"));
+  if (status.reason) root.append(el("p", tr("Czeka: ", "Waiting: ") + recordingReason(status.reason), "muted"));
+}
+
+function renderRecordings(root, recording) {
+  root.append(el("h2", tr("Nagrania", "Recordings")));
+  if (recording.recordings.length === 0) {
+    root.append(el("p", tr("Brak nagrań.", "No recordings."), "muted"));
+    return;
+  }
+  const table = el("table");
+  const head = el("tr");
+  for (const label of [tr("Data", "Date"), tr("Długość", "Length"), tr("Stan", "State"), ""]) head.append(el("th", label));
+  table.append(head);
+  const states = recordingStates();
+  for (const item of recording.recordings) {
+    const row = el("tr");
+    const length = item.end_ms ? clock(item.end_ms - item.start_ms) : "";
+    let state = states[item.state] || item.state;
+    if (item.progress !== null && item.progress !== undefined) state += " " + item.progress + "%";
+    if (item.reason) state += " (" + recordingReason(item.reason) + ")";
+    const actions = el("td", null, "row");
+    if (item.state === "done") {
+      actions.append(
+        button(tr("Pokaż", "Show"), async () => {
+          shownRecording = { id: item.id, cues: await call("show_transcript", { id: item.id }) };
+          await renderRecording();
+        }),
+      );
+    }
+    if (item.state === "failed" && item.audio) {
+      actions.append(
+        button(tr("Ponów", "Retry"), async () => {
+          await call("retry_recording", { id: item.id });
+          await renderRecording();
+        }),
+      );
+    }
+    actions.append(
+      button(
+        tr("Usuń", "Delete"),
+        async () => {
+          if (!confirm(tr("Usunąć to nagranie i jego tekst?", "Delete this recording and its text?"))) return;
+          await call("delete_recording", { id: item.id });
+          if (shownRecording && shownRecording.id === item.id) shownRecording = null;
+          await renderRecording();
+        },
+        "danger",
+      ),
+    );
+    row.append(el("td", new Date(item.start_ms).toLocaleString(locale())), el("td", length), el("td", state), actions);
+    table.append(row);
+  }
+  root.append(
+    table,
+    button(
+      tr("Usuń wszystkie", "Delete all"),
+      async () => {
+        if (!confirm(tr("Usunąć wszystkie nagrania i ich teksty?", "Delete all recordings and their texts?"))) return;
+        shownRecording = null;
+        await call("delete_all_recordings");
+        await renderRecording();
+      },
+      "danger",
+    ),
+  );
+  if (shownRecording && recording.recordings.some((item) => item.id === shownRecording.id)) {
+    root.append(el("h2", tr("Transkrypcja", "Transcript")));
+    const text = el("div", null, "transcript");
+    const names = speakers();
+    for (const cue of shownRecording.cues) {
+      text.append(el("p", "[" + clock(cue.start_ms) + "] " + (names[cue.speaker] || cue.speaker) + ": " + cue.text));
+    }
+    root.append(text, button(tr("Zamknij", "Close"), async () => {
+      shownRecording = null;
+      await renderRecording();
+    }));
+  }
+}
+
 const RENDER = {
   accounts: renderAccounts,
   triggers: renderTriggers,
   permissions: renderPermissions,
   waiting: renderWaiting,
   modules: renderModules,
+  recording: renderRecording,
   integrations: renderIntegrations,
   daemon: renderDaemon,
 };

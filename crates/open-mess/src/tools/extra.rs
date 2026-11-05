@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use super::{ToolError, ToolInfo, shared};
+use super::{ToolError, ToolInfo, recordings, shared};
 use crate::modules::{ModuleInfo, ModuleState};
 
 /// The largest arguments object, as JSON.
@@ -50,9 +50,8 @@ pub(crate) fn declared(modules: &[ModuleInfo]) -> BTreeMap<String, Vec<Declared>
             all.entry(name).or_default().push(Declared { module: info.name.clone(), state: info.state.clone(), decl: tool.clone(), listed });
         }
     }
-    let core: Vec<String> = shared::tools().into_iter().map(|tool| tool.name).chain(["status".to_string()]).collect();
     for (name, tools) in &mut all {
-        let taken = if core.contains(name) {
+        let taken = if core(name) {
             Some("its name is a core tool's")
         } else if tools.len() > 1 {
             Some("its name is declared more than once")
@@ -71,10 +70,15 @@ pub(crate) fn declared(modules: &[ModuleInfo]) -> BTreeMap<String, Vec<Declared>
 /// The declarations of a module tool named `name`; None for a core tool's name, which a module
 /// that declares it never shadows.
 pub(crate) fn find(modules: &[ModuleInfo], name: &str) -> Option<Vec<Declared>> {
-    if name == "status" || shared::tools().iter().any(|tool| tool.name == name) {
+    if core(name) {
         return None;
     }
     declared(modules).remove(name)
+}
+
+/// Whether a core tool (`status`, a shared one or a recording one) has this name.
+fn core(name: &str) -> bool {
+    name == "status" || shared::tools().into_iter().chain(recordings::tools()).any(|tool| tool.name == name)
 }
 
 /// The tools of active modules the front ends list.
@@ -275,17 +279,21 @@ mod tests {
     #[test]
     fn names_taken_twice_or_by_the_core_are_listed_for_neither() {
         let modules = [
-            // `list` + `conversations` would shadow the shared tool.
-            module("list", ModuleState::Active, vec![tool("conversations", schema()), tool("twin", schema()), tool("twin", schema())]),
+            // `list` + `conversations` would shadow the shared tool, `list` + `recordings` a recording one.
+            module(
+                "list",
+                ModuleState::Active,
+                vec![tool("conversations", schema()), tool("recordings", schema()), tool("twin", schema()), tool("twin", schema())],
+            ),
             // `a-b` + `c` and `a` + `b_c` are both `a_b_c`.
             module("a-b", ModuleState::Active, vec![tool("c", schema())]),
             module("a", ModuleState::Active, vec![tool("b_c", schema()), tool("d", schema())]),
         ];
         assert_eq!(listed(&modules).iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["a_d"]);
         // A call of the shared tool never reaches the module; the others find their declarations.
-        assert!(find(&modules, "list_conversations").is_none());
+        assert!(find(&modules, "list_conversations").is_none() && find(&modules, "list_recordings").is_none());
         assert_eq!(find(&modules, "a_b_c").map(|tools| tools.len()), Some(2));
-        assert_eq!(reasons(&modules, "list").len(), 3);
+        assert_eq!(reasons(&modules, "list").len(), 4);
         assert_eq!(reasons(&modules, "a-b"), [("a_b_c".to_string(), "its name is declared more than once".to_string())]);
     }
 

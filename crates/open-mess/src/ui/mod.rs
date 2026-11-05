@@ -59,6 +59,11 @@ pub struct UiState {
     pub probation: Flag,
     /// The Aktualizacje block of Demon i logi; None where updates do not install.
     pub update: Option<UpdateService>,
+    /// The Whisper model of the Nagrywanie rozmów section (spec 2026-10-28-local-transcription,
+    /// 4.6); None where nothing is recorded (not on Windows).
+    pub models: Option<Arc<crate::recording::model::Models>>,
+    /// What records the calls: the tray's indicator and stop, the window's section.
+    pub recorder: Option<Arc<crate::recording::recorder::Recorder>>,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.

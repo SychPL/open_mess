@@ -53,6 +53,8 @@ fn state(d: &Daemon) -> Arc<UiState> {
         exit: Arc::default(),
         probation: d.registry.pending().unwrap().probation().clone(),
         update: None,
+        models: None,
+        recorder: None,
     })
 }
 
@@ -83,6 +85,8 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         ui_ready: Arc::default(),
         exit: Arc::default(),
         update: None,
+        models: None,
+        recorder: None,
     };
     (dir, state)
 }
@@ -235,6 +239,7 @@ fn updates(d: &Daemon, installable: Result<(), NotInstallable>, local: &Path) ->
             runs: Runs::new(d.dir.path().join("runs"), RUN_TIMEOUT, Counters::default()),
             modules: Vec::new(),
             host_events: mpsc::channel(1).0,
+            recording: Arc::default(),
         },
         launcher: Arc::new(NoHelper),
         exit: Arc::new(Notify::new()),

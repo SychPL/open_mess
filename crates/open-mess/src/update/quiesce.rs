@@ -50,11 +50,17 @@ pub struct Activity {
     pub modules: Vec<ModuleHandle>,
     /// The modules' event queue: at full capacity it is empty.
     pub host_events: mpsc::Sender<HostEvent>,
+    /// The call recording: a call recorded in phase A or B stops the installation (spec
+    /// 2026-10-28-local-transcription, 4.8).
+    pub recording: Arc<crate::recording::UpdateLink>,
 }
 
-/// The user cancelled; everything was resumed.
+/// The user cancelled, or a call was being recorded (`by_recording`, looked at when the phase
+/// stopped); everything was resumed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cancelled;
+pub struct Cancelled {
+    pub by_recording: bool,
+}
 
 /// Phase A: pauses the modules and waits until the work they started is done and 60 s passed with
 /// no delivery and no tool call, at most 30 minutes. Tool calls keep working meanwhile.
@@ -68,9 +74,9 @@ pub async fn finish_work(activity: &Activity, cancel: &watch::Receiver<bool>) ->
     let mut ends = (activity.triggers.last_delivery_ms.load(Ordering::SeqCst), activity.gate.last_end_ms());
     let mut idle_before = false;
     loop {
-        if *cancel.borrow() {
+        if let Some(by_recording) = stopped(activity, cancel) {
             resume(activity).await;
-            return Err(Cancelled);
+            return Err(Cancelled { by_recording });
         }
         let (idle, now_ends, calls) = look(activity);
         let now = Instant::now();
@@ -114,9 +120,9 @@ fn look(activity: &Activity) -> (bool, (u64, u64), usize) {
 pub async fn switch(activity: &Activity, cancel: &watch::Receiver<bool>) -> Result<(), Cancelled> {
     activity.gate.set(GateMode::Closed);
     loop {
-        if *cancel.borrow() {
+        if let Some(by_recording) = stopped(activity, cancel) {
             resume(activity).await;
-            return Err(Cancelled);
+            return Err(Cancelled { by_recording });
         }
         // In this order: a call that ended has stored its action, and an approval moves an action
         // from waiting to approved.
@@ -128,6 +134,13 @@ pub async fn switch(activity: &Activity, cancel: &watch::Receiver<bool>) -> Resu
         }
         sleep(POLL).await;
     }
+}
+
+/// Whether to stop, and whether for a call being recorded rather than the user's cancel: the
+/// installation waits for the call's end (spec 2026-10-28-local-transcription, 4.8), so phase A
+/// never ends by giving up during one.
+fn stopped(activity: &Activity, cancel: &watch::Receiver<bool>) -> Option<bool> {
+    if *cancel.borrow() { Some(false) } else { activity.recording.recording().then_some(true) }
 }
 
 /// Back to work: tool calls are taken and the modules get their events again.
