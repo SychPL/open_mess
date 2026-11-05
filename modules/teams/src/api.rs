@@ -16,7 +16,7 @@ use crate::component::bindings::open_mess::module::{http, sign_in, storage};
 use crate::http::HttpRequest;
 use crate::poll;
 use crate::retry::{self, GiveUpReason, Retry};
-use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, SEARCH_SCOPE, Session};
+use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, MCPS_SCOPE, SEARCH_SCOPE, Session};
 
 /// The part of the host's call limit (30 s) the module plans with: no wait starts that would end
 /// past it, so a slow service ends a call with an error, not a timeout that unloads the module.
@@ -81,6 +81,8 @@ pub enum Service {
     /// AMS images, with the chat service's token (docs 7; which token AMS takes is to be
     /// confirmed live).
     Media,
+    /// A meeting's artifacts (docs 9.3).
+    Mcps,
 }
 
 impl Service {
@@ -88,6 +90,7 @@ impl Service {
         match self {
             Service::Chat | Service::Media => CHAT_SCOPE,
             Service::Search => SEARCH_SCOPE,
+            Service::Mcps => MCPS_SCOPE,
         }
     }
 }
@@ -189,17 +192,59 @@ fn open(account: &str) -> Result<Session, ModuleError> {
 /// The authsvc exchange: Teams accepts the account and names its services (docs 2). Its 404 is
 /// an answer, not a regional redirect.
 fn establish(token: String, claims: Claims) -> Result<Session, ModuleError> {
-    let response = exchange(&authsvc::request(), &token, false, false)?;
+    let auth = authorize(&token)?;
+    let expires = claims.expires_ms;
+    let mut session = Session::new(claims, auth.directory);
+    session.keep(AUTHSVC_SCOPE, token, expires);
+    session.keep_skype(auth.skype_token, auth.expires_at_ms);
+    Ok(session)
+}
+
+fn authorize(token: &str) -> Result<authsvc::Session, ModuleError> {
+    let response = exchange(&authsvc::request(), token, false, false)?;
     match response.status {
         200..=299 => {}
         401 | 403 => return Err(ModuleError::AuthRequired(format!("Teams refused the account (HTTP {})", response.status))),
         status => return Err(ModuleError::Platform(format!("Teams sign-in failed (HTTP {status})"))),
     }
-    let auth = authsvc::decode(&response.body, now_ms()).map_err(proto)?;
-    let expires = claims.expires_ms;
-    let mut session = Session::new(claims, auth.directory);
-    session.keep(AUTHSVC_SCOPE, token, expires);
-    Ok(session)
+    authsvc::decode(&response.body, now_ms()).map_err(proto)
+}
+
+/// A new authsvc exchange for the session: a new skype token and service directory.
+fn reauthorize(session: &mut Session, token: &str) -> Result<(), ModuleError> {
+    let auth = authorize(token)?;
+    session.directory = auth.directory;
+    session.keep_skype(auth.skype_token, auth.expires_at_ms);
+    Ok(())
+}
+
+/// A read from the middle tier (docs 9.1): the authsvc audience's token and the skype token. A
+/// skype token about to expire is renewed by a new authsvc exchange first; a 401 gets a new token,
+/// one more exchange and one more try (spec 2026-10-28-meetings-transcripts, 5.3).
+pub fn middle_tier(session: &mut Session, req: &HttpRequest) -> Result<Vec<u8>, ModuleError> {
+    let token = token(session, AUTHSVC_SCOPE)?;
+    if session.skype(now_ms(), true).is_none() {
+        reauthorize(session, &token)?;
+    }
+    let first = exchange(&with_skype(session, req)?, &token, false, false)?;
+    if first.status != 401 {
+        return ok(first);
+    }
+    let claims = header(&first.headers, "www-authenticate").and_then(session::challenge_claims);
+    let token = renew(session, AUTHSVC_SCOPE, claims.as_deref())?;
+    reauthorize(session, &token)?;
+    let second = exchange(&with_skype(session, req)?, &token, false, false)?;
+    if second.status == 401 {
+        return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
+    }
+    ok(second)
+}
+
+fn with_skype(session: &Session, req: &HttpRequest) -> Result<HttpRequest, ModuleError> {
+    let skype = session.skype(now_ms(), false).ok_or_else(|| ModuleError::NotSupported("no calendar service for this account".to_string()))?;
+    let mut req = req.clone();
+    req.headers.push(("x-skypetoken".to_string(), skype.to_string()));
+    Ok(req)
 }
 
 /// Runs `f` with the account's session, opened silently if this instance has none yet (after a
@@ -225,7 +270,7 @@ pub fn with_session<T>(account: &str, f: impl FnOnce(&mut Session) -> Result<T, 
 }
 
 /// A token for `scope` that is not about to expire.
-fn token(session: &mut Session, scope: &'static str) -> Result<String, ModuleError> {
+fn token(session: &mut Session, scope: &str) -> Result<String, ModuleError> {
     match session.token(scope, now_ms()) {
         Some(token) => Ok(token.to_string()),
         None => renew(session, scope, None),
@@ -233,7 +278,7 @@ fn token(session: &mut Session, scope: &'static str) -> Result<String, ModuleErr
 }
 
 /// A new token from WAM, silently, for the session's own account only.
-fn renew(session: &mut Session, scope: &'static str, claims: Option<&str>) -> Result<String, ModuleError> {
+fn renew(session: &mut Session, scope: &str, claims: Option<&str>) -> Result<String, ModuleError> {
     let (token, c) = wam(scope, false, claims)?;
     if c.oid != session.account {
         return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
@@ -259,6 +304,25 @@ pub fn send(session: &mut Session, service: Service, req: &HttpRequest, write: b
         return Err(ModuleError::AuthRequired("the service refused a new token".to_string()));
     }
     Ok(second)
+}
+
+/// A read from the organization's SharePoint or OneDrive at `origin`, with a token for that
+/// origin. A 401 gets one silent refresh, as in [`send`]; a refusal after that, or a 403, is the
+/// platform's answer about this transcript, not a sign-in the account needs (spec
+/// 2026-10-28-meetings-transcripts, 4.2).
+pub fn sharepoint(session: &mut Session, origin: &str, req: &HttpRequest) -> Result<Vec<u8>, ModuleError> {
+    let scope = format!("{origin}/.default");
+    let mut response = exchange(req, &token(session, &scope)?, false, false)?;
+    if response.status == 401 {
+        let claims = header(&response.headers, "www-authenticate").and_then(session::challenge_claims);
+        let token = renew(session, &scope, claims.as_deref())?;
+        response = exchange(req, &token, false, false)?;
+    }
+    match response.status {
+        401 | 403 => Err(ModuleError::Platform("access to this transcript was refused".to_string())),
+        404 => Err(ModuleError::Platform("transcript not found".to_string())),
+        _ => ok(response),
+    }
 }
 
 /// [`send`] for a read: the body of a 2xx answer, any other status an error.

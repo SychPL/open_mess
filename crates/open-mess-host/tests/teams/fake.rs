@@ -158,6 +158,7 @@ pub fn authz() -> Value {
             "middleTier": "https://teams.microsoft.com/api/mt/emea",
             "amsV2": "https://eu-prod.asyncgw.teams.microsoft.com",
             "search": "https://teams.microsoft.com/api/search/emea",
+            "mcpService": "https://teams.microsoft.com/api/mcps/eu",
         },
         "tokens": {"skypeToken": "synthetic-skype-token", "expiresIn": 4500, "tokenType": "SkypeToken"},
     })

@@ -16,7 +16,7 @@ use crate::session::Session;
 use crate::text::{html_to_markdown, markdown_to_html};
 use crate::unread::{self, UnreadState};
 use crate::writing::{self, Purpose};
-use crate::{search, time};
+use crate::{meetings, search, time};
 
 /// Pages a listing reads at most, newest first: 1000 conversations or messages at the page size
 /// of 50. ponytail: a "mark as unread" on a conversation past them is not seen; page further if
@@ -42,6 +42,8 @@ pub fn call(account: &str, tool: &str, args_json: &str) -> Result<String, Module
         "send" => send,
         "edit_message" => edit_message,
         "react" => react,
+        "list_meetings" => list_meetings,
+        "get_transcript" => get_transcript,
         _ => return Err(ModuleError::NotSupported(tool.to_string())),
     };
     api::with_session(account, |session| run(session, &args)).map(|result| result.to_string())
@@ -343,6 +345,173 @@ fn writing_context(session: &mut Session, args: &Value) -> Result<Value, ModuleE
         .map(|c| json!({"sent_at": time::rfc3339(c.sent_ms), "untrusted": {"text": c.text}}))
         .collect();
     Ok(json!({ "examples": examples }))
+}
+
+/// The longest window of `list_meetings`, and its default: from a week back to a day ahead.
+const MAX_MEETINGS_WINDOW_MS: i64 = 31 * DAY_MS;
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// The largest `list_meetings` result, as JSON: below the core's 1 MiB for the module's own tools.
+const MAX_MEETINGS_RESULT: usize = 900 * 1024;
+
+/// The Teams meetings of the user's calendar between `from` and `to` (spec 4.1). Not cut to a
+/// count: the core leaves out the meetings the agent may not read only after this.
+fn list_meetings(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let at = |key: &str, default: i64| match args.get(key) {
+        None => Ok(default),
+        Some(t) => t.as_str().and_then(time::rfc3339_ms).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} must be an RFC 3339 time"))),
+    };
+    let now = api::now_ms();
+    let (from, to) = (at("from", now.saturating_sub(7 * DAY_MS))?, at("to", now.saturating_add(DAY_MS))?);
+    if to <= from || to - from > MAX_MEETINGS_WINDOW_MS {
+        return Err(ModuleError::InvalidArgs("to must be after from, at most 31 days".to_string()));
+    }
+    let middle_tier =
+        session.directory.middle_tier.clone().ok_or_else(|| ModuleError::NotSupported("no calendar service for this account".to_string()))?;
+    let body = api::middle_tier(session, &meetings::calendar(&middle_tier, from, to))?;
+    let items = meetings::decode_calendar(&body)
+        .map_err(api::proto)?
+        .iter()
+        .map(meetings::meeting_item)
+        .collect::<Option<Vec<Value>>>()
+        .ok_or_else(|| ModuleError::Incompatible("a calendar id too long".to_string()))?;
+    let result = json!({ "items": items });
+    if result.to_string().len() > MAX_MEETINGS_RESULT {
+        return Err(ModuleError::Platform("too many events, narrow from/to".to_string()));
+    }
+    Ok(result)
+}
+
+/// A page of a transcript's cues by default, and the smallest and largest one an agent may ask for:
+/// the largest leaves room for the rest of the result below the core's 1 MiB (spec 4.2 step 7).
+const DEFAULT_PAGE_BYTES: u64 = 131_072;
+const PAGE_BYTES: std::ops::RangeInclusive<u64> = 4096..=786_432;
+/// The most transcripts one result lists.
+const MAX_TRANSCRIPTS: usize = 200;
+
+/// One page of a meeting's transcript (spec 2026-10-28-meetings-transcripts, 4.2): MCPS names the
+/// transcripts, OneDrives or team sites of the user's organization hold them. Only GETs; reading
+/// someone else's recording may count as one view in its owner's analytics, which the owner of
+/// open_mess accepted (spec section 10, D3).
+fn get_transcript(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
+    let conversation = required(args, "conversation")?;
+    if !meetings::is_meeting_thread(conversation) {
+        return Err(ModuleError::InvalidArgs("conversation must be a meeting chat, 19:meeting_...".to_string()));
+    }
+    // Ids and versions come back as the tokens this tool and list_meetings gave.
+    let given = |key: &str| match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            v.as_str().and_then(meetings::untoken).map(Some).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} is not one this tool gave")))
+        }
+    };
+    let (ical_uid, wanted, version) = (given("ical_uid")?, given("transcript")?, given("version")?);
+    let at = |key: &str| match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(t) => t.as_str().and_then(time::rfc3339_ms).map(Some).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} must be an RFC 3339 time"))),
+    };
+    let (from, to) = (at("start")?, at("end")?);
+    if from.zip(to).is_some_and(|(from, to)| to < from) {
+        return Err(ModuleError::InvalidArgs("end must not be before start".to_string()));
+    }
+    let number = |key: &str| match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(n) => n.as_u64().map(Some).ok_or_else(|| ModuleError::InvalidArgs(format!("{key} must be a whole number"))),
+    };
+    let cursor = number("cursor")?.map(|c| usize::try_from(c).unwrap_or(usize::MAX));
+    if cursor.is_some() && (wanted.is_none() || version.is_none()) {
+        return Err(ModuleError::InvalidArgs("cursor needs the transcript and version of the page before".to_string()));
+    }
+    let max_bytes = number("max_bytes")?.unwrap_or(DEFAULT_PAGE_BYTES);
+    if !PAGE_BYTES.contains(&max_bytes) {
+        return Err(ModuleError::InvalidArgs("max_bytes must be 4096-786432".to_string()));
+    }
+
+    let mcps = session
+        .directory
+        .mcp_service
+        .clone()
+        .ok_or_else(|| ModuleError::NotSupported("no meeting artifacts service for this account".to_string()))?;
+    let request = meetings::artifacts(&mcps, conversation, ical_uid.as_deref(), &api::uuid());
+    let artifacts = meetings::decode_artifacts(&api::read(session, Service::Mcps, &request)?).map_err(api::proto)?;
+    let too_many = || ModuleError::Platform("too many meeting artifacts, pass ical_uid of the occurrence".to_string());
+    if artifacts.more {
+        // The rest of the list is on pages of a shape not seen yet: never a pick from part of it.
+        return Err(if ical_uid.is_none() {
+            too_many()
+        } else {
+            api::proto(crate::ProtoError::Incompatible("paginationInfo.hasNextPage".to_string()))
+        });
+    }
+    let found: Vec<&meetings::Artifact> = artifacts.transcripts.iter().filter(|a| a.overlaps(from, to)).collect();
+    if found.len() > MAX_TRANSCRIPTS {
+        return Err(too_many());
+    }
+    let chosen = match &wanted {
+        Some(id) => {
+            Some(*found.iter().find(|a| a.id == *id).ok_or_else(|| ModuleError::InvalidArgs("no such transcript of this meeting".to_string()))?)
+        }
+        None => found.iter().filter(|a| a.v2.is_some()).max_by_key(|a| a.start_ms).copied(),
+    };
+    let items = meetings::transcript_items(conversation, &found, chosen.map(|a| a.id.as_str()))
+        .ok_or_else(|| ModuleError::Incompatible("a meeting artifact id too long".to_string()))?;
+    let result =
+        |transcript: Option<&str>, version: Option<&str>, language: Option<String>, cues: Vec<Value>, next: Option<usize>, reason: Option<&str>| {
+            let token = |raw: Option<&str>| {
+                raw.map(|raw| meetings::token(raw).ok_or_else(|| ModuleError::Incompatible("a transcript id too long".to_string()))).transpose()
+            };
+            Ok(json!({
+                "items": items,
+                "transcript": token(transcript)?,
+                "version": token(version)?,
+                "language": language,
+                "next_cursor": next,
+                "reason": reason,
+                "untrusted": {"cues": cues},
+            }))
+        };
+    let Some(chosen) = chosen else { return result(None, None, None, Vec::new(), None, Some("no transcript")) };
+    let v2 = chosen.v2.as_ref().ok_or_else(|| ModuleError::NotSupported("an older kind of Teams transcript".to_string()))?;
+
+    // Whose transcript it is, before any SharePoint token is asked for (spec 4.2 step 3).
+    let tenant = session.tenant.clone().ok_or_else(|| ModuleError::NotSupported("cannot tell the account's organization".to_string()))?;
+    if !v2.owner_tenant.eq_ignore_ascii_case(&tenant) {
+        return Err(ModuleError::NotSupported("the transcript is stored by another organization".to_string()));
+    }
+    let origin = meetings::own_origin(&v2.location, &sharepoint_tenant(session)?)
+        .ok_or_else(|| ModuleError::Platform("transcript stored outside your organization".to_string()))?;
+    let (drive, item) = (v2.drive_id.as_str(), v2.drive_item_id.as_str());
+    let list = meetings::transcript_list(&origin, drive, item).map_err(api::proto)?;
+    let Some(odsp) = meetings::decode_transcript_list(&api::sharepoint(session, &origin, &list)?, v2.transcript_id.as_deref()).map_err(api::proto)?
+    else {
+        return result(Some(&chosen.id), None, None, Vec::new(), None, Some("transcript not ready"));
+    };
+    let changed = || ModuleError::Platform("transcript changed, read it again from the start".to_string());
+    if version.as_ref().is_some_and(|v| *v != odsp.version) {
+        return Err(changed());
+    }
+    let content = meetings::transcript_content(&origin, drive, item, &odsp.id).map_err(api::proto)?;
+    let cues = meetings::parse_vtt(&api::sharepoint(session, &origin, &content)?).map_err(api::proto)?;
+    // Read during a change, the text would pass as the version read before it (spec 4.2 step 2).
+    let after = meetings::decode_transcript_list(&api::sharepoint(session, &origin, &list)?, Some(&odsp.id)).map_err(api::proto)?;
+    if after.as_ref().map(|a| (&a.id, &a.version)) != Some((&odsp.id, &odsp.version)) {
+        return Err(changed());
+    }
+    let (page, next) = meetings::page(&cues, cursor.unwrap_or(0), usize::try_from(max_bytes).unwrap_or(usize::MAX));
+    result(Some(&chosen.id), Some(&odsp.version), odsp.language, page, next, None)
+}
+
+/// The label of the organization's SharePoint, from the user's own OneDrive, read once a session
+/// (spec 4.2 step 4).
+fn sharepoint_tenant(session: &mut Session) -> Result<String, ModuleError> {
+    if let Some(tenant) = &session.sharepoint_tenant {
+        return Ok(tenant.clone());
+    }
+    let request = meetings::user_properties(&session.directory.chat_service);
+    let tenant = meetings::decode_personal_site(&api::read(session, Service::Chat, &request)?)
+        .map_err(api::proto)?
+        .ok_or_else(|| ModuleError::NotSupported("cannot tell your organization's SharePoint".to_string()))?;
+    session.sharepoint_tenant = Some(tenant.clone());
+    Ok(tenant)
 }
 
 /// An AMS image of a message: only one the message references (docs 7).
