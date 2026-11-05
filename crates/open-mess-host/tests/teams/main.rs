@@ -1775,6 +1775,36 @@ async fn live_captions_end_at_once_when_the_user_is_not_in_the_meeting() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_end_of_the_leg_is_a_refusal_and_the_end_of_the_conversation_the_meeting_end() {
+    let (teams, trouter) = Teams::live().await;
+    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
+    // The session's state and reason once it is no longer joining.
+    async fn settled(teams: &Teams) -> (String, String) {
+        for _ in 0..100 {
+            let page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
+            if page["state"] != "joining" {
+                return (page["state"].as_str().unwrap_or("").into(), page["reason"].as_str().unwrap_or("").into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("not within 10 s");
+    }
+    let joins = |teams: &Teams| requests(&teams.fake, "POST", CONTROLLER_PATH);
+    // `/call/end/` ends open_mess's leg (430/10067 came live when Teams refused it, "Live results" 19).
+    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    let join = wait_for(|| joins(&teams).pop()).await.json();
+    let end = join["callInvitation"]["links"]["end"].as_str().unwrap().to_string();
+    assert!(trouter.callback(1, &end, &json!({"callEnd": {"code": 430, "subCode": 10067}})));
+    assert_eq!(settled(&teams).await, ("failed".into(), "refused".into()));
+    // `/conversation/conversationEnd/` is the meeting's end.
+    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    let join = wait_for(|| joins(&teams).get(1).map(|join| join.json())).await;
+    let end = join["conversationRequest"]["links"]["conversationEnd"].as_str().unwrap().to_string();
+    assert!(trouter.callback(2, &end, &json!({"conversationEnd": {"code": 0}})));
+    assert_eq!(settled(&teams).await, ("ended".into(), "meeting_ended".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn joining_needs_the_meeting_in_the_call_store_and_one_session_an_account() {
     let (teams, trouter) = Teams::live().await;
     teams.fake.on(meeting_server(json!({"official-client": {}}), false));
