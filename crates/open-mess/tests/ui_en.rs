@@ -164,9 +164,15 @@ async fn sign_in_as(state: &Arc<UiState>, again: Option<&str>, account: &str) ->
         tokio::spawn(async move { commands::sign_in_start(&state, "test-echo", again.as_deref()).await })
     };
     let page = prompt(state, "page").await;
-    // Only cancelled from the window: the page's own redirect answers it.
-    let made_up = commands::sign_in_answer(state, page.id, AnswerDto::Done(Some("https://login.example.com/done".into())));
-    assert_eq!(made_up, Err("a sign-in page can only be cancelled".to_string()));
+    // On Windows only cancelled from the window: the page's own redirect answers it. Elsewhere the
+    // pasted address must be the one the sign-in ended on.
+    let made_up = commands::sign_in_answer(state, page.id, AnswerDto::Done(Some("https://evil.example/done".into())));
+    let refused = if cfg!(windows) {
+        "a sign-in page can only be cancelled"
+    } else {
+        "this is not the address the sign-in ended on - copy the whole address from the browser's address bar"
+    };
+    assert_eq!(made_up, Err(refused.to_string()));
     let redirect = format!("https://login.example.com/done?account={account}&code=1");
     state.sign_ins.answer(page.id, SignInReply::Done(Some(redirect))).unwrap();
     signing_in.await.unwrap()
