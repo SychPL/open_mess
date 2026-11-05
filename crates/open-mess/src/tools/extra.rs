@@ -1,6 +1,8 @@
 //! The modules' own tools (manifest `extra_tools`, spec 2026-10-28-meetings-transcripts 5.1): which
 //! of them both front ends list, as `<module>_<tool>`, and the arguments the core checks before the
-//! module gets them. The module checks the types and ranges of its own arguments.
+//! module gets them. The module checks the types and ranges of its own arguments. A write tool
+//! names the conversation it writes to and the account that writes (spec 2026-10-29-live-captions,
+//! 5.1); its calls become pending actions.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +35,7 @@ pub(crate) struct Listed {
 
 /// The name both front ends use: `-` in the module name becomes `_`, as model APIs take only
 /// `[a-zA-Z0-9_-]{1,64}` and `.` is not among them.
-fn full_name(module: &str, tool: &str) -> String {
+pub(crate) fn full_name(module: &str, tool: &str) -> String {
     format!("{}_{tool}", module.replace('-', "_"))
 }
 
@@ -99,12 +101,9 @@ fn plain_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// A declared tool as the front ends list it: read tools only, plain names, and a schema the core
-/// can check arguments against; `account` is the core's to add.
+/// A declared tool as the front ends list it: plain names, a schema the core can check arguments
+/// against, and a conversation required of a write tool; `account` is the core's to add.
 fn check(name: &str, tool: &open_mess_host::ToolDecl) -> Result<Listed, String> {
-    if tool.writes {
-        return Err("not supported yet: module write tools".to_string());
-    }
     if !plain_name(&tool.name) {
         return Err("the name must be 1-32 characters of a-z, 0-9 and _, starting with a letter".to_string());
     }
@@ -138,10 +137,22 @@ fn check(name: &str, tool: &open_mess_host::ToolDecl) -> Result<Listed, String> 
         }
         Some(_) => return Err("required is not a list".to_string()),
     };
-    let account =
-        json!({"type": "string", "description": "Account id from the accounts tool; left out, the module's only account the agent may read."});
+    if tool.writes && !required.iter().any(|key| key == "conversation") {
+        return Err("a module write tool must name its conversation".to_string());
+    }
+    let account = if tool.writes {
+        // As for `send`: the core never guesses the account that writes.
+        json!({"type": "string", "description": "Account id from the accounts tool: the account that writes."})
+    } else {
+        json!({"type": "string", "description": "Account id from the accounts tool; left out, the module's only account the agent may read."})
+    };
     if let Some(Value::Object(published)) = schema.get_mut("properties") {
         published.insert("account".to_string(), account);
+    }
+    if tool.writes
+        && let Some(Value::Array(keys)) = schema.get_mut("required")
+    {
+        keys.push(json!("account"));
     }
     schema.insert("additionalProperties".to_string(), json!(false));
     let info = ToolInfo { name: name.to_string(), description: tool.description.clone(), input_schema: Value::Object(schema) };
@@ -187,6 +198,7 @@ mod tests {
             sign_in_hosts: Vec::new(),
             wam: None,
             extra_tools: tools,
+            media: None,
         };
         ModuleInfo {
             name: name.into(),
@@ -217,22 +229,25 @@ mod tests {
     #[test]
     fn only_fit_tools_of_active_modules_are_listed() {
         let writes = ToolDecl { writes: true, ..tool("poke", schema()) };
+        let anywhere = ToolDecl { writes: true, ..tool("nudge", json!({"type": "object", "properties": {"conversation": {}}})) };
         let modules = [
             module(
                 "my-mod",
                 ModuleState::Active,
-                vec![tool("peek", schema()), writes, tool("Bad", schema()), tool("x".repeat(33).as_str(), schema())],
+                vec![tool("peek", schema()), writes, anywhere, tool("Bad", schema()), tool("x".repeat(33).as_str(), schema())],
             ),
             module("off", ModuleState::Disabled, vec![tool("peek", schema())]),
         ];
         let listed = listed(&modules);
-        assert_eq!(listed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["my_mod_peek"]);
-        // `account` is added, other properties refused.
+        assert_eq!(listed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["my_mod_peek", "my_mod_poke"]);
+        // `account` is added, other properties refused; a write tool requires it.
         assert_eq!(listed[0].input_schema["properties"]["account"]["type"], "string");
         assert_eq!(listed[0].input_schema["additionalProperties"], false);
+        assert_eq!(listed[0].input_schema["required"], json!(["conversation"]));
+        assert_eq!(listed[1].input_schema["required"], json!(["conversation", "account"]));
         let reasons = reasons(&modules, "my-mod");
         assert_eq!(reasons.len(), 3, "{reasons:?}");
-        assert!(reasons.iter().any(|(name, why)| name == "my_mod_poke" && why == "not supported yet: module write tools"));
+        assert!(reasons.iter().any(|(name, why)| name == "my_mod_nudge" && why == "a module write tool must name its conversation"));
         assert!(reasons.iter().any(|(name, why)| name == "my_mod_Bad" && why.contains("a-z")));
     }
 

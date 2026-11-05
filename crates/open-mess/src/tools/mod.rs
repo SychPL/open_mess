@@ -7,8 +7,8 @@
 //! (spec 8.6): an account or conversation the agent may not read is refused when named and left
 //! out of lists. The writes never reach a module from here: they become pending actions
 //! (pending.rs), which run under the write permission. Every call passes the [`Gate`], which an
-//! update closes (spec 7.1). Active modules add their own read tools (extra.rs), under the same
-//! permissions.
+//! update closes (spec 7.1). Active modules add their own tools (extra.rs), under the same
+//! permissions; their write tools make pending actions too.
 
 pub mod extra;
 pub mod shared;
@@ -28,7 +28,7 @@ use tokio::task::JoinSet;
 
 use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::{ModuleInfo, ModuleState};
-use crate::pending::{Kind, Pending, State};
+use crate::pending::{self, Kind, Pending, State};
 use crate::permissions;
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
@@ -103,15 +103,16 @@ impl Gate {
         self.0.last_end_ms.load(Ordering::SeqCst)
     }
 
-    /// Takes a call of `tool`, counted while the guard lives, or refuses it.
-    fn enter(&self, tool: &str) -> Result<InFlight, ToolError> {
+    /// Takes a call of a tool, a write tool if `writes`, counted while the guard lives, or refuses
+    /// it.
+    fn enter(&self, writes: bool) -> Result<InFlight, ToolError> {
         // Counted before the mode is read: whoever closes the gate and then sees no call running
         // knows that every later call sees it closed.
         self.0.in_flight.fetch_add(1, Ordering::SeqCst);
         let call = InFlight(Arc::clone(&self.0));
         match *self.0.mode.lock().unwrap_or_else(PoisonError::into_inner) {
             GateMode::Closed => Err(update_in_progress()),
-            GateMode::WritesBlocked if Kind::for_tool(tool).is_some() => Err(update_in_progress()),
+            GateMode::WritesBlocked if writes => Err(update_in_progress()),
             _ => Ok(call),
         }
     }
@@ -278,7 +279,12 @@ impl Registry {
 
     /// Runs a tool. `args` is the arguments object.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
-        let _call = self.gate.enter(name)?;
+        // A module's write tool is known by its declaration, not by a list (spec
+        // 2026-10-29-live-captions, 5.1, R9).
+        let module_writes =
+            |accounts: &Arc<Accounts>| extra::find(&accounts.modules().list(), name).is_some_and(|tools| tools.iter().any(|tool| tool.decl.writes));
+        let writes = Kind::for_tool(name).is_some() || self.accounts.as_ref().is_some_and(module_writes);
+        let _call = self.gate.enter(writes)?;
         self.run(name, args).await
     }
 
@@ -287,10 +293,10 @@ impl Registry {
             no_params(&args)?;
             return self.status();
         }
-        if let Some(accounts) = &self.accounts
+        if let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending)
             && let Some(tool) = extra::find(&accounts.modules().list(), name)
         {
-            return call_extra(accounts, name, tool, args).await;
+            return call_extra(accounts, pending, name, tool, args).await;
         }
         let args = shared::validate(name, args)?;
         let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending) else {
@@ -488,8 +494,10 @@ fn finish(accounts: &Accounts, account: &Account, tool: &str, args: &Value, resu
 }
 
 /// Runs a module's own tool (spec 2026-10-28-meetings-transcripts, 5.1); `tools` are the
-/// declarations of its full `name`, one when it is listed.
-async fn call_extra(accounts: &Accounts, name: &str, mut tools: Vec<extra::Declared>, args: Value) -> Result<Value, ToolError> {
+/// declarations of its full `name`, one when it is listed. A write tool's call becomes a pending
+/// action under the write permission, as `send`'s does, and never reaches the module from here
+/// (spec 2026-10-29-live-captions, 5.1).
+async fn call_extra(accounts: &Accounts, pending: &Pending, name: &str, mut tools: Vec<extra::Declared>, args: Value) -> Result<Value, ToolError> {
     let (Some(tool), None) = (tools.pop(), tools.first()) else { return Err(ToolError::UnknownTool(name.into())) };
     // A client that missed the change of the list learns why the tool is gone.
     if tool.state != ModuleState::Active {
@@ -505,14 +513,25 @@ async fn call_extra(accounts: &Accounts, name: &str, mut tools: Vec<extra::Decla
             }
             account
         }
+        None if tool.decl.writes => return Err(ToolError::InvalidArgs("account is required".into())),
         None => only_readable(accounts, &tool.module)?,
     };
-    let account = readable(accounts, &account.id, &module_args)?;
+    // A write is under the write permission only, as for `send` (spec 2026-10-29-live-captions, R3).
+    let account = if tool.decl.writes { account } else { readable(accounts, &account.id, &module_args)? };
     let handle = module(accounts, &account)?;
     // The module may have been replaced since its tools were read: the one called must declare
     // this very tool, never one that writes now.
     if !handle.manifest().is_ok_and(|manifest| manifest.extra_tools.contains(&tool.decl)) {
         return Err(ToolError::Module(format!("module {} changed meanwhile; try again", tool.module)));
+    }
+    if tool.decl.writes {
+        if accounts.module_writes().blocked() {
+            return Err(ToolError::Failed(pending::MODULES_CHANGING.into()));
+        }
+        // The schema makes `conversation` required and text.
+        let conversation = module_args.get("conversation").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let outcome = pending.create_tool(name, &tool.decl, &account.id, &conversation, module_args).await?;
+        return serde_json::to_value(outcome).map_err(failed);
     }
     let json = within(&account.module, handle.call(&account.module_account, &tool.decl.name, &module_args.to_string())).await?;
     if json.len() > extra::MAX_RESULT {

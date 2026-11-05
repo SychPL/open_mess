@@ -44,6 +44,9 @@ pub fn call(account: &str, tool: &str, args_json: &str) -> Result<String, Module
         "react" => react,
         "list_meetings" => list_meetings,
         "get_transcript" => get_transcript,
+        "join_captions" => crate::live::join,
+        "read_captions" => crate::live::read,
+        "leave_captions" => crate::live::leave,
         _ => return Err(ModuleError::NotSupported(tool.to_string())),
     };
     api::with_session(account, |session| run(session, &args)).map(|result| result.to_string())
@@ -113,8 +116,16 @@ fn conversations(session: &mut Session, start_ms: i64, partial: bool, mut keep: 
 
 /// Walks a conversation's text messages, newest first, while `keep` returns true, within
 /// `MAX_PAGES` and the call's time.
-/// With `end_ms`, the walk starts at messages before then.
-fn messages(session: &mut Session, conversation: &str, end_ms: Option<i64>, mut keep: impl FnMut(Message) -> bool) -> Result<(), ModuleError> {
+/// With `end_ms`, the walk starts at messages before then. With `partial`, a walk the pages or the
+/// time cut short ends with what it saw; without, that is an error, so a short list always means
+/// there is no more (`read_messages`; spec 2026-10-29-live-captions, 4.5).
+fn messages(
+    session: &mut Session,
+    conversation: &str,
+    end_ms: Option<i64>,
+    partial: bool,
+    mut keep: impl FnMut(Message) -> bool,
+) -> Result<(), ModuleError> {
     let mut link: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let request = chat::read_messages(&session.directory, conversation, link.as_deref(), PAGE_SIZE, end_ms).map_err(api::proto)?;
@@ -127,10 +138,11 @@ fn messages(session: &mut Session, conversation: &str, end_ms: Option<i64>, mut 
         }
         match page.backward_link {
             Some(next) if !empty && api::has_time() => link = Some(next),
+            Some(_) if !empty && !partial => return Err(ModuleError::Platform("Teams answers too slowly; try again later".to_string())),
             _ => return Ok(()),
         }
     }
-    Ok(())
+    if partial { Ok(()) } else { Err(ModuleError::Platform("could not read that far back in one call".to_string())) }
 }
 
 fn message_item(m: &Message, me: &str) -> Value {
@@ -254,7 +266,7 @@ fn mentions(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
         if !api::has_time() {
             break;
         }
-        messages(session, &conversation, None, |m| {
+        messages(session, &conversation, None, true, |m| {
             if m.sent_ms <= since {
                 return false;
             }
@@ -284,7 +296,7 @@ fn read_messages(session: &mut Session, args: &Value) -> Result<Value, ModuleErr
         }
     };
     let mut items = Vec::new();
-    messages(session, conversation, before_ms, |m| {
+    messages(session, conversation, before_ms, false, |m| {
         if before_ms.is_some_and(|b| m.sent_ms >= b) {
             return true;
         }
@@ -333,7 +345,7 @@ fn writing_context(session: &mut Session, args: &Value) -> Result<Value, ModuleE
     };
     let me = session.me();
     let (mut seen, mut candidates) = (0, Vec::new());
-    messages(session, conversation, None, |m| {
+    messages(session, conversation, None, true, |m| {
         seen += 1;
         if m.sender_id == me && !m.deleted {
             candidates.extend(writing::candidate(&m.html, m.sent_ms));

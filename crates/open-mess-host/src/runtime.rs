@@ -14,6 +14,7 @@ use crate::error::HostError;
 use crate::hosts::HostList;
 use crate::limits::{self, Limits, ModuleLimiter};
 use crate::net::Net;
+use crate::rtc::{Allowed, Connections, Peers};
 use crate::sign_in::{Caller, CodeShown, SignInPrompts};
 use crate::storage::Storage;
 use crate::timers::Timers;
@@ -30,6 +31,14 @@ pub struct Manifest {
     pub sign_in_hosts: Vec<String>,
     pub wam: Option<WamIdentity>,
     pub extra_tools: Vec<ToolDecl>,
+    pub media: Option<MediaAccess>,
+}
+
+/// Mirrors `media-access` in `wit/module.wit`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaAccess {
+    /// CIDR ranges of the media peers.
+    pub peers: Vec<String>,
 }
 
 /// Mirrors `wam-identity` in `wit/module.wit`.
@@ -161,6 +170,8 @@ pub(crate) struct ModuleEnv {
     pub(crate) sign_in: SignInPrompts,
     /// The manifest's Windows account identity, the only one `wam-token` asks for.
     pub(crate) wam: Option<WamIdentity>,
+    /// Who the module's media connections may reach; none without `media` in the manifest.
+    pub(crate) media: Option<Allowed>,
 }
 
 /// The state a module instance runs with: a WASI context with nothing inherited, plus the host
@@ -172,6 +183,7 @@ pub(crate) struct HostState {
     pub(crate) deadline: Deadline,
     pub(crate) env: Arc<ModuleEnv>,
     pub(crate) sockets: Sockets,
+    pub(crate) rtc: Connections,
     pub(crate) timers: Timers,
     pub(crate) storage: Option<Storage>,
     /// The largest HTTP body `http.fetch` takes now: `MAX_ATTACHMENT` during `get-attachment`.
@@ -203,6 +215,7 @@ impl HostState {
             deadline,
             env,
             sockets: Sockets::default(),
+            rtc: Connections::default(),
             timers: Timers::default(),
             storage: None,
             max_body: limits::MAX_BODY,
@@ -330,6 +343,7 @@ impl Engine {
             timer_cap: None,
             sign_in: sign_in.clone(),
             wam: None,
+            media: None,
         };
         let (mut actor, state) = Actor::new(self.engine.clone(), pre, self.limits, Arc::new(loading));
         let manifest: Manifest = actor
@@ -342,6 +356,7 @@ impl Engine {
         // Not used until the sign-in window (milestone E), but a bad manifest is refused now.
         HostList::parse(&manifest.sign_in_hosts)?;
         crate::sign_in::check_scopes(manifest.wam.as_ref())?;
+        let media = manifest.media.as_ref().map(|media| Peers::parse(&media.peers)).transpose()?.map(|peers| Allowed::new(peers, net.policy()));
         actor.reset(Arc::new(ModuleEnv {
             name: manifest.name.clone(),
             data_dir,
@@ -354,6 +369,7 @@ impl Engine {
             timer_cap: self.timer_cap,
             sign_in,
             wam: manifest.wam.clone(),
+            media,
         }));
         let (requests, queue) = mpsc::channel(QUEUE);
         let crashes_since_load = actor.crashes_since_load.clone();
@@ -445,6 +461,13 @@ impl ModuleHandle {
 
     pub async fn sign_out(&self, account: &str) -> Result<(), HostError> {
         self.request(|reply| Request::SignOut(account.to_string(), reply)).await
+    }
+
+    /// Ends now what other people see of the account's sessions (live captions), before the
+    /// daemon stops, an update pauses the module's events or a scan stops or replaces the module;
+    /// at most `END_SESSIONS_TIMEOUT` once its turn in the module's queue comes.
+    pub async fn end_sessions(&self, account: &str) -> Result<(), HostError> {
+        self.request(|reply| Request::EndSessions(account.to_string(), reply)).await
     }
 
     /// Runs a tool: a shared one (spec 8.5) or one of the manifest's extra tools.

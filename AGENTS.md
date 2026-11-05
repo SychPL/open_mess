@@ -42,6 +42,9 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
   - `crates/open-mess-host/src/wam.rs`, function `request_for_window`: the WAM sign-in dialog,
     `IWebAuthenticationCoreManagerInterop::RequestTokenForWindowAsync`, an interop call the
     `windows` crate exposes only as `unsafe`.
+  - `crates/open-mess-host/src/proxy.rs`, module `winhttp` (functions `free` and `auto_config`):
+    the user's proxy settings and `WinHttpGetProxyForUrl` (PAC script and WPAD) for media
+    connections, and `GlobalFree` for the strings WinHTTP hands back.
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
   returns an error ("not supported yet: ..."); it never panics.
 - **Everything from the network is hostile:** server responses, WebSocket events, message
@@ -75,7 +78,9 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
 - **One tool registry.** Every capability is a tool with the same name, parameters and results
   over MCP and the CLI. No MCP-only or CLI-only features.
 - **Modules reach the outside world only through host imports** (HTTP, WebSocket, storage,
-  secrets, sign-in prompts). A module's network access is limited to the hosts in its manifest.
+  secrets, sign-in prompts, and media connections (`rtc`) for a module whose manifest has
+  `media`). A module's network access is limited to the hosts in its manifest, and its media
+  connections to the address ranges in its `media`.
 - **One process.** No permanent helper processes and no browser engine running in the
   background. The configuration window's WebView exists only while the window is open. The only
   exception is `om mcp-stdio` (spec 8.7): a bridge Claude Code starts for a session with channels,
