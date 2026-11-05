@@ -4,8 +4,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -155,10 +154,7 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
 /// names. Each only where it exists.
 fn relabel<R: tauri::Runtime>(app: &AppHandle<R>, lang: Lang) {
     // ponytail: a menu or title that fails to change keeps the old language until the next change.
-    {
-        let recording = TRAY_RECORDING.lock().unwrap_or_else(PoisonError::into_inner);
-        show_tray(app, lang, *recording);
-    }
+    refresh_tray(app);
     if let Some(window) = app.get_webview_window(LABEL) {
         let _ = window.set_title(title(lang));
     }
@@ -421,17 +417,23 @@ fn tray_tooltip(lang: Lang, recording: bool) -> &'static str {
     if recording { lang.pick("open_mess - nagrywanie", "open_mess - recording") } else { "open_mess" }
 }
 
-/// Whether the tray shows a recording. Held while the tray's menu and tooltip change, so a change of
-/// language never puts back the state from before a recording started or ended.
-static TRAY_RECORDING: Mutex<bool> = Mutex::new(false);
+/// Whether a call is recorded, as the tray shows it.
+static TRAY_RECORDING: AtomicBool = AtomicBool::new(false);
 
-/// Shows the tray in `lang`, `recording` or not; the caller holds [`TRAY_RECORDING`].
-fn show_tray<R: tauri::Runtime>(app: &AppHandle<R>, lang: Lang, recording: bool) {
+/// Redraws the tray's menu and tooltip on the main thread, in the language and the recording state
+/// of that moment. Nobody waits for it and no lock is held across it (the recorder calls its
+/// indicator under its own lock, while the main thread may be relabelling), and the last redraw
+/// always shows the latest state.
+fn refresh_tray<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let handle = app.clone();
     // ponytail: a menu or tooltip that fails to change keeps the old one until the next change.
-    if let (Some(tray), Ok(menu)) = (app.tray_by_id(TRAY), tray_menu(app, lang, recording)) {
-        let _ = tray.set_menu(Some(menu));
-        let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
-    }
+    let _ = app.run_on_main_thread(move || {
+        let (lang, recording) = (i18n::current(), TRAY_RECORDING.load(Ordering::SeqCst));
+        if let (Some(tray), Ok(menu)) = (handle.tray_by_id(TRAY), tray_menu(&handle, lang, recording)) {
+            let _ = tray.set_menu(Some(menu));
+            let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
+        }
+    });
 }
 
 fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
@@ -465,9 +467,8 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
     if let Some(recorder) = &app.state::<UiState>().recorder {
         let handle = app.handle().clone();
         recorder.set_indicator(Box::new(move |recording| {
-            let mut shown = TRAY_RECORDING.lock().unwrap_or_else(PoisonError::into_inner);
-            *shown = recording;
-            show_tray(&handle, i18n::current(), recording);
+            TRAY_RECORDING.store(recording, Ordering::SeqCst);
+            refresh_tray(&handle);
         }));
     }
     Ok(())
