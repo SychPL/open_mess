@@ -860,6 +860,129 @@ note from the step 0b probe (two local `webrtc` 0.14 peers, no Teams involved): 
 reached ICE `connected` and carried framed messages; an offer with an inactive audio transceiver
 stayed in ICE `checking`, so an inactive audio section may need work in the host's WebRTC stack.
 
+### 10.8 Turning captions on, refusals, 1:1 calls (step 0a of the captions archive spec)
+
+**Static analysis, not verified live.** Added 2026-11-05 for step 0a of
+`.specs/2026-11-04-captions-archive.md`, on a newer build than the sections above: package
+`MSTeams_26276.513.5241.9675`, `desktop-assets/hashed-assets` decompressed as described in "Sources
+and method" (ripgrep and bounded reads, no code executed). Chunks: calling core
+`383696-2098d8e277f05e1b.js` (8.9 MB), `calling-pluginless-acd72efe322640b8.js`,
+`calling-electron-80165cea3c2be944.js`, `calling-app-bba740373c983e13.js`,
+`r_data-client-calling-8f185bb5207d976d.js`, `config-prod-381bbe721fce0ca0.js`, config getters
+`166144-caf8b23f3035d73d.js`, header constants `560441-7a93a69d122e7781.js`,
+`services-live-meeting-status-bar-1c9c3116643010dd.js`.
+
+Turning captions on:
+- **CONFIRMED** the GraphQL `startClosedCaptions` resolver (`r_data-client-calling`) sends nothing; it
+  calls the call model's `startClosedCaption` (`383696`, captions mixin). With the bot in the call and
+  its `closedCaptions` mode not `Active` it sends the bot a start command; without the bot it sets
+  `pendingInviteBot` and, once the call is connected, `addBotParticipant()`. When the bot joins later
+  without the mode active, the initiator sends the start command (`PENDING_ON_BOT_JOIN`).
+- **CONFIRMED** `addBotParticipant()` adds the combined recording/transcription bot when
+  `isCombinedBotEnabled()` (`addCombinedRecorderBot`, mode `RecordingAndTranscription`, owner
+  `CombinedClosedCaptions`), else `addParticipant(getBotDefaultMRI(), ...)`. `config-prod` sets
+  `enableCombinedRecordingBot` and `enableCombinedRecordingBotForCCBackedScenario` to true, so with the
+  shipped defaults the combined bot is added. **UNCONFIRMED** whether ECS overrides them at run time.
+- **CONFIRMED** bot MRIs come from `config-prod` by call region (`getCurrentRegionBotMri`): the
+  captions-only bot (`closedCaptionsBotToRegion`) `28:b1902c3e-b9f7-4650-9b23-5772bd429747`, the
+  combined/recording bot (`recordingBotMriToRegion`) `28:bdd75849-e0a6-4cce-8fc1-d7c0d4da43e5`;
+  fallbacks `callingConstants.callRecording.closedCaptionsBotMri` and `.recordingBotMri`. Both are
+  Microsoft service identities, not user data.
+- **CONFIRMED** adding the bot (`calling-pluginless`, `addParticipantsToCall`): `POST` to the
+  conversation's `links.addParticipantAndModality` when a thread is known, else `links.addParticipant`;
+  body (no `payload` envelope) `disableUnmute`, `participants.from {id, displayName, endpointId,
+  participantId, languageId}`, `participants.to [{id, assertedId, displayName, participantId}]`,
+  `participantInvitationData`, `replacementDetails`, `groupContext {id} | null`, `groupChat {threadId,
+  messageId} | null`, `links {addParticipantSuccess, addParticipantFailure}`.
+  `participantInvitationData` is `{botData: {meetingTitle, clientInfo: "Teams-<ring>", callId, threadId,
+  recorderFeatures, mode, iCalUid, consumerType, spokenLanguage, correlationId, initiatorUserToken,
+  exchangeId, meetingOrganizer, language?}}` (`createBotPayload`, `383696`); `initiatorUserToken` is an
+  AAD token carried in the body. On the desktop the same data goes to the native `addParticipantToCall`
+  (**UNCONFIRMED** which link the native stack uses).
+- **CONFIRMED** the start command (`CallingBotRestClient.sendCommand`, `383696`): `POST` to the bot's
+  roster `endpointMetadata.commandUrl`, body `{timestamp, participantMri, participantLegId, action:
+  "start", mode: "transcription", processingModes: ["closedCaptions"], actionParameters: undefined,
+  participantSkypeToken: ""}` - no language. Headers `Content-Type: application/json`, `requestId`
+  (UUID), `X-Microsoft-Skype-Chain-ID` (call id), `Authorization: Bearer <AAD>`, `X-Skypetoken`; when
+  the AAD token fails the skype token is used as the bearer.
+- **CONFIRMED** the AAD token's resource is `4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76`
+  (`callingConstants.callRecording.resource`, `config-prod`; getter in `166144`), from the normal token
+  provider.
+- **CONFIRMED** spoken language: only `botData.spokenLanguage` is sent, from
+  `getClosedCaptionsLanguage()` - the bot's `endpointMetadata.spokenLanguage`, or a language the user
+  picked before the bot was there, `""` by default; `botData.language` only when the meeting has
+  `allowTranscription`. The start command carries none. **UNCONFIRMED** the service default for `""`
+  (section 10.4 says `en-us`) and whether a `spokenLanguage` given when adding the bot shows the
+  "Meeting language was changed" notice.
+- **CONFIRMED** what others get in data: the bot as a `28:` roster participant, and the initiator's own
+  `endpointMetadata.transcriptionPrefs.closedCaptions` written through `updateEndpointMetadata`; no code
+  reading the latter was found. **UNCONFIRMED** any toast for others (the strings use hashed keys).
+
+Join refusals:
+- **CONFIRMED** end-screen rules (`calling-app`) match `callEndDiagnosticsInfo.callControllerCode` and
+  `callControllerSubCode`: end-to-end encrypted meeting, single device limit = 403 / 4158 (with
+  `call.encryptionDetails.e2eeEnabled`); unsupported client 403 / 6150; media failure 410 / 301999 or
+  463; meeting full 413 when E2EE. 410 / 301999 also ended the probe's legs with
+  `InvalidFinalAnswerMediaDescriptions` ("Live results"), so it means E2EE only with the flag.
+- **CONFIRMED** lobby (`calling-pluginless`): `callAcceptance.controllerName == "lobby"`
+  (`applyLobbyStateIfNeeded`), a roster endpoint with a `lobby` object instead of `call`; endings code 0
+  with subCode 5854 (denied in lobby) or 5855 (timed out), 413 / 5807 (lobby full), 403 / 5354.
+- **CONFIRMED** policy refusals (`calling-pluginless`, table `sr`): 403 with subCode 5448
+  (`PolicyRestriction`), 5723, 5724, 5810 (information barrier), 10005, 10193; 412 / 5204
+  (`InsufficientCapabilities`).
+- **CONFIRMED** captions policy is checked by the client, not by the join: `liveCaptionsEnabledType !==
+  "Disabled"` from the meeting policy settings, the meeting's
+  `meetingDetails.meetingCapability.allowTranscription`; bot failures in
+  `endpointMetadata.runtimeErrors[].errorCode` (`TranscriptRecognitionSessionError` for captions).
+
+1:1 calls and escalation:
+- **CONFIRMED** 1:1 calls are in the user's call store, told apart by shape (`383696` `isOneToOneCall`,
+  and the status bar's "Invalid groupContext - OneToOneCall"): `correlationId`,
+  `conversationController`, `participants[]` (MRIs), `additionalData.participantList[{id,
+  endpointType}]`, `userJoinTime`, optional `paActiveCallDetails`, and no `groupContext`. The item of
+  "Live results" 11 had this key set, so it was most likely a 1:1 call, not a scheduled meeting.
+- **CONFIRMED** an item without `groupContext` is a 1:1 call whose chat the client finds from
+  `participants` (`getConversationWithV2`, `handleRegularCallBanner`).
+- **CONFIRMED** adding a person to a 1:1 call keeps the same call (`handleCallEscalation`): the client
+  finds or creates the group chat of the new member set and calls `addParticipant` on the same call
+  with that `threadId` through `addParticipantAndModality`; the call store then reports the same
+  `correlationId` with a `groupContext` (`isEscalatedToGroupCall`). With
+  `enableDecouplingCallEscalationFromThreadId` the thread may be empty.
+- **CONFIRMED** a second endpoint of the same user can join a 1:1 call (companion banner: `callInfo
+  {callId: correlationId, callUrl: conversationController}`, join with `conversationUrl` and
+  `conversationId`); the media peer type becomes `EnterpriseMultiParty` instead of
+  `EnterpriseTwoPartyOnlineOnly`, without a thread. **UNCONFIRMED** whether the other party notices the
+  media change.
+
+Call store fields:
+- **CONFIRMED** `correlationId` is the call's id, one per call and shared by the user's endpoints
+  (`getCallId`; passed as `conversationId` into the join; equal to the awareness property's
+  `conversationId`; sent as `X-Microsoft-Skype-Chain-ID`). Push events 115 and 116 carry items of the
+  same shape.
+- **UNCONFIRMED** `userJoinTime` format: only passed through (`callStartTime: userJoinTime`, a GraphQL
+  String).
+- **CONFIRMED** the conversation resource carries the thread in `activeModalities.groupChat {groupId,
+  threadId, messageId, backroomThreadId, streamThreadId, lobbyThreadId}` with `state.conversationType`
+  and `state.isMultiParty` (`calling-pluginless`, `updateGroupChatIds`).
+
+Roster endpoints:
+- **CONFIRMED** `endpoints` is keyed by endpoint id; each has `call {mediaStreams, ...}` or
+  `lobby {mediaStreams}`, `endpointCapabilities`, `participantId`, `clientVersion`, `endpointMetadata`,
+  `endpointType`, `deviceType` and others (`fromRosterEndpoints`); every `mediaStreams[]` item has
+  `type` (`audio`, `audio-teleconferencing`, `video`, `applicationsharing-video`, `data`), `sourceId`,
+  `direction`, `serverMuted`. A data-only leg should have only a `data` stream, while a muted official
+  client still has `audio`. **UNCONFIRMED** live.
+- **CONFIRMED** `updateEndpointMetadata` is a `PUT` to `links.updateEndpointMetadata` with
+  `{participants: {from: {...}}, endpointMetadata: <object>}`; every endpoint's metadata is in
+  everyone's roster, so a custom marker would reach all participants.
+
+Reading a call without joining:
+- **CONFIRMED** the JS stack never `GET`s a running call's conversation resource: before joining it
+  uses the call store, the thread property `awareness_conversationLiveState`, and a roster-only join
+  (`JoinConversationWithoutCallModality` with `subscribe: true`; `joinOneToOneCallWithoutModality` for
+  shared-line calls). The probe's `GET` of the conversation URL ("Live results" 13) is therefore not
+  client behaviour. **UNCONFIRMED** what native SlimCore does.
+
 ## Proposed spec changes
 
 Section 9 of `.specs/2026-10-26-open-mess-design.md` should change as follows:
