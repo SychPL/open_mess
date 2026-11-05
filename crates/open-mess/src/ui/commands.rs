@@ -187,7 +187,8 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
             detail: describe(&info.state, i18n::current()),
             hosts,
             sign_in_hosts,
-            wam: wam.map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes }),
+            wam: wam
+                .map(|wam| WamDto { client_id: wam.client_id, scopes: wam.scopes.iter().map(|scope| scope_text(scope, i18n::current())).collect() }),
             tools: extra_tools.into_iter().map(|tool| ToolDto { name: tool.name, writes: tool.writes }).collect(),
             file_sha256: info.file_sha256.clone(),
             manifest_sha256: info.manifest_sha256.clone(),
@@ -196,6 +197,20 @@ pub fn modules(state: &UiState) -> Result<Vec<ModuleDto>, String> {
         });
     }
     Ok(dtos)
+}
+
+/// A WAM scope as the approval shows it: a pattern says what it hands over (spec
+/// 2026-10-28-meetings-transcripts, 5.2; spec 15 asks to name the trust given).
+fn scope_text(scope: &str, lang: Lang) -> String {
+    let what = match scope {
+        "https://*.sharepoint.com/.default" => lang.pick(
+            "token do dowolnej witryny SharePoint/OneDrive Twojej organizacji, z pełnymi uprawnieniami (także zapis i usuwanie plików, Sites.FullControl.All)",
+            "a token for any SharePoint/OneDrive site of your organization, with full permissions (writing and deleting files too, Sites.FullControl.All)",
+        ),
+        _ if scope.contains('*') => lang.pick("token do dowolnej usługi pasującej do wzorca", "a token for any service that matches the pattern"),
+        _ => return scope.to_string(),
+    };
+    format!("{scope} - {what}")
 }
 
 fn empty_manifest(info: &ModuleInfo) -> Manifest {
@@ -858,6 +873,19 @@ mod tests {
         for (state, pl, en) in states {
             assert_eq!((describe(&state, Lang::Pl).as_str(), describe(&state, Lang::En).as_str()), (pl, en));
         }
+    }
+
+    #[test]
+    fn wam_scopes_in_both_languages() {
+        let sharepoint = "https://*.sharepoint.com/.default";
+        assert!(scope_text(sharepoint, Lang::Pl).starts_with(&format!("{sharepoint} - token do dowolnej witryny SharePoint/OneDrive")));
+        assert!(scope_text(sharepoint, Lang::En).starts_with(&format!("{sharepoint} - a token for any SharePoint/OneDrive site")));
+        assert!(scope_text(sharepoint, Lang::En).ends_with("Sites.FullControl.All)"));
+        assert_eq!(
+            scope_text("https://*.example.com/.default", Lang::En),
+            "https://*.example.com/.default - a token for any service that matches the pattern"
+        );
+        assert_eq!(scope_text("https://graph.microsoft.com/.default", Lang::Pl), "https://graph.microsoft.com/.default");
     }
 
     #[test]

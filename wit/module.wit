@@ -4,8 +4,11 @@
 // Guests are WebAssembly components built for wasm32-wasip2. Besides the imports below they get
 // only wasi:clocks and wasi:random from the host - no filesystem, no sockets, no environment.
 // Calls look synchronous to the guest; the host runs them asynchronously with time, memory and
-// size limits. Tool arguments and results cross the boundary as JSON text, validated by the core
-// against the shared tool schemas (spec 8.5) or the module's declared extra tools.
+// size limits. Tool arguments and results cross the boundary as JSON text. The core validates a
+// shared tool's arguments and result strictly (spec 8.5). For an extra tool it checks that the
+// arguments are an object with only the schema's properties, every required one, and `account`
+// and `conversation` as text; the module checks the types and ranges of the rest. Its result must
+// be a JSON object of at most 1 MiB (spec 2026-10-28-meetings-transcripts, 5.1).
 
 package open-mess:module@0.1.0;
 
@@ -17,10 +20,14 @@ interface types {
     }
 
     record tool-decl {
+        // `[a-z][a-z0-9_]{0,31}`; agents see it as `<module>_<name>`, `-` in the module name as `_`.
         name: string,
         description: string,
-        // JSON Schema of the arguments object.
+        // JSON Schema of the arguments object: `"type": "object"`, at most 32 `properties` with
+        // plain names (never `account`, which the core adds), `required` among them, and no
+        // `additionalProperties` other than false.
         input-schema: string,
+        // Only read tools are listed for now.
         writes: bool,
     }
 

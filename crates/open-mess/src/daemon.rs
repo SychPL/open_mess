@@ -75,6 +75,7 @@ pub fn run() -> Result<(), Error> {
     let _ = std::fs::remove_file(&error_file);
     let exit = Arc::clone(&ui.exit);
     let registry = Arc::new(registry);
+    runtime.spawn(Arc::clone(&registry).watch_tools());
     if let Some((paths, launcher)) = update.filter(|_| probation) {
         let activity = Activity {
             gate: ui.gate.clone(),

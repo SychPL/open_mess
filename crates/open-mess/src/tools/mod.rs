@@ -7,17 +7,21 @@
 //! (spec 8.6): an account or conversation the agent may not read is refused when named and left
 //! out of lists. The writes never reach a module from here: they become pending actions
 //! (pending.rs), which run under the write permission. Every call passes the [`Gate`], which an
-//! update closes (spec 7.1).
+//! update closes (spec 7.1). Active modules add their own read tools (extra.rs), under the same
+//! permissions.
 
+pub mod extra;
 pub mod shared;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use open_mess_host::limits::CALL_TIMEOUT;
 use open_mess_host::{HostError, ModuleHandle};
+use rmcp::RoleServer;
+use rmcp::service::Peer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
@@ -146,7 +150,14 @@ pub struct Registry {
     accounts_restored: Arc<AtomicBool>,
     /// The updates, shown in `status` and changed by no tool (spec 2026-10-27-self-update, 6).
     update: Option<UpdateService>,
+    /// Every MCP session, told when the list of tools changes.
+    mcp_sessions: Mutex<Vec<Peer<RoleServer>>>,
+    /// The list of tools the sessions were last told about; None until the first look.
+    announced: Mutex<Option<Vec<ToolInfo>>>,
 }
+
+/// How long telling one MCP session that the tools changed may take.
+const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Registry {
     /// The tools with no modules and no accounts; `started` is when the daemon started, for
@@ -162,6 +173,8 @@ impl Registry {
             ui_ready: Arc::default(),
             accounts_restored: Arc::default(),
             update: None,
+            mcp_sessions: Mutex::default(),
+            announced: Mutex::default(),
         }
     }
 
@@ -208,6 +221,7 @@ impl Registry {
         self.update = Some(update);
     }
 
+    /// The tools: `status`, the shared ones, and the read tools of the active modules.
     pub fn list(&self) -> Vec<ToolInfo> {
         let mut tools = vec![ToolInfo {
             name: "status".into(),
@@ -215,7 +229,51 @@ impl Registry {
             input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         }];
         tools.extend(shared::tools());
+        if let Some(accounts) = &self.accounts {
+            tools.extend(extra::listed(&accounts.modules().list()));
+        }
         tools
+    }
+
+    /// Adds an MCP session to those told when the list of tools changes.
+    pub fn add_mcp_session(&self, peer: Peer<RoleServer>) {
+        let mut sessions = self.mcp_sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        sessions.retain(|session| !session.is_transport_closed());
+        sessions.push(peer);
+    }
+
+    /// Tells every MCP session that the tools changed, if they did since the last time (spec
+    /// 2026-10-28-meetings-transcripts, 5.1). The sessions are told in the background.
+    pub fn announce_tools(&self) {
+        let tools = self.list();
+        {
+            let mut announced = self.announced.lock().unwrap_or_else(PoisonError::into_inner);
+            // The first look has nothing to compare with: a session lists the tools when it starts.
+            let unchanged = announced.as_ref().is_none_or(|known| *known == tools);
+            *announced = Some(tools);
+            if unchanged {
+                return;
+            }
+        }
+        let mut sessions = self.mcp_sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        sessions.retain(|session| !session.is_transport_closed());
+        for session in sessions.iter() {
+            let session = session.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(ANNOUNCE_TIMEOUT, session.notify_tool_list_changed()).await;
+            });
+        }
+    }
+
+    /// Announces the tools whenever the modules change, until they are gone. The daemon runs it.
+    pub async fn watch_tools(self: Arc<Registry>) {
+        let Some(mut changes) = self.accounts.as_ref().map(|accounts| accounts.modules().changes()) else { return };
+        loop {
+            self.announce_tools();
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Runs a tool. `args` is the arguments object.
@@ -228,6 +286,11 @@ impl Registry {
         if name == "status" {
             no_params(&args)?;
             return self.status();
+        }
+        if let Some(accounts) = &self.accounts
+            && let Some(tool) = extra::find(&accounts.modules().list(), name)
+        {
+            return call_extra(accounts, name, tool, args).await;
         }
         let args = shared::validate(name, args)?;
         let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending) else {
@@ -272,6 +335,7 @@ impl Registry {
                 (accounts.modules().list(), list.collect())
             }
         };
+        let infos = modules.clone();
         // Known only for an active module: a stopped one has no instance to ask.
         let crashes = |module: &ModuleInfo| {
             let accounts = self.accounts.as_ref().filter(|_| module.state == ModuleState::Active)?;
@@ -288,6 +352,7 @@ impl Registry {
                     "state": module.state.to_string(),
                     "hosts": module.hosts,
                     "crashes_since_load": crashes(&module),
+                    "tools_not_listed": extra::not_listed(&infos, &module.name),
                 })
             })
             .collect();
@@ -401,7 +466,14 @@ pub(crate) async fn call_account(accounts: &Accounts, account: &Account, tool: &
     let handle = module(accounts, account)?;
     let json = within(&account.module, handle.call(&account.module_account, tool, &args.to_string())).await?;
     let mut result = shared::parse(tool, &json)?;
-    drop_unreadable(accounts, &account.id, tool, &mut result)?;
+    finish(accounts, account, tool, args, &mut result)?;
+    Ok(result)
+}
+
+/// A module's result without what the agent may not read, cut to the `limit` of `args` and
+/// labelled with the account.
+fn finish(accounts: &Accounts, account: &Account, tool: &str, args: &Value, result: &mut Value) -> Result<(), ToolError> {
+    drop_unreadable(accounts, &account.id, tool, result)?;
     if let Some(limit) = args.get("limit").and_then(Value::as_u64).and_then(|limit| usize::try_from(limit).ok()) {
         for key in ["items", "examples"] {
             if let Some(list) = result.get_mut(key).and_then(Value::as_array_mut) {
@@ -412,7 +484,70 @@ pub(crate) async fn call_account(accounts: &Accounts, account: &Account, tool: &
     for item in result.get_mut("items").and_then(Value::as_array_mut).into_iter().flatten().filter_map(Value::as_object_mut) {
         item.insert("account".into(), account.id.clone().into());
     }
-    Ok(result)
+    Ok(())
+}
+
+/// Runs a module's own tool (spec 2026-10-28-meetings-transcripts, 5.1); `tools` are the
+/// declarations of its full `name`, one when it is listed.
+async fn call_extra(accounts: &Accounts, name: &str, mut tools: Vec<extra::Declared>, args: Value) -> Result<Value, ToolError> {
+    let (Some(tool), None) = (tools.pop(), tools.first()) else { return Err(ToolError::UnknownTool(name.into())) };
+    // A client that missed the change of the list learns why the tool is gone.
+    if tool.state != ModuleState::Active {
+        return Err(ToolError::Module(format!("module {} is {}", tool.module, tool.state)));
+    }
+    let Ok(listed) = &tool.listed else { return Err(ToolError::UnknownTool(name.into())) };
+    let (account, module_args) = extra::arguments(listed, args)?;
+    let account = match account {
+        Some(id) => {
+            let account = find(accounts, &id)?;
+            if account.module != tool.module {
+                return Err(ToolError::InvalidArgs(format!("account {id:?} is not a {} account", tool.module)));
+            }
+            account
+        }
+        None => only_readable(accounts, &tool.module)?,
+    };
+    let account = readable(accounts, &account.id, &module_args)?;
+    let handle = module(accounts, &account)?;
+    // The module may have been replaced since its tools were read: the one called must declare
+    // this very tool, never one that writes now.
+    if !handle.manifest().is_ok_and(|manifest| manifest.extra_tools.contains(&tool.decl)) {
+        return Err(ToolError::Module(format!("module {} changed meanwhile; try again", tool.module)));
+    }
+    let json = within(&account.module, handle.call(&account.module_account, &tool.decl.name, &module_args.to_string())).await?;
+    if json.len() > extra::MAX_RESULT {
+        return Err(ToolError::Module(format!("module returned a result over {} MiB", extra::MAX_RESULT / 1024 / 1024)));
+    }
+    // The parse error is not shown: it may quote other people's text.
+    let invalid = || ToolError::Module("module returned an invalid result".into());
+    let mut result = serde_json::from_str::<Value>(&json).ok().filter(Value::is_object).ok_or_else(invalid)?;
+    // The permission may have been taken back while the module ran, and what the result holds
+    // outside `items` (a transcript's cues) passes no item filter: the same account and
+    // conversation are checked again.
+    let account = readable(accounts, &account.id, &module_args)?;
+    finish(accounts, &account, name, &module_args, &mut result)?;
+    Ok(shared::with_notice(result))
+}
+
+/// The one account of `module` the agent may read, for a call that names none.
+fn only_readable(accounts: &Accounts, module: &str) -> Result<Account, ToolError> {
+    let all: Vec<Account> =
+        accounts.list().map_err(failed)?.into_iter().filter(|account| account.module == module && account.state != REMOVING).collect();
+    let mut readable = Vec::new();
+    for account in &all {
+        if permissions::readable_anywhere(&accounts.store(), &account.id).map_err(failed)? {
+            readable.push(account);
+        }
+    }
+    match readable.as_slice() {
+        [account] => Ok((*account).clone()),
+        [] if all.is_empty() => Err(ToolError::InvalidArgs(format!("no {module} account - the accounts tool lists them"))),
+        [] => Err(ToolError::NotAllowed("reading this account is not allowed".into())),
+        several => {
+            let ids: Vec<&str> = several.iter().map(|account| account.id.as_str()).collect();
+            Err(ToolError::InvalidArgs(format!("name the account: {}", ids.join(", "))))
+        }
+    }
 }
 
 /// Asks every account at once, each under the call limit; an account that fails or is not online

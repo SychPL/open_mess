@@ -150,12 +150,12 @@ async fn rescan_keeps_running_version_until_approved() {
     install(d.dir.path(), "echo.wasm", &echo_with_another_host());
     commands::rescan_modules(&state).await.unwrap();
     let running = d.accounts.modules().handle("test-echo").unwrap();
-    assert_eq!(running.manifest().unwrap().hosts, ["localhost"]);
+    assert_eq!(running.manifest().unwrap().hosts, ["localhost", "*.sharepoint.com"]);
     let list = modules(&state);
     assert_eq!(list.len(), 2);
-    assert_eq!(module(&list, "active").hosts, ["localhost"]);
+    assert_eq!(module(&list, "active").hosts, ["localhost", "*.sharepoint.com"]);
     let replacement = module(&list, "replacement").clone();
-    assert_eq!(replacement.hosts, ["localhost", "extra.example.com"]);
+    assert_eq!(replacement.hosts, ["localhost", "extra.example.com", "*.sharepoint.com"]);
     assert_eq!(replacement.changes, ["nowy host: extra.example.com"]);
     assert!(replacement.takes_over);
     // The account and its waiting action are untouched.
@@ -170,7 +170,7 @@ async fn rescan_keeps_running_version_until_approved() {
     let list = modules(&state);
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].status, "active");
-    assert_eq!(d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap().hosts, ["localhost", "extra.example.com"]);
+    assert_eq!(d.accounts.modules().handle("test-echo").unwrap().manifest().unwrap().hosts, ["localhost", "extra.example.com", "*.sharepoint.com"]);
     assert_eq!(state.pending.state(&waiting.action).unwrap(), State::Expired);
     assert!(state.pending.waiting().is_empty());
     // test-echo restores only its "known" account; the account was asked again.
