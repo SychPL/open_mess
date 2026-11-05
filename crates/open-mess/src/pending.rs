@@ -9,21 +9,26 @@
 //! does a write permission set to `never` meanwhile.
 //! An action that may have reached the platform without an answer is `uncertain` and never run
 //! again by itself (spec 8.5, R7). Nothing here logs or returns message text.
+//!
+//! A module's own write tool makes an action too (spec 2026-10-29-live-captions, 5.1). It always
+//! waits for the user, `autonomous` or not, and its approval binds to the conversation and its
+//! title (a meeting's participants change while it runs) and to the tool as its module declared it:
+//! a module replaced meanwhile runs only the very tool the approval showed.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use open_mess_host::limits::CALL_TIMEOUT;
-use open_mess_host::{HostError, ModuleError, ModuleHandle, Target};
+use open_mess_host::{HostError, ModuleError, ModuleHandle, Target, ToolDecl};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
 use crate::Error;
-use crate::accounts::{Account, Accounts};
+use crate::accounts::{Account, Accounts, RunningWrite};
 use crate::permissions::{self, Write};
-use crate::tools::{ToolError, find, module, within};
+use crate::tools::{ToolError, extra, find, module, within};
 use crate::update::probation;
 
 /// How long an action waits for the user's approval.
@@ -41,42 +46,66 @@ const RETENTION_SWEEP: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_NAME: usize = 256;
 const MAX_TEXT: usize = 28_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     Send,
     Edit,
     React,
+    /// A module's own write tool, by its full name (`teams_join_captions`).
+    ModuleTool(String),
 }
 
+/// The `kind` column's mark of a module tool's action: `module:<full name>`.
+const MODULE_TOOL: &str = "module:";
+
 impl Kind {
-    pub fn name(self) -> &'static str {
+    /// What the `pending` tool and the window call it.
+    pub fn name(&self) -> &str {
         match self {
             Kind::Send => "send",
             Kind::Edit => "edit",
             Kind::React => "react",
+            Kind::ModuleTool(name) => name,
         }
     }
 
-    /// The write tool (and module tool) that makes it.
+    /// The core write tool that makes it.
     pub fn for_tool(tool: &str) -> Option<Kind> {
         [Kind::Send, Kind::Edit, Kind::React].into_iter().find(|kind| kind.tool() == tool)
     }
 
-    fn tool(self) -> &'static str {
+    /// The module's tool that runs it.
+    fn tool(&self) -> &str {
         match self {
             Kind::Send => "send",
             Kind::Edit => "edit_message",
             Kind::React => "react",
+            Kind::ModuleTool(name) => name,
         }
     }
 
     /// The message the action is about: the one replied to, edited or reacted to.
-    fn message(self, args: &Value) -> Option<&str> {
-        args.get(if self == Kind::Send { "reply_to" } else { "message" }).and_then(Value::as_str)
+    fn message<'a>(&self, args: &'a Value) -> Option<&'a str> {
+        let key = match self {
+            Kind::Send => "reply_to",
+            Kind::Edit | Kind::React => "message",
+            Kind::ModuleTool(_) => return None,
+        };
+        args.get(key).and_then(Value::as_str)
     }
 
-    fn parse(name: &str) -> Result<Kind, Error> {
-        [Kind::Send, Kind::Edit, Kind::React].into_iter().find(|kind| kind.name() == name).ok_or_else(|| bad_row("kind", name))
+    fn column(&self) -> String {
+        match self {
+            Kind::ModuleTool(name) => format!("{MODULE_TOOL}{name}"),
+            kind => kind.name().to_string(),
+        }
+    }
+
+    fn parse(column: &str) -> Result<Kind, Error> {
+        if let Some(name) = column.strip_prefix(MODULE_TOOL) {
+            return Ok(Kind::ModuleTool(name.to_string()));
+        }
+        [Kind::Send, Kind::Edit, Kind::React].into_iter().find(|kind| kind.name() == column).ok_or_else(|| bad_row("kind", column))
     }
 }
 
@@ -140,6 +169,10 @@ pub struct Preview {
     pub target_text: Option<String>,
     /// That text was longer than an approval shows, so this action can only be rejected.
     pub target_cut: bool,
+    /// A module tool's description, from the manifest the user approved, in full.
+    pub description: Option<String>,
+    /// A module tool's arguments but `conversation`, each as `key: value`, in full.
+    pub arguments: Vec<String>,
 }
 
 // Hand-written so that a `{:?}` never prints names or text.
@@ -210,15 +243,19 @@ impl Pending {
         self.changed.subscribe()
     }
 
-    /// Creates the action a write tool asked for, under the account's or conversation's write
+    /// Creates the action a core write tool asked for, under the account's or conversation's write
     /// permission: run at once, left waiting for approval, or refused.
     pub async fn create(&self, kind: Kind, account: &str, conversation: &str, args: Value) -> Result<Outcome, ToolError> {
+        // A module tool's action never runs at once: [`Pending::create_tool`] makes it.
+        if let Kind::ModuleTool(name) = &kind {
+            return Err(ToolError::UnknownTool(name.clone()));
+        }
         let account = find(&self.accounts, account)?;
         let write = permissions::effective(&self.accounts.store(), &account.id, Some(conversation)).map_err(failed)?.write;
         match write {
             Write::Never => Err(ToolError::NotAllowed("writing to this conversation is not allowed".into())),
             Write::Autonomous => {
-                let action = self.insert(&account, conversation, kind, &args, "", State::Approved, None)?;
+                let action = self.insert(&account, conversation, &kind, &args, "", State::Approved, None)?;
                 let (state, detail) = self.execute(&action).await.map_err(failed)?;
                 Ok(Outcome { action, state, detail })
             }
@@ -228,12 +265,44 @@ impl Pending {
                 }
                 let handle = module(&self.accounts, &account)?;
                 let target = within(&account.module, handle.describe_target(&account.module_account, conversation, kind.message(&args))).await?;
-                let action = self.insert(&account, conversation, kind, &args, &fingerprint(&target), State::Waiting, Some(&handle))?;
-                self.previews().push(preview(&action, kind, &account, &args, target));
+                let action = self.insert(&account, conversation, &kind, &args, &fingerprint(&target), State::Waiting, Some(&handle))?;
+                self.previews().push(preview(&action, kind, &account, &args, target, None));
                 self.changed.send_replace(());
                 Ok(Outcome { action, state: State::Waiting, detail: None })
             }
         }
+    }
+
+    /// Creates the action a module's write tool `name`, declared as `decl`, asked for: left waiting
+    /// for the user's approval under `confirm` and `autonomous` alike, refused under `never`.
+    pub(crate) async fn create_tool(
+        &self,
+        name: &str,
+        decl: &ToolDecl,
+        account: &str,
+        conversation: &str,
+        args: Value,
+    ) -> Result<Outcome, ToolError> {
+        let account = find(&self.accounts, account)?;
+        if permissions::effective(&self.accounts.store(), &account.id, Some(conversation)).map_err(failed)?.write == Write::Never {
+            return Err(ToolError::NotAllowed("writing to this conversation is not allowed".into()));
+        }
+        if self.count_waiting(&account.id)? >= MAX_WAITING {
+            return Err(too_many());
+        }
+        let handle = module(&self.accounts, &account)?;
+        let target = within(&account.module, handle.describe_target(&account.module_account, conversation, None)).await?;
+        // The modules may have started to change while the module described the target: from then
+        // on no action is made (a swap meanwhile is refused by `insert` too).
+        if self.accounts.module_writes().blocked() {
+            return Err(ToolError::Failed(MODULES_CHANGING.into()));
+        }
+        let kind = Kind::ModuleTool(name.into());
+        let fingerprint = tool_fingerprint(conversation, &target, decl);
+        let action = self.insert(&account, conversation, &kind, &args, &fingerprint, State::Waiting, Some(&handle))?;
+        self.previews().push(preview(&action, kind, &account, &args, target, Some(decl)));
+        self.changed.send_replace(());
+        Ok(Outcome { action, state: State::Waiting, detail: None })
     }
 
     /// The actions in `state`, over all accounts.
@@ -260,7 +329,7 @@ impl Pending {
         &self,
         account: &Account,
         conversation: &str,
-        kind: Kind,
+        kind: &Kind,
         args: &Value,
         fingerprint: &str,
         state: State,
@@ -281,7 +350,17 @@ impl Pending {
                 "INSERT INTO pending (id, account, conversation, kind, args, fingerprint, state, created_ms)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
                  WHERE ?7 <> 'waiting' OR (SELECT COUNT(*) FROM pending WHERE account = ?2 AND state = 'waiting') < ?9",
-                rusqlite::params![action, account.id, conversation, kind.name(), args.to_string(), fingerprint, state.name(), now_ms(), MAX_WAITING],
+                rusqlite::params![
+                    action,
+                    account.id,
+                    conversation,
+                    kind.column(),
+                    args.to_string(),
+                    fingerprint,
+                    state.name(),
+                    now_ms(),
+                    MAX_WAITING
+                ],
             )
             .map_err(failed)?;
         if inserted == 0 {
@@ -334,7 +413,10 @@ impl Pending {
             .query_map(rusqlite::params![account, state.map(State::name), limit], |row| {
                 let mut item = Map::new();
                 for (index, key) in ["action", "account", "conversation", "kind", "state"].into_iter().enumerate() {
-                    item.insert(key.into(), row.get::<_, String>(index)?.into());
+                    let value: String = row.get(index)?;
+                    // A module tool's action by the tool's name, as the agent called it.
+                    let value = if key == "kind" { value.strip_prefix(MODULE_TOOL).map(str::to_string).unwrap_or(value) } else { value };
+                    item.insert(key.into(), value.into());
                 }
                 item.insert("created".into(), time(row.get(5)?).into());
                 if let Some(decided) = row.get::<_, Option<i64>>(6)? {
@@ -395,8 +477,16 @@ impl Pending {
             let args = serde_json::from_str::<Value>(&row.args).unwrap_or_default();
             match describe(&self.accounts, &account, &row.conversation, kind.message(&args)).await {
                 Err(err) => return (State::Failed, Some(format!("cannot check the target: {err}"))),
-                Ok(target) if fingerprint(&target) != row.fingerprint => return (State::Voided, Some(VOIDED.into())),
-                Ok(_) => {}
+                Ok(target) => match &kind {
+                    Kind::ModuleTool(_)
+                        if row.fingerprint.split_once('/').map(|(title, _)| title) != Some(&title_fingerprint(&row.conversation, &target)) =>
+                    {
+                        return (State::Voided, Some(TITLE_CHANGED.into()));
+                    }
+                    Kind::ModuleTool(_) => {}
+                    _ if fingerprint(&target) != row.fingerprint => return (State::Voided, Some(VOIDED.into())),
+                    _ => {}
+                },
             }
         }
         // The user may have turned writing off while the action waited.
@@ -405,8 +495,15 @@ impl Pending {
             Ok(effective) if effective.write == Write::Never => return (State::Voided, Some(NOT_ALLOWED.into())),
             Ok(_) => {}
         }
+        let (handle, tool, _running) = match &kind {
+            Kind::ModuleTool(name) => match self.module_tool(&account, name, &row.fingerprint) {
+                Ok((handle, tool, running)) => (handle, tool, Some(running)),
+                Err(why) => return (State::Failed, Some(why)),
+            },
+            kind => (handle, kind.tool().to_string(), None),
+        };
         let module_name = &account.module;
-        match tokio::time::timeout(CALL_TIMEOUT, handle.call(&account.module_account, kind.tool(), &row.args)).await {
+        match tokio::time::timeout(CALL_TIMEOUT, handle.call(&account.module_account, &tool, &row.args)).await {
             // What the module returns besides success is not needed, and never shown.
             Ok(Ok(_)) => (State::Done, None),
             Ok(Err(HostError::Module(ModuleError::Uncertain(why)))) => (State::Uncertain, Some(format!("module {module_name}: {why}; {CHECK}"))),
@@ -416,6 +513,21 @@ impl Pending {
                 (State::Uncertain, Some(format!("module {module_name} did not answer in time; {CHECK}")))
             }
             Ok(Err(err)) => (State::Failed, Some(format!("module {module_name}: {err}"))),
+        }
+    }
+
+    /// The module and the tool an approved action of module tool `name` calls, its call counted
+    /// while the guard lives: none while the modules change (spec 2026-10-29-live-captions, 4.3),
+    /// and only the very tool the approval showed.
+    fn module_tool(&self, account: &Account, name: &str, fingerprint: &str) -> Result<(ModuleHandle, String, RunningWrite<'_>), String> {
+        let running = self.accounts.module_writes().start().ok_or(MODULES_CHANGING)?;
+        // Looked up again under the guard: no swap of the module comes between this and the call.
+        let handle = module(&self.accounts, account).map_err(|err| err.to_string())?;
+        let manifest = handle.manifest().map_err(|err| err.to_string())?;
+        let decl = manifest.extra_tools.into_iter().find(|decl| extra::full_name(&account.module, &decl.name) == name);
+        match decl {
+            Some(decl) if fingerprint.split_once('/').is_some_and(|(_, approved)| approved == declared(&decl)) => Ok((handle, decl.name, running)),
+            _ => Err(TOOL_CHANGED.into()),
         }
     }
 
@@ -472,6 +584,10 @@ struct Row {
 }
 
 const VOIDED: &str = "the participants or the target message changed after the approval; nothing was sent";
+const TITLE_CHANGED: &str = "the conversation's title changed after the approval; nothing was done";
+const TOOL_CHANGED: &str = "the module's tool changed after the approval; nothing was done";
+/// Why a module write tool is refused while an update's phase A or a scan of the modules folder runs.
+pub(crate) const MODULES_CHANGING: &str = "the modules are being updated or reloaded; nothing was done - try again shortly";
 const NOT_ALLOWED: &str = "writing to this conversation is not allowed any more; nothing was sent";
 const CHECK: &str = "it may have reached the platform - check the conversation before trying again";
 
@@ -507,6 +623,21 @@ async fn describe(accounts: &Accounts, account: &Account, conversation: &str, me
     within(&account.module, handle.describe_target(&account.module_account, conversation, message)).await
 }
 
+/// What a module tool's approval binds to: the conversation and its title, then, after a `/`, the
+/// tool as the module declared it. Not the participants: a meeting's change while it runs, and
+/// they don't say whose words a tool reads (spec 2026-10-29-live-captions, 5.1, R6).
+fn tool_fingerprint(conversation: &str, target: &Target, decl: &ToolDecl) -> String {
+    format!("{}/{}", title_fingerprint(conversation, target), declared(decl))
+}
+
+fn title_fingerprint(conversation: &str, target: &Target) -> String {
+    crate::modules::sha256_hex(json!([conversation, target.conversation_title]).to_string().as_bytes())
+}
+
+fn declared(decl: &ToolDecl) -> String {
+    crate::modules::sha256_hex(json!([decl.name, decl.description, decl.input_schema, decl.writes]).to_string().as_bytes())
+}
+
 /// SHA-256 of the sorted participant ids and the target text: what an approval binds to.
 fn fingerprint(target: &Target) -> String {
     let mut ids: Vec<&str> = target.participants.iter().map(|participant| participant.id.as_str()).collect();
@@ -518,8 +649,15 @@ fn cut(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-fn preview(action: &str, kind: Kind, account: &Account, args: &Value, target: Target) -> Preview {
-    let arg = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
+/// What the approval shows; `tool` is a module tool's declaration.
+fn preview(action: &str, kind: Kind, account: &Account, args: &Value, target: Target, tool: Option<&ToolDecl>) -> Preview {
+    let arg = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned).filter(|_| tool.is_none());
+    // Each in full: they fit the 16 KiB of a module tool's arguments (extra.rs).
+    let arguments = args.as_object().into_iter().flatten().filter(|(key, _)| tool.is_some() && *key != "conversation");
+    let arguments = arguments.map(|(key, value)| match value {
+        Value::String(text) => format!("{key}: {text}"),
+        other => format!("{key}: {other}"),
+    });
     Preview {
         action: action.into(),
         kind,
@@ -530,5 +668,7 @@ fn preview(action: &str, kind: Kind, account: &Account, args: &Value, target: Ta
         reaction: arg("reaction"),
         target_cut: target.target_text.as_deref().is_some_and(|text| text.chars().count() > MAX_TEXT),
         target_text: target.target_text.as_deref().map(|text| cut(text, MAX_TEXT)),
+        description: tool.map(|decl| decl.description.clone()),
+        arguments: arguments.collect(),
     }
 }

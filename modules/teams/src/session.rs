@@ -84,6 +84,8 @@ pub struct Session {
     pub upn: Option<String>,
     pub tenant: Option<String>,
     pub directory: ServiceDirectory,
+    /// authsvc's `region` and `partition`.
+    pub region: Option<(String, String)>,
     /// Scope, token and when it expires. SharePoint's scope is the organization's origin, so
     /// scopes are not all constants.
     tokens: Vec<(String, SecretString, Option<i64>)>,
@@ -104,6 +106,7 @@ impl Session {
             upn: claims.upn,
             tenant: claims.tenant,
             directory,
+            region: None,
             tokens: Vec::new(),
             skype: None,
             sharepoint_tenant: None,

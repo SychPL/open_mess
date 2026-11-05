@@ -457,7 +457,7 @@ pub fn decode_transcript_list(body: &[u8], transcript_id: Option<&str>) -> Resul
 }
 
 /// `^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8}){0,4}$` (spec 4.2 step 6).
-fn language_tag(tag: &str) -> bool {
+pub(crate) fn language_tag(tag: &str) -> bool {
     let mut parts = tag.split('-');
     let first = parts.next().unwrap_or_default();
     let rest: Vec<&str> = parts.collect();
@@ -574,7 +574,7 @@ fn entities(text: &str) -> String {
 }
 
 /// `text` cut to `max` characters, the last one the cut mark.
-fn cut(text: &str, max: usize) -> String {
+pub(crate) fn cut(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }

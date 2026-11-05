@@ -5,6 +5,9 @@ use std::time::Duration;
 
 /// Wall-clock limit of one call into a module, time spent in host imports included.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The `end-sessions` call: the daemon waits on it before it stops (spec 2026-10-29-live-captions,
+/// 4.3).
+pub const END_SESSIONS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Linear memory of one module instance, all its memories together.
 pub const MAX_MEMORY: usize = 256 * 1024 * 1024;
 /// Table elements of one module instance, all its tables together.
@@ -32,6 +35,27 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_WS_MESSAGE: usize = 4 * 1024 * 1024;
 /// Open WebSockets per module instance.
 pub const MAX_SOCKETS: usize = 4;
+/// Open media (`rtc`) connections per module instance (spec 2026-10-29-live-captions, 5.2).
+pub const MAX_RTC: usize = 4;
+/// A data channel message to a module; a larger one is dropped and counted.
+pub const MAX_RTC_MESSAGE: usize = 64 * 1024;
+/// Data channel messages and bytes one connection may pass to its module each second; the rest is
+/// dropped and counted.
+pub const MAX_RTC_MESSAGES_PER_SECOND: usize = 50;
+pub const MAX_RTC_BYTES_PER_SECOND: usize = 256 * 1024;
+/// Data channel messages waiting for a busy module, per connection; beyond either bound the
+/// newest are dropped and counted.
+pub const MAX_RTC_QUEUE: usize = 2000;
+pub const MAX_RTC_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+/// A media connection is closed this long after it was opened.
+pub const RTC_LIFETIME: Duration = Duration::from_secs(4 * 3600);
+/// How long `rtc.open` waits for the local candidates.
+pub const RTC_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
+/// An SDP answer given to `rtc.accept`, and a data channel label.
+pub const MAX_SDP: usize = 64 * 1024;
+pub const MAX_RTC_LABEL: usize = 64;
+/// Address ranges in a manifest's `media`.
+pub const MAX_MEDIA_RANGES: usize = 32;
 /// Pending timers per module instance.
 pub const MAX_TIMERS: usize = 32;
 /// The shortest timer delay; shorter ones are lengthened to it.

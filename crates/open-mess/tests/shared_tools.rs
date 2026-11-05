@@ -277,14 +277,14 @@ fn conversations(result: &Value) -> Vec<&str> {
 async fn module_read_tools_are_listed_with_account() {
     let d = peeking(&[]).await;
     let listed: Vec<_> = d.registry.list().into_iter().filter(|tool| tool.name.starts_with("test_echo_")).collect();
-    assert_eq!(listed.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), ["test_echo_peek"]);
+    assert_eq!(listed.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), ["test_echo_peek", "test_echo_poke"]);
     let schema = &listed[0].input_schema;
     assert_eq!((&schema["properties"]["account"]["type"], &schema["additionalProperties"]), (&json!("string"), &json!(false)));
     // The others say why they are not listed.
     let status = d.registry.call("status", json!({})).await.unwrap();
     let not_listed = status["modules"][0]["tools_not_listed"].as_array().unwrap();
     let reason = |name: &str| not_listed.iter().find(|tool| tool["tool"] == name).map(|tool| tool["reason"].as_str().unwrap().to_string());
-    assert_eq!(reason("test_echo_poke").as_deref(), Some("not supported yet: module write tools"));
+    assert_eq!(reason("test_echo_nudge").as_deref(), Some("a module write tool must name its conversation"));
     assert!(reason("test_echo_Bad-Name").unwrap().contains("a-z"));
     assert!(reason("test_echo_with_account").unwrap().contains("account"));
     assert!(reason("test_echo_loose").unwrap().contains("other properties"));

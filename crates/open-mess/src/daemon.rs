@@ -12,6 +12,7 @@ use open_mess_host::{Engine, ModuleContext, Net, SignInPrompts};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc, oneshot};
+use tracing_subscriber::filter::{LevelFilter, Targets};
 
 use crate::accounts::Accounts;
 use crate::events::Bus;
@@ -40,6 +41,18 @@ pub const LAST_START_ERROR_FILE: &str = "last-start-error.txt";
 /// tray menu. The tray and the configuration window take the main thread; the API runs on the
 /// runtime's threads.
 pub fn run() -> Result<(), Error> {
+    // Diagnostics only: OPEN_MESS_LOG (error, warn, info, debug or trace) prints the daemon's and
+    // the modules' logs to stderr. Logs carry states, codes and counts, never tokens or message
+    // contents (spec 8.4).
+    if let Some(level) = std::env::var("OPEN_MESS_LOG").ok().and_then(|level| level.parse::<LevelFilter>().ok()) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
+            .with(log_targets(level))
+            .try_init()
+            .ok();
+    }
     let started = Instant::now();
     let dir = paths::data_dir()?;
     let error_file = dir.join(LAST_START_ERROR_FILE);
@@ -76,6 +89,8 @@ pub fn run() -> Result<(), Error> {
     let exit = Arc::clone(&ui.exit);
     let registry = Arc::new(registry);
     runtime.spawn(Arc::clone(&registry).watch_tools());
+    runtime.spawn(Arc::clone(&ui.accounts).restore_after_crashes());
+    let accounts = Arc::clone(&ui.accounts);
     if let Some((paths, launcher)) = update.filter(|_| probation) {
         let activity = Activity {
             gate: ui.gate.clone(),
@@ -113,6 +128,9 @@ pub fn run() -> Result<(), Error> {
         runtime.block_on(window.close());
         runtime.block_on(until_stopped(ended, exit));
     }
+    // Before the modules go with the process: what others see of their sessions ends (spec
+    // 2026-10-29-live-captions, 4.3).
+    runtime.block_on(accounts.end_sessions(&accounts.modules().handles()));
     let _ = stop.send(());
     runtime.block_on(server).map_err(|err| Error::Io(std::io::Error::other(err)))?
 }
@@ -128,6 +146,12 @@ async fn until_stopped(ended: Arc<Notify>, exit: Arc<Notify>) {
 
 /// An update's folders and what starts its helper.
 type Update = (Paths, Arc<dyn Launcher>);
+
+/// What `OPEN_MESS_LOG` prints: open_mess's own targets only (`open_mess` and `open_mess_host`, by
+/// prefix). A dependency's debug log, like rmcp's, prints whole tool results (Codex review of 0cff6c1).
+fn log_targets(level: LevelFilter) -> Targets {
+    Targets::new().with_target("open_mess", level)
+}
 
 /// None where updates do not install.
 #[cfg(windows)]
@@ -281,5 +305,24 @@ async fn ctrl_c() {
     // Without a Ctrl+C handler the daemon runs until it is killed, rather than stopping at once.
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_print_only_open_mess_logs() {
+        let targets = log_targets(LevelFilter::DEBUG);
+        let debug = LevelFilter::DEBUG.into_level().unwrap();
+        let error = LevelFilter::ERROR.into_level().unwrap();
+        let trace = LevelFilter::TRACE.into_level().unwrap();
+        assert!(targets.would_enable("open_mess::daemon", &debug));
+        assert!(targets.would_enable("open_mess_host::bindings", &debug));
+        assert!(!targets.would_enable("open_mess_host::bindings", &trace));
+        // rmcp logs whole tool results at debug; not even its errors are printed.
+        assert!(!targets.would_enable("rmcp::service", &error));
+        assert!(!targets.would_enable("hyper", &error));
     }
 }

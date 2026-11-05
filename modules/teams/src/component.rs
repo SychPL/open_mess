@@ -37,21 +37,35 @@ impl module::Guest for Teams {
                 .into_iter()
                 .map(|t| types::ToolDecl { name: t.name, description: t.description, input_schema: t.input_schema, writes: t.writes })
                 .collect(),
+            media: m.media.map(|peers| types::MediaAccess { peers }),
         }
     }
 
     fn sign_in() -> Result<types::AccountInfo, types::ModuleError> {
         api::begin();
-        api::sign_in()
+        let info = api::sign_in()?;
+        // Signed in again after a lost session: meetings it could not leave are left now.
+        crate::live::restore(&info.id);
+        Ok(info)
     }
 
     fn restore(account: String) -> Result<(), types::ModuleError> {
         api::begin();
-        api::restore(&account)
+        api::restore(&account)?;
+        crate::live::restore(&account);
+        Ok(())
     }
 
     fn sign_out(account: String) {
+        api::begin();
+        crate::live::sign_out(&account);
         api::sign_out(&account);
+    }
+
+    /// Leaves the account's meeting, within the host's 5 s.
+    fn end_sessions(account: String) {
+        api::begin_within(std::time::Duration::from_secs(4));
+        crate::live::end_sessions(&account);
     }
 
     fn call(account: String, tool: String, args_json: String) -> Result<String, types::ModuleError> {
@@ -71,14 +85,32 @@ impl module::Guest for Teams {
 }
 
 impl events::Guest for Teams {
-    fn on_ws_message(_conn: u32, _text: String) {}
+    fn on_ws_message(conn: u32, text: String) {
+        api::begin();
+        crate::live::ws_message(conn, &text);
+    }
 
-    fn on_ws_closed(_conn: u32, _reason: String) {}
+    fn on_ws_closed(conn: u32, _reason: String) {
+        api::begin();
+        crate::live::ws_closed(conn);
+    }
+
+    fn on_rtc_data(conn: u32, messages: Vec<Vec<u8>>, dropped: u32) {
+        api::begin();
+        crate::live::rtc_data(conn, &messages, dropped);
+    }
+
+    fn on_rtc_state(conn: u32, state: String) {
+        api::begin();
+        crate::live::rtc_state(conn, &state);
+    }
 
     /// The poll (`poll`): every signed-in account, each round starting with the next one so a
     /// slow account cannot keep the others from their turn, then the timer again.
     fn on_timer(id: u32) {
         if id != crate::poll::TIMER {
+            api::begin();
+            crate::live::timer_fired(id);
             return;
         }
         api::timer_fired();

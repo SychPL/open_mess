@@ -20,8 +20,9 @@ use crate::sign_in::Caller;
 
 /// Requests waiting for a module beyond this are refused with backpressure on the sender.
 pub(crate) const QUEUE: usize = 32;
-/// WebSocket frames and timer firings waiting for a module; a full queue holds the socket back.
-/// With `MAX_WS_MESSAGE` frames that is at most 64 MiB held for a module outside its memory.
+/// WebSocket frames, media batches and timer firings waiting for a module; a full queue holds the
+/// socket or connection back. With `MAX_WS_MESSAGE` frames (or `MAX_RTC_QUEUE_BYTES` batches) that
+/// is at most 64 MiB held for a module outside its memory.
 const EVENT_QUEUE: usize = 16;
 
 pub(crate) type Reply<T> = oneshot::Sender<Result<T, HostError>>;
@@ -31,6 +32,7 @@ pub(crate) enum Request {
     SignIn(Reply<AccountInfo>),
     Restore(String, Reply<()>),
     SignOut(String, Reply<()>),
+    EndSessions(String, Reply<()>),
     Call {
         account: String,
         tool: String,
@@ -59,10 +61,27 @@ impl Request {
         match self {
             Request::SignIn(_) => Caller::SignIn,
             Request::PauseEvents(_) | Request::ResumeEvents(_) => Caller::Event,
-            Request::Restore(account, _) | Request::SignOut(account, _) | Request::Call { account, .. } => Caller::Account(account.clone()),
+            Request::Restore(account, _) | Request::SignOut(account, _) | Request::EndSessions(account, _) | Request::Call { account, .. } => {
+                Caller::Account(account.clone())
+            }
             Request::GetAttachment { ids: [account, ..], .. } | Request::DescribeTarget { ids: [account, ..], .. } => {
                 Caller::Account(account.clone())
             }
+        }
+    }
+
+    /// Nobody waits for the answer any more: the caller's limit passed while the request queued
+    /// behind others. Such a call is not run, so a write its caller reported as uncertain never goes
+    /// out late (spec 2026-10-29-live-captions, 4.1, R17). Ending the sessions and signing out still
+    /// run: they take back what other people see.
+    fn abandoned(&self) -> bool {
+        match self {
+            Request::SignIn(reply) => reply.is_closed(),
+            Request::Restore(_, reply) => reply.is_closed(),
+            Request::Call { reply, .. } => reply.is_closed(),
+            Request::GetAttachment { reply, .. } => reply.is_closed(),
+            Request::DescribeTarget { reply, .. } => reply.is_closed(),
+            Request::SignOut(..) | Request::EndSessions(..) | Request::PauseEvents(_) | Request::ResumeEvents(_) => false,
         }
     }
 }
@@ -73,6 +92,8 @@ pub(crate) enum GuestEvent {
     WsMessage { conn: u32, text: String },
     WsClosed { conn: u32, reason: String },
     Timer { id: u32, generation: u64 },
+    RtcData { conn: u32, messages: Vec<Vec<u8>>, dropped: u32 },
+    RtcState { conn: u32, state: String },
 }
 
 /// A task that belongs to a module instance (a socket, a timer): aborted when dropped, so an
@@ -291,10 +312,19 @@ impl Actor {
         &mut self,
         export: impl for<'a> FnOnce(&'a PlatformModule, &'a mut Store<HostState>) -> Export<'a, R>,
     ) -> Result<R, HostError> {
+        self.run_for(self.limits.call_timeout, export).await
+    }
+
+    /// [`Actor::run`] with a shorter limit than the call limit.
+    async fn run_for<R>(
+        &mut self,
+        limit: Duration,
+        export: impl for<'a> FnOnce(&'a PlatformModule, &'a mut Store<HostState>) -> Export<'a, R>,
+    ) -> Result<R, HostError> {
         if *self.state.borrow() == ModuleState::Disabled {
             return Err(HostError::Closed);
         }
-        self.deadline.set(Some(Instant::now() + self.limits.call_timeout));
+        self.deadline.set(Some(Instant::now() + limit.min(self.limits.call_timeout)));
         let result = self.run_on_instance(export).await;
         self.deadline.set(None);
         match result {
@@ -382,6 +412,21 @@ impl Actor {
                 })
                 .await
             }
+            GuestEvent::RtcData { conn, messages, dropped } => {
+                self.run(move |m, s| Box::pin(async move { m.open_mess_module_events().call_on_rtc_data(s, conn, &messages, dropped).await })).await
+            }
+            GuestEvent::RtcState { conn, state } => {
+                self.run(move |m, s| {
+                    Box::pin(async move {
+                        // A failed or closed connection is gone; the module hears it once.
+                        if state != "connected" {
+                            s.data_mut().rtc.close(conn);
+                        }
+                        m.open_mess_module_events().call_on_rtc_state(s, conn, &state).await
+                    })
+                })
+                .await
+            }
             GuestEvent::Timer { id, generation } => {
                 self.run(move |m, s| {
                     Box::pin(async move {
@@ -397,6 +442,9 @@ impl Actor {
     }
 
     async fn answer(&mut self, request: Request) {
+        if request.abandoned() {
+            return;
+        }
         self.caller = request.caller();
         match request {
             // The actor runs one request or event at a time, so answering proves no handler runs.
@@ -425,6 +473,14 @@ impl Actor {
             }
             Request::SignOut(account, reply) => {
                 let result = self.run(move |m, s| Box::pin(async move { m.open_mess_module_module().call_sign_out(s, &account).await })).await;
+                reply.send(result).ok();
+            }
+            Request::EndSessions(account, reply) => {
+                let result = self
+                    .run_for(limits::END_SESSIONS_TIMEOUT, move |m, s| {
+                        Box::pin(async move { m.open_mess_module_module().call_end_sessions(s, &account).await })
+                    })
+                    .await;
                 reply.send(result).ok();
             }
             Request::Call { account, tool, args, reply } => {
