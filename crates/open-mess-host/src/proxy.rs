@@ -10,7 +10,8 @@ use hyper_util::client::proxy::matcher::Matcher;
 
 use crate::net::HttpError;
 
-/// What proxy auto-configuration said for one address.
+/// What proxy auto-configuration said for one address. Only Windows has auto-configuration to ask.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Auto {
     Direct,
@@ -29,6 +30,14 @@ fn goes_direct(auto: Option<Auto>, static_proxy: bool) -> bool {
         Some(Auto::Proxy | Auto::Failed) => false,
         Some(Auto::NoScript) | None => !static_proxy,
     }
+}
+
+/// What proxy settings that cannot be read mean: none set up when Windows has no settings at all;
+/// any other error fails closed, since a PAC script it hides may require a proxy (Codex review of
+/// b21b25d).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn unreadable(no_settings: bool) -> Option<Auto> {
+    if no_settings { None } else { Some(Auto::Failed) }
 }
 
 /// The address as a URL, the way the proxy rules are asked about it.
@@ -65,7 +74,7 @@ fn auto_config(targets: &[SocketAddr]) -> Vec<Option<Auto>> {
 mod winhttp {
     use std::net::SocketAddr;
 
-    use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GlobalFree, HGLOBAL};
     use windows::Win32::Networking::WinHttp::{
         ERROR_WINHTTP_AUTODETECTION_FAILED, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_AUTO_DETECT_TYPE_DHCP, WINHTTP_AUTO_DETECT_TYPE_DNS_A,
         WINHTTP_AUTOPROXY_AUTO_DETECT, WINHTTP_AUTOPROXY_CONFIG_URL, WINHTTP_AUTOPROXY_OPTIONS, WINHTTP_CURRENT_USER_IE_PROXY_CONFIG,
@@ -73,7 +82,7 @@ mod winhttp {
     };
     use windows::core::{BOOL, HRESULT, HSTRING, PCWSTR, PWSTR};
 
-    use super::{Auto, url};
+    use super::{Auto, unreadable, url};
 
     /// Frees a string WinHTTP allocated for the caller, which WinHTTP documents is freed with
     /// `GlobalFree` (a Windows API binding with no safe wrapper, AGENTS.md "Never crash").
@@ -96,8 +105,11 @@ mod winhttp {
         let detect = settings.fAutoDetect.as_bool();
         free(settings.lpszProxy);
         free(settings.lpszProxyBypass);
-        if read.is_err() || (!detect && config_url.is_null()) {
+        if let Err(e) = read {
             free(config_url);
+            return vec![unreadable(e.code() == ERROR_FILE_NOT_FOUND.to_hresult()); targets.len()];
+        }
+        if !detect && config_url.is_null() {
             return vec![None; targets.len()];
         }
         let agent = HSTRING::from("open_mess");
@@ -150,6 +162,12 @@ mod tests {
         assert!(!goes_direct(Some(Auto::NoScript), true));
         assert!(goes_direct(None, false));
         assert!(!goes_direct(None, true));
+    }
+
+    #[test]
+    fn settings_that_cannot_be_read_refuse_unless_there_are_none() {
+        assert_eq!(unreadable(true), None);
+        assert!(!goes_direct(unreadable(false), false));
     }
 
     #[test]
