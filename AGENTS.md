@@ -111,6 +111,7 @@ P3 for two rounds in a row. Ten rounds at most; after that, ask the owner. A dea
 ## Commits and reviews
 
 - **`cargo xtask ci` is green before every commit** (fmt, clippy with `-D warnings`, tests).
+  A commit that changes only Markdown files (specs, docs) skips it: cargo checks none of them.
   Commit after every piece of work that builds.
 - **Every commit is reviewed by Codex and GLM.** `cargo xtask hooks` (once per clone) enables
   `.githooks/post-commit`, which sends the commit to both reviewers in the background; verdicts
