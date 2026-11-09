@@ -1,8 +1,11 @@
 //! Local recordings of Teams calls (spec 2026-10-28-local-transcription). Each recording is a
 //! folder under `<local>\recordings` (`%LOCALAPPDATA%\open_mess`, never the data folder, which
 //! may roam to a server): `meta.json` with its state, the tracks' WAV files until the transcription
-//! is done, and `transcript.json`. The folder is the record; nothing of it is in the database.
+//! is done, and `transcript.json`. The folder is the record; nothing of it is in the database. A
+//! recording of a call's live captions (spec 2026-11-04-captions-archive) has `captions.jsonl` and
+//! `gaps.jsonl` instead (archive.rs).
 
+pub mod archive;
 pub mod capture;
 pub mod detect;
 pub mod model;
@@ -37,9 +40,10 @@ pub const MAX_TRANSCRIPTS_TOTAL: u64 = 1024 * 1024 * 1024;
 /// Free disk space below which no recording starts and a running one ends (4.4).
 pub const MIN_FREE_DISK: u64 = 2 * 1024 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
+    #[default]
     Recording,
     Waiting,
     Transcribing,
@@ -87,11 +91,51 @@ pub enum Reason {
     /// Less than [`MIN_FREE_DISK`] free (4.4).
     #[serde(rename = "low disk")]
     LowDisk,
+    /// The transcripts and captions reached [`MAX_TRANSCRIPTS_TOTAL`].
+    #[serde(rename = "text limit")]
+    TextLimit,
+    // A captions recording's ends (spec 2026-11-04-captions-archive, 4.4): the owner's "Zatrzymaj",
+    // the automatic mode turned off, and why the call could not be joined.
+    #[serde(rename = "stopped")]
+    Stopped,
+    #[serde(rename = "auto_off")]
+    AutoOff,
+    #[serde(rename = "e2ee")]
+    E2ee,
+    #[serde(rename = "lobby")]
+    Lobby,
+    #[serde(rename = "policy")]
+    Policy,
+    #[serde(rename = "media_failed")]
+    MediaFailed,
+    #[serde(rename = "proxy")]
+    Proxy,
+    #[serde(rename = "protocol")]
+    Protocol,
+    #[serde(rename = "refused")]
+    Refused,
+    #[serde(rename = "connection_limit")]
+    ConnectionLimit,
+    /// The module's call failed: over its time limit, busy or not running.
+    #[serde(rename = "module failed")]
+    ModuleFailed,
+}
+
+/// What a recording's text comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// The call's audio, transcribed here (spec 2026-10-28-local-transcription).
+    #[default]
+    Audio,
+    /// The call's live captions (spec 2026-11-04-captions-archive).
+    Captions,
 }
 
 /// `meta.json`. Unknown fields are ignored, not refused: a rolled-back daemon still reads the
-/// recordings of a newer one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// recordings of a newer one. The fields after `source` are a captions recording's only (spec
+/// 2026-11-04-captions-archive, 4.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
     pub state: State,
     /// Wall-clock start and end, in milliseconds since 1970.
@@ -99,6 +143,38 @@ pub struct Meta {
     pub end_ms: Option<u64>,
     pub language: Option<String>,
     pub reason: Option<Reason>,
+    #[serde(default)]
+    pub source: Source,
+    /// The open_mess account whose call it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The first of `threads`, or `call:<id>` for a call without a chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    /// Every chat thread of the call, in order: an agent must be allowed to read each (4.6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    /// When the user joined the call, as Teams says, in milliseconds since 1970.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_at: Option<u64>,
+    /// The share of the time from `start_ms` that no gap covers, 0-100 (4.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<u8>,
+    /// The lines of `gaps.jsonl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gaps: Option<u32>,
+    /// The cues written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cues: Option<u64>,
+    /// The last successful read of the module's captions, in milliseconds since 1970: what a
+    /// crash loses counts from here (4.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_ms: Option<u64>,
+    /// The recording this one continues, after 12 hours or 200 000 cues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,15 +315,19 @@ impl Recordings {
 
     /// A new recording in state `recording`, started at `now_ms`; returns its id.
     pub fn create(&self, now_ms: u64) -> io::Result<String> {
+        self.create_with(&Meta { start_ms: now_ms, ..Meta::default() })
+    }
+
+    /// A new recording with `meta`; returns its id.
+    pub fn create_with(&self, meta: &Meta) -> io::Result<String> {
         fs::create_dir_all(&self.dir)?;
-        let meta = Meta { state: State::Recording, start_ms: now_ms, end_ms: None, language: None, reason: None };
         for _ in 0..8 {
             let mut bytes = [0u8; 16];
             getrandom::fill(&mut bytes).map_err(|err| io::Error::other(err.to_string()))?;
             let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
             match fs::create_dir(self.dir.join(&id)) {
                 Ok(()) => {
-                    self.set_meta(&id, &meta)?;
+                    self.set_meta(&id, meta)?;
                     return Ok(id);
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -298,9 +378,8 @@ impl Recordings {
                 let meta = self.meta(&id).unwrap_or_else(|_| Meta {
                     state: State::Failed,
                     start_ms: dir.metadata().and_then(|meta| meta.modified()).map(millis).unwrap_or(0),
-                    end_ms: None,
-                    language: None,
                     reason: Some(Reason::Damaged),
+                    ..Meta::default()
                 });
                 Some(Entry { id, meta })
             })
@@ -318,11 +397,11 @@ impl Recordings {
     /// transcription that wrote its transcript is done; a done recording loses leftover audio.
     /// `busy` are the recording and the transcription running now, which are left alone. What
     /// could not be put right (a track another program holds) is returned and tried again in the
-    /// next pass.
+    /// next pass. Captions recordings are the archiver's (captions.rs).
     pub fn recover(&self, busy: &[&str]) -> Vec<(String, io::Error)> {
         let mut failures = Vec::new();
         for Entry { id, meta } in self.list() {
-            if busy.contains(&id.as_str()) {
+            if busy.contains(&id.as_str()) || meta.source == Source::Captions {
                 continue;
             }
             let Some(path) = self.path(&id) else { continue };
@@ -371,7 +450,7 @@ impl Recordings {
     pub fn expire(&self, now_ms: u64) -> Vec<(String, io::Error)> {
         let retention = AUDIO_RETENTION.as_millis() as u64;
         let mut failures = Vec::new();
-        for Entry { id, meta } in self.list() {
+        for Entry { id, meta } in self.list().into_iter().filter(|entry| entry.meta.source == Source::Audio) {
             let Some(path) = self.path(&id) else { continue };
             let old = meta.end_ms.unwrap_or(meta.start_ms).saturating_add(retention) <= now_ms;
             let result = match meta.state {
@@ -393,13 +472,19 @@ impl Recordings {
         self.path(id).is_some_and(|path| TRACKS.iter().any(|track| path.join(track).exists()))
     }
 
-    /// The bytes of all audio and of all transcripts.
+    /// The bytes of all audio and of all text: transcripts and captions.
     pub fn usage(&self) -> (u64, u64) {
         let Ok(dirs) = fs::read_dir(&self.dir) else { return (0, 0) };
         dirs.flatten().fold((0, 0), |(audio, text), dir| {
             let path = dir.path();
-            (audio + TRACKS.iter().map(|track| file_len(&path.join(track))).sum::<u64>(), text + file_len(&path.join(TRANSCRIPT)))
+            let audio = audio + TRACKS.iter().map(|track| file_len(&path.join(track))).sum::<u64>();
+            (audio, text + file_len(&path.join(TRANSCRIPT)) + file_len(&path.join(archive::CAPTIONS)))
         })
+    }
+
+    /// The folder of the recordings, where the archiver keeps its state of the calls.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Why a new recording may not start, given the free space on the disk (4.4).
@@ -649,6 +734,23 @@ mod tests {
         assert_eq!(recordings.meta(&failed).unwrap().reason, Some(Reason::Failed));
         assert!(!recordings.has_audio(&failed));
         assert!(recordings.has_audio(&fresh) && recordings.has_audio(&transcribing));
+    }
+
+    #[test]
+    fn a_captions_recording_is_left_to_the_archiver_and_counts_as_text() {
+        let (_dir, recordings) = recordings();
+        let captions = Meta { source: Source::Captions, call: Some("c1".into()), start_ms: 0, ..Meta::default() };
+        let id = recordings.create_with(&captions).unwrap();
+        let failed = recordings.create_with(&Meta { state: State::Failed, end_ms: Some(0), ..captions.clone() }).unwrap();
+        archive::append_cues(&recordings.path(&id).unwrap(), &[archive::Cue::capped(0, "Ann", false, "hello")]).unwrap();
+        // Neither the start's nor the daily pass touch it, however old.
+        assert!(recordings.recover(&[]).is_empty() && recordings.expire(30 * DAY).is_empty());
+        assert_eq!(recordings.meta(&id).unwrap(), captions);
+        assert_eq!(recordings.meta(&failed).unwrap().state, State::Failed);
+        assert!(recordings.usage().1 > 0);
+        // A meta.json of a daemon before the archive reads as audio.
+        fs::write(recordings.path(&id).unwrap().join(META), br#"{"state":"done","start_ms":1,"end_ms":2,"language":null,"reason":null}"#).unwrap();
+        assert_eq!(recordings.meta(&id).unwrap().source, Source::Audio);
     }
 
     #[test]

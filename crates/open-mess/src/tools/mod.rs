@@ -31,8 +31,8 @@ use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::{ModuleInfo, ModuleState};
 use crate::pending::{self, Kind, Pending, State};
 use crate::permissions;
-use crate::recording::Recordings;
 use crate::recording::queue::Queue;
+use crate::recording::{Meta, Recordings, Source};
 use crate::recording::recorder::{By, Recorder};
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
@@ -371,9 +371,9 @@ impl Registry {
         let (Some(recordings), Some(accounts)) = (&self.recordings, &self.accounts) else {
             return Err(ToolError::Module("not supported yet: local recording works on Windows only".into()));
         };
-        let readable = || Ok(permissions::effective(&accounts.store(), permissions::LOCAL, None).map_err(failed)?.read);
+        let readable = |meta: Option<&Meta>| recording_readable(accounts, meta);
         let progress = |id: &str| self.queue.as_ref().and_then(|queue| queue.progress(id));
-        recordings::call(recordings, &progress, readable, name, args)
+        recordings::call(recordings, &progress, &readable, name, args)
     }
 
     /// `stop_recording`, under the same read permission of `local` as the other recording tools
@@ -433,6 +433,29 @@ impl Registry {
             "recording": self.recorder.as_ref().map(|recorder| recorder.status()),
         }))
     }
+}
+
+/// Whether an agent may read the local recordings (`meta` None), or the recording `meta`: the read
+/// permission of `local`, and for a captions recording that of its conversation and of each of its
+/// threads on its account, which must still be there (spec 2026-11-04-captions-archive, 4.6). A
+/// removed account's recordings stay the owner's: its permissions are gone with it, and the
+/// defaults would let an agent read.
+pub(crate) fn recording_readable(accounts: &Accounts, meta: Option<&Meta>) -> Result<bool, ToolError> {
+    if !permissions::effective(&accounts.store(), permissions::LOCAL, None).map_err(failed)?.read {
+        return Ok(false);
+    }
+    let Some(meta) = meta.filter(|meta| meta.source == Source::Captions) else { return Ok(true) };
+    let (Some(account), Some(conversation)) = (&meta.account, &meta.conversation) else { return Ok(false) };
+    if find(accounts, account).is_err() {
+        return Ok(false);
+    }
+    let store = accounts.store();
+    for conversation in std::iter::once(conversation).chain(&meta.threads) {
+        if !permissions::effective(&store, account, Some(conversation)).map_err(failed)?.read {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn no_params(args: &Value) -> Result<(), ToolError> {
