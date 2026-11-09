@@ -301,6 +301,10 @@ pub fn join(s: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let account = s.account.clone();
     let now = api::now_ms();
     let want = start_captions && !seen(&account, &call);
+    // Only this call, and only under a name of its own: its chat, its 1:1 chat or `call:<id>` -
+    // a session never takes a thread it does not have (archive spec 4.2-4.3).
+    let mut live =
+        calls(s)?.into_iter().find(|c| c.call == call && c.named(&conversation, &account)).ok_or_else(|| ModuleError::Platform(GONE.to_string()))?;
     // The call's session goes on: no second join (archive spec 4.3).
     if let Some(token) = token_of(|leg| leg.account == account && leg.captions.active() && leg.captions.call == call)
         && let Some(mut leg) = take(&token)
@@ -314,8 +318,6 @@ pub fn join(s: &mut Session, args: &Value) -> Result<Value, ModuleError> {
         put(leg, now);
         return Ok(json!({"state": state}));
     }
-    let mut live =
-        calls(s)?.into_iter().find(|c| c.call == call && c.named(&conversation, &account)).ok_or_else(|| ModuleError::Platform(GONE.to_string()))?;
     // Another call's session in this conversation is over: it ends first (archive spec 4.3).
     for token in tokens(|leg| leg.account == account && leg.captions.active() && leg.captions.named(&conversation)) {
         if let Some(mut leg) = take(&token) {

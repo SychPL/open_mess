@@ -1990,6 +1990,10 @@ async fn an_account_has_a_session_a_call_three_at_most() {
     // The same call again, even under another name: the session goes on, no second join.
     let again = teams.call("join_captions", json!({"conversation": "call:".to_string() + CALL, "call": CALL})).await.unwrap();
     assert!(matches!(again["state"].as_str(), Some("joining" | "live")), "{again}");
+    // Under a name that is not the call's, it is refused, and the session never takes that name.
+    let foreign = module_error(teams.call("join_captions", json!({"conversation": CHANNEL, "call": CALL})).await);
+    assert!(matches!(&foreign, ModuleError::Platform(why) if why == "that call is no longer running"), "{foreign:?}");
+    assert_eq!(teams.call("read_captions", json!({"conversation": CHANNEL})).await.unwrap()["state"], "not_joined");
     // A fourth call of the account: refused before anything reaches it.
     let limit = module_error(teams.call("join_captions", json!({"conversation": CHANNEL, "call": "c4"})).await);
     assert!(matches!(&limit, ModuleError::Platform(why) if why.starts_with("connection_limit:")), "{limit:?}");
