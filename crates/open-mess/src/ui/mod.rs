@@ -64,6 +64,8 @@ pub struct UiState {
     pub models: Option<Arc<crate::recording::model::Models>>,
     /// What records the calls: the tray's indicator and stop, the window's section.
     pub recorder: Option<Arc<crate::recording::recorder::Recorder>>,
+    /// What keeps the calls' live captions (spec 2026-11-04-captions-archive), likewise.
+    pub captions: Option<Arc<crate::recording::captions::Archiver>>,
 }
 
 /// One request to open the window, answered once the window is open or failed to open.

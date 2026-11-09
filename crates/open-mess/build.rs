@@ -43,6 +43,9 @@ const COMMANDS: &[&str] = &[
     "delete_all_recordings",
     "retry_recording",
     "stop_recording",
+    "set_captions_settings",
+    "show_captions",
+    "stop_captions",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

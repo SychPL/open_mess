@@ -1,8 +1,10 @@
 //! The recording's toasts (spec 2026-10-28-local-transcription, 4.2), under their own
 //! AppUserModelID so that taking the approvals' toasts away leaves them. They are shown from a
 //! thread of their own, so the recorder never waits for Windows; a button acts on the recording
-//! it names only, so a toast left in the action centre stops nothing else.
+//! it names only, so a toast left in the action centre stops nothing else. The captions archive
+//! shows its own toast with them (spec 2026-11-04-captions-archive, 4.7).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -10,6 +12,7 @@ use tauri_winrt_notification::Toast;
 use windows::UI::Notifications::ToastNotificationManager;
 use windows::core::HSTRING;
 
+use super::captions::{self, Archiver};
 use super::recorder::{By, Notices, Recorder};
 use crate::approval::RECORDING_APP_ID;
 use crate::i18n::{self, Lang};
@@ -19,6 +22,9 @@ type Job = Box<dyn FnOnce() + Send>;
 pub struct Toasts {
     jobs: Sender<Job>,
     recorder: Arc<OnceLock<Weak<Recorder>>>,
+    archiver: Arc<OnceLock<Weak<Archiver>>>,
+    /// The toasts Windows refused, for `status`.
+    failed: Arc<AtomicUsize>,
 }
 
 impl Toasts {
@@ -29,7 +35,7 @@ impl Toasts {
                 job();
             }
         })?;
-        Ok(Toasts { jobs, recorder: Arc::default() })
+        Ok(Toasts { jobs, recorder: Arc::default(), archiver: Arc::default(), failed: Arc::default() })
     }
 
     /// The recorder the buttons stop.
@@ -37,29 +43,38 @@ impl Toasts {
         let _ = self.recorder.set(Arc::downgrade(recorder));
     }
 
-    fn show(&self, title: String, lines: [String; 2], buttons: Option<String>) {
-        let recorder = Arc::clone(&self.recorder);
-        // ponytail: a toast Windows refuses is not shown; the tray and `status` still tell.
+    /// The captions archive whose recordings the buttons stop.
+    pub fn attach_archiver(&self, archiver: &Arc<Archiver>) {
+        let _ = self.archiver.set(Arc::downgrade(archiver));
+    }
+
+    /// Shows a toast whose buttons, label and argument each, act on one recording.
+    fn show(&self, title: String, lines: [String; 2], buttons: Vec<(&'static str, String)>) {
+        let (recorder, archiver, failed) = (Arc::clone(&self.recorder), Arc::clone(&self.archiver), Arc::clone(&self.failed));
         let _ = self.jobs.send(Box::new(move || {
             let [first, second] = &lines;
             let mut toast = Toast::new(RECORDING_APP_ID).title(&title).text1(first).text2(second);
-            if let Some(id) = buttons {
-                let lang = i18n::current();
-                let (stop, delete) = (lang.pick("Zatrzymaj", "Stop"), lang.pick("Zatrzymaj i usuń", "Stop and delete"));
-                toast = toast.add_button(stop, &format!("stop:{id}")).add_button(delete, &format!("delete:{id}"));
+            for (label, argument) in &buttons {
+                toast = toast.add_button(label, argument);
             }
             let toast = toast.on_activated(move |argument| {
+                let Some((action, id)) = argument.as_deref().and_then(|argument| argument.split_once(':')) else { return Ok(()) };
                 let recorder = recorder.get().and_then(Weak::upgrade);
-                if let (Some(recorder), Some((action, id))) = (recorder, argument.as_deref().and_then(|argument| argument.split_once(':'))) {
-                    match action {
-                        "stop" => drop(recorder.stop(By::Owner, false, Some(id))),
-                        "delete" => drop(recorder.stop(By::Owner, true, Some(id))),
-                        _ => {}
+                match (action, recorder) {
+                    ("stop", Some(recorder)) => drop(recorder.stop(By::Owner, false, Some(id))),
+                    ("delete", Some(recorder)) => drop(recorder.stop(By::Owner, true, Some(id))),
+                    ("captions", _) => {
+                        if let Some(archiver) = archiver.get().and_then(Weak::upgrade) {
+                            archiver.stop_soon(id.to_owned());
+                        }
                     }
+                    _ => {}
                 }
                 Ok(())
             });
-            let _ = toast.show();
+            if toast.show().is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+            }
         }));
     }
 }
@@ -74,7 +89,9 @@ impl Notices for Toasts {
             (Lang::En, false) => "(only the call's device) on this computer.",
         };
         let lines = [what.into(), lang.pick("Poinformuj uczestników.", "Tell the participants.").into()];
-        self.show(lang.pick("Nagrywam rozmowę Teams", "Recording the Teams call").into(), lines, Some(id.to_owned()));
+        let buttons =
+            vec![(lang.pick("Zatrzymaj", "Stop"), format!("stop:{id}")), (lang.pick("Zatrzymaj i usuń", "Stop and delete"), format!("delete:{id}"))];
+        self.show(lang.pick("Nagrywam rozmowę Teams", "Recording the Teams call").into(), lines, buttons);
     }
 
     fn not_recording(&self, why: &str) {
@@ -83,7 +100,7 @@ impl Notices for Toasts {
             Lang::Pl => format!("Przyczyna: {}.", reason(why, lang)),
             Lang::En => format!("Reason: {why}."),
         };
-        self.show(lang.pick("Nie nagrywam tej rozmowy", "Not recording this call").into(), [reason, String::new()], None);
+        self.show(lang.pick("Nie nagrywam tej rozmowy", "Not recording this call").into(), [reason, String::new()], Vec::new());
     }
 
     fn track_lost(&self, microphone: bool) {
@@ -98,19 +115,35 @@ impl Notices for Toasts {
             lang.pick("Nie da się otworzyć urządzenia.", "The device cannot be opened.").into(),
             lang.pick("Nagranie trwa bez tej ścieżki.", "The recording goes on without this track.").into(),
         ];
-        self.show(title.into(), lines, None);
+        self.show(title.into(), lines, Vec::new());
     }
 
     fn agent_stopped(&self) {
         let lang = i18n::current();
         let line = lang.pick("Nagranie rozmowy zostało zatrzymane przez agenta.", "An agent stopped the call's recording.");
-        self.show(lang.pick("Agent zatrzymał nagrywanie", "An agent stopped recording").into(), [line.into(), String::new()], None);
+        self.show(lang.pick("Agent zatrzymał nagrywanie", "An agent stopped recording").into(), [line.into(), String::new()], Vec::new());
     }
 
     fn clear(&self) {
         let _ = self.jobs.send(Box::new(|| {
             let _ = ToastNotificationManager::History().and_then(|history| history.ClearWithId(&HSTRING::from(RECORDING_APP_ID)));
         }));
+    }
+}
+
+impl captions::Notices for Toasts {
+    fn started(&self, id: &str) {
+        let lang = i18n::current();
+        let lines = [
+            lang.pick("Tekst z imionami mówców zostaje na tym komputerze.", "The text with the speakers' names stays on this computer.").into(),
+            lang.pick("Uczestników informujesz Ty.", "Telling the participants is up to you.").into(),
+        ];
+        let title = lang.pick("open_mess zapisuje napisy tej rozmowy", "open_mess keeps this call's captions");
+        self.show(title.into(), lines, vec![(lang.pick("Zatrzymaj", "Stop"), format!("captions:{id}"))]);
+    }
+
+    fn failed(&self) -> usize {
+        self.failed.load(Ordering::SeqCst)
     }
 }
 

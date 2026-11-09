@@ -4,7 +4,8 @@
 //! names the conversation it writes to and the account that writes (spec 2026-10-29-live-captions,
 //! 5.1); its calls become pending actions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, PoisonError};
 
 use serde_json::{Value, json};
 
@@ -16,6 +17,61 @@ const MAX_ARGS: usize = 16 * 1024;
 /// The largest result a module's own tool may return.
 pub const MAX_RESULT: usize = 1024 * 1024;
 const MAX_PROPERTIES: usize = 32;
+
+/// The chat threads of the captions sessions agents read, by account and conversation, while the
+/// session lasts (spec 2026-11-04-captions-archive, 4.2): a session's buffer holds what was said
+/// in each of them, so an agent reading or leaving it must be allowed to read every one, checked
+/// before the module is called and again on its answer. Only in memory.
+#[derive(Default)]
+pub(crate) struct Threads(Mutex<HashMap<(String, String), Known>>);
+
+/// The threads a session named, and its token.
+struct Known {
+    session: Option<String>,
+    threads: Vec<String>,
+}
+
+/// The sessions remembered; past it the map starts over (an agent reading more at once is unlikely).
+const MAX_KNOWN: usize = 256;
+const MAX_THREADS: usize = 16;
+
+impl Threads {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Known>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The threads known of the account's session in `conversation`.
+    pub(crate) fn known(&self, account: &str, conversation: &str) -> Vec<String> {
+        self.map().get(&(account.to_owned(), conversation.to_owned())).map(|known| known.threads.clone()).unwrap_or_default()
+    }
+
+    /// Takes in the threads a module's `result` names, and returns every thread known of the
+    /// session. A result of another session forgets the earlier one's.
+    pub(crate) fn learn(&self, account: &str, conversation: &str, result: &Value) -> Vec<String> {
+        let session = result.get("session").and_then(Value::as_str).map(str::to_owned);
+        let named = result.get("threads").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
+        let named: Vec<String> = named.filter(|thread| thread.len() <= 256).take(MAX_THREADS).map(str::to_owned).collect();
+        let mut map = self.map();
+        let key = (account.to_owned(), conversation.to_owned());
+        if map.get(&key).is_some_and(|known| session.is_some() && known.session != session) {
+            map.remove(&key);
+        }
+        if named.is_empty() {
+            return map.get(&key).map(|known| known.threads.clone()).unwrap_or_default();
+        }
+        if map.len() >= MAX_KNOWN && !map.contains_key(&key) {
+            map.clear();
+        }
+        let known = map.entry(key).or_insert_with(|| Known { session: session.clone(), threads: Vec::new() });
+        known.session = session.or(known.session.take());
+        for thread in named {
+            if !known.threads.contains(&thread) && known.threads.len() < MAX_THREADS {
+                known.threads.push(thread);
+            }
+        }
+        known.threads.clone()
+    }
+}
 
 /// An extra tool of a module file that is the module (not one waiting to replace it).
 pub(crate) struct Declared {

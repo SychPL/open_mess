@@ -50,6 +50,7 @@ fn state(d: &Daemon) -> UiState {
         update: None,
         models: None,
         recorder: None,
+        captions: None,
     }
 }
 
@@ -91,6 +92,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         update: None,
         models: None,
         recorder: None,
+        captions: None,
     };
     (dir, state)
 }
@@ -721,12 +723,93 @@ async fn the_recording_section_manages_settings_and_recordings() {
     recorder.observe(&call, Instant::now());
     let active = commands::recordings(&state).unwrap().active.unwrap();
     assert_eq!(commands::delete_model(&state).unwrap_err(), "trwa nagrywanie albo transkrypcja");
-    commands::delete_recording(&state, &active).unwrap();
+    commands::delete_recording(&state, &active).await.unwrap();
     assert!(recorder.active().is_none() && recordings.meta(&active).is_err());
 
-    commands::delete_all_recordings(&state).unwrap();
+    commands::delete_all_recordings(&state).await.unwrap();
     assert!(commands::recordings(&state).unwrap().recordings.is_empty());
 }
+
+#[tokio::test]
+async fn the_recording_section_keeps_and_shows_calls_captions() {
+    use open_mess::recording::archive::{self, CallState, Cue, Gap, GapReason, Gaps};
+    use open_mess::recording::captions::{Archiver, Notices, Setup};
+    use open_mess::recording::{Meta, Reason, Recordings, Source, State as RecordingState};
+
+    struct Silent;
+    impl Notices for Silent {
+        fn started(&self, _: &str) {}
+    }
+
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("a")).unwrap();
+    d.registry.ui_ready().store(true, std::sync::atomic::Ordering::SeqCst);
+    let local = d.dir.path().join("local");
+    let mut state = state(&d);
+    state.recorder = Some(recorder(&local));
+    // Without the archive (not on Windows) its settings are null and its commands refused.
+    assert_eq!(commands::recordings(&state).unwrap().captions, Value::Null);
+    assert!(commands::set_captions_settings(&state, true, "pl-pl").await.is_err());
+    let setup = Setup {
+        accounts: Arc::clone(&d.accounts),
+        gate: d.registry.gate().clone(),
+        probation: d.registry.pending().unwrap().probation().clone(),
+        ui_ready: Arc::clone(d.registry.ui_ready()),
+        notices: Arc::new(Silent),
+        free_disk: Box::new(|| u64::MAX),
+    };
+    let archiver = Archiver::new(Recordings::new(&local), setup);
+    state.captions = Some(Arc::clone(&archiver));
+
+    // Off by default, with the default language; saved and checked.
+    let view = commands::recordings(&state).unwrap();
+    assert_eq!((view.captions_auto, view.captions_language.as_str(), &view.captions["auto"]), (false, "pl-pl", &json!(false)));
+    assert!(commands::set_captions_settings(&state, true, "../x").await.is_err());
+    commands::set_captions_settings(&state, true, "en-us").await.unwrap();
+    let view = commands::recordings(&state).unwrap();
+    assert_eq!((view.captions_auto, view.captions_language.as_str()), (true, "en-us"));
+
+    // A call kept now: on the list with its source and coverage, shown as text with its gaps.
+    let handle = d.accounts.modules().handle("test-echo").unwrap();
+    let calls = json!({"items": [{"call": "c1", "conversation": "19:meeting_x@thread.v2"}]});
+    handle.call("a", "set-calls", &calls.to_string()).await.unwrap();
+    let start = open_mess::recording::captions::now_ms();
+    archiver.pass(start).await;
+    archiver.pass(start + 5000).await;
+    let said = json!({"conversation": "19:meeting_x@thread.v2", "cues": [{"at": "2999-01-01T00:00:00Z", "speaker": "Ann", "text": "<b>hej</b>"}]});
+    handle.call("a", "captions-say", &said.to_string()).await.unwrap();
+    archiver.pass(start + 10_000).await;
+    let view = commands::recordings(&state).unwrap();
+    let item = view.recordings.iter().find(|item| item.source == Source::Captions).unwrap().clone();
+    assert_eq!((item.state, item.coverage, item.gaps), ("recording", Some(50), Some(1)));
+    assert_eq!(view.captions["active"], 1);
+    // As text, untouched, also with agents refused.
+    commands::set_permissions(&state, "local", None, false, "never").unwrap();
+    let shown = commands::show_captions(&state, &item.id).unwrap();
+    assert_eq!((shown.cues[0].speaker.as_str(), shown.cues[0].text.as_str(), shown.damaged, shown.more), ("Ann", "<b>hej</b>", 0, false));
+    assert_eq!(shown.gaps, [Gap { from: 0, to: Some(5000), reason: GapReason::LateStart }]);
+    assert!(commands::show_captions(&state, "../x").is_err());
+
+    // Deleting it while it goes on stops it first and keeps the call from being kept again.
+    commands::delete_recording(&state, &item.id).await.unwrap();
+    let recordings = Recordings::new(&local);
+    assert!(recordings.meta(&item.id).is_err());
+    let calls = archive::load_calls(&local.join("recordings")).0;
+    assert_eq!(calls.iter().find(|call| call.call == "c1").map(|call| call.state), Some(CallState::Blocked));
+    archiver.pass(start + MINUTE_MS).await;
+    assert!(recordings.list().is_empty());
+
+    // "Zatrzymaj" of one recording of the window, and "Usuń wszystkie" of finished ones.
+    let meta = Meta { source: Source::Captions, account: Some("test-echo:a".into()), call: Some("c9".into()), ..Meta::default() };
+    let done = recordings.create_with(&Meta { state: RecordingState::Done, reason: Some(Reason::Stopped), ..meta }).unwrap();
+    archive::append_cues(&recordings.path(&done).unwrap(), &[Cue::capped(0, "Bob", true, "x")]).unwrap();
+    Gaps::default().save(&recordings.path(&done).unwrap()).unwrap();
+    commands::stop_captions(&state, None).await.unwrap();
+    commands::delete_all_recordings(&state).await.unwrap();
+    assert!(commands::recordings(&state).unwrap().recordings.is_empty());
+}
+
+const MINUTE_MS: u64 = 60_000;
 
 /// A file of this crate, as the repository has it.
 fn repo_file(file: &str) -> String {

@@ -276,14 +276,16 @@ fn bak_path(dir: &Path) -> PathBuf {
     dir.join(format!("{CALLS}.bak"))
 }
 
+/// The calls of a file; one entry that is not ours makes the whole file unreadable, since it may
+/// hide a stop (Codex on 4a885da).
 fn parse_calls(path: &Path) -> io::Result<Vec<Call>> {
-    let calls: Vec<Call> =
-        serde_json::from_slice(&read_capped(path, MAX_CALLS_FILE)?).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    Ok(calls
-        .into_iter()
-        .filter(|call| valid_call(&call.call) && call.account.len() <= 256 && call.recording.as_deref().is_none_or(valid_id))
-        .take(MAX_CALLS)
-        .collect())
+    let damaged = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
+    let calls: Vec<Call> = serde_json::from_slice(&read_capped(path, MAX_CALLS_FILE)?).map_err(|err| damaged(err.to_string()))?;
+    let ours = |call: &Call| valid_call(&call.call) && call.account.len() <= 256 && call.recording.as_deref().is_none_or(valid_id);
+    if calls.len() > MAX_CALLS || !calls.iter().all(ours) {
+        return Err(damaged("an entry that is not a call's".into()));
+    }
+    Ok(calls)
 }
 
 /// The calls of the recordings folder `dir`, and whether their state was lost: the file cannot be
@@ -308,7 +310,7 @@ pub fn save_calls(dir: &Path, calls: &mut Vec<Call>, now_ms: u64) -> io::Result<
     fs::create_dir_all(dir)?;
     let bytes = serde_json::to_vec(calls).map_err(io::Error::other)?;
     // The previous version first, copied whole: after a crash in between the file is still there.
-    if let Ok(previous) = fs::read(calls_path(dir)) {
+    if let Ok(previous) = read_capped(&calls_path(dir), MAX_CALLS_FILE) {
         write_atomic(&bak_path(dir), &previous)?;
     }
     write_atomic(&calls_path(dir), &bytes)
@@ -494,12 +496,18 @@ mod tests {
         save_calls(dir.path(), &mut calls, 20_000).unwrap();
         assert_eq!(calls.len(), MAX_CALLS);
         assert!(!calls.iter().any(|call| call.call == "c0"));
-        let bad = r#"[{"account": "a", "call": "../x", "state": "active", "seen_ms": 1},
-                      {"account": "a", "call": "ok", "recording": "..", "state": "active", "seen_ms": 1},
-                      {"account": "a", "call": "fine", "state": "blocked", "seen_ms": 1}]"#;
-        fs::write(dir.path().join(CALLS), bad).unwrap();
-        let (calls, lost) = load_calls(dir.path());
-        assert_eq!((calls.len(), calls[0].call.as_str(), lost), (1, "fine", false));
+        // An entry that is not ours may hide a stop: the file is unreadable, its previous version
+        // is taken and the state counts as lost.
+        let good = r#"[{"account": "a", "call": "fine", "state": "blocked", "seen_ms": 1}]"#;
+        fs::write(bak_path(dir.path()), good).unwrap();
+        for bad in [
+            r#"[{"account": "a", "call": "../x", "state": "active", "seen_ms": 1}]"#,
+            r#"[{"account": "a", "call": "ok", "recording": "..", "state": "active", "seen_ms": 1}]"#,
+        ] {
+            fs::write(dir.path().join(CALLS), bad).unwrap();
+            let (calls, lost) = load_calls(dir.path());
+            assert_eq!((calls.len(), calls[0].call.as_str(), calls[0].state, lost), (1, "fine", CallState::Blocked, true));
+        }
         assert!(valid_call("19ab-CD") && !valid_call("") && !valid_call(&"a".repeat(65)) && !valid_call("a b"));
     }
 }

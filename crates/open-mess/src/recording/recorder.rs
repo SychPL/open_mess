@@ -442,7 +442,7 @@ pub fn free_disk(path: &Path) -> u64 {
     holding.max_by_key(|disk| disk.mount_point().as_os_str().len()).map_or(u64::MAX, sysinfo::Disk::available_space)
 }
 
-/// The recorder of this computer: Teams' audio sessions, WASAPI and the toasts. Starts the
+/// The recorder of this computer: Teams' audio sessions, WASAPI and `toasts`. Starts the
 /// detection, which reads the sessions every second.
 #[cfg(windows)]
 pub fn start(
@@ -451,8 +451,8 @@ pub fn start(
     ui_ready: Arc<AtomicBool>,
     settings: Box<dyn Fn() -> Settings + Send + Sync>,
     model: Box<dyn Fn() -> &'static str + Send + Sync>,
+    toasts: Arc<super::notice::Toasts>,
 ) -> io::Result<Arc<Recorder>> {
-    let toasts = Arc::new(super::notice::Toasts::new()?);
     let free = local.to_path_buf();
     let hooks = Hooks {
         settings,

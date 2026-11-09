@@ -75,12 +75,25 @@ pub fn tools() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: STOP.into(),
-            description: "Stops the recording of the call going on, if one is made; that call is then not recorded again. \
-                          The owner is shown that an agent stopped it. Starting a recording is up to the owner."
+            description: "Stops the recording going on named by recording, or without it every one going on: the call's \
+                          audio recording and the captions recordings of calls you may read. A stopped call is not \
+                          recorded again, and open_mess leaves it. Returns the recordings stopped. The owner is shown \
+                          that an agent stopped an audio recording. Starting a recording is up to the owner."
                 .into(),
-            input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"recording": {"type": "string", "description": "Recording id from list_recordings."}},
+                "additionalProperties": false,
+            }),
         },
     ]
+}
+
+/// The arguments of [`STOP`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopArgs {
+    pub recording: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -169,10 +182,10 @@ fn list(recordings: &Recordings, progress: &dyn Fn(&str) -> Option<u8>, readable
         Some(before) => {
             let at = entries.iter().position(|Entry { id, .. }| *id == before).ok_or_else(unknown)?;
             // One the agent may not read was never on its page.
-            if !entries.get(at).is_some_and(|entry| readable(Some(&entry.meta)).unwrap_or(false)) {
-                return Err(unknown());
+            match entries.get(at) {
+                Some(entry) if readable(Some(&entry.meta))? => at + 1,
+                _ => return Err(unknown()),
             }
-            at + 1
         }
         None => 0,
     };
@@ -186,12 +199,15 @@ fn list(recordings: &Recordings, progress: &dyn Fn(&str) -> Option<u8>, readable
             kept.push(entry);
         }
     }
-    let mut items = Vec::new();
-    for Entry { id, meta } in kept {
-        // Asked again just before the answer.
-        if !readable(Some(&meta))? {
-            continue;
+    // Asked again for each, once the page is made: a permission taken back meanwhile drops it.
+    let mut checked = Vec::new();
+    for entry in kept {
+        if readable(Some(&entry.meta))? {
+            checked.push(entry);
         }
+    }
+    let mut items = Vec::new();
+    for Entry { id, meta } in checked {
         let percent = (meta.state == State::Transcribing).then(|| progress(&id)).flatten();
         let mut item = json!({
             "recording": id,
@@ -539,6 +555,24 @@ mod tests {
             .unwrap();
         let page = call(&recordings, &|_| None, &yes, TRANSCRIPT, json!({"recording": failed})).unwrap();
         assert_eq!((page["untrusted"]["cues"].as_array().unwrap().len(), &page["reason"]), (0, &json!("e2ee")));
+    }
+
+    #[test]
+    fn a_conversation_taken_back_while_the_list_is_made_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = Recordings::new(dir.path());
+        let kept = captions(&recordings, 2_000, "19:open@thread.v2", 1);
+        captions(&recordings, 1_000, "19:revoked@thread.v2", 1);
+        // Readable when the page is made, taken back before the answer (Codex on 4a885da).
+        let asked = Cell::new(0);
+        let revoked = |meta: Option<&Meta>| {
+            let revoked = meta.is_some_and(|meta| meta.conversation.as_deref() == Some("19:revoked@thread.v2"));
+            asked.set(asked.get() + u32::from(revoked));
+            Ok(!revoked || asked.get() < 2)
+        };
+        let page = call(&recordings, &|_| None, &revoked, LIST, json!({})).unwrap();
+        let ids: Vec<&str> = page["items"].as_array().unwrap().iter().map(|item| item["recording"].as_str().unwrap()).collect();
+        assert_eq!(ids, [kept.as_str()]);
     }
 
     #[test]

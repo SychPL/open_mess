@@ -31,9 +31,10 @@ use crate::accounts::{Account, Accounts, REMOVING};
 use crate::modules::{ModuleInfo, ModuleState};
 use crate::pending::{self, Kind, Pending, State};
 use crate::permissions;
+use crate::recording::captions::Archiver;
 use crate::recording::queue::Queue;
-use crate::recording::{Meta, Recordings, Source};
 use crate::recording::recorder::{By, Recorder};
+use crate::recording::{Meta, Recordings, Source};
 use crate::triggers::Counters;
 use crate::triggers::channel::Sessions;
 use crate::triggers::engine::now_ms;
@@ -103,6 +104,11 @@ impl Gate {
         self.0.in_flight.load(Ordering::SeqCst)
     }
 
+    /// Writes are held now: an update, or its new version's probation.
+    pub fn writes_blocked(&self) -> bool {
+        *self.0.mode.lock().unwrap_or_else(PoisonError::into_inner) != GateMode::Open
+    }
+
     pub fn last_end_ms(&self) -> u64 {
         self.0.last_end_ms.load(Ordering::SeqCst)
     }
@@ -161,6 +167,10 @@ pub struct Registry {
     queue: Option<Arc<Queue>>,
     /// What records the calls, for `stop_recording` and `status`; None where nothing is recorded.
     recorder: Option<Arc<Recorder>>,
+    /// What keeps the calls' captions (spec 2026-11-04-captions-archive), likewise.
+    archiver: Option<Arc<Archiver>>,
+    /// The threads of the captions sessions agents read.
+    threads: extra::Threads,
     /// Every MCP session, told when the list of tools changes.
     mcp_sessions: Mutex<Vec<Peer<RoleServer>>>,
     /// The list of tools the sessions were last told about; None until the first look.
@@ -187,6 +197,8 @@ impl Registry {
             recordings: None,
             queue: None,
             recorder: None,
+            archiver: None,
+            threads: extra::Threads::default(),
             mcp_sessions: Mutex::default(),
             announced: Mutex::default(),
         }
@@ -243,6 +255,10 @@ impl Registry {
 
     pub fn set_recorder(&mut self, recorder: Arc<Recorder>) {
         self.recorder = Some(recorder);
+    }
+
+    pub fn set_archiver(&mut self, archiver: Arc<Archiver>) {
+        self.archiver = Some(archiver);
     }
 
     /// The transcription queue, once the recordings are set.
@@ -326,12 +342,12 @@ impl Registry {
             return self.recording_tool(name, args);
         }
         if name == recordings::STOP {
-            return self.stop_recording(&args);
+            return self.stop_recording(args).await;
         }
         if let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending)
             && let Some(tool) = extra::find(&accounts.modules().list(), name)
         {
-            return call_extra(accounts, pending, name, tool, args).await;
+            return call_extra(accounts, pending, &self.threads, name, tool, args).await;
         }
         let args = shared::validate(name, args)?;
         let (Some(accounts), Some(pending)) = (&self.accounts, &self.pending) else {
@@ -377,16 +393,48 @@ impl Registry {
     }
 
     /// `stop_recording`, under the same read permission of `local` as the other recording tools
-    /// (4.5).
-    fn stop_recording(&self, args: &Value) -> Result<Value, ToolError> {
-        no_params(args)?;
-        let (Some(recorder), Some(accounts)) = (&self.recorder, &self.accounts) else {
+    /// (4.5): the recording `recording`, or the call's audio recording and every captions
+    /// recording going on whose conversation the agent may read (spec 2026-11-04-captions-archive,
+    /// 4.6). A stop only takes away; the calls stopped are not recorded again.
+    async fn stop_recording(&self, args: Value) -> Result<Value, ToolError> {
+        let args: recordings::StopArgs = serde_json::from_value(args).map_err(|err| ToolError::InvalidArgs(err.to_string()))?;
+        let (Some(accounts), Some(recordings)) = (&self.accounts, &self.recordings) else {
             return Err(ToolError::Module("not supported yet: local recording works on Windows only".into()));
         };
-        if !permissions::effective(&accounts.store(), permissions::LOCAL, None).map_err(failed)?.read {
+        if self.recorder.is_none() && self.archiver.is_none() {
+            return Err(ToolError::Module("not supported yet: local recording works on Windows only".into()));
+        }
+        if !recording_readable(accounts, None)? {
             return Err(ToolError::NotAllowed("the local recordings are not allowed".into()));
         }
-        Ok(json!({"recording": recorder.stop(By::Agent, false, None)}))
+        let mut stopped = Vec::new();
+        let readable = |meta: &Meta| recording_readable(accounts, Some(meta)).unwrap_or(false);
+        match args.recording {
+            Some(id) => {
+                let unknown = || ToolError::InvalidArgs("no such recording going on - list_recordings lists them".into());
+                let meta = recordings.meta(&id).ok().filter(|_| crate::recording::valid_id(&id)).ok_or_else(unknown)?;
+                if !readable(&meta) {
+                    return Err(ToolError::NotAllowed("reading this recording is not allowed".into()));
+                }
+                match (meta.source, &self.recorder, &self.archiver) {
+                    (Source::Audio, Some(recorder), _) => stopped.extend(recorder.stop(By::Agent, false, Some(&id))),
+                    (Source::Captions, _, Some(archiver)) => stopped.extend(archiver.stop(|recording, _| recording == id).await),
+                    _ => {}
+                }
+                if stopped.is_empty() {
+                    return Err(unknown());
+                }
+            }
+            None => {
+                if let Some(recorder) = &self.recorder {
+                    stopped.extend(recorder.stop(By::Agent, false, None));
+                }
+                if let Some(archiver) = &self.archiver {
+                    stopped.extend(archiver.stop(|_, meta| readable(meta)).await);
+                }
+            }
+        }
+        Ok(json!({"stopped": stopped}))
     }
 
     /// What the `status` tool answers; the daemon's own check during an update's probation reads it
@@ -431,6 +479,7 @@ impl Registry {
             "accounts_restored": self.accounts_restored.load(Ordering::SeqCst),
             "update": self.update.as_ref().map(UpdateService::status),
             "recording": self.recorder.as_ref().map(|recorder| recorder.status()),
+            "captions": self.archiver.as_ref().map(|archiver| archiver.status()),
         }))
     }
 }
@@ -580,7 +629,14 @@ fn finish(accounts: &Accounts, account: &Account, tool: &str, args: &Value, resu
 /// declarations of its full `name`, one when it is listed. A write tool's call becomes a pending
 /// action under the write permission, as `send`'s does, and never reaches the module from here
 /// (spec 2026-10-29-live-captions, 5.1).
-async fn call_extra(accounts: &Accounts, pending: &Pending, name: &str, mut tools: Vec<extra::Declared>, args: Value) -> Result<Value, ToolError> {
+async fn call_extra(
+    accounts: &Accounts,
+    pending: &Pending,
+    threads: &extra::Threads,
+    name: &str,
+    mut tools: Vec<extra::Declared>,
+    args: Value,
+) -> Result<Value, ToolError> {
     let (Some(tool), None) = (tools.pop(), tools.first()) else { return Err(ToolError::UnknownTool(name.into())) };
     // A client that missed the change of the list learns why the tool is gone.
     if tool.state != ModuleState::Active {
@@ -616,6 +672,13 @@ async fn call_extra(accounts: &Accounts, pending: &Pending, name: &str, mut tool
         let outcome = pending.create_tool(name, &tool.decl, &account.id, &conversation, module_args).await?;
         return serde_json::to_value(outcome).map_err(failed);
     }
+    // Every thread a captions session of the conversation named is checked too, before the module
+    // runs: a refused call neither ends the session nor counts as its read (spec
+    // 2026-11-04-captions-archive, 4.2, R4, R6).
+    let conversation = module_args.get("conversation").and_then(Value::as_str).map(str::to_owned);
+    if let Some(conversation) = &conversation {
+        threads_readable(accounts, &account.id, &threads.known(&account.id, conversation))?;
+    }
     let json = within(&account.module, handle.call(&account.module_account, &tool.decl.name, &module_args.to_string())).await?;
     if json.len() > extra::MAX_RESULT {
         return Err(ToolError::Module(format!("module returned a result over {} MiB", extra::MAX_RESULT / 1024 / 1024)));
@@ -627,8 +690,22 @@ async fn call_extra(accounts: &Accounts, pending: &Pending, name: &str, mut tool
     // outside `items` (a transcript's cues) passes no item filter: the same account and
     // conversation are checked again.
     let account = readable(accounts, &account.id, &module_args)?;
+    if let Some(conversation) = &conversation {
+        threads_readable(accounts, &account.id, &threads.learn(&account.id, conversation, &result))?;
+    }
     finish(accounts, &account, name, &module_args, &mut result)?;
     Ok(shared::with_notice(result))
+}
+
+/// Refuses unless the agent may read every one of `threads` of the account.
+fn threads_readable(accounts: &Accounts, account: &str, threads: &[String]) -> Result<(), ToolError> {
+    let store = accounts.store();
+    for thread in threads {
+        if !permissions::effective(&store, account, Some(thread)).map_err(failed)?.read {
+            return Err(ToolError::NotAllowed("reading this conversation is not allowed".into()));
+        }
+    }
+    Ok(())
 }
 
 /// The one account of `module` the agent may read, for a call that names none.

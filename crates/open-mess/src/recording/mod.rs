@@ -6,11 +6,12 @@
 //! `gaps.jsonl` instead (archive.rs).
 
 pub mod archive;
+pub mod captions;
 pub mod capture;
 pub mod detect;
 pub mod model;
 #[cfg(windows)]
-mod notice;
+pub mod notice;
 pub mod queue;
 pub mod recorder;
 pub mod stt;
@@ -375,10 +376,15 @@ impl Recordings {
             .flatten()
             .filter_map(|dir| {
                 let id = dir.file_name().into_string().ok().filter(|id| valid_id(id))?;
+                let path = dir.path();
+                // A captions recording's files tell it apart: its agents' permission is its
+                // conversation's, which a damaged one does not name (nobody but the owner sees it).
+                let captions = [archive::CAPTIONS, archive::GAPS].iter().any(|file| path.join(file).exists());
                 let meta = self.meta(&id).unwrap_or_else(|_| Meta {
                     state: State::Failed,
                     start_ms: dir.metadata().and_then(|meta| meta.modified()).map(millis).unwrap_or(0),
                     reason: Some(Reason::Damaged),
+                    source: if captions { Source::Captions } else { Source::Audio },
                     ..Meta::default()
                 });
                 Some(Entry { id, meta })
@@ -478,7 +484,8 @@ impl Recordings {
         dirs.flatten().fold((0, 0), |(audio, text), dir| {
             let path = dir.path();
             let audio = audio + TRACKS.iter().map(|track| file_len(&path.join(track))).sum::<u64>();
-            (audio, text + file_len(&path.join(TRANSCRIPT)) + file_len(&path.join(archive::CAPTIONS)))
+            let captions = file_len(&path.join(archive::CAPTIONS)) + file_len(&path.join(archive::GAPS));
+            (audio, text + file_len(&path.join(TRANSCRIPT)) + captions)
         })
     }
 
@@ -748,6 +755,10 @@ mod tests {
         assert_eq!(recordings.meta(&id).unwrap(), captions);
         assert_eq!(recordings.meta(&failed).unwrap().state, State::Failed);
         assert!(recordings.usage().1 > 0);
+        // A damaged one is still a captions recording, which agents only read by its conversation.
+        fs::write(recordings.path(&id).unwrap().join(META), b"{damaged").unwrap();
+        let listed = recordings.list().into_iter().find(|entry| entry.id == id).unwrap().meta;
+        assert_eq!((listed.source, listed.reason, listed.conversation), (Source::Captions, Some(Reason::Damaged), None));
         // A meta.json of a daemon before the archive reads as audio.
         fs::write(recordings.path(&id).unwrap().join(META), br#"{"state":"done","start_ms":1,"end_ms":2,"language":null,"reason":null}"#).unwrap();
         assert_eq!(recordings.meta(&id).unwrap().source, Source::Audio);

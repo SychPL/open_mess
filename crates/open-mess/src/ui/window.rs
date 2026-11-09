@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -71,7 +71,10 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::delete_recording,
             ipc::delete_all_recordings,
             ipc::retry_recording,
-            ipc::stop_recording
+            ipc::stop_recording,
+            ipc::set_captions_settings,
+            ipc::show_captions,
+            ipc::stop_captions
         ])
         .build(tauri::generate_context!())
         .map_err(failed)?;
@@ -364,12 +367,27 @@ mod ipc {
     // Deleting waits for a transcription to stop: off the async workers.
     #[tauri::command(rename_all = "snake_case")]
     pub async fn delete_recording(state: State<'_, UiState>, id: String) -> Result<(), String> {
-        tokio::task::block_in_place(|| commands::delete_recording(&state, &id))
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(commands::delete_recording(&state, &id)))
     }
 
     #[tauri::command(rename_all = "snake_case")]
     pub async fn delete_all_recordings(state: State<'_, UiState>) -> Result<(), String> {
-        tokio::task::block_in_place(|| commands::delete_all_recordings(&state))
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(commands::delete_all_recordings(&state)))
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn set_captions_settings(state: State<'_, UiState>, auto: bool, language: String) -> Result<(), String> {
+        commands::set_captions_settings(&state, auto, &language).await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn show_captions(state: State<'_, UiState>, id: String) -> Result<commands::CaptionsDto, String> {
+        commands::show_captions(&state, &id)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn stop_captions(state: State<'_, UiState>, id: Option<String>) -> Result<(), String> {
+        commands::stop_captions(&state, id.as_deref()).await
     }
 
     #[tauri::command(rename_all = "snake_case")]
@@ -404,21 +422,42 @@ mod ipc {
 }
 
 /// The tray menu in `lang`; while a call is recorded it can stop it (spec
-/// 2026-10-28-local-transcription, 4.2). Its items are told apart by id, never by label.
-fn tray_menu<R: tauri::Runtime, M: Manager<R>>(manager: &M, lang: Lang, recording: bool) -> tauri::Result<Menu<R>> {
+/// 2026-10-28-local-transcription, 4.2), and while calls' captions are kept it says how many and
+/// stops them all (spec 2026-11-04-captions-archive, 4.7). Its items are told apart by id, never
+/// by label.
+fn tray_menu<R: tauri::Runtime, M: Manager<R>>(manager: &M, lang: Lang, recording: bool, captions: usize) -> tauri::Result<Menu<R>> {
     let open = MenuItem::with_id(manager, "open", lang.pick("Otwórz ustawienia", "Open settings"), true, None::<&str>)?;
     let stop = MenuItem::with_id(manager, "stop_recording", lang.pick("Zatrzymaj nagrywanie", "Stop recording"), true, None::<&str>)?;
+    let kept = match lang {
+        Lang::Pl => format!("Zapisuję napisy: {captions} {}", crate::i18n::plural_pl(captions, "rozmowa", "rozmowy", "rozmów")),
+        Lang::En => format!("Keeping captions: {captions} {}", if captions == 1 { "call" } else { "calls" }),
+    };
+    let kept = MenuItem::with_id(manager, "captions", kept, false, None::<&str>)?;
+    let stop_all = MenuItem::with_id(manager, "stop_captions", lang.pick("Zatrzymaj wszystkie", "Stop all"), true, None::<&str>)?;
     let quit = MenuItem::with_id(manager, "quit", lang.pick("Zakończ", "Quit"), true, None::<&str>)?;
-    if recording { Menu::with_items(manager, &[&open, &stop, &quit]) } else { Menu::with_items(manager, &[&open, &quit]) }
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<R>> = vec![&open];
+    if recording {
+        items.push(&stop);
+    }
+    if captions > 0 {
+        items.extend([&kept as &dyn tauri::menu::IsMenuItem<R>, &stop_all]);
+    }
+    items.push(&quit);
+    Menu::with_items(manager, &items)
 }
 
-/// The tray's tooltip, which says while a call is recorded.
-fn tray_tooltip(lang: Lang, recording: bool) -> &'static str {
-    if recording { lang.pick("open_mess - nagrywanie", "open_mess - recording") } else { "open_mess" }
+/// The tray's tooltip, which says while a call is recorded or its captions kept.
+fn tray_tooltip(lang: Lang, recording: bool, captions: usize) -> &'static str {
+    match (recording, captions > 0) {
+        (true, _) => lang.pick("open_mess - nagrywanie", "open_mess - recording"),
+        (false, true) => lang.pick("open_mess - zapis napisów", "open_mess - keeping captions"),
+        (false, false) => "open_mess",
+    }
 }
 
-/// Whether a call is recorded, as the tray shows it.
+/// Whether a call is recorded, and the calls whose captions are kept, as the tray shows them.
 static TRAY_RECORDING: AtomicBool = AtomicBool::new(false);
+static TRAY_CAPTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Redraws the tray's menu and tooltip on the main thread, in the language and the recording state
 /// of that moment. Nobody waits for it and no lock is held across it (the recorder calls its
@@ -428,16 +467,16 @@ fn refresh_tray<R: tauri::Runtime>(app: &AppHandle<R>) {
     let handle = app.clone();
     // ponytail: a menu or tooltip that fails to change keeps the old one until the next change.
     let _ = app.run_on_main_thread(move || {
-        let (lang, recording) = (i18n::current(), TRAY_RECORDING.load(Ordering::SeqCst));
-        if let (Some(tray), Ok(menu)) = (handle.tray_by_id(TRAY), tray_menu(&handle, lang, recording)) {
+        let (lang, recording, captions) = (i18n::current(), TRAY_RECORDING.load(Ordering::SeqCst), TRAY_CAPTIONS.load(Ordering::SeqCst));
+        if let (Some(tray), Ok(menu)) = (handle.tray_by_id(TRAY), tray_menu(&handle, lang, recording, captions)) {
             let _ = tray.set_menu(Some(menu));
-            let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording)));
+            let _ = tray.set_tooltip(Some(tray_tooltip(lang, recording, captions)));
         }
     });
 }
 
 fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
-    let menu = tray_menu(app, i18n::current(), false)?;
+    let menu = tray_menu(app, i18n::current(), false, 0)?;
     let on_click = profile.clone();
     let mut tray = TrayIconBuilder::with_id(TRAY)
         .tooltip("open_mess")
@@ -450,6 +489,11 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
             "stop_recording" => {
                 if let Some(recorder) = &app.state::<UiState>().recorder {
                     recorder.stop(crate::recording::recorder::By::Owner, false, None);
+                }
+            }
+            "stop_captions" => {
+                if let Some(archiver) = &app.state::<UiState>().captions {
+                    archiver.stop_all_soon();
                 }
             }
             "quit" => app.exit(0),
@@ -468,6 +512,13 @@ fn tray(app: &tauri::App, profile: PathBuf) -> tauri::Result<()> {
         let handle = app.handle().clone();
         recorder.set_indicator(Box::new(move |recording| {
             TRAY_RECORDING.store(recording, Ordering::SeqCst);
+            refresh_tray(&handle);
+        }));
+    }
+    if let Some(archiver) = &app.state::<UiState>().captions {
+        let handle = app.handle().clone();
+        archiver.set_indicator(Box::new(move |captions| {
+            TRAY_CAPTIONS.store(captions, Ordering::SeqCst);
             refresh_tray(&handle);
         }));
     }
@@ -543,18 +594,37 @@ mod tests {
     fn tray_and_window_follow_the_language() {
         let app = tauri::test::mock_app();
         for (lang, open, quit) in [(Lang::Pl, "Otwórz ustawienia", "Zakończ"), (Lang::En, "Open settings", "Quit")] {
-            let menu = tray_menu(app.handle(), lang, false).unwrap();
+            let menu = tray_menu(app.handle(), lang, false, 0).unwrap();
             let items: Vec<(String, String)> =
                 menu.items().unwrap().iter().filter_map(|item| item.as_menuitem().map(|item| (item.id().0.clone(), item.text().unwrap()))).collect();
             assert_eq!(items, [("open".to_string(), open.to_string()), ("quit".to_string(), quit.to_string())]);
         }
         // While a call is recorded the menu can stop it, in the language too.
         for (lang, stop) in [(Lang::Pl, "Zatrzymaj nagrywanie"), (Lang::En, "Stop recording")] {
-            let menu = tray_menu(app.handle(), lang, true).unwrap();
+            let menu = tray_menu(app.handle(), lang, true, 0).unwrap();
             let items: Vec<String> = menu.items().unwrap().iter().filter_map(|item| item.as_menuitem().map(|item| item.text().unwrap())).collect();
             assert_eq!(items.get(1).map(String::as_str), Some(stop));
         }
-        assert_eq!((tray_tooltip(Lang::Pl, true), tray_tooltip(Lang::En, true)), ("open_mess - nagrywanie", "open_mess - recording"));
+        assert_eq!((tray_tooltip(Lang::Pl, true, 0), tray_tooltip(Lang::En, true, 0)), ("open_mess - nagrywanie", "open_mess - recording"));
+        // While calls' captions are kept, also without a recording, the menu says how many and
+        // stops them all (spec 2026-11-04-captions-archive, 4.7).
+        let menu = tray_menu(app.handle(), Lang::Pl, false, 2).unwrap();
+        let items: Vec<(String, String, bool)> = menu
+            .items()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.as_menuitem().map(|item| (item.id().0.clone(), item.text().unwrap(), item.is_enabled().unwrap())))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("open".to_string(), "Otwórz ustawienia".to_string(), true),
+                ("captions".to_string(), "Zapisuję napisy: 2 rozmowy".to_string(), false),
+                ("stop_captions".to_string(), "Zatrzymaj wszystkie".to_string(), true),
+                ("quit".to_string(), "Zakończ".to_string(), true),
+            ]
+        );
+        assert_eq!(tray_tooltip(Lang::En, false, 1), "open_mess - keeping captions");
         assert_eq!((title(Lang::Pl), title(Lang::En)), ("open_mess - ustawienia", "open_mess - settings"));
         // With the window open (no tray in the mock): its title and its page are told.
         let profile = tempfile::tempdir().unwrap();
