@@ -101,7 +101,13 @@ struct Session {
     cursor: u64,
     /// `missed` of the last page; None before the first.
     missed: Option<u64>,
+    /// Reads that failed in a row.
+    failures: u32,
 }
+
+/// Reads of a session that fail in a row before it counts as gone: a minute of passes. A session
+/// the module no longer answers for never keeps its recording open (4.4, "nigdy nie wisi").
+const MAX_READ_FAILURES: u32 = 12;
 
 /// A call the archiver knows of, in memory.
 struct Live {
@@ -795,7 +801,19 @@ impl Archiver {
     /// Reads the call's session page by page until one brings nothing new, then deals with its end.
     async fn read(&self, inner: &mut Inner, key: &Key, live: &mut Live, now: u64) {
         let Some((account, handle)) = self.module_of(&key.0) else { return };
-        let Some((state, reason)) = self.read_pages(inner, key, live, &account, &handle, now, false).await else { return };
+        let (state, reason) = match self.read_pages(inner, key, live, &account, &handle, now, false).await {
+            Some(last) => last,
+            None => {
+                let failures = live.session.as_mut().map_or(0, |session| {
+                    session.failures = session.failures.saturating_add(1);
+                    session.failures
+                });
+                if failures < MAX_READ_FAILURES {
+                    return;
+                }
+                (PageState::NotJoined, None)
+            }
+        };
         let outcome = match state {
             PageState::Ended | PageState::Failed => outcome(reason.as_deref().unwrap_or_default()),
             // The module lost the session (reloaded, crashed), or it is another call's.
@@ -870,7 +888,7 @@ impl Archiver {
             }
             let session = live.session.get_or_insert_with(Session::default);
             let lost = !first && (page.skipped > 0 || session.missed.is_some_and(|missed| page.missed > missed));
-            (session.token, session.cursor, session.missed) = (page.session.clone(), page.next_cursor, Some(page.missed));
+            (session.token, session.cursor, session.missed, session.failures) = (page.session.clone(), page.next_cursor, Some(page.missed), 0);
             if let Some(rec) = &mut live.rec {
                 // A call a person joined has the new chat's thread from then on (4.2).
                 if valid_thread(&live.conversation) && !rec.meta.threads.contains(&live.conversation) {
@@ -1058,13 +1076,15 @@ impl Archiver {
 
     /// Deletes a recording from the window; one going on is stopped first, its call blocked (4.7).
     pub async fn delete(&self, id: &str) -> std::io::Result<()> {
-        self.stop(|recording, _| recording == id).await;
-        // Its "stopped" goes with it: the block must be on the disk first (Codex on f3e3b79).
-        let mut inner = self.inner.lock().await;
-        if !self.save(&mut inner, now_ms()) {
-            return Err(std::io::Error::other("the calls' state cannot be written; the recording is kept"));
+        let stopped = !self.stop(|recording, _| recording == id).await.is_empty();
+        // A stopped call's recording keeps it stopped across a restart: the block must be on the
+        // disk before it goes (Codex on f3e3b79). Any other recording goes as it is (on f2f52cb).
+        if stopped || self.recordings.meta(id).is_ok_and(|meta| meta.reason == Some(Reason::Stopped)) {
+            let mut inner = self.inner.lock().await;
+            if !self.save(&mut inner, now_ms()) {
+                return Err(std::io::Error::other("the calls' state cannot be written; the recording is kept"));
+            }
         }
-        drop(inner);
         self.recordings.delete(id)
     }
 

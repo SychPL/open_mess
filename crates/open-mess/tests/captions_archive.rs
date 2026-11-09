@@ -653,9 +653,36 @@ async fn a_stop_holds_when_its_state_cannot_be_written() {
     let id = a.kept()[0].0.clone();
     assert!(a.archiver.delete(&id).await.is_err());
     assert!(a.recordings().meta(&id).is_ok());
+    // A recording that keeps no call stopped goes all the same.
+    let other = a.recordings().create_with(&Meta { source: Source::Captions, state: State::Done, ..Meta::default() }).unwrap();
+    a.archiver.delete(&other).await.unwrap();
     read_only(&state, false);
     a.archiver.delete(&id).await.unwrap();
     assert_eq!(a.call_state("c1"), Some(CallState::Blocked));
+}
+
+#[tokio::test]
+async fn a_session_whose_reads_keep_failing_is_joined_again_after_a_minute() {
+    let a = Archive::new().await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    a.echo("captions-say", json!({"conversation": THREAD, "forget": true})).await;
+    for step in 2..13 {
+        a.at(step * 5000).await;
+    }
+    assert_eq!(a.joins().await.len(), 1);
+    // A minute of failed reads: the session counts as gone, and the call is joined again.
+    a.at(65_000).await;
+    let id = &a.kept()[0].0;
+    assert_eq!((a.joins().await.len(), a.gaps(id)), (2, vec![GapReason::LateStart, GapReason::Rejoin]));
+    // Not listed any more and still unread: the recording ends instead of staying open.
+    a.echo("captions-say", json!({"conversation": THREAD, "forget": true})).await;
+    a.calls(&[]).await;
+    for step in 14..30 {
+        a.at(step * 5000).await;
+    }
+    assert_eq!(a.recordings().meta(id).unwrap().state, State::Done);
 }
 
 #[tokio::test]

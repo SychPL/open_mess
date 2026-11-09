@@ -59,7 +59,8 @@
 //! latest) from `{"cursor"}` with `skipped`, and `leave_captions` ends it (`left`). `captions-say`
 //! changes a session: it adds `{"cues"}`, drops the `{"drop"}` oldest, and sets `state`, `reason`,
 //! `captions_on`, `captions_seen`, `threads` and `missed` when given; the session is then found by
-//! each of its `threads` too. `end-sessions` ends the account's sessions (`update`).
+//! each of its `threads` too, and with `{"forget": true}` its reads fail. `end-sessions` ends the
+//! account's sessions (`update`).
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -514,7 +515,9 @@ mod guest {
             for thread in args.get("threads").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
                 put(&format!("conversation:{account}:{thread}"), &json!(token))?;
             }
-            put(&format!("session:{token}"), &session)?;
+            // Forgotten, as by a module that lost track of it: reads of it fail from now on.
+            let forget = args.get("forget") == Some(&json!(true));
+            put(&format!("session:{token}"), if forget { &Value::Null } else { &session })?;
             Ok(json!({"session": token}))
         }
 
