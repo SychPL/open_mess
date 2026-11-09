@@ -134,6 +134,7 @@ fn archiver(d: &Daemon) -> (Arc<Archiver>, Arc<Told>, Arc<AtomicUsize>) {
         ui_ready: Arc::clone(d.registry.ui_ready()),
         notices: Arc::clone(&told) as Arc<dyn Notices>,
         free_disk: Box::new(move || disk.load(Ordering::SeqCst) as u64),
+        threads: Arc::clone(d.registry.threads()),
     };
     (Archiver::new(Recordings::new(&d.dir.path().join("local")), setup), told, free)
 }
@@ -530,6 +531,39 @@ async fn turning_the_switch_off_during_a_join_leaves_the_call() {
 }
 
 #[tokio::test]
+async fn a_scan_during_a_join_ends_its_session_after_it_and_keeps_the_last_cue() {
+    let a = Archive::new().await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    a.say(THREAD, &[(6000, "Ann", "before the scan")]).await;
+    // A second call is listed, and joined slowly while the module is turned off and scanned.
+    a.calls(&[("c1", THREAD), ("c2", "19:two@thread.v2")]).await;
+    a.echo("set-join", json!({"slow": true})).await;
+    a.d.registry.ui_ready().store(false, Ordering::SeqCst);
+    a.at(20_000).await;
+    a.d.registry.ui_ready().store(true, Ordering::SeqCst);
+    let store = common::store(a.d.dir.path());
+    let scan = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        open_mess::modules::set_enabled(&store, "test-echo", false).unwrap();
+        a.d.accounts.rescan_modules(None).await.unwrap();
+    };
+    tokio::join!(a.at(25_000), scan);
+    // The cue in the buffer was read before the version that went ended its sessions.
+    let c1 = a.kept().into_iter().find(|(_, meta)| meta.call.as_deref() == Some("c1")).unwrap().0;
+    assert_eq!(a.cues(&c1), ["before the scan"]);
+    // The module is gone: the recording ends, interrupted, at the next list.
+    a.at(40_000).await;
+    assert_eq!(a.recordings().meta(&c1).unwrap().reason, Some(Reason::Interrupted));
+    // The join that ran during the scan left no session behind: it was ended after the join.
+    open_mess::modules::set_enabled(&store, "test-echo", true).unwrap();
+    a.d.accounts.rescan_modules(None).await.unwrap();
+    let c2 = a.echo("read_captions", json!({"conversation": "19:two@thread.v2"})).await;
+    assert_eq!((&c2["state"], &c2["reason"]), (&json!("ended"), &json!("update")));
+}
+
+#[tokio::test]
 async fn an_agent_may_not_read_a_session_with_a_thread_it_may_not_read() {
     let a = Archive::new().await;
     // An agent's session of a call without a chat; the module learned the call's thread.
@@ -572,6 +606,74 @@ async fn an_escalated_call_s_earlier_chat_must_be_readable_too() {
     assert!(meta.threads.contains(&one_to_one.to_string()) && meta.threads.contains(&group.to_string()), "{:?}", meta.threads);
     let page = a.d.registry.call("get_recording_transcript", json!({"recording": id})).await;
     assert!(matches!(page, Err(ToolError::NotAllowed(_))), "{page:?}");
+}
+
+#[tokio::test]
+async fn what_the_archive_learned_of_a_session_s_threads_holds_an_agent_s_first_call() {
+    let a = Archive::new().await;
+    let (one_to_one, group) = ("19:a_b@unq.gbl.spaces", "19:group@thread.v2");
+    a.calls(&[("c8", one_to_one)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    // A person joins: the chat is a group now, and the archive reads that.
+    a.echo("captions-say", json!({"conversation": one_to_one, "threads": [one_to_one, group]})).await;
+    a.calls(&[("c8", group)]).await;
+    a.at(20_000).await;
+    permissions::set(&common::store(a.d.dir.path()), "test-echo:a", Some(one_to_one), false, Write::Never).unwrap();
+    // The agent's very first call, a leave under the group's name, never reaches the module.
+    let leave = a.d.registry.call("test_echo_leave_captions", json!({"account": "test-echo:a", "conversation": group})).await;
+    assert!(matches!(leave, Err(ToolError::NotAllowed(_))), "{leave:?}");
+    assert_eq!(a.leaves().await, 0);
+}
+
+/// Makes a file read-only, or writable again.
+fn read_only(path: &std::path::Path, on: bool) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(on);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[tokio::test]
+async fn a_stop_holds_when_its_state_cannot_be_written() {
+    let mut a = Archive::new().await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    let state = a.d.dir.path().join("local").join("recordings").join(archive::CALLS);
+    read_only(&state, true);
+    a.archiver.stop(|_, _| true).await;
+    // The state on the disk still says active; the recording's "stopped" keeps the call stopped.
+    assert_eq!(a.call_state("c1"), Some(CallState::Active));
+    a.restart();
+    a.at(MINUTE).await;
+    a.at(MINUTE + 5000).await;
+    assert_eq!(a.joins().await.len(), 1);
+    // Deleting it now would take that away: refused while the state cannot be written.
+    let id = a.kept()[0].0.clone();
+    assert!(a.archiver.delete(&id).await.is_err());
+    assert!(a.recordings().meta(&id).is_ok());
+    read_only(&state, false);
+    a.archiver.delete(&id).await.unwrap();
+    assert_eq!(a.call_state("c1"), Some(CallState::Blocked));
+}
+
+#[tokio::test]
+async fn cues_that_cannot_be_written_are_a_gap() {
+    let a = Archive::new().await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    a.say(THREAD, &[(6000, "Ann", "kept")]).await;
+    a.at(10_000).await;
+    let id = a.kept()[0].0.clone();
+    let file = a.recordings().path(&id).unwrap().join(archive::CAPTIONS);
+    read_only(&file, true);
+    a.say(THREAD, &[(11_000, "Ann", "not written")]).await;
+    a.at(15_000).await;
+    read_only(&file, false);
+    assert_eq!(a.cues(&id), ["kept"]);
+    assert_eq!(a.gaps(&id), [GapReason::LateStart, GapReason::Lost]);
 }
 
 #[tokio::test]

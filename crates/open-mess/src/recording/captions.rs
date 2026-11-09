@@ -344,6 +344,8 @@ pub struct Setup {
     pub notices: Arc<dyn Notices>,
     /// Free bytes on the disk of the recordings.
     pub free_disk: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The threads of the sessions, which agents' reads of them are checked against (4.2).
+    pub threads: Arc<extra::Threads>,
 }
 
 pub struct Archiver {
@@ -545,16 +547,18 @@ impl Archiver {
         inner.lost = lost;
         self.lost.store(lost, Ordering::SeqCst);
         let entries: Vec<_> = self.recordings.list().into_iter().filter(|entry| entry.meta.source == Source::Captions).collect();
-        if lost {
-            // The previous version may lack the last stop: every call stopped in the last day stays so.
-            for entry in entries.iter().filter(|entry| entry.meta.reason == Some(Reason::Stopped)) {
-                let (Some(account), Some(id)) = (&entry.meta.account, &entry.meta.call) else { continue };
-                if entry.meta.end_ms.unwrap_or(entry.meta.start_ms).saturating_add(archive::CALL_TTL_MS) > now {
-                    inner.entry(&(account.clone(), id.clone()), now).state = CallState::Blocked;
-                }
+        // The state, or a previous version of it, may lack the last stop (a write that failed, a
+        // damaged file): every call stopped in the last day stays so (4.4, R8; Codex on f3e3b79).
+        for entry in entries.iter().filter(|entry| entry.meta.reason == Some(Reason::Stopped)) {
+            let (Some(account), Some(id)) = (&entry.meta.account, &entry.meta.call) else { continue };
+            let key = (account.clone(), id.clone());
+            let recent = entry.meta.end_ms.unwrap_or(entry.meta.start_ms).saturating_add(archive::CALL_TTL_MS) > now;
+            if recent && inner.state(&key) != Some(CallState::Blocked) {
+                inner.entry(&key, now).state = CallState::Blocked;
             }
-            inner.changed = true;
         }
+        // What the previous version holds is written as the state from now on.
+        inner.changed |= lost;
         for entry in entries.into_iter().filter(|entry| entry.meta.state == State::Recording) {
             let Some(dir) = self.recordings.path(&entry.id) else { continue };
             let gaps = Gaps::load(&dir, true).map(|(gaps, _)| gaps).unwrap_or_default();
@@ -729,6 +733,8 @@ impl Archiver {
     /// it was never kept (4.4).
     fn give_up(&self, inner: &mut Inner, key: &Key, live: &mut Live, reason: Reason, now: u64) {
         inner.entry(key, now).state = CallState::GaveUp;
+        // On the disk before its recording: a crash in between never joins it once more (GLM on f3e3b79).
+        self.save(inner, now);
         tracing::info!(target: "open_mess::captions", reason = ?reason, "a call is given up");
         if let Some(rec) = live.rec.take() {
             let read = rec.meta.read_ms;
@@ -844,7 +850,10 @@ impl Archiver {
                 args.insert("session".into(), token.clone().into());
                 args.insert("cursor".into(), session.cursor.into());
             }
-            let page = call(handle, account, READ, args).await.ok().and_then(|page| parse_page(&page, now))?;
+            let value = call(handle, account, READ, args).await.ok()?;
+            // What the session names, agents' calls about it meet before the module (4.2).
+            self.setup.threads.learn(&key.0, &live.conversation, &value);
+            let page = parse_page(&value, now)?;
             // Only this call's session is ever written to its recording (4.3, R2).
             if page.state == PageState::NotJoined || page.call.as_deref().is_some_and(|call| call != key.1) || page.session.is_none() {
                 return Some((PageState::NotJoined, None));
@@ -889,16 +898,15 @@ impl Archiver {
             .filter(|(at, ..)| *at >= rec.meta.start_ms)
             .map(|(at, speaker, own, text)| Cue::capped(rec.at(*at), speaker, *own, text))
             .collect();
-        if let Some(dir) = self.recordings.path(&rec.id) {
-            // ponytail: cues that cannot be written are lost without a gap; the next read tries the disk again.
-            if archive::append_cues(&dir, &cues).is_ok() {
-                rec.meta.cues = Some(rec.meta.cues.unwrap_or(0).saturating_add(cues.len() as u64));
-            }
+        let written = self.recordings.path(&rec.id).is_some_and(|dir| archive::append_cues(&dir, &cues).is_ok());
+        if written {
+            rec.meta.cues = Some(rec.meta.cues.unwrap_or(0).saturating_add(cues.len() as u64));
         }
         if page.state == PageState::Live {
             rec.gaps.end(Some(GapReason::Rejoin), rec.at(now));
         }
-        if lost {
+        // Cues that could not be written are lost, and said so (Codex on f3e3b79).
+        if lost || !written {
             rec.gaps.add(from, Some(rec.at(now)), GapReason::Lost);
         }
         if page.state == PageState::Live && page.captions_on == Some(false) {
@@ -1051,6 +1059,12 @@ impl Archiver {
     /// Deletes a recording from the window; one going on is stopped first, its call blocked (4.7).
     pub async fn delete(&self, id: &str) -> std::io::Result<()> {
         self.stop(|recording, _| recording == id).await;
+        // Its "stopped" goes with it: the block must be on the disk first (Codex on f3e3b79).
+        let mut inner = self.inner.lock().await;
+        if !self.save(&mut inner, now_ms()) {
+            return Err(std::io::Error::other("the calls' state cannot be written; the recording is kept"));
+        }
+        drop(inner);
         self.recordings.delete(id)
     }
 
@@ -1073,17 +1087,21 @@ impl Archiver {
         self.save(&mut inner, now);
     }
 
-    /// Writes the calls' state when it changed.
-    fn save(&self, inner: &mut Inner, now: u64) {
+    /// Writes the calls' state when it changed; false when it could not be written. It is tried
+    /// again at every pass, and a stop stays in the memory meanwhile and in its recording's
+    /// "stopped" after a restart.
+    fn save(&self, inner: &mut Inner, now: u64) -> bool {
         if !inner.changed {
-            return;
+            return true;
         }
         let mut calls: Vec<Call> = inner.calls.values().cloned().collect();
-        // ponytail: a state that cannot be written is tried again at the next change.
-        if archive::save_calls(self.recordings.dir(), &mut calls, now).is_ok() {
-            inner.calls = calls.into_iter().map(|call| ((call.account.clone(), call.call.clone()), call)).collect();
-            inner.changed = false;
+        if archive::save_calls(self.recordings.dir(), &mut calls, now).is_err() {
+            tracing::warn!(target: "open_mess::captions", "the calls' state cannot be written");
+            return false;
         }
+        inner.calls = calls.into_iter().map(|call| ((call.account.clone(), call.call.clone()), call)).collect();
+        inner.changed = false;
+        true
     }
 }
 

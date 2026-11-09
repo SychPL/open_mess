@@ -757,6 +757,7 @@ async fn the_recording_section_keeps_and_shows_calls_captions() {
         ui_ready: Arc::clone(d.registry.ui_ready()),
         notices: Arc::new(Silent),
         free_disk: Box::new(|| u64::MAX),
+        threads: Arc::clone(d.registry.threads()),
     };
     let archiver = Archiver::new(Recordings::new(&local), setup);
     state.captions = Some(Arc::clone(&archiver));

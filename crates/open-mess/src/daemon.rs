@@ -286,6 +286,7 @@ fn start(
                 ui_ready: Arc::clone(registry.ui_ready()),
                 notices: toasts.clone(),
                 free_disk: Box::new(move || crate::recording::recorder::free_disk(&free)),
+                threads: Arc::clone(registry.threads()),
             },
         );
         attach_archiver(toasts, &archiver);

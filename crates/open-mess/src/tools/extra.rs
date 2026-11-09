@@ -21,17 +21,20 @@ const MAX_PROPERTIES: usize = 32;
 /// The chat threads of the captions sessions agents read, by account and conversation, while the
 /// session lasts (spec 2026-11-04-captions-archive, 4.2): a session's buffer holds what was said
 /// in each of them, so an agent reading or leaving it must be allowed to read every one, checked
-/// before the module is called and again on its answer. Only in memory.
+/// before the module is called and again on its answer. Only in memory; the captions archive's
+/// reads tell it too, so an agent's first call already meets what the archiver learned.
 #[derive(Default)]
-pub(crate) struct Threads(Mutex<HashMap<(String, String), Known>>);
+pub struct Threads(Mutex<HashMap<(String, String), Known>>);
 
-/// The threads a session named, and its token.
+/// The threads a session named, its token, and when they were last told (a count).
 struct Known {
     session: Option<String>,
     threads: Vec<String>,
+    told: u64,
 }
 
-/// The sessions remembered; past it the map starts over (an agent reading more at once is unlikely).
+/// The sessions remembered; past it the one told of longest ago goes. A session read now is told
+/// of every few seconds (the archive reads every 5 s), so it is never that one (GLM on f3e3b79).
 const MAX_KNOWN: usize = 256;
 const MAX_THREADS: usize = 16;
 
@@ -56,14 +59,25 @@ impl Threads {
         if map.get(&key).is_some_and(|known| session.is_some() && known.session != session) {
             map.remove(&key);
         }
+        let told = map.values().map(|known| known.told).max().unwrap_or(0).saturating_add(1);
         if named.is_empty() {
-            return map.get(&key).map(|known| known.threads.clone()).unwrap_or_default();
+            return match map.get_mut(&key) {
+                Some(known) => {
+                    known.told = told;
+                    known.threads.clone()
+                }
+                None => Vec::new(),
+            };
         }
-        if map.len() >= MAX_KNOWN && !map.contains_key(&key) {
-            map.clear();
+        if map.len() >= MAX_KNOWN
+            && !map.contains_key(&key)
+            && let Some(oldest) = map.iter().min_by_key(|(_, known)| known.told).map(|(key, _)| key.clone())
+        {
+            map.remove(&oldest);
         }
-        let known = map.entry(key).or_insert_with(|| Known { session: session.clone(), threads: Vec::new() });
+        let known = map.entry(key).or_insert_with(|| Known { session: session.clone(), threads: Vec::new(), told });
         known.session = session.or(known.session.take());
+        known.told = told;
         for thread in named {
             if !known.threads.contains(&thread) && known.threads.len() < MAX_THREADS {
                 known.threads.push(thread);
@@ -351,6 +365,22 @@ mod tests {
         assert_eq!(find(&modules, "a_b_c").map(|tools| tools.len()), Some(2));
         assert_eq!(reasons(&modules, "list").len(), 4);
         assert_eq!(reasons(&modules, "a-b"), [("a_b_c".to_string(), "its name is declared more than once".to_string())]);
+    }
+
+    #[test]
+    fn the_threads_of_a_session_read_now_outlive_older_ones() {
+        let threads = Threads::default();
+        let named = |n: usize| json!({"session": format!("s{n}"), "threads": [format!("19:t{n}@thread.v2")]});
+        threads.learn("a", "c0", &named(0));
+        for n in 1..MAX_KNOWN + 10 {
+            threads.learn("a", &format!("c{n}"), &named(n));
+            // The first session is read all along.
+            threads.learn("a", "c0", &json!({"session": "s0"}));
+        }
+        assert_eq!(threads.known("a", "c0"), ["19:t0@thread.v2"]);
+        assert!(threads.known("a", "c1").is_empty());
+        // Another session in the conversation forgets the earlier one's threads.
+        assert!(threads.learn("a", "c0", &json!({"session": "other"})).is_empty());
     }
 
     #[test]

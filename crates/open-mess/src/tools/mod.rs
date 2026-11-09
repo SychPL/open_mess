@@ -169,8 +169,8 @@ pub struct Registry {
     recorder: Option<Arc<Recorder>>,
     /// What keeps the calls' captions (spec 2026-11-04-captions-archive), likewise.
     archiver: Option<Arc<Archiver>>,
-    /// The threads of the captions sessions agents read.
-    threads: extra::Threads,
+    /// The threads of the captions sessions agents read, shared with the captions archive.
+    threads: Arc<extra::Threads>,
     /// Every MCP session, told when the list of tools changes.
     mcp_sessions: Mutex<Vec<Peer<RoleServer>>>,
     /// The list of tools the sessions were last told about; None until the first look.
@@ -198,7 +198,7 @@ impl Registry {
             queue: None,
             recorder: None,
             archiver: None,
-            threads: extra::Threads::default(),
+            threads: Arc::default(),
             mcp_sessions: Mutex::default(),
             announced: Mutex::default(),
         }
@@ -259,6 +259,11 @@ impl Registry {
 
     pub fn set_archiver(&mut self, archiver: Arc<Archiver>) {
         self.archiver = Some(archiver);
+    }
+
+    /// The threads of captions sessions, for the archive to tell what it learns.
+    pub fn threads(&self) -> &Arc<extra::Threads> {
+        &self.threads
     }
 
     /// The transcription queue, once the recordings are set.
