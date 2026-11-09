@@ -103,7 +103,9 @@ async fn module_dto_lists_hosts_and_identity() {
     assert_eq!(teams.media, ["52.112.0.0/14", "52.122.0.0/15", "2603:1063::/38"]);
     let wam = teams.wam.as_ref().unwrap();
     assert_eq!(wam.client_id, "1fec8e78-bce4-4aaf-ab1b-5451cc387264");
-    assert_eq!(wam.scopes.len(), 5);
+    // With the recording resource the captions bot takes (spec 2026-11-04-captions-archive, 4.3).
+    assert_eq!(wam.scopes.len(), 6);
+    assert!(wam.scopes.iter().any(|s| s == "4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76/.default"), "{:?}", wam.scopes);
     // The SharePoint pattern is shown with the trust it hands over (spec 2026-10-28-meetings-transcripts, 5.2).
     assert!(
         wam.scopes.iter().any(|s| s.starts_with("https://*.sharepoint.com/.default - ") && s.contains("Sites.FullControl.All")),

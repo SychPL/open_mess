@@ -1,8 +1,9 @@
-//! Live captions of a Teams meeting (spec 2026-10-29-live-captions, 4 and 5.3;
-//! docs/protocols/teams.md 10.7 and "Live results" 11-18): a session's state and deadlines, the
-//! caption messages of the call's data channel, the buffer agents read, and the requests and
-//! answers of the conversation service. No network and no clock: the glue (`live.rs`) does the
-//! I/O and passes the time in.
+//! Live captions of a Teams call (spec 2026-10-29-live-captions, 4 and 5.3, and
+//! 2026-11-04-captions-archive, 4.2-4.3; docs/protocols/teams.md 10.7, 10.8 and "Live results"
+//! 11-20): a session's state and deadlines, the caption messages of the call's data channel, the
+//! buffer agents read, turning captions on, and the requests and answers of the call store and the
+//! conversation service. No network and no clock: the glue (`live.rs`) does the I/O and passes the
+//! time in.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -29,8 +30,6 @@ const CLIENT_LOCATION: &str = "PL";
 
 /// Deadlines of a session (spec 4.1-4.3).
 pub const JOIN_MS: i64 = 60_000;
-pub const CAPTIONS_WAIT_MS: i64 = 30_000;
-pub const CAPTIONS_OFF_MS: i64 = 5 * 60_000;
 pub const IDLE_MS: i64 = 10 * 60_000;
 pub const TIME_LIMIT_MS: i64 = 3 * 3_600_000;
 /// How long the cues of an ended session can still be read.
@@ -42,6 +41,29 @@ pub const LEAVE_RETRY_MS: i64 = 30_000;
 pub const LEAVE_RETRIES_FOR_MS: i64 = 10 * 60_000;
 /// A session record older than this gets one `leave` and goes, whatever the answer (spec 4.3).
 pub const STALE_RECORD_MS: i64 = 4 * 3_600_000;
+/// Turning captions on (archive spec 4.3): the first try this long after the data channel opened,
+/// a failed one again after [`ENABLE_RETRY_MS`], at most [`ENABLE_TRIES`] tries in all.
+pub const ENABLE_AFTER_MS: i64 = 10_000;
+pub const ENABLE_RETRY_MS: i64 = 5 * 60_000;
+const ENABLE_TRIES: u8 = 4;
+
+/// The combined recording and transcription bot, the one the official client adds for captions
+/// with its shipped configuration, and the captions-only bot (docs 10.8, "Live results" 20). The
+/// captions bot is told by these MRIs, not by `28:`: a meeting can have another `28:` participant.
+pub const COMBINED_BOT: &str = "28:bdd75849-e0a6-4cce-8fc1-d7c0d4da43e5";
+const BOTS: [&str; 2] = [COMBINED_BOT, "28:b1902c3e-b9f7-4650-9b23-5772bd429747"];
+
+/// `teams_list_calls` lists at most this many calls (archive spec 4.2).
+pub const MAX_CALLS: usize = 20;
+/// Chat threads one session can have (a 1:1 call that people are added to); past them it ends.
+const MAX_THREADS: usize = 8;
+/// Calls whose captions were on, remembered in the module's storage for this long, at most this
+/// many (archive spec 4.3).
+const SEEN_FOR_MS: i64 = 24 * 3_600_000;
+const MAX_SEEN: usize = 200;
+/// A call's subject in an approval, and the people listed there.
+const MAX_SUBJECT: usize = 200;
+const MAX_PEOPLE: usize = 500;
 
 /// The buffer of one session (spec 5.3).
 const MAX_CUES: usize = 20_000;
@@ -59,8 +81,7 @@ const CAPTIONS_DATA_ID: u8 = 3;
 /// Session records kept per account; a record past them is the oldest and goes.
 const MAX_RECORDS: usize = 8;
 
-/// Why a session ended (spec 4.2). Lobby, end-to-end encryption and policy refusals have no
-/// signal of their own yet; the service's refusal of the join is `Refused`.
+/// Why a session ended (spec 4.2; `lobby`, `e2ee` and `policy` from the codes of docs 10.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     MeetingEnded,
@@ -71,7 +92,9 @@ pub enum Reason {
     TimeLimit,
     Left,
     Refused,
-    NoCaptions,
+    Lobby,
+    E2ee,
+    Policy,
     MediaFailed,
     Proxy,
     ConnectionLimit,
@@ -89,7 +112,9 @@ impl Reason {
             Reason::TimeLimit => "time_limit",
             Reason::Left => "left",
             Reason::Refused => "refused",
-            Reason::NoCaptions => "no_captions",
+            Reason::Lobby => "lobby",
+            Reason::E2ee => "e2ee",
+            Reason::Policy => "policy",
             Reason::MediaFailed => "media_failed",
             Reason::Proxy => "proxy",
             Reason::ConnectionLimit => "connection_limit",
@@ -101,6 +126,25 @@ impl Reason {
     fn failed(self) -> bool {
         !matches!(self, Reason::MeetingEnded | Reason::Update | Reason::UserLeft | Reason::Idle | Reason::TimeLimit | Reason::Left)
     }
+}
+
+/// Why the service refused the join or ended open_mess's leg, from its code and sub-code (docs
+/// 10.8, the client's end-screen and refusal tables): an end-to-end encrypted meeting, the lobby
+/// and policy are told apart; anything else is `Refused`.
+pub fn refusal(code: Option<i64>, sub_code: Option<i64>) -> Reason {
+    match (code, sub_code) {
+        (Some(403), Some(4158)) => Reason::E2ee,
+        (Some(0), Some(5854 | 5855)) | (Some(413), Some(5807)) | (Some(403), Some(5354)) => Reason::Lobby,
+        (Some(403), Some(5448 | 5723 | 5724 | 5810 | 10005 | 10193)) | (Some(412), Some(5204)) => Reason::Policy,
+        _ => Reason::Refused,
+    }
+}
+
+/// The refusal of a join the service answered with `status` and `body` (a `subCode` at the top,
+/// if any; whether E2EE comes this way or as the leg's end is open, docs step 0b(11)).
+pub fn refused(status: u16, body: &[u8]) -> Reason {
+    let sub_code = serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get("subCode").and_then(Value::as_i64));
+    refusal(Some(i64::from(status)), sub_code)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +173,10 @@ pub enum Due {
     End(Reason),
     /// Read the roster again (Trouter is down).
     Roster,
+    /// Turn captions on: add the captions bot to the call.
+    AddBot,
+    /// Turn captions on: `start` to the bot at this command URL.
+    Start(String),
     /// The ended session's cues are gone: forget it.
     Forget,
 }
@@ -141,6 +189,8 @@ pub struct SessionChanged;
 struct Cue {
     at_ms: i64,
     speaker: Option<String>,
+    /// The user said it.
+    own: bool,
     text: String,
     language: Option<String>,
     /// Its share of the buffer's byte limit.
@@ -158,6 +208,16 @@ struct Buffer {
     read_to: u64,
     /// Cues lost: dropped by the host or the module, or gone from the buffer unread.
     missed: u64,
+}
+
+/// A page of cues ([`Buffer::page`]).
+struct Page {
+    cues: Vec<Value>,
+    next: u64,
+    /// The last cue's language.
+    language: Option<String>,
+    /// Cues between the cursor and the page that were gone from the buffer already.
+    skipped: u64,
 }
 
 impl Buffer {
@@ -180,24 +240,24 @@ impl Buffer {
     }
 
     /// The cues from `cursor` (from the oldest kept when it is older) that fit in `max_bytes` of
-    /// JSON - at least one, at most [`MAX_PAGE_CUES`] - the next cursor, and the last one's language.
-    fn page(&mut self, cursor: u64, max_bytes: usize) -> (Vec<Value>, u64, Option<String>) {
+    /// JSON - at least one, at most [`MAX_PAGE_CUES`].
+    fn page(&mut self, cursor: u64, max_bytes: usize) -> Page {
         let start = cursor.clamp(self.first, self.next());
         let skip = usize::try_from(start - self.first).unwrap_or(usize::MAX);
-        let (mut items, mut used, mut language) = (Vec::new(), 0, None);
+        let (mut cues, mut used, mut language) = (Vec::new(), 0, None);
         for cue in self.cues.iter().skip(skip) {
-            let item = json!({"at": crate::time::rfc3339(cue.at_ms), "speaker": cue.speaker, "text": cue.text});
+            let item = json!({"at": crate::time::rfc3339_millis(cue.at_ms), "speaker": cue.speaker, "own": cue.own, "text": cue.text});
             let size = item.to_string().len();
-            if !items.is_empty() && (used + size > max_bytes || items.len() == MAX_PAGE_CUES) {
+            if !cues.is_empty() && (used + size > max_bytes || cues.len() == MAX_PAGE_CUES) {
                 break;
             }
             used += size;
             language = cue.language.clone();
-            items.push(item);
+            cues.push(item);
         }
-        let next = start + items.len() as u64;
+        let next = start + cues.len() as u64;
         self.read_to = self.read_to.max(next);
-        (items, next, language)
+        Page { cues, next, language, skipped: self.first.saturating_sub(cursor) }
     }
 }
 
@@ -261,11 +321,11 @@ impl Feed {
         Ok(None)
     }
 
-    /// The final captions of one data channel message, arrived at `now`. `None` when it cannot be
-    /// read; then [`Feed::broken`] says whether that ends the session.
-    fn push(&mut self, bytes: &[u8], now: i64) -> Option<Vec<Cue>> {
+    /// The final captions of one data channel message, arrived at `now`; `me` is the user's MRI.
+    /// `None` when it cannot be read; then [`Feed::broken`] says whether that ends the session.
+    fn push(&mut self, bytes: &[u8], now: i64, me: &str) -> Option<Vec<Cue>> {
         let cues = match self.reassemble(bytes) {
-            Ok(Some((CAPTIONS_DATA_ID, payload))) => captions(&payload, now),
+            Ok(Some((CAPTIONS_DATA_ID, payload))) => captions(&payload, now, me),
             // Another data id, or a fragment of a message still coming.
             Ok(_) => Some(Vec::new()),
             Err(()) => None,
@@ -280,8 +340,9 @@ impl Feed {
 }
 
 /// The final results of a caption message (keys of "Live results" 16): `recognitionResults`, each
-/// with `isFinal`, `text`, `displayName` and `spokenLanguage`. `None` when it is not that shape.
-fn captions(payload: &[u8], now: i64) -> Option<Vec<Cue>> {
+/// with `isFinal`, `text`, `displayName`, `spokenLanguage` and `userId`, the speaker's MRI, which
+/// tells the user's own (`me`) and goes no further. `None` when it is not that shape.
+fn captions(payload: &[u8], now: i64, me: &str) -> Option<Vec<Cue>> {
     let message: Value = serde_json::from_slice(payload).ok()?;
     let results = match message.as_object()?.get("recognitionResults") {
         None => return Some(Vec::new()),
@@ -295,27 +356,54 @@ fn captions(payload: &[u8], now: i64) -> Option<Vec<Cue>> {
         }
         let text = cut(result.get("text")?.as_str()?, MAX_TEXT);
         let speaker = result.get("displayName").and_then(Value::as_str).map(|name| cut(name, MAX_SPEAKER));
+        let own = result.get("userId").and_then(Value::as_str).is_some_and(|id| id.eq_ignore_ascii_case(me));
         let language = result.get("spokenLanguage").and_then(Value::as_str).filter(|tag| language_tag(tag)).map(str::to_string);
         let bytes = text.len() + speaker.as_ref().map_or(0, String::len) + 64;
-        cues.push(Cue { at_ms: now, speaker, text, language, bytes });
+        cues.push(Cue { at_ms: now, speaker, own, text, language, bytes });
     }
     Some(cues)
 }
 
-/// What a roster says for the session (spec 4.1, 4.2).
+/// What a roster says for the session (spec 4.1, 4.2; archive spec 4.2-4.3).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Roster {
-    /// Another endpoint of the user is in the call: the user is in the meeting there.
+    /// Another device of the user is in the call: the user is in the meeting there.
     pub user_elsewhere: bool,
     /// The captions bot is in the call with `closedCaptions` active.
     pub captions: bool,
+    /// The captions bot is in the call.
+    pub bot: bool,
+    /// The bot's command URL, if it gave one on the service's host.
+    pub command: Option<String>,
+}
+
+/// Turning captions on in a session (archive spec 4.3).
+#[derive(Default)]
+struct Enable {
+    /// The caller asked for it, and no participant turned captions off in this call before.
+    wanted: bool,
+    /// Captions were on at some roster read of the session; never false again.
+    seen: bool,
+    tries: u8,
+    /// When the next try is due.
+    at: Option<i64>,
+    /// This try added the bot; it gets `start` once it is in the call.
+    added: bool,
+    started: bool,
 }
 
 /// One live-captions session of an account (spec 4).
 pub struct Session {
+    /// The conversation the session was joined with: a chat thread or `call:<id>`.
     pub conversation: String,
+    /// The call store's `correlationId` of the call.
+    pub call: String,
     /// The `session` agents pass back (base64url, random).
     pub token: String,
+    /// The user's MRI: whose cues are `own`.
+    me: String,
+    /// Every chat thread of the call, in order (archive spec 4.2).
+    threads: Vec<String>,
     state: State,
     reason: Option<Reason>,
     started: i64,
@@ -323,14 +411,13 @@ pub struct Session {
     last_read: i64,
     /// The service's SDP answer was accepted.
     answered: bool,
-    /// When the data channel opened.
-    channel_at: Option<i64>,
-    /// A roster showed the user's other endpoint.
+    /// A roster showed the user's other device.
     roster_seen: bool,
     captions_on: Option<bool>,
-    /// Captions were on 30 s after the data channel opened (spec 4.1), and since when they are off.
-    checked: bool,
-    off_since: Option<i64>,
+    /// The captions bot of the last roster, and its command URL.
+    bot: bool,
+    command: Option<String>,
+    enable: Enable,
     /// Since Trouter went down or lost a message: cues are dropped until a roster is read again.
     paused: bool,
     /// Trouter is down: the roster is read every 10 s until it is back (spec 5.3, Codex R24).
@@ -341,21 +428,25 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(conversation: &str, token: &str, now: i64) -> Session {
+    /// A session joining `call`, named `conversation`; `me` is the user's MRI.
+    pub fn new(conversation: &str, call: &str, token: &str, me: &str, now: i64) -> Session {
         Session {
             conversation: conversation.to_string(),
+            call: call.to_string(),
             token: token.to_string(),
+            me: me.to_string(),
+            threads: if is_thread(conversation) { vec![conversation.to_string()] } else { Vec::new() },
             state: State::Joining,
             reason: None,
             started: now,
             ended: None,
             last_read: now,
             answered: false,
-            channel_at: None,
             roster_seen: false,
             captions_on: None,
-            checked: false,
-            off_since: None,
+            bot: false,
+            command: None,
+            enable: Enable::default(),
             paused: false,
             down: false,
             roster_at: None,
@@ -372,6 +463,41 @@ impl Session {
         matches!(self.state, State::Joining | State::Live)
     }
 
+    pub fn started(&self) -> i64 {
+        self.started
+    }
+
+    pub fn ended(&self) -> Option<i64> {
+        self.ended
+    }
+
+    /// Whether `name` is the session's conversation or one of its threads.
+    pub fn named(&self, name: &str) -> bool {
+        self.conversation == name || self.threads.iter().any(|t| t == name)
+    }
+
+    /// A chat thread of the call, the newest last; anything else is ignored. False when the
+    /// session would have more than [`MAX_THREADS`]: it should end.
+    pub fn thread(&mut self, thread: &str) -> bool {
+        if !is_thread(thread) || self.threads.iter().any(|t| t == thread) {
+            return true;
+        }
+        if self.threads.len() >= MAX_THREADS {
+            return false;
+        }
+        self.threads.push(thread.to_string());
+        true
+    }
+
+    /// Turning captions on is asked for (archive spec 4.3): tried while captions were not on yet.
+    pub fn want_captions(&mut self) {
+        self.enable.wanted = true;
+    }
+
+    pub fn captions_seen(&self) -> bool {
+        self.enable.seen
+    }
+
     /// Ends the session, once; the cues stay readable for [`KEEP_MS`].
     pub fn end(&mut self, reason: Reason, now: i64) {
         if self.active() {
@@ -386,11 +512,12 @@ impl Session {
         self.answered = true;
     }
 
-    /// The data channel opened: the session is live.
+    /// The data channel opened: the session is live, and captions are turned on in a while if no
+    /// one has.
     pub fn channel_open(&mut self, now: i64) {
         if self.state == State::Joining {
             self.state = State::Live;
-            self.channel_at = Some(now);
+            self.enable.at = Some(now.saturating_add(ENABLE_AFTER_MS));
         }
     }
 
@@ -420,11 +547,9 @@ impl Session {
         }
         self.roster_seen = true;
         // Whether captions are on counts even while Trouter is down (Codex review of 263a526).
-        if roster.captions {
-            self.off_since = None;
-        } else {
-            self.off_since.get_or_insert(now);
-        }
+        self.enable.seen |= roster.captions;
+        self.bot = roster.bot;
+        self.command.clone_from(&roster.command);
         if self.down {
             self.roster_at = Some(now.saturating_add(ROSTER_POLL_MS));
             return None;
@@ -444,7 +569,7 @@ impl Session {
             return None;
         }
         for message in messages {
-            match self.feed.push(message, now) {
+            match self.feed.push(message, now, &self.me) {
                 Some(cues) => cues.into_iter().for_each(|cue| self.buffer.push(cue)),
                 None => self.buffer.missed += 1,
             }
@@ -455,8 +580,43 @@ impl Session {
         None
     }
 
-    /// What is due at `now`, the most urgent first. Notes that captions were on 30 s after the data
-    /// channel opened, once they were.
+    /// Whether turning captions on is still to do: asked for, live, no gap, and captions not seen
+    /// on in this session yet - once they were, a participant who turns them off decides.
+    fn enabling(&self) -> bool {
+        self.state == State::Live && !self.paused && self.enable.wanted && !self.enable.seen
+    }
+
+    /// The bot this session added is in the call without captions: it gets `start`.
+    fn start_due(&self) -> Option<&String> {
+        (self.enable.added && !self.enable.started && self.bot).then_some(self.command.as_ref()).flatten()
+    }
+
+    /// The next step of turning captions on, due at `now` (archive spec 4.3): the bot this
+    /// session added gets `start` once it is in the call; a try adds the bot when it is not in the
+    /// call, or sends it `start` when it is (only to a command URL on the service's host).
+    fn enable_due(&mut self, now: i64) -> Option<Due> {
+        if !self.enabling() {
+            return None;
+        }
+        if let Some(url) = self.start_due().cloned() {
+            self.enable.started = true;
+            return Some(Due::Start(url));
+        }
+        if self.enable.tries >= ENABLE_TRIES || self.enable.at.is_none_or(|at| now < at) {
+            return None;
+        }
+        self.enable.tries += 1;
+        self.enable.at = Some(now.saturating_add(ENABLE_RETRY_MS));
+        self.enable.added = !self.bot;
+        self.enable.started = self.bot;
+        match (self.bot, &self.command) {
+            (false, _) => Some(Due::AddBot),
+            (true, Some(url)) => Some(Due::Start(url.clone())),
+            (true, None) => None,
+        }
+    }
+
+    /// What is due at `now`, the most urgent first.
     pub fn due(&mut self, now: i64) -> Option<Due> {
         if !self.active() {
             return self.ended.is_some_and(|at| now >= at.saturating_add(KEEP_MS)).then_some(Due::Forget);
@@ -471,15 +631,8 @@ impl Session {
         if self.state == State::Joining && past(self.started, JOIN_MS) {
             return Some(Due::End(if self.answered { Reason::MediaFailed } else { Reason::Protocol }));
         }
-        // Nobody had captions on 30 s after the channel opened; a gap decides at the next roster read.
-        if !self.checked && !self.paused && self.channel_at.is_some_and(|at| past(at, CAPTIONS_WAIT_MS)) {
-            if self.captions_on != Some(true) {
-                return Some(Due::End(Reason::NoCaptions));
-            }
-            self.checked = true;
-        }
-        if self.checked && self.off_since.is_some_and(|at| past(at, CAPTIONS_OFF_MS)) {
-            return Some(Due::End(Reason::NoCaptions));
+        if let Some(due) = self.enable_due(now) {
+            return Some(due);
         }
         if self.roster_at.is_some_and(|at| now >= at) {
             return Some(Due::Roster);
@@ -508,35 +661,43 @@ impl Session {
         if self.state == State::Joining {
             times.push(self.started.saturating_add(JOIN_MS));
         }
-        if !self.checked && !self.paused {
-            times.extend(self.channel_at.map(|at| at.saturating_add(CAPTIONS_WAIT_MS)));
-        }
-        if self.checked {
-            times.extend(self.off_since.map(|at| at.saturating_add(CAPTIONS_OFF_MS)));
+        if self.enabling() {
+            // A `start` waiting is due now: any time past is.
+            times.extend(self.start_due().map(|_| self.started));
+            times.extend(self.enable.at.filter(|_| self.enable.tries < ENABLE_TRIES));
         }
         times.extend(self.roster_at);
         times.into_iter().min()
     }
 
-    /// The result of `teams_read_captions` (spec 4.2). `session` from the agent must be this one's;
-    /// a read counts against the idle limit.
+    /// The result of `teams_read_captions` (spec 4.2, archive spec 4.3). `session` from the agent
+    /// must be this one's; a read counts against the idle limit.
     pub fn read(&mut self, session: Option<&str>, cursor: Option<u64>, max_bytes: usize, now: i64) -> Result<Value, SessionChanged> {
         if session.is_some_and(|s| s != self.token) {
             return Err(SessionChanged);
         }
-        let (cues, next, language) = self.buffer.page(cursor.unwrap_or(0), max_bytes);
+        let page = self.buffer.page(cursor.unwrap_or(0), max_bytes);
         self.last_read = now;
         let captions_on = if self.active() { self.captions_on } else { None };
-        Ok(json!({
+        let mut result = json!({
             "state": self.state.name(),
             "session": self.token,
+            "call": self.call,
             "captions_on": captions_on,
-            "next_cursor": next,
+            "captions_seen": self.enable.seen,
+            "next_cursor": page.next,
             "missed": self.buffer.missed,
-            "language": language,
+            "skipped": page.skipped,
+            "language": page.language,
             "reason": self.reason.map(Reason::name),
-            "untrusted": {"cues": cues},
-        }))
+            "untrusted": {"cues": page.cues},
+        });
+        // The threads, when there is more to them than the conversation joined (archive spec 4.2).
+        let more = self.threads.len() > 1 || self.threads.first().is_some_and(|t| *t != self.conversation);
+        if more && let Some(map) = result.as_object_mut() {
+            map.insert("threads".to_string(), json!(self.threads));
+        }
+        Ok(result)
     }
 }
 
@@ -552,13 +713,43 @@ pub fn on_service(url: &str) -> bool {
     })
 }
 
-/// The user's live call in the meeting, from the call store (spec 4.1).
-#[derive(Debug, PartialEq)]
+/// A chat thread id as the call store and a conversation name it: `19:`, an `@`, at most 256
+/// letters, digits and `-_.@:=+` (archive spec 4.2).
+pub fn is_thread(id: &str) -> bool {
+    id.len() <= 256 && id.starts_with("19:") && id.contains('@') && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.@:=+".contains(&b))
+}
+
+/// A call id, `^[A-Za-z0-9-]{1,64}$` (archive spec 4.2).
+pub fn is_call(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// A call of the user's call store (docs 10.8, "Live results" 18 and 20).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Live {
-    /// Where to join and read the roster.
+    /// `correlationId`: the call's id, the same when someone is added to a 1:1 call.
+    pub call: String,
+    /// Where to join and read the call.
     pub controller: String,
+    /// The call's chat thread and its message id: `groupContext`, or the conversation's
+    /// `activeModalities.groupChat` once it has one. None in a 1:1 call.
+    pub chat: Option<(String, String)>,
     pub meeting_info: Value,
-    pub message: String,
+    /// The other person's object id, when `participants` are the user and one other.
+    pub other: Option<String>,
+}
+
+impl Live {
+    /// Whether `conversation` names this call: its chat thread, `call:<id>`, or the 1:1 chat of
+    /// the user (object id `me`) and the other person, in either order of ids.
+    pub fn named(&self, conversation: &str, me: &str) -> bool {
+        let direct = |other: &String| {
+            [format!("19:{me}_{other}@unq.gbl.spaces"), format!("19:{other}_{me}@unq.gbl.spaces")].contains(&conversation.to_string())
+        };
+        self.chat.as_ref().is_some_and(|(thread, _)| thread == conversation)
+            || conversation.strip_prefix("call:") == Some(self.call.as_str())
+            || self.other.as_ref().is_some_and(direct)
+    }
 }
 
 /// The call store's request (docs 10.7, "Live results" 11): the user's calls.
@@ -567,20 +758,55 @@ pub fn call_store(mri: &str) -> HttpRequest {
     HttpRequest { method: "GET".to_string(), url, headers: Vec::new(), body: Vec::new() }
 }
 
-/// The call store item of the meeting chat `thread`, if the user is in that meeting ("Live
-/// results" 18: an item's `groupContext.threadId`). A matching item whose URL the module would not
-/// send a token to is an error.
-pub fn live_call(body: &[u8], thread: &str) -> Result<Option<Live>, ProtoError> {
+/// The user's calls in the call store (`me` is the user's MRI), once each, and how many items
+/// were left out: no call id of the pattern, or a conversation URL the module would not send a
+/// token to (archive spec 4.2, R6).
+pub fn calls(body: &[u8], me: &str) -> Result<(Vec<Live>, usize), ProtoError> {
     let v = parse_json(body)?;
     let items = v.as_array().ok_or_else(|| incompatible("$"))?;
-    let Some(item) = items.iter().find(|item| item.pointer("/groupContext/threadId").and_then(Value::as_str) == Some(thread)) else {
-        return Ok(None);
+    let (mut calls, mut skipped): (Vec<Live>, usize) = (Vec::new(), 0);
+    for item in items {
+        let call = item.get("correlationId").and_then(Value::as_str).filter(|id| is_call(id));
+        let controller = item.get("conversationController").and_then(Value::as_str).filter(|url| on_service(url));
+        let (Some(call), Some(controller)) = (call, controller) else {
+            skipped += 1;
+            continue;
+        };
+        if calls.iter().any(|c| c.call == call) {
+            continue;
+        }
+        calls.push(Live {
+            call: call.to_string(),
+            controller: controller.to_string(),
+            chat: chat(item.get("groupContext")),
+            meeting_info: item.get("meetingInfo").filter(|info| info.is_object()).cloned().unwrap_or(Value::Null),
+            other: other(item, me),
+        });
+    }
+    Ok((calls, skipped))
+}
+
+/// A `{threadId, messageId}` object's chat thread, and its message id (`"0"` without one, as the
+/// web client sends it).
+fn chat(v: Option<&Value>) -> Option<(String, String)> {
+    let v = v?;
+    let thread = v.get("threadId").and_then(Value::as_str).filter(|t| is_thread(t))?;
+    let message = v.get("messageId").and_then(Value::as_str).filter(|m| (1..=32).contains(&m.len()) && m.bytes().all(|b| b.is_ascii_digit()));
+    Some((thread.to_string(), message.unwrap_or("0").to_string()))
+}
+
+/// The other person's object id of a call whose `participants` are the user (`me`) and one other
+/// person, MRIs as plain strings ("Live results" 20).
+fn other(item: &Value, me: &str) -> Option<String> {
+    let [a, b] = item.get("participants")?.as_array()?.as_slice() else { return None };
+    let (a, b) = (a.as_str()?, b.as_str()?);
+    let other = match (a.eq_ignore_ascii_case(me), b.eq_ignore_ascii_case(me)) {
+        (true, false) => b,
+        (false, true) => a,
+        _ => return None,
     };
-    let controller = item.get("conversationController").and_then(Value::as_str).filter(|url| on_service(url));
-    let controller = controller.ok_or_else(|| incompatible("conversationController"))?.to_string();
-    let meeting_info = item.get("meetingInfo").filter(|info| info.is_object()).cloned().unwrap_or(Value::Null);
-    let message = item.pointer("/groupContext/messageId").and_then(Value::as_str).unwrap_or("0").to_string();
-    Ok(Some(Live { controller, meeting_info, message }))
+    let oid = other.strip_prefix("8:orgid:")?;
+    ((1..=64).contains(&oid.len()) && oid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')).then(|| oid.to_string())
 }
 
 /// open_mess's endpoint in the call, as `participants.from` names it.
@@ -612,9 +838,15 @@ impl Links<'_> {
     }
 }
 
+/// `groupChat` of a request: the call's chat thread, or null in a 1:1 call (docs 10.8: a second
+/// device joins a 1:1 call without a thread).
+fn group_chat(live: &Live) -> Value {
+    live.chat.as_ref().map_or(Value::Null, |(thread, message)| json!({"threadId": thread, "messageId": message}))
+}
+
 /// The join (`POST <controller>`): the probe's body that gave captions with a data-only offer
 /// ("Live results" 15 and 18) - no `payload` envelope, muted, no call modalities.
-pub fn join(me: &Me<'_>, links: &Links<'_>, live: &Live, thread: &str, offer: &str, media_leg: &str) -> Value {
+pub fn join(me: &Me<'_>, links: &Links<'_>, live: &Live, offer: &str, media_leg: &str) -> Value {
     let l = |n: u32, path: &str| links.link(n, path);
     json!({
         "conversationRequest": {
@@ -641,7 +873,7 @@ pub fn join(me: &Me<'_>, links: &Links<'_>, live: &Live, thread: &str, offer: &s
             },
         },
         "groupContext": null,
-        "groupChat": {"threadId": thread, "messageId": live.message},
+        "groupChat": group_chat(live),
         "contentSharing": null,
         "participants": {"from": me.json(), "to": []},
         "meetingData": null,
@@ -676,35 +908,125 @@ pub fn join(me: &Me<'_>, links: &Links<'_>, live: &Live, thread: &str, offer: &s
     })
 }
 
-/// The `leave` link of a conversation (the join's answer or a read of the conversation, docs
-/// 10.7), and the roster in it, if it has one.
-pub fn conversation(body: &[u8], me: &str, endpoint: &str) -> Result<(String, Option<Roster>), ProtoError> {
+/// Adding the captions bot (docs 10.8, `addParticipantsToCall` and `createBotPayload`): the
+/// combined bot, as the official client adds it with its shipped configuration, `botData` with
+/// the captions language and `token`, the user's token for the recording resource. The values the
+/// static analysis did not show (`disableUnmute`, the target's ids, `mode`, `consumerType`) are the
+/// client's names for the combined bot, to be checked live (step 0b(3) of the archive spec).
+pub fn add_bot(me: &Me<'_>, links: &Links<'_>, live: &Live, language: &str, token: &str) -> Value {
+    json!({
+        "disableUnmute": false,
+        "participants": {"from": me.json(), "to": [{"id": COMBINED_BOT, "assertedId": null, "displayName": null, "participantId": null}]},
+        "participantInvitationData": {"botData": {
+            "meetingTitle": null,
+            "clientInfo": "Teams-general",
+            "callId": live.call,
+            "threadId": live.chat.as_ref().map(|(thread, _)| thread),
+            "recorderFeatures": null,
+            "mode": "RecordingAndTranscription",
+            "iCalUid": null,
+            "consumerType": "CombinedClosedCaptions",
+            "spokenLanguage": language,
+            "correlationId": live.call,
+            "initiatorUserToken": token,
+            "exchangeId": null,
+            "meetingOrganizer": live.meeting_info.get("organizerId"),
+        }},
+        "replacementDetails": null,
+        "groupContext": null,
+        "groupChat": group_chat(live),
+        "links": {
+            "addParticipantSuccess": links.link(4, "/conversation/addParticipantSuccess/"),
+            "addParticipantFailure": links.link(5, "/conversation/addParticipantFailure/"),
+        },
+    })
+}
+
+/// The `start` command to the captions bot (docs 10.8, `CallingBotRestClient.sendCommand`): only
+/// captions, no language. `participant` is open_mess's leg (its `participantId`; which id the
+/// client puts in `participantLegId` is to be checked live), `call` the chain id. The tokens are
+/// the caller's to add.
+pub fn start(url: &str, me: &str, participant: &str, call: &str, request: &str, now_ms: i64) -> HttpRequest {
+    let body = json!({
+        "timestamp": crate::time::rfc3339_millis(now_ms),
+        "participantMri": me,
+        "participantLegId": participant,
+        "action": "start",
+        "mode": "transcription",
+        "processingModes": ["closedCaptions"],
+        "participantSkypeToken": "",
+    });
+    let headers = [("Content-Type", "application/json"), ("requestId", request), ("X-Microsoft-Skype-Chain-ID", call)];
+    HttpRequest {
+        method: "POST".to_string(),
+        url: url.to_string(),
+        headers: headers.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
+        body: body.to_string().into_bytes(),
+    }
+}
+
+/// What the module reads of a conversation (the join's answer or `GET <controller>`; docs 10.7,
+/// 10.8). Links are kept only on the service's host.
+#[derive(Debug, Default, PartialEq)]
+pub struct Resource {
+    pub leave: Option<String>,
+    /// `links.addParticipantAndModality` and `links.addParticipant`: where the bot is added.
+    pub add_with_chat: Option<String>,
+    pub add: Option<String>,
+    pub roster: Option<Roster>,
+    /// `activeModalities.groupChat`: the call's chat thread and message id, once it has one.
+    pub chat: Option<(String, String)>,
+    /// `meetingDetails.meetingCapability.allowTranscription`; null is no refusal ("Live results" 20).
+    pub allow_transcription: Option<bool>,
+}
+
+/// A conversation as [`Resource`]; `me` is the user's MRI and `endpoint` open_mess's own device.
+pub fn resource(body: &[u8], me: &str, endpoint: &str) -> Result<Resource, ProtoError> {
     let v = parse_json(body)?;
-    let leave = v.pointer("/links/leave").and_then(Value::as_str).filter(|url| on_service(url));
-    let leave = leave.ok_or_else(|| incompatible("links.leave"))?.to_string();
+    let link =
+        |name: &str| v.get("links").and_then(|links| links.get(name)).and_then(Value::as_str).filter(|url| on_service(url)).map(str::to_string);
     let roster = match v.get("roster") {
         Some(roster) => Some(read_roster(roster, me, endpoint)?),
         None => None,
     };
-    Ok((leave, roster))
+    Ok(Resource {
+        leave: link("leave"),
+        add_with_chat: link("addParticipantAndModality"),
+        add: link("addParticipant"),
+        roster,
+        chat: chat(v.pointer("/activeModalities/groupChat")),
+        allow_transcription: v.pointer("/meetingDetails/meetingCapability/allowTranscription").and_then(Value::as_bool),
+    })
 }
 
-/// The roster of a conversation (`roster.participants`, keyed by MRI; "Live results" 15-18): the
-/// user's entry lists its endpoints by id, and the captions bot (a `28:` MRI) has
-/// `processingModes.closedCaptions.state` `Active` while captions are on (docs 10.7).
+/// The roster of a conversation (`roster.participants`, keyed by MRI; "Live results" 15-20): the
+/// user's entry lists its devices by id, and the captions bot, one of [`BOTS`], has
+/// `processingModes.closedCaptions.state` `Active` while captions are on (docs 10.7) and its
+/// `commandUrl`. Another device of the user counts only with a media stream other than `data`:
+/// a leg of open_mess, here or on another computer, has only `data` (archive spec 4.2, docs 10.8).
 fn read_roster(roster: &Value, me: &str, endpoint: &str) -> Result<Roster, ProtoError> {
     let participants = roster.get("participants").and_then(Value::as_object).ok_or_else(|| incompatible("roster.participants"))?;
-    let mut user_elsewhere = false;
-    let mut captions = false;
+    let mut found = Roster { user_elsewhere: false, captions: false, bot: false, command: None };
     for (mri, entry) in participants {
         if mri.eq_ignore_ascii_case(me) {
             let endpoints = entry.get("endpoints").and_then(Value::as_object).ok_or_else(|| incompatible("roster.participants.endpoints"))?;
-            user_elsewhere |= endpoints.keys().any(|id| !id.eq_ignore_ascii_case(endpoint));
-        } else if mri.starts_with("28:") {
-            captions |= captions_active(entry, 0);
+            found.user_elsewhere |= endpoints.iter().any(|(id, device)| !id.eq_ignore_ascii_case(endpoint) && media(device));
+        } else if BOTS.iter().any(|bot| mri.eq_ignore_ascii_case(bot)) {
+            found.bot = true;
+            found.captions |= captions_active(entry, 0);
+            let devices = entry.get("endpoints").and_then(Value::as_object).into_iter().flat_map(|endpoints| endpoints.values());
+            let command =
+                devices.filter_map(|device| device.pointer("/endpointMetadata/commandUrl").and_then(Value::as_str)).find(|url| on_service(url));
+            found.command = found.command.take().or_else(|| command.map(str::to_string));
         }
     }
-    Ok(Roster { user_elsewhere, captions })
+    Ok(found)
+}
+
+/// Whether a device is in the call with a media stream other than `data` (`call.mediaStreams`).
+fn media(device: &Value) -> bool {
+    let streams = device.pointer("/call/mediaStreams").and_then(Value::as_array);
+    streams.is_some_and(|streams| streams.iter().any(|s| s.get("type").and_then(Value::as_str).is_some_and(|t| t != "data")))
 }
 
 /// A `processingModes.closedCaptions.state` of `Active` anywhere in a bot's entry, as the probe
@@ -723,6 +1045,29 @@ fn captions_active(v: &Value, depth: u8) -> bool {
     }
 }
 
+/// What an approval shows of a call without a chat (archive spec 4.3): the conversation's
+/// `subject` (at most 200 characters, "Teams call without a chat" when it has none) with its
+/// `conversationStartTime`, and the people of its roster, MRI and name (the MRI without one).
+pub fn call_target(body: &[u8]) -> Result<(String, Vec<(String, String)>), ProtoError> {
+    let v = parse_json(body)?;
+    let subject = v.get("subject").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let mut title = subject.map_or_else(|| "Teams call without a chat".to_string(), |s| cut(s, MAX_SUBJECT));
+    if let Some(at) = v.get("conversationStartTime").and_then(Value::as_str).and_then(crate::time::rfc3339_ms) {
+        title = format!("{title}, started {}", crate::time::rfc3339(at));
+    }
+    let participants = v.pointer("/roster/participants").and_then(Value::as_object).ok_or_else(|| incompatible("roster.participants"))?;
+    let people = participants
+        .iter()
+        .filter(|(mri, _)| mri.len() <= 256)
+        .take(MAX_PEOPLE)
+        .map(|(mri, entry)| {
+            let name = entry.get("displayName").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty());
+            (mri.clone(), cut(name.unwrap_or(mri), MAX_SPEAKER))
+        })
+        .collect();
+    Ok((title, people))
+}
+
 /// The body of `leave` (docs 10.7): open_mess's endpoint, ended by the user.
 pub fn leave(me: &Me<'_>) -> Value {
     json!({"participants": {"from": me.json()}, "callTransactionEnd": {"code": 0, "subCode": 0, "phrase": "LOCAL_USER_INITIATED"}})
@@ -738,10 +1083,12 @@ pub fn acknowledgement() -> Value {
 pub enum Call {
     /// `/call/acceptance/`: the SDP answer, and where to acknowledge it.
     Acceptance { answer: String, acknowledgement: Option<String> },
+    /// `/call/acceptance/` into the lobby (`controllerName` `lobby`, docs 10.8).
+    Lobby,
     /// `/conversation/rosterUpdate/`: the roster changed; the module reads it whole.
     Roster,
     /// `/conversation/conversationEnd/` (`meeting`, the meeting is over) or `/call/end/` (the
-    /// service ended open_mess's leg), with the end's code and sub-code for the log (docs 10.7).
+    /// service ended open_mess's leg), with the end's code and sub-code (docs 10.7, 10.8).
     Ended { meeting: bool, code: Option<i64>, sub_code: Option<i64> },
     /// Anything else, or another session's: not read.
     Other,
@@ -758,6 +1105,9 @@ pub fn callback(url: &str, body: &str, session: &str) -> Result<Call, ProtoError
     match path.as_str() {
         "/call/acceptance/" => {
             let v: Value = serde_json::from_str(body).map_err(|_| incompatible("callAcceptance"))?;
+            if v.pointer("/callAcceptance/controllerName").and_then(Value::as_str) == Some("lobby") {
+                return Ok(Call::Lobby);
+            }
             let answer = v
                 .pointer("/callAcceptance/mediaContent/blob")
                 .and_then(Value::as_str)
@@ -771,8 +1121,10 @@ pub fn callback(url: &str, body: &str, session: &str) -> Result<Call, ProtoError
             let meeting = path == "/conversation/conversationEnd/";
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let end = v.get(if meeting { "conversationEnd" } else { "callEnd" });
-            let number = |key: &str| end.and_then(|end| end.get(key)).and_then(Value::as_i64);
-            Ok(Call::Ended { meeting, code: number("code"), sub_code: number("subCode") })
+            // The client's end screen reads `callControllerCode` and `callControllerSubCode` (docs
+            // 10.8); the ends seen live had `code` and `subCode` ("Live results" 19).
+            let number = |keys: [&str; 2]| keys.iter().find_map(|key| end.and_then(|end| end.get(*key)).and_then(Value::as_i64));
+            Ok(Call::Ended { meeting, code: number(["callControllerCode", "code"]), sub_code: number(["callControllerSubCode", "subCode"]) })
         }
         _ => Ok(Call::Other),
     }
@@ -838,14 +1190,42 @@ pub fn decode_records(bytes: &[u8]) -> Vec<Record> {
         .collect()
 }
 
+/// The calls whose captions were on (archive spec 4.3), as stored: `[account, call, at_ms]`, the
+/// newest last; ones older than a day or that cannot be read are left out.
+fn seen_calls(stored: Option<&[u8]>, now: i64) -> Vec<(String, String, i64)> {
+    let items = stored.and_then(|bytes| serde_json::from_slice::<Vec<(String, String, i64)>>(bytes).ok()).unwrap_or_default();
+    items.into_iter().filter(|(_, _, at)| now.saturating_sub(*at) < SEEN_FOR_MS).collect()
+}
+
+/// Whether `account` saw captions on in `call` within the day: then open_mess never turns them on
+/// there, whatever the caller asks (archive spec 4.3, R7).
+pub fn seen(stored: Option<&[u8]>, account: &str, call: &str, now: i64) -> bool {
+    seen_calls(stored, now).iter().any(|(a, c, _)| a == account && c == call)
+}
+
+/// The stored list with `account` and `call` added at `now`, at most [`MAX_SEEN`], the oldest out.
+pub fn note_seen(stored: Option<&[u8]>, account: &str, call: &str, now: i64) -> Vec<u8> {
+    let mut items = seen_calls(stored, now);
+    items.retain(|(a, c, _)| !(a == account && c == call));
+    items.push((account.to_string(), call.to_string(), now));
+    let start = items.len().saturating_sub(MAX_SEEN);
+    serde_json::to_vec(items.get(start..).unwrap_or_default()).unwrap_or_default()
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ME: &str = "8:orgid:00000000-0000-0000-0000-000000000001";
+    const ME_OID: &str = "00000000-0000-0000-0000-000000000001";
+    const OTHER_OID: &str = "00000000-0000-0000-0000-000000000002";
     const ENDPOINT: &str = "11111111-1111-4111-8111-111111111111";
     const THREAD: &str = "19:meeting_c3ludGhldGlj@thread.v2";
+    const GROUP: &str = "19:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@thread.v2";
+    const CALL: &str = "5a3e1b9c-0000-4000-8000-00000000000c";
     const CONTROLLER: &str = "https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv.example/conv/abc";
+    const COMMAND: &str = "https://api.flightproxy.teams.microsoft.com/api/v2/bot/command";
 
     /// A data channel fragment as docs 10.7 frames it.
     fn packet(start: bool, id: u8, seq: u16, remaining: u8, payload: &[u8]) -> Vec<u8> {
@@ -858,38 +1238,54 @@ mod tests {
         b
     }
 
-    fn caption(text: &str, last: bool) -> Vec<u8> {
+    fn said(text: &str, last: bool, by: &str) -> Vec<u8> {
         let results = json!({"recognitionResults": [
             {"isFinal": false, "text": "partial", "displayName": "Speaker"},
-            {"isFinal": last, "text": text, "displayName": "Speaker", "spokenLanguage": "pl-pl", "userId": "8:orgid:x"},
+            {"isFinal": last, "text": text, "displayName": "Speaker", "spokenLanguage": "pl-pl", "userId": by},
         ], "events": [], "version": 1});
         packet(true, 3, 1, 0, results.to_string().as_bytes())
     }
 
+    fn caption(text: &str, last: bool) -> Vec<u8> {
+        said(text, last, "8:orgid:x")
+    }
+
+    /// A roster with the user's other device, and the captions bot in the state given.
+    fn roster(user_elsewhere: bool, captions: bool) -> Roster {
+        Roster { user_elsewhere, captions, bot: captions, command: captions.then(|| COMMAND.to_string()) }
+    }
+
+    fn joining(now: i64) -> Session {
+        Session::new(THREAD, CALL, "dG9rZW4", ME, now)
+    }
+
     fn live(now: i64) -> Session {
-        let mut s = Session::new(THREAD, "dG9rZW4", now);
+        let mut s = joining(now);
         s.answered();
         s.channel_open(now);
-        assert_eq!(s.roster(&Roster { user_elsewhere: true, captions: true }, now), None);
-        assert_eq!(s.due(now + CAPTIONS_WAIT_MS), None);
+        assert_eq!(s.roster(&roster(true, true), now), None);
+        assert_eq!(s.due(now + ENABLE_AFTER_MS), None);
         s
     }
 
     #[test]
-    fn final_captions_are_paged_with_cursor_and_language() {
+    fn final_captions_are_paged_with_cursor_language_and_own() {
         let mut s = live(0);
-        assert_eq!(s.data(&[caption("one", true), caption("not yet", false), caption("two", true)], 0, 1_800_000_000_000), None);
+        let messages = [caption("one", true), caption("not yet", false), said("two", true, &ME.to_uppercase())];
+        assert_eq!(s.data(&messages, 0, 1_800_000_000_123), None);
         let page = s.read(None, None, 65536, 1).unwrap();
         assert_eq!(page["state"], "live");
-        assert_eq!(page["captions_on"], true);
-        assert_eq!(page["next_cursor"], 2);
+        assert_eq!((page["call"].as_str(), page["captions_on"].as_bool(), page["captions_seen"].as_bool()), (Some(CALL), Some(true), Some(true)));
+        assert_eq!((page["next_cursor"].as_u64(), page["skipped"].as_u64()), (Some(2), Some(0)));
         assert_eq!(page["language"], "pl-pl");
         assert_eq!(page["reason"], Value::Null);
+        // One thread, the conversation joined: no `threads`.
+        assert!(page.get("threads").is_none());
         assert_eq!(
             page["untrusted"]["cues"],
             json!([
-                {"at": "2027-01-15T08:00:00Z", "speaker": "Speaker", "text": "one"},
-                {"at": "2027-01-15T08:00:00Z", "speaker": "Speaker", "text": "two"},
+                {"at": "2027-01-15T08:00:00.123Z", "speaker": "Speaker", "own": false, "text": "one"},
+                {"at": "2027-01-15T08:00:00.123Z", "speaker": "Speaker", "own": true, "text": "two"},
             ])
         );
         let next = s.read(Some("dG9rZW4"), Some(2), 65536, 2).unwrap();
@@ -920,7 +1316,7 @@ mod tests {
         let messages = [packet(true, 3, 5, 1, a.as_bytes()), packet(false, 3, 6, 0, b.as_bytes()), vec![0x20, 0], packet(true, 24, 1, 0, b"rtt")];
         assert_eq!(s.data(&messages, 2, 0), None);
         let page = s.read(None, None, 65536, 0).unwrap();
-        assert_eq!(page["untrusted"]["cues"][0]["text"], "joined");
+        assert_eq!((page["untrusted"]["cues"][0]["text"].as_str(), page["untrusted"]["cues"][0]["own"].as_bool()), (Some("joined"), Some(false)));
         // Two dropped by the host and one frame that could not be read.
         assert_eq!(page["missed"], 3);
         // A fragment out of sequence breaks its message.
@@ -940,9 +1336,9 @@ mod tests {
     }
 
     #[test]
-    fn the_oldest_cues_go_and_unread_ones_count_as_missed() {
+    fn the_oldest_cues_go_unread_ones_count_as_missed_and_a_late_cursor_as_skipped() {
         let mut buffer = Buffer::default();
-        let cue = |n: usize| Cue { at_ms: 0, speaker: None, text: n.to_string(), language: None, bytes: 1 };
+        let cue = |n: usize| Cue { at_ms: 0, speaker: None, own: false, text: n.to_string(), language: None, bytes: 1 };
         for n in 0..MAX_CUES {
             buffer.push(cue(n));
         }
@@ -954,8 +1350,10 @@ mod tests {
         assert_eq!(buffer.first, 10);
         // The ones read before they went are not missed.
         assert_eq!(buffer.missed, 10 - read);
-        let (items, next, _) = buffer.page(0, 100);
-        assert_eq!((items[0]["text"].as_str(), next), (Some("10"), 10 + items.len() as u64));
+        // A reader still at 4 lost 6 cues, though someone else read some of them (archive spec 4.3).
+        let page = buffer.page(4, 100);
+        assert_eq!((page.cues[0]["text"].as_str(), page.next, page.skipped), (Some("10"), 10 + page.cues.len() as u64, 6));
+        assert_eq!(buffer.page(page.next, 100).skipped, 0);
         // Bytes too: a cue over the space left pushes out old ones.
         let mut buffer = Buffer::default();
         buffer.push(Cue { bytes: MAX_BUFFER_BYTES - 10, ..cue(0) });
@@ -966,34 +1364,17 @@ mod tests {
     #[test]
     fn deadlines_end_the_session_with_their_reasons() {
         // No answer within the join budget, then no data channel after it.
-        let mut s = Session::new(THREAD, "t", 0);
+        let mut s = joining(0);
         assert_eq!((s.due(JOIN_MS - 1), s.due(JOIN_MS)), (None, Some(Due::End(Reason::Protocol))));
-        let mut s = Session::new(THREAD, "t", 0);
+        let mut s = joining(0);
         s.answered();
         assert_eq!(s.due(JOIN_MS), Some(Due::End(Reason::MediaFailed)));
-        // Nobody turned captions on within 30 s of the data channel opening.
-        let mut s = Session::new(THREAD, "t", 0);
+        // Captions off for good keep the session: the archive notes the gap (archive spec 4.3).
+        let mut s = joining(0);
         s.channel_open(1000);
-        s.roster(&Roster { user_elsewhere: true, captions: false }, 1000);
-        assert_eq!(s.next_at(), Some(1000 + CAPTIONS_WAIT_MS));
-        assert_eq!(s.due(1000 + CAPTIONS_WAIT_MS), Some(Due::End(Reason::NoCaptions)));
-        // On when joining but off before the 30 s were up: the end at 30 s (Codex review of 96070fd).
-        let mut s = Session::new(THREAD, "t", 0);
-        s.roster(&Roster { user_elsewhere: true, captions: true }, 0);
-        s.channel_open(1000);
-        s.roster(&Roster { user_elsewhere: true, captions: false }, 2000);
-        assert_eq!(s.due(1000 + CAPTIONS_WAIT_MS), Some(Due::End(Reason::NoCaptions)));
-        // Captions turned off later in the session: 5 minutes, then the end.
-        let mut s = live(0);
-        s.roster(&Roster { user_elsewhere: true, captions: false }, 40_000);
-        assert_eq!(s.read(None, None, 4096, 40_000).unwrap()["captions_on"], false);
-        assert_eq!(s.next_at(), Some(40_000 + CAPTIONS_OFF_MS));
-        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS - 1), None);
-        s.roster(&Roster { user_elsewhere: true, captions: true }, 200_000);
-        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS), None);
-        let mut s = live(0);
-        s.roster(&Roster { user_elsewhere: true, captions: false }, 40_000);
-        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS), Some(Due::End(Reason::NoCaptions)));
+        s.roster(&roster(true, false), 1000);
+        assert_eq!(s.read(None, None, 4096, 3_600_000).unwrap()["captions_on"], false);
+        assert_eq!(s.due(3_600_000), None);
         // Silence keeps the session; not reading it for 10 minutes ends it, and 3 hours do.
         let mut s = live(0);
         s.read(None, None, 4096, 9 * 60_000).unwrap();
@@ -1014,15 +1395,88 @@ mod tests {
     }
 
     #[test]
+    fn captions_are_turned_on_when_no_one_has() {
+        // No bot 10 s after the data channel opened: the bot is added, and gets `start` once it is
+        // in the call without captions on; a try that fails is repeated every 5 minutes, 4 in all.
+        let mut s = joining(0);
+        s.want_captions();
+        s.channel_open(1000);
+        s.roster(&roster(true, false), 1000);
+        assert_eq!(s.next_at(), Some(1000 + ENABLE_AFTER_MS));
+        assert_eq!(s.due(1000 + ENABLE_AFTER_MS - 1), None);
+        assert_eq!(s.due(1000 + ENABLE_AFTER_MS), Some(Due::AddBot));
+        assert_eq!(s.due(1000 + ENABLE_AFTER_MS), None);
+        let in_call = Roster { user_elsewhere: true, captions: false, bot: true, command: Some(COMMAND.to_string()) };
+        s.roster(&in_call, 20_000);
+        assert_eq!(s.next_at(), Some(0));
+        assert_eq!(s.due(20_000), Some(Due::Start(COMMAND.to_string())));
+        assert_eq!(s.due(20_000), None);
+        // Still off: tried again with `start` to the bot that is there now.
+        let again = 1000 + ENABLE_AFTER_MS + ENABLE_RETRY_MS;
+        assert_eq!(s.next_at(), Some(again));
+        // Read as the archive reads, so the session is not idle.
+        fn at(s: &mut Session, t: i64) -> Option<Due> {
+            s.read(None, None, 4096, t).unwrap();
+            s.due(t)
+        }
+        assert_eq!(at(&mut s, again), Some(Due::Start(COMMAND.to_string())));
+        assert_eq!(at(&mut s, again + ENABLE_RETRY_MS), Some(Due::Start(COMMAND.to_string())));
+        assert_eq!(at(&mut s, again + 2 * ENABLE_RETRY_MS), Some(Due::Start(COMMAND.to_string())));
+        assert_eq!(at(&mut s, again + 3 * ENABLE_RETRY_MS), None);
+        assert_eq!(s.next_at(), Some(again + 3 * ENABLE_RETRY_MS + IDLE_MS));
+        // A bot whose command URL is not on the service's host gets nothing.
+        let mut s = joining(0);
+        s.want_captions();
+        s.channel_open(0);
+        s.roster(&Roster { user_elsewhere: true, captions: false, bot: true, command: None }, 0);
+        assert_eq!(s.due(ENABLE_AFTER_MS), None);
+        // Not asked for (`start_captions: false`): nothing, until a later join asks.
+        let mut s = joining(0);
+        s.channel_open(0);
+        s.roster(&roster(true, false), 0);
+        assert_eq!(s.due(ENABLE_AFTER_MS), None);
+        s.want_captions();
+        assert_eq!(s.due(ENABLE_AFTER_MS + 1), Some(Due::AddBot));
+        // On once, then off: a participant decided; open_mess never turns them on again.
+        let mut s = joining(0);
+        s.want_captions();
+        s.channel_open(0);
+        s.roster(&roster(true, true), 1);
+        s.roster(&roster(true, false), 2);
+        assert_eq!(s.due(ENABLE_AFTER_MS), None);
+        let page = s.read(None, None, 4096, 3).unwrap();
+        assert_eq!((page["captions_on"].as_bool(), page["captions_seen"].as_bool()), (Some(false), Some(true)));
+        // No try during a gap: the roster may be stale.
+        let mut s = joining(0);
+        s.want_captions();
+        s.channel_open(0);
+        s.roster(&roster(true, false), 0);
+        s.pause(1);
+        assert_eq!(s.due(ENABLE_AFTER_MS), None);
+    }
+
+    #[test]
+    fn captions_seen_holds_from_the_first_roster_with_captions_on_even_in_a_gap() {
+        let mut s = joining(0);
+        s.channel_open(0);
+        assert!(!s.captions_seen());
+        s.down(1);
+        s.roster(&roster(true, true), 2);
+        assert!(s.captions_seen());
+        s.roster(&roster(true, false), 3);
+        assert!(s.captions_seen());
+    }
+
+    #[test]
     fn the_user_must_be_in_the_meeting_on_another_endpoint() {
-        let mut s = Session::new(THREAD, "t", 0);
-        assert_eq!(s.roster(&Roster { user_elsewhere: false, captions: true }, 0), Some(Reason::UserNotInMeeting));
+        let mut s = joining(0);
+        assert_eq!(s.roster(&roster(false, true), 0), Some(Reason::UserNotInMeeting));
         let mut s = live(0);
-        assert_eq!(s.roster(&Roster { user_elsewhere: false, captions: true }, 5), Some(Reason::UserLeft));
+        assert_eq!(s.roster(&roster(false, true), 5), Some(Reason::UserLeft));
         s.end(Reason::UserLeft, 5);
         assert_eq!(s.state(), State::Ended);
-        s.end(Reason::NoCaptions, 6);
-        let mut failed = Session::new(THREAD, "t", 0);
+        s.end(Reason::Protocol, 6);
+        let mut failed = joining(0);
         failed.end(Reason::UserNotInMeeting, 1);
         assert_eq!(failed.state(), State::Failed);
     }
@@ -1032,23 +1486,20 @@ mod tests {
         let mut s = live(0);
         s.down(1000);
         // A read that finds the user keeps the reads going and the captions out (Codex review of 96070fd).
-        assert_eq!(s.roster(&Roster { user_elsewhere: true, captions: true }, 11_000), None);
+        assert_eq!(s.roster(&roster(true, true), 11_000), None);
         assert_eq!(s.due(21_000), Some(Due::Roster));
         s.data(&[caption("lost", true)], 0, 21_000);
         assert_eq!(s.read(None, None, 4096, 21_000).unwrap()["missed"], 1);
-        assert_eq!(s.roster(&Roster { user_elsewhere: false, captions: true }, 21_000), Some(Reason::UserLeft));
-        // Captions back on during the gap: the 5 minutes of captions off stop counting.
+        assert_eq!(s.roster(&roster(false, true), 21_000), Some(Reason::UserLeft));
         let mut s = live(0);
-        s.roster(&Roster { user_elsewhere: true, captions: false }, 40_000);
         s.down(50_000);
-        s.roster(&Roster { user_elsewhere: true, captions: true }, 60_000);
-        assert_eq!(s.due(40_000 + CAPTIONS_OFF_MS), Some(Due::Roster));
+        s.roster(&roster(true, true), 60_000);
         assert_eq!(s.read(None, None, 4096, 60_000).unwrap()["captions_on"], Value::Null);
         // Back up: the next read lets captions in again.
         let mut s = live(0);
         s.down(1000);
         s.up();
-        assert_eq!(s.roster(&Roster { user_elsewhere: true, captions: true }, 2000), None);
+        assert_eq!(s.roster(&roster(true, true), 2000), None);
         s.data(&[caption("kept", true)], 0, 2000);
         assert_eq!(s.read(None, None, 4096, 2000).unwrap()["untrusted"]["cues"][0]["text"], "kept");
         assert_eq!(s.next_at(), Some(2000 + IDLE_MS));
@@ -1065,47 +1516,106 @@ mod tests {
         s.roster_polled(1000 + ROSTER_POLL_MS);
         assert_eq!(s.next_at(), Some(1000 + 2 * ROSTER_POLL_MS));
         // The user left meanwhile: the session ends at the next read of the roster.
-        assert_eq!(s.roster(&Roster { user_elsewhere: false, captions: true }, 21_000), Some(Reason::UserLeft));
+        assert_eq!(s.roster(&roster(false, true), 21_000), Some(Reason::UserLeft));
         let mut s = live(0);
         s.pause(1000);
-        s.roster(&Roster { user_elsewhere: true, captions: true }, 2000);
+        s.roster(&roster(true, true), 2000);
         s.data(&[caption("kept", true)], 0, 2000);
         assert_eq!(s.read(None, None, 4096, 2000).unwrap()["untrusted"]["cues"][0]["text"], "kept");
         assert_eq!(s.due(60_000), None);
     }
 
     #[test]
-    fn the_call_store_gives_the_meetings_call_on_the_service_host_only() {
-        let item = |url: &str, thread: &str| {
-            json!({"conversationController": url, "correlationId": "c", "groupContext": {"messageId": "1700000000000", "threadId": thread},
-                   "meetingInfo": {"organizerId": "o", "tenantId": "t"}, "userJoinTime": "x"})
+    fn a_session_keeps_every_thread_of_its_call() {
+        // A 1:1 call named by its chat, then a person added: the group chat is the second thread.
+        let direct = format!("19:{ME_OID}_{OTHER_OID}@unq.gbl.spaces");
+        let mut s = Session::new(&direct, CALL, "t", ME, 0);
+        assert!(s.thread(&direct) && s.thread("not a thread") && s.thread(GROUP));
+        assert!(s.named(&direct) && s.named(GROUP) && !s.named(THREAD));
+        assert_eq!(s.read(None, None, 4096, 0).unwrap()["threads"], json!([direct, GROUP]));
+        // A call without a chat learns its thread after the join.
+        let mut s = Session::new(&format!("call:{CALL}"), CALL, "t", ME, 0);
+        assert!(s.read(None, None, 4096, 0).unwrap().get("threads").is_none());
+        assert!(s.thread(GROUP));
+        assert_eq!(s.read(None, None, 4096, 0).unwrap()["threads"], json!([GROUP]));
+        // A call store that keeps changing threads ends the session.
+        let mut s = joining(0);
+        let added: Vec<bool> = (0..10).map(|n| s.thread(&format!("19:t{n}@thread.v2"))).collect();
+        assert_eq!(added.iter().filter(|added| **added).count(), MAX_THREADS - 1);
+        assert!(!added[9]);
+    }
+
+    #[test]
+    fn the_call_store_lists_calls_named_and_checked() {
+        let item =
+            |call: &str, url: &str| json!({"correlationId": call, "conversationController": url, "userJoinTime": "2027-01-15T08:00:00.1234567Z"});
+        let meeting = || {
+            let mut m = item(CALL, CONTROLLER);
+            m["groupContext"] = json!({"messageId": "1700000000000", "threadId": THREAD});
+            m["meetingInfo"] = json!({"organizerId": "o", "tenantId": "t"});
+            m
         };
-        let body = json!([item(CONTROLLER, "19:other@thread.v2"), item(CONTROLLER, THREAD)]).to_string();
-        let live = live_call(body.as_bytes(), THREAD).unwrap().unwrap();
-        assert_eq!((live.controller.as_str(), live.message.as_str()), (CONTROLLER, "1700000000000"));
-        assert_eq!(live.meeting_info, json!({"organizerId": "o", "tenantId": "t"}));
-        assert_eq!(live_call(b"[]", THREAD), Ok(None));
-        assert_eq!(live_call(br#"{"conversations": []}"#, THREAD), Err(incompatible("$")));
-        for url in [
-            "http://api.flightproxy.teams.microsoft.com/x",
-            "https://evil.example/x",
-            "https://u@api.flightproxy.teams.microsoft.com/x",
-            "https://api.flightproxy.teams.microsoft.com:8443/x",
-        ] {
-            let body = json!([item(url, THREAD)]).to_string();
-            assert_eq!(live_call(body.as_bytes(), THREAD), Err(incompatible("conversationController")), "{url}");
-        }
+        let direct = |call: &str, participants: Value| {
+            let mut d = item(call, CONTROLLER);
+            d["participants"] = participants;
+            d["additionalData"] = json!({"participantList": [{"id": "x", "endpointType": null}]});
+            d
+        };
+        let other = format!("8:orgid:{OTHER_OID}");
+        let body = json!([
+            meeting(),
+            meeting(),
+            direct("d1", json!([other, ME.to_uppercase()])),
+            direct("d2", json!([other, "8:orgid:00000000-0000-0000-0000-000000000003"])),
+            direct("d3", json!([other])),
+            {"correlationId": "e1", "conversationController": CONTROLLER, "groupContext": {"threadId": "not a thread"}},
+            item("bad id!", CONTROLLER),
+            item(&"x".repeat(65), CONTROLLER),
+            item("f1", "https://evil.example/conv"),
+            {"conversationController": CONTROLLER},
+        ]);
+        let (calls, skipped) = calls(body.to_string().as_bytes(), ME).unwrap();
+        assert_eq!(skipped, 4);
+        let ids: Vec<&str> = calls.iter().map(|c| c.call.as_str()).collect();
+        assert_eq!(ids, [CALL, "d1", "d2", "d3", "e1"]);
+        let [m, d1, d2, d3, e1] = calls.as_slice() else { panic!() };
+        assert_eq!(
+            (m.controller.as_str(), &m.chat, &m.meeting_info),
+            (CONTROLLER, &Some((THREAD.to_string(), "1700000000000".to_string())), &json!({"organizerId": "o", "tenantId": "t"}))
+        );
+        assert_eq!((&d1.chat, d1.other.as_deref()), (&None, Some(OTHER_OID)));
+        assert_eq!((d2.other.as_deref(), d3.other.as_deref(), &e1.chat), (None, None, &None));
+        // What a conversation may name a call: its thread, `call:<id>`, its 1:1 chat either way round.
+        assert!(m.named(THREAD, ME_OID) && m.named(&format!("call:{CALL}"), ME_OID) && !m.named(GROUP, ME_OID));
+        assert!(
+            d1.named(&format!("19:{ME_OID}_{OTHER_OID}@unq.gbl.spaces"), ME_OID)
+                && d1.named(&format!("19:{OTHER_OID}_{ME_OID}@unq.gbl.spaces"), ME_OID)
+        );
+        assert!(!d1.named(&format!("19:{ME_OID}_{ME_OID}@unq.gbl.spaces"), ME_OID) && !d1.named("call:d2", ME_OID));
+        assert_eq!(super::calls(b"[]", ME), Ok((Vec::new(), 0)));
+        assert_eq!(super::calls(br#"{"conversations": []}"#, ME), Err(incompatible("$")));
+        assert!(is_call(CALL) && !is_call("") && !is_call("a b") && is_thread(THREAD) && !is_thread("19:no-at") && !is_thread("19:a/b@thread.v2"));
     }
 
     fn me() -> Me<'static> {
         Me { mri: ME, name: "Synthetic Person One", endpoint: ENDPOINT, participant: "p" }
     }
 
+    fn meeting_call() -> Live {
+        Live {
+            call: CALL.to_string(),
+            controller: CONTROLLER.to_string(),
+            chat: Some((THREAD.to_string(), "0".to_string())),
+            meeting_info: json!({"organizerId": "o"}),
+            other: None,
+        }
+    }
+
     #[test]
     fn the_join_is_the_probes_data_only_body() {
-        let live = Live { controller: CONTROLLER.to_string(), meeting_info: json!({"organizerId": "o"}), message: "0".to_string() };
+        let live = meeting_call();
         let links = Links { surl: "https://trouter.example/v4/f/abc/", session: "s1", tag: 0xffff_fffe };
-        let body = join(&me(), &links, &live, THREAD, "v=0\r\n", "leg");
+        let body = join(&me(), &links, &live, "v=0\r\n", "leg");
         assert_eq!(
             body["conversationRequest"]["roster"]["rosterUpdate"],
             "https://trouter.example/v4/f/abc/callAgent/s1/fffffffe/conversation/rosterUpdate/"
@@ -1119,34 +1629,124 @@ mod tests {
         assert!(body.get("payload").is_none());
         let no_slash = Links { surl: "https://trouter.example/v4/f/abc", ..links };
         assert!(
-            join(&me(), &no_slash, &live, THREAD, "", "leg")["conversationRequest"]["links"]["conversationEnd"]
+            join(&me(), &no_slash, &live, "", "leg")["conversationRequest"]["links"]["conversationEnd"]
                 .as_str()
                 .is_some_and(|l| l.starts_with("https://trouter.example/v4/f/abc/callAgent/s1/"))
+        );
+        // A 1:1 call: no thread, as the client's second device joins it.
+        let direct = Live { chat: None, ..live };
+        assert_eq!(join(&me(), &no_slash, &direct, "", "leg")["groupChat"], Value::Null);
+    }
+
+    #[test]
+    fn the_bot_is_added_and_started_as_the_client_does() {
+        let links = Links { surl: "https://trouter.example/v4/f/abc/", session: "s1", tag: 0 };
+        let body = add_bot(&me(), &links, &meeting_call(), "pl-pl", "aad-token");
+        assert_eq!(body["participants"]["to"][0]["id"], COMBINED_BOT);
+        let bot = &body["participantInvitationData"]["botData"];
+        assert_eq!(
+            (bot["spokenLanguage"].as_str(), bot["initiatorUserToken"].as_str(), bot["callId"].as_str()),
+            (Some("pl-pl"), Some("aad-token"), Some(CALL))
+        );
+        assert_eq!((bot["threadId"].as_str(), bot["meetingOrganizer"].as_str()), (Some(THREAD), Some("o")));
+        assert_eq!(body["groupChat"]["threadId"], THREAD);
+        assert_eq!(
+            body["links"]["addParticipantFailure"],
+            "https://trouter.example/v4/f/abc/callAgent/s1/00000005/conversation/addParticipantFailure/"
+        );
+        let direct = add_bot(&me(), &links, &Live { chat: None, ..meeting_call() }, "en-us", "t");
+        assert_eq!((&direct["groupChat"], &direct["participantInvitationData"]["botData"]["threadId"]), (&Value::Null, &Value::Null));
+        // `start`: only captions, no language, the chain id the call's.
+        let request = start(COMMAND, ME, "p", CALL, "r1", 1_800_000_000_123);
+        let header = |name: &str| request.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+        assert_eq!((request.method.as_str(), header("X-Microsoft-Skype-Chain-ID"), header("requestId")), ("POST", Some(CALL), Some("r1")));
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"timestamp": "2027-01-15T08:00:00.123Z", "participantMri": ME, "participantLegId": "p", "action": "start",
+                   "mode": "transcription", "processingModes": ["closedCaptions"], "participantSkypeToken": ""})
         );
     }
 
     #[test]
-    fn the_roster_tells_the_users_other_endpoint_and_the_captions_bot() {
-        let conversation = |endpoints: Value, bot: &str| {
-            json!({"links": {"leave": format!("{CONTROLLER}/leave")}, "roster": {"participants": {
+    fn the_roster_tells_the_users_other_device_and_the_captions_bot() {
+        let device = |streams: &[&str]| json!({"call": {"mediaStreams": streams.iter().map(|t| json!({"type": t, "direction": "sendrecv"})).collect::<Vec<_>>()}});
+        let bot = |state: &str, command: &str| json!({"endpoints": {"b": {"endpointMetadata": {"commandUrl": command, "processingModes": {"closedCaptions": {"state": state}}}}}});
+        let conversation = |endpoints: Value, bots: Value| {
+            let mut participants = json!({
                 ME.to_uppercase(): {"state": "active", "endpoints": endpoints},
-                "8:orgid:someone-else": {"endpoints": {"x": {}}},
-                "28:bot": {"endpoints": {"b": {"endpointMetadata": {"processingModes": {"closedCaptions": {"state": bot}}}}}},
-            }}})
+                "8:orgid:someone-else": {"endpoints": {"x": device(&["audio"])}},
+                // Another `28:` participant, not a captions bot ("Live results" 20).
+                "28:00000000-0000-0000-0000-0000000000cc": {"endpoints": {"a": device(&["audio"])}},
+            });
+            for (mri, entry) in bots.as_object().unwrap() {
+                participants[mri] = entry.clone();
+            }
+            json!({"links": {"leave": format!("{CONTROLLER}/leave"), "addParticipant": format!("{CONTROLLER}/add"),
+                             "addParticipantAndModality": "https://evil.example/add"},
+                   "roster": {"participants": participants},
+                   "activeModalities": {"groupChat": {"threadId": GROUP, "messageId": "1"}},
+                   "meetingDetails": {"meetingCapability": {"allowTranscription": false}}})
             .to_string()
         };
-        let both = conversation(json!({ENDPOINT: {}, "official": {}}), "Active");
-        let (leave, roster) = super::conversation(both.as_bytes(), ME, ENDPOINT).unwrap();
-        assert_eq!(leave, format!("{CONTROLLER}/leave"));
-        assert_eq!(roster, Some(Roster { user_elsewhere: true, captions: true }));
-        let alone = conversation(json!({ENDPOINT: {}}), "Inactive");
-        assert_eq!(super::conversation(alone.as_bytes(), ME, ENDPOINT).unwrap().1, Some(Roster { user_elsewhere: false, captions: false }));
-        let no_roster = json!({"links": {"leave": format!("{CONTROLLER}/leave")}}).to_string();
-        assert_eq!(super::conversation(no_roster.as_bytes(), ME, ENDPOINT).unwrap().1, None);
-        let foreign = json!({"links": {"leave": "https://evil.example/leave"}}).to_string();
-        assert_eq!(super::conversation(foreign.as_bytes(), ME, ENDPOINT), Err(incompatible("links.leave")));
-        let listed = conversation(json!([ENDPOINT]), "Active");
-        assert!(super::conversation(listed.as_bytes(), ME, ENDPOINT).is_err());
+        let official = json!({ENDPOINT: device(&["data"]), "official": device(&["audio", "video", "data"])});
+        let both = conversation(official.clone(), json!({COMBINED_BOT: bot("Active", COMMAND)}));
+        let r = resource(both.as_bytes(), ME, ENDPOINT).unwrap();
+        assert_eq!((r.leave, r.add, r.add_with_chat), (Some(format!("{CONTROLLER}/leave")), Some(format!("{CONTROLLER}/add")), None));
+        assert_eq!(r.roster, Some(Roster { user_elsewhere: true, captions: true, bot: true, command: Some(COMMAND.to_string()) }));
+        assert_eq!((r.chat, r.allow_transcription), (Some((GROUP.to_string(), "1".to_string())), Some(false)));
+        // The captions-only bot, off, with a command URL elsewhere: no URL.
+        let off = conversation(official, json!({"28:b1902c3e-b9f7-4650-9b23-5772bd429747": bot("Inactive", "https://evil.example/c")}));
+        assert_eq!(
+            resource(off.as_bytes(), ME, ENDPOINT).unwrap().roster,
+            Some(Roster { user_elsewhere: true, captions: false, bot: true, command: None })
+        );
+        // Only open_mess's devices - its own, another instance's data-only leg, one in the lobby -
+        // and another `28:` that is not the bot: the user is not there, and no captions.
+        let alone =
+            json!({ENDPOINT: device(&["audio"]), "other-open-mess": device(&["data"]), "lobby": {"lobby": {"mediaStreams": [{"type": "audio"}]}}});
+        let alone = conversation(alone, json!({}));
+        assert_eq!(
+            resource(alone.as_bytes(), ME, ENDPOINT).unwrap().roster,
+            Some(Roster { user_elsewhere: false, captions: false, bot: false, command: None })
+        );
+        let bare = json!({"links": {"leave": "https://evil.example/leave"}, "meetingDetails": {"meetingCapability": {"allowTranscription": null}}});
+        assert_eq!(resource(bare.to_string().as_bytes(), ME, ENDPOINT), Ok(Resource::default()));
+        let listed = conversation(json!([ENDPOINT]), json!({}));
+        assert!(resource(listed.as_bytes(), ME, ENDPOINT).is_err());
+    }
+
+    #[test]
+    fn a_call_without_a_chat_is_described_from_its_conversation() {
+        let body = json!({"subject": "  Weekly sync  ", "conversationStartTime": "2027-01-15T08:00:00.1234567Z", "roster": {"participants": {
+            ME: {"displayName": "Synthetic Person One", "endpoints": {}},
+            "8:orgid:nameless": {"endpoints": {}},
+        }}});
+        let (title, people) = call_target(body.to_string().as_bytes()).unwrap();
+        assert_eq!(title, "Weekly sync, started 2027-01-15T08:00:00Z");
+        assert_eq!(people, [(ME.to_string(), "Synthetic Person One".to_string()), ("8:orgid:nameless".to_string(), "8:orgid:nameless".to_string())]);
+        let long = json!({"subject": "x".repeat(300), "roster": {"participants": {}}});
+        assert_eq!(call_target(long.to_string().as_bytes()).unwrap().0.chars().count(), MAX_SUBJECT);
+        let bare = json!({"subject": "", "conversationStartTime": "soon", "roster": {"participants": {}}});
+        assert_eq!(call_target(bare.to_string().as_bytes()).unwrap().0, "Teams call without a chat");
+        assert_eq!(call_target(b"{}"), Err(incompatible("roster.participants")));
+    }
+
+    #[test]
+    fn refusals_are_told_apart_by_code() {
+        assert_eq!(refusal(Some(403), Some(4158)), Reason::E2ee);
+        for (code, sub) in [(0, 5854), (0, 5855), (413, 5807), (403, 5354)] {
+            assert_eq!(refusal(Some(code), Some(sub)), Reason::Lobby, "{code}/{sub}");
+        }
+        for (code, sub) in [(403, 5448), (403, 5723), (403, 5724), (403, 5810), (403, 10005), (403, 10193), (412, 5204)] {
+            assert_eq!(refusal(Some(code), Some(sub)), Reason::Policy, "{code}/{sub}");
+        }
+        for (code, sub) in [(Some(430), Some(10067)), (Some(403), None), (None, Some(4158)), (Some(410), Some(301_999))] {
+            assert_eq!(refusal(code, sub), Reason::Refused, "{code:?}/{sub:?}");
+        }
+        assert_eq!(refused(403, br#"{"subCode": 4158}"#), Reason::E2ee);
+        assert_eq!(refused(403, b"not json"), Reason::Refused);
+        assert_eq!(Reason::E2ee.name(), "e2ee");
     }
 
     #[test]
@@ -1164,10 +1764,17 @@ mod tests {
             callback(&format!("{base}/call/acceptance/"), &foreign_ack, "s1"),
             Ok(Call::Acceptance { answer: "v=0".to_string(), acknowledgement: None })
         );
+        let lobby = json!({"callAcceptance": {"controllerName": "lobby"}}).to_string();
+        assert_eq!(callback(&format!("{base}/call/acceptance/"), &lobby, "s1"), Ok(Call::Lobby));
         assert!(callback(&format!("{base}/call/acceptance/"), "{}", "s1").is_err());
         assert_eq!(callback(&format!("{base}/conversation/rosterUpdate/"), "{}", "s1"), Ok(Call::Roster));
         let ended = json!({"callEnd": {"code": 410, "subCode": 5000, "phrase": "x"}}).to_string();
         assert_eq!(callback(&format!("{base}/call/end/"), &ended, "s1"), Ok(Call::Ended { meeting: false, code: Some(410), sub_code: Some(5000) }));
+        let diagnosed = json!({"callEnd": {"code": 0, "subCode": 0, "callControllerCode": 403, "callControllerSubCode": 4158}}).to_string();
+        assert_eq!(
+            callback(&format!("{base}/call/end/"), &diagnosed, "s1"),
+            Ok(Call::Ended { meeting: false, code: Some(403), sub_code: Some(4158) })
+        );
         assert_eq!(
             callback(&format!("{base}/conversation/conversationEnd/"), "", "s1"),
             Ok(Call::Ended { meeting: true, code: None, sub_code: None })
@@ -1186,6 +1793,22 @@ mod tests {
         let foreign = br#"[{"controller": "https://evil.example/x", "endpoint": "e", "participant": "p", "at_ms": 1}, {"endpoint": "e"}]"#;
         assert_eq!(decode_records(foreign), Vec::new());
         assert_eq!(decode_records(b"junk"), Vec::new());
+    }
+
+    #[test]
+    fn calls_with_captions_seen_are_remembered_for_a_day_at_most_200() {
+        let day = SEEN_FOR_MS;
+        let stored = note_seen(None, "a", CALL, 1000);
+        assert!(seen(Some(&stored), "a", CALL, 1000 + day - 1));
+        assert!(!seen(Some(&stored), "a", CALL, 1000 + day) && !seen(Some(&stored), "b", CALL, 1000) && !seen(Some(&stored), "a", "x", 1000));
+        let mut stored = stored;
+        for n in 0..MAX_SEEN {
+            stored = note_seen(Some(&stored), "a", &format!("c{n}"), 2000);
+        }
+        // The oldest went for the 200 newer ones.
+        assert!(!seen(Some(&stored), "a", CALL, 2000) && seen(Some(&stored), "a", "c0", 2000));
+        assert!(!seen(Some(b"junk"), "a", CALL, 0) && !seen(None, "a", CALL, 0));
+        assert_eq!(seen_calls(Some(&note_seen(Some(b"junk"), "a", CALL, 0)), 0).len(), 1);
     }
 
     #[test]

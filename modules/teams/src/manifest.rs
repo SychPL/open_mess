@@ -1,6 +1,6 @@
 //! The module manifest: name, network hosts and sign-in identity (spec 8.3, 9.1).
 
-use crate::session::{AUTHSVC_SCOPE, CHAT_SCOPE, MCPS_SCOPE, SEARCH_SCOPE};
+use crate::session::{AUTHSVC_SCOPE, CHAT_SCOPE, MCPS_SCOPE, RECORDING_SCOPE, SEARCH_SCOPE};
 
 /// The Teams desktop client id; its redirect is `https://login.microsoftonline.com/common/oauth2/nativeclient`
 /// (docs/protocols/teams.md 1.1 and 1.3, spec 9.1).
@@ -63,9 +63,10 @@ const HOSTS: &[&str] = &[
 const MEDIA_PEERS: &[&str] = &["52.112.0.0/14", "52.122.0.0/15", "2603:1063::/38"];
 
 /// Token audiences the module asks WAM for (docs/protocols/teams.md 1.4): authsvc and middle
-/// tier, chat service, search, MCPS. SharePoint's audience is the organization's own origin, known
-/// only after sign-in, so it is a pattern of one label (spec 2026-10-28-meetings-transcripts, 5.2).
-const SCOPES: &[&str] = &[AUTHSVC_SCOPE, CHAT_SCOPE, SEARCH_SCOPE, MCPS_SCOPE, "https://*.sharepoint.com/.default"];
+/// tier, chat service, search, MCPS, the recording resource the captions bot takes (docs 10.8).
+/// SharePoint's audience is the organization's own origin, known only after sign-in, so it is a
+/// pattern of one label (spec 2026-10-28-meetings-transcripts, 5.2).
+const SCOPES: &[&str] = &[AUTHSVC_SCOPE, CHAT_SCOPE, SEARCH_SCOPE, MCPS_SCOPE, RECORDING_SCOPE, "https://*.sharepoint.com/.default"];
 
 pub fn manifest() -> Manifest {
     let strings = |list: &[&str]| list.iter().map(|s| s.to_string()).collect();
@@ -81,8 +82,9 @@ pub fn manifest() -> Manifest {
     }
 }
 
-/// The module's own tools (spec 2026-10-28-meetings-transcripts, 4, and 2026-10-29-live-captions,
-/// 4); the core lists them as `teams_<name>`. Only `join_captions` writes.
+/// The module's own tools (spec 2026-10-28-meetings-transcripts, 4, 2026-10-29-live-captions, 4,
+/// and 2026-11-04-captions-archive, 4.2-4.3); the core lists them as `teams_<name>`. Only
+/// `join_captions` writes.
 fn extra_tools() -> Vec<ToolDecl> {
     let time = |what: &str| serde_json::json!({"type": "string", "description": what});
     let list_meetings = serde_json::json!({
@@ -109,10 +111,24 @@ fn extra_tools() -> Vec<ToolDecl> {
         "required": ["conversation"],
         "additionalProperties": false,
     });
+    let conversation = || text("A conversation from list_calls: the call's chat thread, 19:..., or call:<id> for a call without a chat.");
+    let list_calls = serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false});
+    let join_captions = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "conversation": conversation(),
+            "call": text("The call id from list_calls: open_mess joins only this call, not a later one in the same conversation."),
+            "language": text("The captions language, BCP 47 such as pl-pl, if open_mess turns captions on; pl-pl when left out. \
+                              A language the call has already is never changed."),
+            "start_captions": {"type": "boolean", "description": "Whether open_mess turns captions on if no one has; true when left out."},
+        },
+        "required": ["conversation", "call"],
+        "additionalProperties": false,
+    });
     let read_captions = serde_json::json!({
         "type": "object",
         "properties": {
-            "conversation": text("The meeting chat, 19:meeting_..., the session was joined with."),
+            "conversation": text("A conversation the session was joined with or has, from list_calls."),
             "session": text("session of the previous result; another one means the session changed."),
             "cursor": {"type": "integer", "description": "next_cursor of the previous result; needs session."},
             "max_bytes": {"type": "integer", "description": "Size of the cues as JSON, 4096-262144; 65536 when left out."},
@@ -143,46 +159,56 @@ fn extra_tools() -> Vec<ToolDecl> {
             writes: false,
         },
         ToolDecl {
-            name: "join_captions".to_string(),
-            description: "Join the meeting for its live captions. open_mess joins the meeting as a second device of your \
-                          account, without audio or video, only to read the captions someone turned on in Teams, and \
-                          only while you are in the meeting in Teams yourself; Teams counts a second device of your \
-                          account in the meeting meanwhile. Done means joining started: read_captions tells how it goes."
+            name: "list_calls".to_string(),
+            description: "The Teams calls you are in now - meetings, group and 1:1 calls - from Teams' list of your calls: \
+                          each with its conversation (the call's chat, or call:<id> for a call without one) and its call \
+                          id for join_captions; joined_at is null for now. Reading never marks anything as read."
                 .to_string(),
-            input_schema: meeting(&text).to_string(),
+            input_schema: list_calls.to_string(),
+            writes: false,
+        },
+        ToolDecl {
+            name: "join_captions".to_string(),
+            description: "Join the call for its live captions, and turn captions on if no one has. open_mess joins the \
+                          call as a second device of your account, without audio or video, and only while you are in \
+                          the call in Teams yourself; Teams counts a second device of your account in the call meanwhile. \
+                          Turning captions on adds Teams' captions bot to the call, as the Teams app does - with Teams' \
+                          default settings the bot that also records and transcribes, though only captions are started, \
+                          in the language given when the call has none yet. Done means joining started: read_captions \
+                          tells how it goes."
+                .to_string(),
+            input_schema: join_captions.to_string(),
             writes: true,
         },
         ToolDecl {
             name: "read_captions".to_string(),
-            description: "The live captions of the meeting open_mess joined with join_captions: the session's state, \
-                          the final cues (at, speaker, text) from cursor, how many were missed, and why the session \
-                          ended; pass session and next_cursor of the last result to go on. What people write in the \
-                          meeting chat is part of the meeting too: read_messages on the same conversation reads it, with \
-                          since this meeting's start from list_meetings or the time you joined (a recurring meeting keeps \
-                          one chat for all its occurrences); while a read returns limit messages, go on with before (the \
-                          oldest message returned) and the same since. An edited message keeps its time, so read from \
-                          that start again for the final text."
+            description: "The live captions of the call open_mess joined with join_captions: the session's state and \
+                          call, whether captions are on and were ever on in the session, the final cues (at, speaker, \
+                          own - said by you - and text) from cursor, how many were missed and skipped (gone before you \
+                          read them), the call's chat threads when it has more than the conversation joined (someone \
+                          added to a 1:1 call), and why the session ended; pass session and next_cursor of the last \
+                          result to go on. What people write in the call's chat is part of the call too: read_messages \
+                          on the same conversation reads it, with since this meeting's start from list_meetings or the \
+                          time you joined (a recurring meeting keeps one chat for all its occurrences); while a read \
+                          returns limit messages, go on with before (the oldest message returned) and the same since. \
+                          An edited message keeps its time, so read from that start again for the final text."
                 .to_string(),
             input_schema: read_captions.to_string(),
             writes: false,
         },
         ToolDecl {
             name: "leave_captions".to_string(),
-            description: "Leaves the meeting open_mess joined for its live captions; only open_mess's device leaves.".to_string(),
-            input_schema: meeting(&text).to_string(),
+            description: "Leaves the call open_mess joined for its live captions; only open_mess's device leaves.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"conversation": conversation()},
+                "required": ["conversation"],
+                "additionalProperties": false,
+            })
+            .to_string(),
             writes: false,
         },
     ]
-}
-
-/// The schema of a tool that takes only the meeting chat.
-fn meeting(text: &impl Fn(&str) -> serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {"conversation": text("The meeting chat, 19:meeting_..., from list_meetings or list_conversations.")},
-        "required": ["conversation"],
-        "additionalProperties": false,
-    })
 }
 
 #[cfg(test)]
@@ -210,6 +236,19 @@ mod tests {
             );
             assert!(schema["properties"].get("account").is_none(), "{}", tool.name);
         }
+    }
+
+    #[test]
+    fn joining_names_its_call_and_says_it_turns_captions_on() {
+        let m = manifest();
+        assert!(m.wam.unwrap().scopes.iter().any(|s| s == "4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76/.default"));
+        let join = m.extra_tools.iter().find(|t| t.name == "join_captions").unwrap();
+        // The first sentence is the approval's title (spec 2026-10-29-live-captions, 5.1).
+        assert!(join.description.starts_with("Join the call for its live captions, and turn captions on if no one has. "));
+        assert!(join.description.contains("captions bot"));
+        let schema: serde_json::Value = serde_json::from_str(&join.input_schema).unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["conversation", "call"]));
+        assert!(m.extra_tools.iter().any(|t| t.name == "list_calls" && !t.writes));
     }
 
     #[test]
