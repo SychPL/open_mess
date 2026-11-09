@@ -1280,6 +1280,9 @@ token, tenant id, user id or account name.
       meeting's `19:meeting_...` thread, so the call store says that the user is in a call, not in
       which meeting: the live captions spec can check "in a call" before joining, and "in this
       meeting" only from the roster after joining (spec 4.1, second path). The store may lag a join.
+      Note 2026-11-05 (10.8): this key set - no `groupContext`, no `meetingInfo`, two participants -
+      is the shape the client takes for a 1:1 call (`isOneToOneCall`); whether the owner's call at that
+      moment was the meeting or a 1:1 call is not known.
     - `GET https://teams.microsoft.com/trap/tokens` with `X-Skypetoken` and `api-version: 2`: HTTP 200,
       top keys `expires` (a number) and `tokens` (one entry, its `realm` a quoted string as 10.7 says).
 
@@ -1400,7 +1403,7 @@ token, tenant id, user id or account name.
     - Call store: the items now have the keys `conversationController`, `correlationId`,
       `groupContext` (`messageId`, `threadId`), `meetingInfo` (`organizerId`, `tenantId`) and
       `userJoinTime`, and `groupContext.threadId` is the chat thread of the call - unlike item 11,
-      where no field held the thread (that was a scheduled meeting; these were a "Meet now" meeting
+      where no field held the thread (taken then for a scheduled meeting, but see the note at item 11; these were a "Meet now" meeting
       and a group chat call). The owner was in 2, then 3 calls at once.
     - The thread property `awareness_conversationLiveState:<n>` was missing on the owner's own
       "Meet now" chat although he was still in that call, so it is not a reliable "call is live"
@@ -1705,8 +1708,8 @@ token, tenant id, user id or account name.
       `conversationController` was the same URL as the `conversationUrl` of the chat's
       `awareness_conversationLiveState` (an https URL on `api.flightproxy.teams.microsoft.com`). A
       `GET` of that URL returns the conversation with the `roster` and `links` (`leave`,
-      `notificationLinks` among them). Item 11 found no `groupContext` on a scheduled meeting on
-      2026-10-29; what differed then is not known.
+      `notificationLinks` among them). Item 11 found no `groupContext` on 2026-10-29 while the
+      owner was in a scheduled meeting; 10.8 reads that item's shape as a 1:1 call (note at item 11).
     - **Join at the call store's URL, callbacks answered late**: HTTP 200 in 0.35-1.4 s; no callback
       was answered while the `POST` was open, and the acceptance with the SDP answer came after it.
       Offer audio `sendonly` with no track plus the data section: the data channel opened, 183
