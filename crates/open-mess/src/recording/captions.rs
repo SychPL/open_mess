@@ -824,7 +824,10 @@ impl Archiver {
             PageState::NotJoined => Outcome::Rejoin,
             PageState::Joining | PageState::Live => return,
         };
-        live.previous = live.session.take().and_then(|session| session.token.map(|token| (token, session.cursor)));
+        // A session given up before its first read knows nothing newer than the one before it.
+        if let Some(read) = live.session.take().and_then(|session| session.token.map(|token| (token, session.cursor))) {
+            live.previous = Some(read);
+        }
         let Some(rec) = &mut live.rec else {
             self.failed(inner, key, live, outcome, now);
             return;
@@ -876,6 +879,8 @@ impl Archiver {
             // What the session names, agents' calls about it meet before the module (4.2).
             self.setup.threads.learn(&key.0, &live.conversation, &value);
             let mut page = parse_page(&value, now)?;
+            // The buffer is read to its end: a page that brought cues is followed by another.
+            let brought = !page.cues.is_empty();
             // Only this call's session is ever written to its recording (4.3, R2).
             if page.state == PageState::NotJoined || page.call.as_deref().is_some_and(|call| call != key.1) || page.session.is_none() {
                 return Some((PageState::NotJoined, None));
@@ -890,11 +895,18 @@ impl Archiver {
             if live.rec.is_none() && page.state == PageState::Live && !draining && !self.start_recording(inner, key, live, now) {
                 return None;
             }
-            // The session given up last, answered again: what was read of it is not written twice.
-            if first && let Some((_, cursor)) = live.previous.take().filter(|(token, _)| page.session.as_ref() == Some(token)) {
-                let from = page.next_cursor.saturating_sub(page.cues.len() as u64);
-                let read = usize::try_from(cursor.saturating_sub(from)).unwrap_or(usize::MAX).min(page.cues.len());
-                page.cues.drain(..read);
+            // The session given up last, answered again: what was read of it is not written twice,
+            // over as many pages as that takes (Codex and GLM on 0633178).
+            match live.previous.take() {
+                Some((token, cursor)) if page.session.as_ref() == Some(&token) => {
+                    let from = page.next_cursor.saturating_sub(page.cues.len() as u64);
+                    let read = usize::try_from(cursor.saturating_sub(from)).unwrap_or(usize::MAX).min(page.cues.len());
+                    page.cues.drain(..read);
+                    if page.next_cursor < cursor {
+                        live.previous = Some((token, cursor));
+                    }
+                }
+                _ => {}
             }
             let session = live.session.get_or_insert_with(Session::default);
             let lost = !first && (page.skipped > 0 || session.missed.is_some_and(|missed| page.missed > missed));
@@ -909,7 +921,7 @@ impl Archiver {
                     self.continue_in_new(inner, key, live, now);
                 }
             }
-            if page.cues.is_empty() {
+            if !brought {
                 return Some((page.state, page.reason));
             }
         }

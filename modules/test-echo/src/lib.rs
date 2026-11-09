@@ -56,7 +56,7 @@
 //! `{"state"}` (the session starts in it) or `{"slow": true}` (busy for 1 s first); a session of the
 //! same call going on answers `done`, one of another call in the conversation ends first
 //! (`meeting_ended`). `read_captions` pages a session (by `{"session"}`, else the conversation's
-//! latest) from `{"cursor"}` with `skipped`, and `leave_captions` ends it (`left`). `captions-say`
+//! latest) from `{"cursor"}`, 100 cues at most, with `skipped`, and `leave_captions` ends it (`left`). `captions-say`
 //! changes a session: it adds `{"cues"}`, drops the `{"drop"}` oldest, and sets `state`, `reason`,
 //! `captions_on`, `captions_seen`, `threads` and `missed` when given; the session is then found by
 //! each of its `threads` too; with `{"forget": true}` its reads fail, and with `{"fail_reads": n}`
@@ -376,6 +376,9 @@ mod guest {
         use super::bindings::open_mess::module::types;
         use super::{put, stored};
 
+        /// The most cues of a page.
+        const PAGE: usize = 100;
+
         fn text<'a>(args: &'a Value, key: &str) -> &'a str {
             args.get(key).and_then(Value::as_str).unwrap_or_default()
         }
@@ -481,7 +484,7 @@ mod guest {
             let cursor = args.get("cursor").and_then(Value::as_u64);
             let start = cursor.unwrap_or(0).max(first);
             let cues: Vec<Value> = get(&session, "cues").as_array().cloned().unwrap_or_default();
-            let page: Vec<Value> = cues.into_iter().skip(usize::try_from(start - first).unwrap_or(usize::MAX)).collect();
+            let page: Vec<Value> = cues.into_iter().skip(usize::try_from(start - first).unwrap_or(usize::MAX)).take(PAGE).collect();
             let mut result = json!({
                 "state": get(&session, "state"), "session": token, "call": get(&session, "call"),
                 "captions_on": get(&session, "captions_on"), "captions_seen": get(&session, "captions_seen"),

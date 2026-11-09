@@ -691,19 +691,26 @@ async fn a_session_joined_again_after_failed_reads_writes_no_cue_twice() {
     a.calls(&[("c1", THREAD)]).await;
     a.at(0).await;
     a.at(5000).await;
-    a.say(THREAD, &[(6000, "Ann", "one")]).await;
+    // More cues than a page holds.
+    let said: Vec<String> = (0..150).map(|n| format!("cue {n}")).collect();
+    let cues: Vec<(u64, &str, &str)> = said.iter().map(|text| (6000, "Ann", text.as_str())).collect();
+    a.say(THREAD, &cues).await;
     a.at(10_000).await;
-    // The module answers no read for a minute, its session going on; the join gets it back.
-    a.echo("captions-say", json!({"conversation": THREAD, "fail_reads": 12})).await;
-    for step in 3..16 {
+    // The module answers no read for two minutes, its session going on: given up twice, and
+    // joined again each time, the join getting that session back.
+    a.echo("captions-say", json!({"conversation": THREAD, "fail_reads": 24})).await;
+    for step in 3..28 {
         a.at(step * 5000).await;
     }
-    a.say(THREAD, &[(81_000, "Ann", "two")]).await;
-    a.at(85_000).await;
-    a.at(90_000).await;
+    a.say(THREAD, &[(141_000, "Ann", "after")]).await;
+    for step in 29..33 {
+        a.at(step * 5000).await;
+    }
     let id = &a.kept()[0].0;
-    assert_eq!(a.joins().await.len(), 2);
-    assert_eq!(a.cues(id), ["one", "two"]);
+    assert_eq!(a.joins().await.len(), 3);
+    let mut expected = said.clone();
+    expected.push("after".into());
+    assert_eq!(a.cues(id), expected);
 }
 
 #[tokio::test]
