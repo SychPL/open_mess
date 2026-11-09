@@ -62,8 +62,9 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
   operations (`consumptionhorizon`, `markRead`, `readReceipt` and their equivalents). Reading a
   message through open_mess must not change what the user sees as read. One exception, the
   owner's decision of 2026-10-29 (`.specs/2026-10-29-live-captions.md`, O1): while a live-captions
-  session the user approved is in a meeting, the official client shows that the user is in the
-  meeting on another device. Nothing else of the official client changes.
+  session the user approved, or a session of the captions archive the user turned on in the window
+  (`.specs/2026-11-04-captions-archive.md`, 4.1), is in a call, the official client shows that the
+  user is in the call on another device. Nothing else of the official client changes.
 - **No token extraction.** Accounts sign in through the platform's own sign-in flow, inside
   open_mess. Never copy tokens, cookies or browser profiles from another app.
 - **Secrets never leave the user's machine; message contents go only to the platform itself and
