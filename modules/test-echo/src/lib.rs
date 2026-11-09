@@ -59,8 +59,8 @@
 //! latest) from `{"cursor"}` with `skipped`, and `leave_captions` ends it (`left`). `captions-say`
 //! changes a session: it adds `{"cues"}`, drops the `{"drop"}` oldest, and sets `state`, `reason`,
 //! `captions_on`, `captions_seen`, `threads` and `missed` when given; the session is then found by
-//! each of its `threads` too, and with `{"forget": true}` its reads fail. `end-sessions` ends the
-//! account's sessions (`update`).
+//! each of its `threads` too; with `{"forget": true}` its reads fail, and with `{"fail_reads": n}`
+//! its next n reads. `end-sessions` ends the account's sessions (`update`).
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -466,9 +466,16 @@ mod guest {
             let Some(token) = token(account, args) else {
                 return Ok(json!({"state": "not_joined", "session": null, "next_cursor": 0, "missed": 0, "untrusted": {"cues": []}}));
             };
-            let session = stored(&format!("session:{token}"));
+            let mut session = stored(&format!("session:{token}"));
             if session.is_null() {
                 return Err(types::ModuleError::InvalidArgs("the captions session changed".to_string()));
+            }
+            // Reads that fail for a while, the session going on.
+            let failing = get(&session, "fail_reads").as_u64().unwrap_or_default();
+            if failing > 0 {
+                set(&mut session, "fail_reads", json!(failing - 1));
+                put(&format!("session:{token}"), &session)?;
+                return Err(types::ModuleError::Platform("busy".to_string()));
             }
             let first = get(&session, "first").as_u64().unwrap_or_default();
             let cursor = args.get("cursor").and_then(Value::as_u64);
@@ -506,7 +513,7 @@ mod guest {
             let first = get(&session, "first").as_u64().unwrap_or_default() + drop as u64;
             set(&mut session, "first", json!(first));
             set(&mut session, "cues", Value::from(cues));
-            for key in ["state", "reason", "captions_on", "captions_seen", "threads", "missed"] {
+            for key in ["state", "reason", "captions_on", "captions_seen", "threads", "missed", "fail_reads"] {
                 if let Some(value) = args.get(key) {
                     set(&mut session, key, value.clone());
                 }

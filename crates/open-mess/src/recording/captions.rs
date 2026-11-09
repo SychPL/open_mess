@@ -124,6 +124,9 @@ struct Live {
     rec: Option<Rec>,
     /// Its recording was left by a daemon that stopped: it ends "interrupted" if the call is gone.
     resumed: bool,
+    /// The token and cursor of the session given up last: a join the module answers with that very
+    /// session goes on from there, never writing a cue twice (Codex on d8f68ae).
+    previous: Option<(String, u64)>,
 }
 
 impl Live {
@@ -138,6 +141,7 @@ impl Live {
             session: None,
             rec: None,
             resumed: false,
+            previous: None,
         }
     }
 }
@@ -820,7 +824,7 @@ impl Archiver {
             PageState::NotJoined => Outcome::Rejoin,
             PageState::Joining | PageState::Live => return,
         };
-        live.session = None;
+        live.previous = live.session.take().and_then(|session| session.token.map(|token| (token, session.cursor)));
         let Some(rec) = &mut live.rec else {
             self.failed(inner, key, live, outcome, now);
             return;
@@ -871,7 +875,7 @@ impl Archiver {
             let value = call(handle, account, READ, args).await.ok()?;
             // What the session names, agents' calls about it meet before the module (4.2).
             self.setup.threads.learn(&key.0, &live.conversation, &value);
-            let page = parse_page(&value, now)?;
+            let mut page = parse_page(&value, now)?;
             // Only this call's session is ever written to its recording (4.3, R2).
             if page.state == PageState::NotJoined || page.call.as_deref().is_some_and(|call| call != key.1) || page.session.is_none() {
                 return Some((PageState::NotJoined, None));
@@ -885,6 +889,12 @@ impl Archiver {
             }
             if live.rec.is_none() && page.state == PageState::Live && !draining && !self.start_recording(inner, key, live, now) {
                 return None;
+            }
+            // The session given up last, answered again: what was read of it is not written twice.
+            if first && let Some((_, cursor)) = live.previous.take().filter(|(token, _)| page.session.as_ref() == Some(token)) {
+                let from = page.next_cursor.saturating_sub(page.cues.len() as u64);
+                let read = usize::try_from(cursor.saturating_sub(from)).unwrap_or(usize::MAX).min(page.cues.len());
+                page.cues.drain(..read);
             }
             let session = live.session.get_or_insert_with(Session::default);
             let lost = !first && (page.skipped > 0 || session.missed.is_some_and(|missed| page.missed > missed));

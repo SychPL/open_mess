@@ -686,6 +686,27 @@ async fn a_session_whose_reads_keep_failing_is_joined_again_after_a_minute() {
 }
 
 #[tokio::test]
+async fn a_session_joined_again_after_failed_reads_writes_no_cue_twice() {
+    let a = Archive::new().await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    a.say(THREAD, &[(6000, "Ann", "one")]).await;
+    a.at(10_000).await;
+    // The module answers no read for a minute, its session going on; the join gets it back.
+    a.echo("captions-say", json!({"conversation": THREAD, "fail_reads": 12})).await;
+    for step in 3..16 {
+        a.at(step * 5000).await;
+    }
+    a.say(THREAD, &[(81_000, "Ann", "two")]).await;
+    a.at(85_000).await;
+    a.at(90_000).await;
+    let id = &a.kept()[0].0;
+    assert_eq!(a.joins().await.len(), 2);
+    assert_eq!(a.cues(id), ["one", "two"]);
+}
+
+#[tokio::test]
 async fn cues_that_cannot_be_written_are_a_gap() {
     let a = Archive::new().await;
     a.calls(&[("c1", THREAD)]).await;
