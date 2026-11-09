@@ -12,6 +12,9 @@ pub const CHAT_SCOPE: &str = "https://ic3.teams.office.com/.default";
 pub const SEARCH_SCOPE: &str = "https://outlook.office.com/.default";
 /// MCPS, a meeting's artifacts: an application id as the resource (docs 9.3).
 pub const MCPS_SCOPE: &str = "6bc3b958-689b-49f5-9006-36d165f30e00/.default";
+/// The calling recording resource, an application id too: the captions bot takes its token in the
+/// `start` command and when it is added (docs 10.8; spec 2026-11-04-captions-archive, 4.3).
+pub const RECORDING_SCOPE: &str = "4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76/.default";
 
 /// A token is renewed this long before it expires.
 pub(crate) const RENEW_BEFORE_MS: i64 = 5 * 60 * 1000;
