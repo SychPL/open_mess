@@ -1564,13 +1564,21 @@ async fn sharepoint_refusals_are_answers_not_a_lost_sign_in() {
     teams.call("get_transcript", json!({"conversation": MEETING})).await.unwrap();
 }
 
-// Live captions (spec 2026-10-29-live-captions, 4): the Teams side of a call against the fake
-// server, a fake Trouter and a WebRTC peer on loopback standing in for Teams' media processor.
+// Live captions (spec 2026-10-29-live-captions, 4, and 2026-11-04-captions-archive, 4.2-4.3): the
+// Teams side of a call against the fake server, a fake Trouter and a WebRTC peer on loopback
+// standing in for Teams' media processor. Shapes from "Live results" 18-20, with invented ids.
 
+const SERVICE: &str = "https://api.flightproxy.teams.microsoft.com";
 const CONTROLLER: &str = "https://api.flightproxy.teams.microsoft.com/api/v2/ep/conv.synthetic/conv/c1";
 const CONTROLLER_PATH: &str = "/api/v2/ep/conv.synthetic/conv/c1";
 const CALL_STORE_PATH: &str = "/api/v2/ep/api.userstore.skype.com/api/v1/user/8:orgid:00000000-0000-0000-0000-000000000001/conversations";
 const REGISTRAR_PATH: &str = "/registrar/prod/V2/registrations";
+/// The call's id in the call store, a GUID as "Live results" 20 saw them.
+const CALL: &str = "5a3e1b9c-0000-4000-8000-00000000000c";
+/// The combined recording and transcription bot (docs 10.8).
+const BOT: &str = "28:bdd75849-e0a6-4cce-8fc1-d7c0d4da43e5";
+const COMMAND_PATH: &str = "/api/v2/ep/bot.synthetic/command";
+const RECORDING: &str = "4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76";
 
 impl Teams {
     /// Signed in, its WebSockets served by a fake Trouter.
@@ -1583,43 +1591,109 @@ impl Teams {
     }
 }
 
-/// The conversation as the service answers the join and reads of it: the leave link, and a roster
-/// with the user's endpoints and the captions bot.
-fn live_conversation(user_endpoints: &Value) -> Value {
-    json!({"links": {"leave": format!("{CONTROLLER}/leave")}, "roster": {"participants": {
-        ME: {"state": "active", "endpoints": user_endpoints},
-        "28:00000000-0000-0000-0000-0000000000bb": {"endpoints": {"bot": {"endpointMetadata": {"processingModes": {"closedCaptions": {"state": "Active"}}}}}},
-    }}})
+/// The user's official client in the call: audio, video and data ("Live results" 20).
+fn official() -> Value {
+    json!({"official-client": {"call": {"mediaStreams": [{"type": "audio", "direction": "sendrecv"}, {"type": "video", "direction": "recvonly"},
+        {"type": "data", "direction": "sendrecv"}]}}})
 }
 
-/// A meeting with captions on, the user in it on the endpoints `user_endpoints` (open_mess's own
-/// is never listed, so any is another device), and the call store's item for it.
-fn meeting_server(user_endpoints: Value, in_call_store: bool) -> impl Fn(&fake::Seen) -> Option<Reply> {
+/// The captions bot with captions `state`, and its command URL on the service's host.
+fn bot(state: &str) -> Value {
+    json!({"endpoints": {"bot-endpoint": {"call": {"mediaStreams": [{"type": "audio", "direction": "recvonly"}, {"type": "data", "direction": "sendrecv"}]},
+        "endpointMetadata": {"commandUrl": format!("{SERVICE}{COMMAND_PATH}"), "spokenLanguage": "pl-pl",
+            "processingModes": {"closedCaptions": {"state": state}, "recording": {"state": "Inactive"}}}}}})
+}
+
+/// The conversation of the call at `path` as the service answers the join and reads of it: its
+/// links, the user's devices and the captions bot in `bot_state`, if it is in the call.
+fn conversation_at(path: &str, user_endpoints: &Value, bot_state: Option<&str>) -> Value {
+    let url = format!("{SERVICE}{path}");
+    let mut participants = json!({ME: {"state": "active", "endpoints": user_endpoints}});
+    if let Some(state) = bot_state {
+        participants[BOT] = bot(state);
+    }
+    json!({"links": {"leave": format!("{url}/leave"), "addParticipant": format!("{url}/add"), "addParticipantAndModality": format!("{url}/addm")},
+           "roster": {"participants": participants}})
+}
+
+fn live_conversation(user_endpoints: &Value) -> Value {
+    conversation_at(CONTROLLER_PATH, user_endpoints, Some("Active"))
+}
+
+/// A call store item: a meeting or group call with its chat `thread`, or without one.
+fn call_item(call: &str, path: &str, thread: Option<&str>) -> Value {
+    let mut item =
+        json!({"correlationId": call, "conversationController": format!("{SERVICE}{path}"), "userJoinTime": "2027-01-15T08:00:00.1234567Z"});
+    if let Some(thread) = thread {
+        item["groupContext"] = json!({"threadId": thread, "messageId": "0"});
+        item["meetingInfo"] = json!({"organizerId": ME_OID, "tenantId": "00000000-0000-0000-0000-0000000000aa"});
+    }
+    item
+}
+
+/// A fake call: its call store item, its conversation's path and what the path answers.
+struct FakeCall {
+    item: Value,
+    path: String,
+    conversation: Arc<std::sync::Mutex<Value>>,
+}
+
+impl FakeCall {
+    fn new(call: &str, path: &str, thread: Option<&str>, conversation: Value) -> FakeCall {
+        FakeCall { item: call_item(call, path, thread), path: path.to_string(), conversation: Arc::new(std::sync::Mutex::new(conversation)) }
+    }
+}
+
+type Calls = Arc<std::sync::Mutex<Vec<FakeCall>>>;
+
+/// The call store with `calls`, their conversations, and the registrar, `leave`, the
+/// acknowledgement, adding the bot and the bot's commands.
+fn calls_server(calls: Calls) -> impl Fn(&fake::Seen) -> Option<Reply> {
     move |s| {
         let path = s.path.as_str();
+        let calls = calls.lock().unwrap();
         match s.method.as_str() {
-            "GET" if path == CALL_STORE_PATH => {
-                let item = json!({"conversationController": CONTROLLER, "groupContext": {"threadId": MEETING, "messageId": "0"}, "meetingInfo": {"organizerId": ME_OID}});
-                Some(Reply::json(if in_call_store { json!([item]) } else { json!([]) }))
-            }
+            "GET" if path == CALL_STORE_PATH => Some(Reply::json(Value::Array(calls.iter().map(|c| c.item.clone()).collect()))),
             "POST" if path == REGISTRAR_PATH => Some(Reply::status(202)),
             "DELETE" if path.starts_with(REGISTRAR_PATH) => Some(Reply::status(202)),
-            "GET" | "POST" if path == CONTROLLER_PATH => Some(Reply::json(live_conversation(&user_endpoints))),
-            "POST" if path == format!("{CONTROLLER_PATH}/leave") => Some(Reply::status(204)),
-            "POST" if path == format!("{CONTROLLER_PATH}/ack") => Some(Reply::status(202)),
+            "POST" if path == COMMAND_PATH => Some(Reply::status(202)),
+            "GET" | "POST" => {
+                let call = calls.iter().find(|c| path.starts_with(&c.path))?;
+                match path.strip_prefix(&call.path).unwrap_or_default() {
+                    "" => Some(Reply::json(call.conversation.lock().unwrap().clone())),
+                    "/leave" => Some(Reply::status(204)),
+                    "/ack" | "/add" | "/addm" => Some(Reply::status(202)),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
 }
 
-async fn wait_for<T>(mut found: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..100 {
+/// A meeting with captions on, the user in it on the devices `user_endpoints` (open_mess's own
+/// is never listed, so any with audio is another device), and the call store's item for it.
+fn meeting_server(user_endpoints: Value, in_call_store: bool) -> impl Fn(&fake::Seen) -> Option<Reply> {
+    let call = FakeCall::new(CALL, CONTROLLER_PATH, Some(MEETING), live_conversation(&user_endpoints));
+    calls_server(Arc::new(std::sync::Mutex::new(if in_call_store { vec![call] } else { Vec::new() })))
+}
+
+fn join_meeting() -> Value {
+    json!({"conversation": MEETING, "call": CALL})
+}
+
+async fn wait_within<T>(seconds: u64, mut found: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..seconds * 10 {
         if let Some(found) = found() {
             return found;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("not within 10 s");
+    panic!("not within {seconds} s");
+}
+
+async fn wait_for<T>(found: impl FnMut() -> Option<T>) -> T {
+    wait_within(10, found).await
 }
 
 fn requests(fake: &Fake, method: &str, path: &str) -> Vec<fake::Seen> {
@@ -1692,10 +1766,27 @@ async fn media_peer(offer: &str) -> (MediaPeer, String) {
     (MediaPeer { pc, channels }, sdp)
 }
 
+/// Teams' media processor answers the join on Trouter, and the data channel opens.
+async fn answer(trouter: &fake::Trouter, join: &Value) -> (MediaPeer, Arc<dyn webrtc::data_channel::DataChannel>) {
+    let offer = join["callInvitation"]["mediaContent"]["blob"].as_str().unwrap();
+    let acceptance = join["callInvitation"]["links"]["acceptance"].as_str().unwrap();
+    let (mut peer, answer) = media_peer(&plain_offer(offer)).await;
+    let accepted =
+        json!({"callAcceptance": {"mediaContent": {"blob": ms_answer(&answer)}, "links": {"acknowledgement": format!("{CONTROLLER}/ack")}}});
+    assert!(trouter.callback(1, acceptance, &accepted));
+    let channel = tokio::time::timeout(Duration::from_secs(10), peer.channels.recv()).await.unwrap().unwrap();
+    while !matches!(
+        tokio::time::timeout(Duration::from_secs(10), channel.poll()).await.unwrap(),
+        Some(webrtc::data_channel::DataChannelEvent::OnOpen)
+    ) {}
+    (peer, channel)
+}
+
 /// A caption message on the data channel (docs 10.7): the 11-byte header, data id 3, one final
-/// result.
-fn caption_message(text: &str) -> Vec<u8> {
-    let result = json!({"isFinal": true, "text": text, "displayName": "Synthetic Person Two", "spokenLanguage": "en-us", "userId": OTHER});
+/// result said by `by`.
+fn caption_message(text: &str, by: &str) -> Vec<u8> {
+    let name = if by == ME { ME_NAME } else { "Synthetic Person Two" };
+    let result = json!({"isFinal": true, "text": text, "displayName": name, "spokenLanguage": "en-us", "userId": by});
     let mut message = vec![0x10, 11, 0x80 | 3, 0, 1, 0, 0, 0, 0, 7, 0];
     message.extend(json!({"recognitionResults": [result], "events": [], "version": 1}).to_string().as_bytes());
     message
@@ -1704,10 +1795,12 @@ fn caption_message(text: &str) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_captions_are_joined_read_and_left() {
     let (teams, trouter) = Teams::live().await;
-    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
-    assert_eq!(teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap(), json!({"state": "joining"}));
-    // Trouter, the registration, then the join with the skype token and no bearer.
+    teams.fake.on(meeting_server(official(), true));
+    assert_eq!(teams.call("join_captions", join_meeting()).await.unwrap(), json!({"state": "joining"}));
+    // The roster read before joining, Trouter, the registration, then the join with the skype
+    // token and no bearer.
     let join = wait_for(|| requests(&teams.fake, "POST", CONTROLLER_PATH).pop()).await;
+    assert_eq!(requests(&teams.fake, "GET", CONTROLLER_PATH).len(), 1);
     assert!(trouter.seen().iter().any(|f| f.contains("\"user.authenticate\"")));
     assert_eq!(requests(&teams.fake, "POST", REGISTRAR_PATH).len(), 1);
     assert_eq!((join.header("x-skypetoken"), join.header("authorization")), (Some("synthetic-skype-token"), None));
@@ -1718,32 +1811,33 @@ async fn live_captions_are_joined_read_and_left() {
     assert!(offer.contains("m=x-data ") && offer.matches("m=").count() == 1, "{offer}");
     let acceptance = body["callInvitation"]["links"]["acceptance"].as_str().unwrap();
     assert!(acceptance.starts_with(&format!("{}callAgent/", fake::SURL)) && acceptance.ends_with("/call/acceptance/"));
-    // Teams' media processor answers on Trouter; the data channel opens and a caption comes.
-    let (mut peer, answer) = media_peer(&plain_offer(offer)).await;
-    let accepted =
-        json!({"callAcceptance": {"mediaContent": {"blob": ms_answer(&answer)}, "links": {"acknowledgement": format!("{CONTROLLER}/ack")}}});
-    assert!(trouter.callback(1, acceptance, &accepted));
-    let channel = tokio::time::timeout(Duration::from_secs(10), peer.channels.recv()).await.unwrap().unwrap();
-    while !matches!(
-        tokio::time::timeout(Duration::from_secs(10), channel.poll()).await.unwrap(),
-        Some(webrtc::data_channel::DataChannelEvent::OnOpen)
-    ) {}
-    channel.send(caption_message("Hello from the meeting.").as_slice().into()).await.unwrap();
+    // Teams' media processor answers on Trouter; the data channel opens and captions come, one of
+    // them the user's own.
+    let (peer, channel) = answer(&trouter, &body).await;
+    channel.send(caption_message("Hello from the meeting.", OTHER).as_slice().into()).await.unwrap();
+    channel.send(caption_message("And hello back.", ME).as_slice().into()).await.unwrap();
     let mut page = Value::Null;
     for _ in 0..100 {
         page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
-        if page["untrusted"]["cues"].as_array().is_some_and(|cues| !cues.is_empty()) {
+        if page["untrusted"]["cues"].as_array().is_some_and(|cues| cues.len() == 2) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!((page["state"].as_str(), page["captions_on"].as_bool(), page["next_cursor"].as_u64()), (Some("live"), Some(true), Some(1)), "{page}");
-    assert_eq!(page["untrusted"]["cues"][0]["speaker"], "Synthetic Person Two");
-    assert_eq!(page["untrusted"]["cues"][0]["text"], "Hello from the meeting.");
+    assert_eq!((page["state"].as_str(), page["captions_on"].as_bool(), page["next_cursor"].as_u64()), (Some("live"), Some(true), Some(2)), "{page}");
+    assert_eq!((page["call"].as_str(), page["captions_seen"].as_bool(), page["skipped"].as_u64()), (Some(CALL), Some(true), Some(0)));
+    let cues = &page["untrusted"]["cues"];
+    assert_eq!((cues[0]["speaker"].as_str(), cues[0]["own"].as_bool()), (Some("Synthetic Person Two"), Some(false)));
+    assert_eq!(cues[0]["text"], "Hello from the meeting.");
+    assert_eq!((cues[1]["own"].as_bool(), cues[1]["text"].as_str()), (Some(true), Some("And hello back.")));
+    // The time of arrival to the millisecond.
+    let at = cues[0]["at"].as_str().unwrap();
+    assert!(at.len() == 24 && at.as_bytes()[19] == b'.' && at.ends_with('Z'), "{at}");
+    assert!(page.get("threads").is_none());
     assert_eq!(page["language"], "en-us");
     assert_eq!(requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/ack")).len(), 1);
     assert!(trouter.seen().iter().any(|f| f.starts_with("3:::") && f.contains("\"status\":200")));
-    // Another meeting's read shows nothing of this one.
+    // Another conversation's read shows nothing of this one.
     let other = teams.call("read_captions", json!({"conversation": GROUP})).await.unwrap();
     assert_eq!((other["state"].as_str(), &other["untrusted"]["cues"]), (Some("not_joined"), &json!([])));
     // Leaving: `leave` as open_mess's endpoint and the registration's removal.
@@ -1754,30 +1848,50 @@ async fn live_captions_are_joined_read_and_left() {
     assert_eq!(teams.fake.seen().iter().filter(|s| s.method == "DELETE" && s.path.starts_with(REGISTRAR_PATH)).count(), 1);
     let session = page["session"].as_str().unwrap();
     let after = teams.call("read_captions", json!({"conversation": MEETING, "session": session, "cursor": 0})).await.unwrap();
-    assert_eq!((after["state"].as_str(), after["reason"].as_str(), after["next_cursor"].as_u64()), (Some("ended"), Some("left"), Some(1)));
+    assert_eq!((after["state"].as_str(), after["reason"].as_str(), after["next_cursor"].as_u64()), (Some("ended"), Some("left"), Some(2)));
     let changed = teams.call("read_captions", json!({"conversation": MEETING, "session": "b3RoZXI", "cursor": 0})).await;
     assert!(matches!(module_error(changed), ModuleError::InvalidArgs(why) if why.contains("session changed")));
+    // Captions were on all along: nothing was sent to turn them on.
+    assert!(requests(&teams.fake, "POST", COMMAND_PATH).is_empty() && requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/addm")).is_empty());
     peer.pc.close().await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn live_captions_end_at_once_when_the_user_is_not_in_the_meeting() {
-    let (teams, _trouter) = Teams::live().await;
-    // The call store lists the meeting, but the roster has no other endpoint of the user.
-    teams.fake.on(meeting_server(json!({}), true));
-    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+async fn the_user_must_be_in_the_call_before_and_after_the_join() {
+    let (teams, trouter) = Teams::live().await;
+    let data_only = json!({"call": {"mediaStreams": [{"type": "data", "direction": "sendrecv"}]}});
+    // Before joining: only a data-only leg of the account, another open_mess's - not the user.
+    teams.fake.on(meeting_server(json!({"another-open-mess": data_only}), true));
+    let refused = module_error(teams.call("join_captions", join_meeting()).await);
+    assert!(matches!(&refused, ModuleError::Platform(why) if why.starts_with("user_not_in_meeting:")), "{refused:?}");
+    assert!(requests(&teams.fake, "POST", CONTROLLER_PATH).is_empty() && trouter.seen().is_empty());
+    let page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!(page["state"], "not_joined");
+    // A call whose policy turns captions off (`allowTranscription: false`): no join either.
+    let mut no_captions = live_conversation(&official());
+    no_captions["meetingDetails"] = json!({"meetingCapability": {"allowTranscription": false}});
+    let call = FakeCall::new(CALL, CONTROLLER_PATH, Some(MEETING), no_captions);
+    teams.fake.on(calls_server(Arc::new(std::sync::Mutex::new(vec![call]))));
+    let refused = module_error(teams.call("join_captions", join_meeting()).await);
+    assert!(matches!(&refused, ModuleError::Platform(why) if why.starts_with("policy:")), "{refused:?}");
+    assert!(requests(&teams.fake, "POST", CONTROLLER_PATH).is_empty() && trouter.seen().is_empty());
+    // In the call before, gone by the join's answer: open_mess leaves at once.
+    let (before, after) = (meeting_server(official(), true), live_conversation(&json!({})));
+    teams.fake.on(move |s| if s.method == "POST" && s.path == CONTROLLER_PATH { Some(Reply::json(after.clone())) } else { before(s) });
+    teams.call("join_captions", join_meeting()).await.unwrap();
     let leave = wait_for(|| requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).pop()).await;
     assert_eq!(leave.json()["callTransactionEnd"]["phrase"], "LOCAL_USER_INITIATED");
     let page = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
     assert_eq!((page["state"].as_str(), page["reason"].as_str()), (Some("failed"), Some("user_not_in_meeting")));
     // Another session of the account can start again.
-    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    teams.fake.on(meeting_server(official(), true));
+    teams.call("join_captions", join_meeting()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_end_of_the_leg_is_a_refusal_and_the_end_of_the_conversation_the_meeting_end() {
     let (teams, trouter) = Teams::live().await;
-    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
+    teams.fake.on(meeting_server(official(), true));
     // The session's state and reason once it is no longer joining.
     async fn settled(teams: &Teams) -> (String, String) {
         for _ in 0..100 {
@@ -1790,40 +1904,266 @@ async fn the_end_of_the_leg_is_a_refusal_and_the_end_of_the_conversation_the_mee
         panic!("not within 10 s");
     }
     let joins = |teams: &Teams| requests(&teams.fake, "POST", CONTROLLER_PATH);
+    let leaves = |teams: &Teams| requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).len();
     // `/call/end/` ends open_mess's leg (430/10067 came live when Teams refused it, "Live results" 19).
-    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    teams.call("join_captions", join_meeting()).await.unwrap();
     let join = wait_for(|| joins(&teams).pop()).await.json();
     let end = join["callInvitation"]["links"]["end"].as_str().unwrap().to_string();
     assert!(trouter.callback(1, &end, &json!({"callEnd": {"code": 430, "subCode": 10067}})));
     assert_eq!(settled(&teams).await, ("failed".into(), "refused".into()));
     // `/conversation/conversationEnd/` is the meeting's end.
-    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    teams.call("join_captions", join_meeting()).await.unwrap();
     let join = wait_for(|| joins(&teams).get(1).map(|join| join.json())).await;
     let end = join["conversationRequest"]["links"]["conversationEnd"].as_str().unwrap().to_string();
     assert!(trouter.callback(2, &end, &json!({"conversationEnd": {"code": 0}})));
     assert_eq!(settled(&teams).await, ("ended".into(), "meeting_ended".into()));
+    // The codes of an end-to-end encrypted meeting (docs 10.8).
+    teams.call("join_captions", join_meeting()).await.unwrap();
+    let join = wait_for(|| joins(&teams).get(2).map(|join| join.json())).await;
+    let end = join["callInvitation"]["links"]["end"].as_str().unwrap().to_string();
+    assert!(trouter.callback(3, &end, &json!({"callEnd": {"code": 403, "subCode": 4158}})));
+    assert_eq!(settled(&teams).await, ("failed".into(), "e2ee".into()));
+    // The lobby: the acceptance names it, and open_mess leaves.
+    let before = leaves(&teams);
+    teams.call("join_captions", join_meeting()).await.unwrap();
+    let join = wait_for(|| joins(&teams).get(3).map(|join| join.json())).await;
+    let acceptance = join["callInvitation"]["links"]["acceptance"].as_str().unwrap().to_string();
+    assert!(trouter.callback(4, &acceptance, &json!({"callAcceptance": {"controllerName": "lobby"}})));
+    assert_eq!(settled(&teams).await, ("failed".into(), "lobby".into()));
+    assert_eq!(leaves(&teams), before + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn joining_needs_the_meeting_in_the_call_store_and_one_session_an_account() {
+async fn joining_needs_its_call_in_the_call_store() {
     let (teams, trouter) = Teams::live().await;
-    teams.fake.on(meeting_server(json!({"official-client": {}}), false));
-    let refused = module_error(teams.call("join_captions", json!({"conversation": MEETING})).await);
-    assert!(matches!(&refused, ModuleError::Platform(why) if why.contains("does not list you in this meeting")), "{refused:?}");
-    // Three reads of the call store, and nothing reached the meeting or Trouter.
-    assert_eq!(requests(&teams.fake, "GET", CALL_STORE_PATH).len(), 3);
-    assert!(requests(&teams.fake, "POST", CONTROLLER_PATH).is_empty() && trouter.seen().is_empty());
-    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
-    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
-    let again = module_error(teams.call("join_captions", json!({"conversation": GROUP})).await);
-    assert!(matches!(&again, ModuleError::Platform(why) if why.contains("leave it first")), "{again:?}");
+    teams.fake.on(meeting_server(official(), false));
+    let gone = module_error(teams.call("join_captions", join_meeting()).await);
+    assert!(matches!(&gone, ModuleError::Platform(why) if why == "that call is no longer running"), "{gone:?}");
+    // One read of the call store, and nothing reached the call or Trouter.
+    assert_eq!(requests(&teams.fake, "GET", CALL_STORE_PATH).len(), 1);
+    assert!(requests(&teams.fake, "GET", CONTROLLER_PATH).is_empty() && trouter.seen().is_empty());
+    // The call is there, but not in this conversation, or another call is: the same.
+    teams.fake.on(meeting_server(official(), true));
+    for args in [json!({"conversation": GROUP, "call": CALL}), json!({"conversation": MEETING, "call": "0ther-ca11"})] {
+        let gone = module_error(teams.call("join_captions", args).await);
+        assert!(matches!(&gone, ModuleError::Platform(why) if why == "that call is no longer running"), "{gone:?}");
+    }
+    // `call` is required, and checked.
+    for args in
+        [json!({"conversation": MEETING}), json!({"conversation": MEETING, "call": "a b"}), json!({"conversation": "8:orgid:x", "call": CALL})]
+    {
+        assert!(matches!(module_error(teams.call("join_captions", args).await), ModuleError::InvalidArgs(_)));
+    }
+    let bad = json!({"conversation": MEETING, "call": CALL, "language": "polish!"});
+    assert!(matches!(module_error(teams.call("join_captions", bad).await), ModuleError::InvalidArgs(_)));
+    assert!(requests(&teams.fake, "GET", CONTROLLER_PATH).is_empty() && trouter.seen().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_has_a_session_a_call_three_at_most() {
+    let (teams, _trouter) = Teams::live().await;
+    let call = |id: &str, path: &str, thread: Option<&str>| FakeCall::new(id, path, thread, conversation_at(path, &official(), Some("Active")));
+    let calls: Calls = Arc::new(std::sync::Mutex::new(vec![
+        call(CALL, CONTROLLER_PATH, Some(MEETING)),
+        call("c2", "/api/v2/ep/conv.synthetic/conv/c2", Some(GROUP)),
+        call("c3", "/api/v2/ep/conv.synthetic/conv/c3", None),
+        call("c4", "/api/v2/ep/conv.synthetic/conv/c4", Some(CHANNEL)),
+    ]));
+    teams.fake.on(calls_server(calls.clone()));
+    let joins = |path: &str| requests(&teams.fake, "POST", path).len();
+    for args in [join_meeting(), json!({"conversation": GROUP, "call": "c2"}), json!({"conversation": "call:c3", "call": "c3"})] {
+        assert_eq!(teams.call("join_captions", args).await.unwrap(), json!({"state": "joining"}));
+    }
+    wait_for(|| {
+        ([CONTROLLER_PATH, "/api/v2/ep/conv.synthetic/conv/c2", "/api/v2/ep/conv.synthetic/conv/c3"].iter().all(|p| joins(p) == 1)).then_some(())
+    })
+    .await;
+    // Each session is a device of its own: three endpoints.
+    let endpoints: std::collections::HashSet<String> = teams
+        .fake
+        .seen()
+        .iter()
+        .filter(|s| s.method == "POST" && s.path.starts_with("/api/v2/ep/conv.synthetic/conv/c") && !s.path.contains("/leave"))
+        .map(|s| s.json()["participants"]["from"]["endpointId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(endpoints.len(), 3);
+    // The same call again, even under another name: the session goes on, no second join.
+    let again = teams.call("join_captions", json!({"conversation": "call:".to_string() + CALL, "call": CALL})).await.unwrap();
+    assert!(matches!(again["state"].as_str(), Some("joining" | "live")), "{again}");
+    // Under a name that is not the call's, it is refused, and the session never takes that name.
+    let foreign = module_error(teams.call("join_captions", json!({"conversation": CHANNEL, "call": CALL})).await);
+    assert!(matches!(&foreign, ModuleError::Platform(why) if why == "that call is no longer running"), "{foreign:?}");
+    assert_eq!(teams.call("read_captions", json!({"conversation": CHANNEL})).await.unwrap()["state"], "not_joined");
+    // A fourth call of the account: refused before anything reaches it.
+    let limit = module_error(teams.call("join_captions", json!({"conversation": CHANNEL, "call": "c4"})).await);
+    assert!(matches!(&limit, ModuleError::Platform(why) if why.starts_with("connection_limit:")), "{limit:?}");
+    assert!(teams.fake.seen().iter().all(|s| !s.path.starts_with("/api/v2/ep/conv.synthetic/conv/c4")));
+    let first = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!(first["call"], CALL);
+    // The meeting's call ended and a new one started in its chat: the old session ends first,
+    // then the new call is joined; the old cues stay readable with the old session.
+    {
+        let mut calls = calls.lock().unwrap();
+        calls.retain(|c| c.path != CONTROLLER_PATH);
+        calls.push(call("c5", "/api/v2/ep/conv.synthetic/conv/c5", Some(MEETING)));
+    }
+    teams.call("join_captions", json!({"conversation": MEETING, "call": "c5"})).await.unwrap();
+    assert_eq!(requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).len(), 1);
+    wait_for(|| (joins("/api/v2/ep/conv.synthetic/conv/c5") == 1).then_some(())).await;
+    assert_eq!(joins(CONTROLLER_PATH), 1);
+    let new = teams.call("read_captions", json!({"conversation": MEETING})).await.unwrap();
+    assert_eq!(new["call"], "c5");
+    let old = teams.call("read_captions", json!({"conversation": MEETING, "session": first["session"], "cursor": 0})).await.unwrap();
+    assert_eq!((old["call"].as_str(), old["state"].as_str(), old["reason"].as_str()), (Some(CALL), Some("ended"), Some("meeting_ended")));
+    // Leaving one conversation leaves only its session.
+    teams.call("leave_captions", json!({"conversation": GROUP})).await.unwrap();
+    assert_eq!(requests(&teams.fake, "POST", "/api/v2/ep/conv.synthetic/conv/c2/leave").len(), 1);
+    assert!(requests(&teams.fake, "POST", "/api/v2/ep/conv.synthetic/conv/c5/leave").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn calls_are_listed_by_their_chat_or_id() {
+    let teams = Teams::signed_in().await;
+    let other_oid = OTHER.trim_start_matches("8:orgid:");
+    let theirs_first = format!("19:{other_oid}_{ME_OID}@unq.gbl.spaces");
+    let third = "8:orgid:00000000-0000-0000-0000-000000000003";
+    let direct = |call: &str, people: [&str; 2]| {
+        let mut item = call_item(call, "/api/v2/ep/conv.synthetic/conv/d", None);
+        item["participants"] = json!(people);
+        item["additionalData"] = json!({"participantList": [{"id": people[0], "endpointType": null}, {"id": people[1], "endpointType": null}]});
+        item
+    };
+    let mut escalated = direct("c4", [ME, OTHER]);
+    escalated["groupContext"] = json!({"threadId": GROUP, "messageId": "1"});
+    escalated["userJoinTime"] = Value::Null;
+    let mut items = vec![
+        call_item(CALL, CONTROLLER_PATH, Some(MEETING)),
+        direct("c2", [OTHER, ME]),
+        direct("c3", [ME, third]),
+        escalated,
+        call_item("not a call id", CONTROLLER_PATH, Some(MEETING)),
+        json!({"correlationId": "c6", "conversationController": "https://evil.example/conv"}),
+    ];
+    items.extend((0..30).map(|n| call_item(&format!("x{n}"), CONTROLLER_PATH, Some(&format!("19:x{n}@thread.v2")))));
+    let existing = theirs_first.clone();
+    teams.fake.on(move |s| {
+        if s.path == CALL_STORE_PATH {
+            Some(Reply::json(Value::Array(items.clone())))
+        } else if s.path == format!("{CHAT_PATH}/{existing}") {
+            Some(Reply::json(fake::conversation(&existing, None, None)))
+        } else {
+            None
+        }
+    });
+    let listed = teams.call("list_calls", json!({})).await.unwrap();
+    let items = listed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 20);
+    assert_eq!(items[0], json!({"conversation": MEETING, "call": CALL, "joined_at": null}));
+    // A 1:1 call by its chat, whichever order its ids have; a chat that does not exist leaves the id.
+    assert_eq!((items[1]["conversation"].as_str(), items[1]["call"].as_str()), (Some(theirs_first.as_str()), Some("c2")));
+    assert_eq!(items[2]["conversation"], "call:c3");
+    // Someone added to a 1:1 call: the same call, now in its group chat.
+    assert_eq!((items[3]["conversation"].as_str(), items[3]["call"].as_str()), (Some(GROUP), Some("c4")));
+    assert_eq!(items[4]["call"], "x0");
+    assert!(listed.get("untrusted").is_none());
+    // Reads only.
+    assert!(writes(&teams.fake).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_without_a_chat_is_described_for_its_approval() {
+    let teams = Teams::signed_in().await;
+    let mut conversation = conversation_at(CONTROLLER_PATH, &official(), Some("Active"));
+    conversation["subject"] = json!("");
+    conversation["conversationStartTime"] = json!("2027-01-15T08:00:00.1234567Z");
+    conversation["roster"]["participants"][ME]["displayName"] = json!(ME_NAME);
+    let call = FakeCall::new(CALL, CONTROLLER_PATH, None, conversation);
+    let calls: Calls = Arc::new(std::sync::Mutex::new(vec![call]));
+    teams.fake.on(calls_server(calls.clone()));
+    let target = teams.module.describe_target(ME_OID, &format!("call:{CALL}"), None).await.unwrap();
+    assert_eq!(target.conversation_title, "Teams call without a chat, started 2027-01-15T08:00:00Z");
+    let mut people: Vec<(String, String)> = target.participants.into_iter().map(|p| (p.id, p.display_name)).collect();
+    people.sort();
+    assert_eq!(people, [(BOT.to_string(), BOT.to_string()), (ME.to_string(), ME_NAME.to_string())]);
+    // Reads only, and no chat is looked for.
+    assert!(writes(&teams.fake).is_empty() && teams.fake.seen().iter().all(|s| !s.path.starts_with(CHAT_PATH)));
+    calls.lock().unwrap().clear();
+    let gone = module_error(teams.module.describe_target(ME_OID, &format!("call:{CALL}"), None).await);
+    assert!(matches!(&gone, ModuleError::Platform(why) if why == "that call is no longer running"), "{gone:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn captions_are_turned_on_once_and_not_after_someone_had_them_on() {
+    let (teams, trouter) = Teams::live().await;
+    // A 1:1 call without captions: no chat thread, no bot.
+    let path = "/api/v2/ep/conv.synthetic/conv/d1";
+    let one_to_one = FakeCall::new(CALL, path, None, conversation_at(path, &official(), None));
+    let conversation = one_to_one.conversation.clone();
+    teams.fake.on(calls_server(Arc::new(std::sync::Mutex::new(vec![one_to_one]))));
+    let args = json!({"conversation": format!("call:{CALL}"), "call": CALL});
+    teams.call("join_captions", args.clone()).await.unwrap();
+    let join = wait_for(|| requests(&teams.fake, "POST", path).pop()).await.json();
+    assert_eq!(join["groupChat"], Value::Null);
+    let (peer, _channel) = answer(&trouter, &join).await;
+    // 10 s after the data channel opened, no one has captions on: the bot is added the client's
+    // way for a call without a chat, with the language and the user's token for the recording
+    // resource.
+    let added = wait_within(20, || requests(&teams.fake, "POST", &format!("{path}/add")).pop()).await;
+    assert!(requests(&teams.fake, "POST", &format!("{path}/addm")).is_empty());
+    assert_eq!(added.header("x-skypetoken"), Some("synthetic-skype-token"));
+    let body = added.json();
+    assert_eq!(body["participants"]["to"][0]["id"], BOT);
+    let bot_data = &body["participantInvitationData"]["botData"];
+    assert_eq!((bot_data["spokenLanguage"].as_str(), bot_data["callId"].as_str()), (Some("pl-pl"), Some(CALL)));
+    assert_eq!(fake::claims(bot_data["initiatorUserToken"].as_str().unwrap())["aud"], RECORDING);
+    // The bot comes in without captions: it gets `start`, with both tokens.
+    *conversation.lock().unwrap() = conversation_at(path, &official(), Some("Inactive"));
+    let roster_update = join["conversationRequest"]["roster"]["rosterUpdate"].as_str().unwrap().to_string();
+    assert!(trouter.callback(5, &roster_update, &json!({})));
+    let start = wait_for(|| requests(&teams.fake, "POST", COMMAND_PATH).pop()).await;
+    assert_eq!((start.audience().as_deref(), start.header("x-skypetoken")), (Some(RECORDING), Some("synthetic-skype-token")));
+    assert_eq!(start.header("x-microsoft-skype-chain-id"), Some(CALL));
+    let command = start.json();
+    assert_eq!((command["action"].as_str(), &command["processingModes"]), (Some("start"), &json!(["closedCaptions"])));
+    assert!(command.get("language").is_none());
+    // Captions on: the session saw them.
+    *conversation.lock().unwrap() = conversation_at(path, &official(), Some("Active"));
+    assert!(trouter.callback(6, &roster_update, &json!({})));
+    let mut seen = Value::Null;
+    for _ in 0..50 {
+        seen = teams.call("read_captions", json!({"conversation": format!("call:{CALL}")})).await.unwrap();
+        if seen["captions_on"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!((seen["captions_on"].as_bool(), seen["captions_seen"].as_bool()), (Some(true), Some(true)), "{seen}");
+    teams.call("leave_captions", json!({"conversation": format!("call:{CALL}")})).await.unwrap();
+    peer.pc.close().await.ok();
+    // Someone turned them off; a new session of the same call does not turn them on, even asked to.
+    *conversation.lock().unwrap() = conversation_at(path, &official(), Some("Inactive"));
+    teams.call("join_captions", json!({"conversation": format!("call:{CALL}"), "call": CALL, "start_captions": true})).await.unwrap();
+    let join = wait_for(|| requests(&teams.fake, "POST", path).get(1).map(fake::Seen::json)).await;
+    let (peer, _channel) = answer(&trouter, &join).await;
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    assert_eq!(requests(&teams.fake, "POST", &format!("{path}/add")).len(), 1);
+    assert_eq!(requests(&teams.fake, "POST", COMMAND_PATH).len(), 1);
+    // Nothing but `start` ever went to the bot: no language change, no stop.
+    assert!(
+        teams
+            .fake
+            .seen()
+            .iter()
+            .all(|s| !String::from_utf8_lossy(&s.body).contains("setLanguage") && !String::from_utf8_lossy(&s.body).contains("\"stop\""))
+    );
+    peer.pc.close().await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn end_sessions_leaves_the_meeting() {
     let (teams, _trouter) = Teams::live().await;
-    teams.fake.on(meeting_server(json!({"official-client": {}}), true));
-    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    teams.fake.on(meeting_server(official(), true));
+    teams.call("join_captions", join_meeting()).await.unwrap();
     wait_for(|| requests(&teams.fake, "POST", CONTROLLER_PATH).pop()).await;
     teams.module.end_sessions(ME_OID).await.unwrap();
     assert_eq!(requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).len(), 1);
@@ -1836,11 +2176,11 @@ async fn a_failed_leave_is_sent_again_from_the_session_record() {
     let (teams, _trouter) = Teams::live().await;
     // `leave` fails until the test lets it through; the rest is the usual meeting.
     let status = Arc::new(AtomicUsize::new(503));
-    let (meeting, answer) = (meeting_server(json!({"official-client": {}}), true), status.clone());
+    let (meeting, answer) = (meeting_server(official(), true), status.clone());
     let leave_path = format!("{CONTROLLER_PATH}/leave");
     teams.fake.on(move |s| if s.path == leave_path { Some(Reply::status(answer.load(Ordering::SeqCst) as u16)) } else { meeting(s) });
     let leaves = |teams: &Teams| requests(&teams.fake, "POST", &format!("{CONTROLLER_PATH}/leave")).len();
-    teams.call("join_captions", json!({"conversation": MEETING})).await.unwrap();
+    teams.call("join_captions", join_meeting()).await.unwrap();
     wait_for(|| requests(&teams.fake, "POST", CONTROLLER_PATH).pop()).await;
     assert_eq!(teams.call("leave_captions", json!({"conversation": MEETING})).await.unwrap(), json!({"state": "ended"}));
     assert_eq!(leaves(&teams), 1);

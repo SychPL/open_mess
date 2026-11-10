@@ -51,7 +51,7 @@ rayon = "1.12.0"
 # hand (update/fetch.rs).
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "system-proxy"] }
 # The MCP server on /mcp, and `om mcp-stdio`, a client of it.
-rmcp = { version = "3.7.0", default-features = false, features = [
+rmcp = { version = "3.9.0", default-features = false, features = [
     "client",
     "server",
     "transport-streamable-http-client-reqwest",
@@ -74,6 +74,8 @@ sha2 = "0.10.9"
 sysinfo = { version = "0.37.2", default-features = false, features = ["disk", "system"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
+# The captions archive's log of states and counts (recording/captions.rs); the module host builds it.
+tracing = "0.1.44"
 # Sign-in pages' URLs (ui/sign_in_page.rs); the version the module host builds.
 url = "2.5.8"
 # OPEN_MESS_LOG: the daemon's and modules' logs on stderr, for diagnostics (daemon.rs); test-echo

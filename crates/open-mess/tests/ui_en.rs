@@ -55,6 +55,7 @@ fn state(d: &Daemon) -> Arc<UiState> {
         update: None,
         models: None,
         recorder: None,
+        captions: None,
     })
 }
 
@@ -87,6 +88,7 @@ async fn unapproved(files: &[(&str, Vec<u8>)]) -> (TempDir, UiState) {
         update: None,
         models: None,
         recorder: None,
+        captions: None,
     };
     (dir, state)
 }

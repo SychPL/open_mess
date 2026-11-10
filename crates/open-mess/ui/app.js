@@ -1163,8 +1163,29 @@ function recordingReason(reason) {
     "text limit": tr("limit transkrypcji", "text limit"),
     "update in progress": tr("trwa aktualizacja", "update in progress"),
     "cannot create the recording": tr("błąd tworzenia nagrania", "cannot create the recording"),
+    stopped: tr("zatrzymane", "stopped"),
+    auto_off: tr("wyłączony zapis", "switched off"),
+    e2ee: tr("spotkanie szyfrowane", "end-to-end encrypted"),
+    lobby: tr("poczekalnia", "lobby"),
+    policy: tr("polityka bez napisów", "no captions by policy"),
+    media_failed: tr("błąd połączenia", "connection failed"),
+    proxy: tr("serwer pośredniczący", "proxy"),
+    protocol: tr("błąd protokołu", "protocol error"),
+    refused: tr("odmowa Teams", "refused by Teams"),
+    connection_limit: tr("limit rozmów", "call limit"),
+    "module failed": tr("błąd modułu", "module failed"),
+    late_start: tr("późny start", "late start"),
+    mixed: tr("różne", "mixed"),
+    captions_off: tr("napisy wyłączone", "captions off"),
+    lost: tr("utracone", "lost"),
+    rejoin: tr("ponowne dołączanie", "rejoining"),
   };
   return texts[reason] || reason;
+}
+
+/** The recording's source, as the list shows it. */
+function recordingSources() {
+  return { audio: tr("dźwięk", "audio"), captions: tr("napisy", "captions") };
 }
 
 function speakers() {
@@ -1198,7 +1219,9 @@ async function renderRecording() {
   const [model, recording] = await Promise.all([call("model_status"), call("recordings")]);
   const root = content("recording");
   root.replaceChildren();
+  renderCaptionsKept(root, recording);
   renderRecordingSettings(root, recording);
+  renderCaptionsSettings(root, recording);
   root.append(
     el(
       "p",
@@ -1233,7 +1256,7 @@ async function renderRecording() {
   root.append(buttons);
   renderRecordings(root, recording);
   // Progress while the section is open.
-  const busy = recording.active || recording.recordings.some((item) => item.state === "transcribing" || item.state === "waiting");
+  const busy = recording.active || recording.recordings.some((item) => ["transcribing", "waiting", "recording"].includes(item.state));
   if (download.state === "running" || busy) {
     setTimeout(() => {
       if (current === "recording") renderRecording().catch(showError);
@@ -1290,6 +1313,54 @@ function renderRecordingSettings(root, recording) {
   if (status.reason) root.append(el("p", tr("Czeka: ", "Waiting: ") + recordingReason(status.reason), "muted"));
 }
 
+// The calls whose captions are kept now, on top of the section (spec 2026-11-04-captions-archive, 4.7).
+function renderCaptionsKept(root, recording) {
+  const kept = recording.recordings.filter((item) => item.source === "captions" && item.state === "recording");
+  if (kept.length === 0) return;
+  const row = el("div", null, "row");
+  row.append(
+    el("strong", tr("Zapisuję napisy rozmów: ", "Keeping the captions of calls: ") + kept.length),
+    button(tr("Zatrzymaj wszystkie", "Stop all"), async () => {
+      await call("stop_captions", { id: null });
+      await renderRecording();
+    }),
+  );
+  root.append(row);
+}
+
+// The captions archive's switch and language (spec 2026-11-04-captions-archive, 4.1).
+function renderCaptionsSettings(root, recording) {
+  if (recording.captions === null) return;
+  root.append(el("h2", tr("Napisy rozmów Teams", "Teams calls' captions")));
+  const auto = el("input");
+  auto.type = "checkbox";
+  auto.checked = recording.captions_auto;
+  const autoLabel = el("label", null, "row");
+  autoLabel.append(auto, el("span", tr("Zapisuj napisy rozmów Teams automatycznie", "Keep the captions of Teams calls automatically")));
+  const language = el("input");
+  language.value = recording.captions_language;
+  const languageLabel = el("label", null, "row");
+  languageLabel.append(el("span", tr("Język napisów, gdy rozmowa nie ma żadnego", "Captions language when a call has none")), language);
+  root.append(
+    autoLabel,
+    el(
+      "p",
+      tr("Gdy jest włączone, open_mess dołącza do każdej rozmowy Teams, na której jesteś, jako drugie urządzenie Twojego konta, bez dźwięku i obrazu; włącza napisy, gdy nikt ich nie ma; zapisuje tekst z imionami mówców na tym komputerze do czasu, aż go usuniesz. Uczestników informujesz Ty. Zatrzymanie zapisu kończy obecność open_mess w rozmowie.", "When on, open_mess joins every Teams call you are in as a second device of your account, without audio or video; turns captions on when no one has; keeps the text with the speakers' names on this computer until you delete it. Telling the participants is up to you. Stopping a call's captions ends open_mess's presence in it."),
+      "muted",
+    ),
+    languageLabel,
+    button(tr("Zapisz ustawienia napisów", "Save captions settings"), async () => {
+      if (auto.checked && !recording.captions_auto && !confirm(tr("Zapisywać napisy każdej rozmowy Teams, na której jesteś?", "Keep the captions of every Teams call you are in?"))) return;
+      await call("set_captions_settings", { auto: auto.checked, language: language.value });
+      await renderRecording();
+    }),
+  );
+  const status = recording.captions || {};
+  if (status.reason) root.append(el("p", tr("Napisy czekają: ", "Captions wait: ") + recordingReason(status.reason), "muted"));
+  if (status.state_lost) root.append(el("p", tr("Stan rozmów przepadł: rozmowy trwające przy starcie nie są zapisywane.", "The calls' state was lost: calls going on at the start are not kept."), "muted"));
+  if (status.notices_failed) root.append(el("p", tr("Nieudane powiadomienia: ", "Notices that failed: ") + status.notices_failed, "muted"));
+}
+
 function renderRecordings(root, recording) {
   root.append(el("h2", tr("Nagrania", "Recordings")));
   if (recording.recordings.length === 0) {
@@ -1298,17 +1369,35 @@ function renderRecordings(root, recording) {
   }
   const table = el("table");
   const head = el("tr");
-  for (const label of [tr("Data", "Date"), tr("Długość", "Length"), tr("Stan", "State"), ""]) head.append(el("th", label));
+  for (const label of [tr("Data", "Date"), tr("Długość", "Length"), tr("Źródło", "Source"), tr("Stan", "State"), ""]) head.append(el("th", label));
   table.append(head);
   const states = recordingStates();
+  const sources = recordingSources();
   for (const item of recording.recordings) {
     const row = el("tr");
     const length = item.end_ms ? clock(item.end_ms - item.start_ms) : "";
     let state = states[item.state] || item.state;
     if (item.progress !== null && item.progress !== undefined) state += " " + item.progress + "%";
+    if (item.coverage !== null && item.coverage !== undefined) state += tr(", pokrycie ", ", coverage ") + item.coverage + "%";
     if (item.reason) state += " (" + recordingReason(item.reason) + ")";
     const actions = el("td", null, "row");
-    if (item.state === "done") {
+    if (item.source === "captions") {
+      actions.append(
+        button(tr("Pokaż", "Show"), async () => {
+          shownRecording = { id: item.id, captions: await call("show_captions", { id: item.id }) };
+          await renderRecording();
+        }),
+      );
+      if (item.state === "recording") {
+        actions.append(
+          button(tr("Zatrzymaj", "Stop"), async () => {
+            await call("stop_captions", { id: item.id });
+            await renderRecording();
+          }),
+        );
+      }
+    }
+    if (item.source !== "captions" && item.state === "done") {
       actions.append(
         button(tr("Pokaż", "Show"), async () => {
           shownRecording = { id: item.id, cues: await call("show_transcript", { id: item.id }) };
@@ -1336,7 +1425,7 @@ function renderRecordings(root, recording) {
         "danger",
       ),
     );
-    row.append(el("td", new Date(item.start_ms).toLocaleString(locale())), el("td", length), el("td", state), actions);
+    row.append(el("td", new Date(item.start_ms).toLocaleString(locale())), el("td", length), el("td", sources[item.source] || item.source), el("td", state), actions);
     table.append(row);
   }
   root.append(
@@ -1356,8 +1445,19 @@ function renderRecordings(root, recording) {
     root.append(el("h2", tr("Transkrypcja", "Transcript")));
     const text = el("div", null, "transcript");
     const names = speakers();
-    for (const cue of shownRecording.cues) {
+    for (const cue of shownRecording.cues || []) {
       text.append(el("p", "[" + clock(cue.start_ms) + "] " + (names[cue.speaker] || cue.speaker) + ": " + cue.text));
+    }
+    // A captions recording: the speakers' names as Teams gave them, and the times nothing was heard.
+    const captions = shownRecording.captions;
+    if (captions) {
+      for (const gap of captions.gaps) {
+        const to = gap.to === null ? tr("trwa", "lasting") : clock(gap.to);
+        root.append(el("p", tr("Luka ", "Gap ") + clock(gap.from) + " - " + to + " (" + recordingReason(gap.reason) + ")", "muted"));
+      }
+      if (captions.damaged) root.append(el("p", tr("Uszkodzone linie: ", "Damaged lines: ") + captions.damaged, "muted"));
+      for (const cue of captions.cues) text.append(el("p", "[" + clock(cue.at_ms) + "] " + cue.speaker + ": " + cue.text));
+      if (captions.more) text.append(el("p", tr("Dalszą część czyta agent.", "An agent reads the rest."), "muted"));
     }
     root.append(text, button(tr("Zamknij", "Close"), async () => {
       shownRecording = null;

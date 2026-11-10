@@ -16,8 +16,10 @@ use super::sign_in::Active;
 use crate::accounts::Account;
 use crate::i18n::{self, Lang};
 use crate::modules::{self, ApprovalReason, ModuleInfo, ModuleState};
+use crate::recording::archive::{self, Gap};
+use crate::recording::captions::{self, Archiver};
 use crate::recording::recorder::{By, Recorder};
-use crate::recording::{Entry, Meta, Reason, Speaker, State, valid_id};
+use crate::recording::{Entry, Meta, Reason, Source, Speaker, State, valid_id};
 use crate::triggers::RuleCounters;
 use crate::triggers::rules::{self, Rule};
 use crate::update::release::Version;
@@ -922,10 +924,15 @@ pub struct RecordingDto {
     pub reason: Option<Reason>,
     /// The audio is still there: a failed one can be tried again.
     pub audio: bool,
+    /// A call's audio or its live captions; a captions recording's coverage in percent and gaps.
+    pub source: Source,
+    pub coverage: Option<u8>,
+    pub gaps: Option<u32>,
 }
 
 /// The Nagrywanie rozmów section: its settings, the recording going on, `status`'s recording
-/// object and the recordings, newest first.
+/// object and the recordings, newest first; and the captions archive's switch, language and
+/// `status` object (spec 2026-11-04-captions-archive, 4.1, 4.7), null without it.
 #[derive(Clone, Debug, Serialize)]
 pub struct RecordingsDto {
     pub auto: bool,
@@ -934,6 +941,9 @@ pub struct RecordingsDto {
     pub active: Option<String>,
     pub status: Value,
     pub recordings: Vec<RecordingDto>,
+    pub captions_auto: bool,
+    pub captions_language: String,
+    pub captions: Value,
 }
 
 pub fn recordings(state: &UiState) -> Result<RecordingsDto, String> {
@@ -950,9 +960,13 @@ pub fn recordings(state: &UiState) -> Result<RecordingsDto, String> {
             end_ms: meta.end_ms,
             state: meta.state.name(),
             reason: meta.reason,
+            source: meta.source,
+            coverage: meta.coverage,
+            gaps: meta.gaps,
             id,
         })
         .collect();
+    let archiver = state.captions.as_ref();
     Ok(RecordingsDto {
         auto: setting("recording.auto").as_deref() == Some("true"),
         microphone: setting("recording.mic").as_deref() != Some("false"),
@@ -960,7 +974,76 @@ pub fn recordings(state: &UiState) -> Result<RecordingsDto, String> {
         active: recorder.active(),
         status: recorder.status(),
         recordings,
+        captions_auto: archiver.is_some_and(|archiver| archiver.auto()),
+        captions_language: archiver.map_or_else(|| captions::DEFAULT_LANGUAGE.into(), |archiver| archiver.language()),
+        captions: archiver.map_or(Value::Null, |archiver| archiver.status()),
     })
+}
+
+fn archiver(state: &UiState) -> Result<&Arc<Archiver>, String> {
+    state.captions.as_ref().ok_or_else(|| i18n::pick("zapis napisów działa tylko w Windows", "keeping captions works on Windows only").to_owned())
+}
+
+/// "Zapisuj napisy rozmów Teams automatycznie" and "Język napisów, gdy rozmowa nie ma żadnego"
+/// (spec 2026-11-04-captions-archive, 4.1): the owner's standing consent. Turning it off ends
+/// every call kept, after a join running now.
+pub async fn set_captions_settings(state: &UiState, auto: bool, language: &str) -> Result<(), String> {
+    changes_allowed(state)?;
+    let archiver = archiver(state)?;
+    if !captions::valid_language(language) {
+        return Err(i18n::pick("nieznany język", "unknown language").into());
+    }
+    archiver.set(auto, language, captions::now_ms()).await
+}
+
+/// One cue of a captions recording, as "Pokaż" shows it.
+#[derive(Clone, Debug, Serialize)]
+pub struct CaptionDto {
+    pub at_ms: u64,
+    pub speaker: String,
+    pub own: bool,
+    pub text: String,
+}
+
+/// A captions recording as "Pokaż" shows it: its cues, its gaps, the lines that could not be read,
+/// and whether more cues are there than shown.
+#[derive(Clone, Debug, Serialize)]
+pub struct CaptionsDto {
+    pub cues: Vec<CaptionDto>,
+    pub gaps: Vec<Gap>,
+    pub damaged: usize,
+    pub more: bool,
+}
+
+/// The most cues "Pokaż" shows.
+const SHOWN_CUES: usize = 20_000;
+
+/// "Pokaż" of a captions recording, in any state, for the owner whatever agents may read (4.7). It
+/// is other people's speech: the window puts it in as text, never as HTML.
+pub fn show_captions(state: &UiState, id: &str) -> Result<CaptionsDto, String> {
+    let recordings = recorder(state)?.recordings();
+    let meta = if valid_id(id) { recordings.meta(id).map_err(|_| unknown())? } else { return Err(unknown()) };
+    let dir = recordings.path(id).filter(|_| meta.source == Source::Captions).ok_or_else(unknown)?;
+    let written = meta.state == State::Recording;
+    let damaged_text = || i18n::pick("zapis jest uszkodzony", "the captions are damaged").to_owned();
+    let (mut cues, mut damaged, mut more) = (Vec::new(), 0, false);
+    archive::read_lines(&dir.join(archive::CAPTIONS), written, |cue: Option<archive::Cue>| {
+        match cue {
+            Some(_) if cues.len() == SHOWN_CUES => more = true,
+            Some(cue) => cues.push(CaptionDto { at_ms: cue.at, speaker: cue.speaker, own: cue.own, text: cue.text }),
+            None => damaged += 1,
+        }
+        true
+    })
+    .map_err(|_| damaged_text())?;
+    let (gaps, gap_lines) = archive::Gaps::load(&dir, written).map_err(|_| damaged_text())?;
+    Ok(CaptionsDto { cues, gaps: gaps.0, damaged: damaged + gap_lines, more })
+}
+
+/// "Zatrzymaj" of a captions recording in the window, or of every one: as the toast's (4.7).
+pub async fn stop_captions(state: &UiState, id: Option<&str>) -> Result<(), String> {
+    archiver(state)?.stop(|recording, _| id.is_none_or(|id| id == recording)).await;
+    Ok(())
 }
 
 /// "Nagrywaj rozmowy Teams automatycznie", "Nagrywaj mój mikrofon" and the language (4.6). The
@@ -1007,18 +1090,32 @@ pub fn show_transcript(state: &UiState, id: &str) -> Result<Vec<CueDto>, String>
     Ok(transcript.cues.into_iter().map(|cue| CueDto { start_ms: cue.start_ms, speaker: cue.speaker, text: cue.text }).collect())
 }
 
-/// "Usuń": the recording going on stops first, a transcription running stops first.
-pub fn delete_recording(state: &UiState, id: &str) -> Result<(), String> {
+/// "Usuń": the recording going on stops first, a transcription running stops first. A captions
+/// recording going on stops as with "Zatrzymaj", and its call is not kept again (spec
+/// 2026-11-04-captions-archive, 4.7).
+pub async fn delete_recording(state: &UiState, id: &str) -> Result<(), String> {
     if !valid_id(id) {
         return Err(unknown());
     }
-    recorder(state)?.delete(id).map_err(text)
+    delete_one(state, recorder(state)?, id).await.map_err(text)
+}
+
+async fn delete_one(state: &UiState, recorder: &Recorder, id: &str) -> std::io::Result<()> {
+    match &state.captions {
+        Some(archiver) if recorder.recordings().meta(id).is_ok_and(|meta| meta.source == Source::Captions) => archiver.delete(id).await,
+        _ => recorder.delete(id),
+    }
 }
 
 /// "Usuń wszystkie": a folder that cannot go (a file another program holds) stays, the rest go.
-pub fn delete_all_recordings(state: &UiState) -> Result<(), String> {
+pub async fn delete_all_recordings(state: &UiState) -> Result<(), String> {
     let recorder = recorder(state)?;
-    let failed = recorder.recordings().list().iter().filter(|entry| recorder.delete(&entry.id).is_err()).count();
+    let mut failed = 0;
+    for entry in recorder.recordings().list() {
+        if delete_one(state, recorder, &entry.id).await.is_err() {
+            failed += 1;
+        }
+    }
     if failed == 0 {
         return Ok(());
     }

@@ -73,6 +73,11 @@ pub fn rfc3339(ms: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", day_secs / 3600, day_secs % 3600 / 60, day_secs % 60)
 }
 
+/// Epoch milliseconds as RFC 3339 UTC to the millisecond: `2027-01-15T08:00:00.123Z`.
+pub fn rfc3339_millis(ms: i64) -> String {
+    format!("{}.{:03}Z", rfc3339(ms).trim_end_matches('Z'), ms.rem_euclid(1000))
+}
+
 /// Exactly `len` ASCII digits; the fixed width keeps every later product far from overflow.
 fn digits(text: &str, len: usize) -> Option<i64> {
     if text.len() != len || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -115,6 +120,9 @@ mod tests {
         assert_eq!(rfc3339(1_800_000_000_123), "2027-01-15T08:00:00Z");
         assert_eq!(rfc3339(951_825_600_000), "2000-02-29T12:00:00Z");
         assert_eq!(rfc3339(-1000), "1969-12-31T23:59:59Z");
+        assert_eq!(rfc3339_millis(1_800_000_000_123), "2027-01-15T08:00:00.123Z");
+        assert_eq!(rfc3339_millis(1_800_000_000_000), "2027-01-15T08:00:00.000Z");
+        assert_eq!(rfc3339_millis(-1), "1969-12-31T23:59:59.999Z");
         assert_eq!(rfc3339_ms("2027-01-15T08:00:00Z"), Some(1_800_000_000_000));
         assert_eq!(rfc3339_ms("2027-01-15T09:30:00+01:30"), Some(1_800_000_000_000));
         assert_eq!(rfc3339_ms("2027-01-15T07:00:00.5-01:00"), Some(1_800_000_000_500));

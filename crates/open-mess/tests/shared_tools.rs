@@ -277,8 +277,16 @@ fn conversations(result: &Value) -> Vec<&str> {
 async fn module_read_tools_are_listed_with_account() {
     let d = peeking(&[]).await;
     let listed: Vec<_> = d.registry.list().into_iter().filter(|tool| tool.name.starts_with("test_echo_")).collect();
-    assert_eq!(listed.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), ["test_echo_peek", "test_echo_poke"]);
-    let schema = &listed[0].input_schema;
+    let names = [
+        "test_echo_join_captions",
+        "test_echo_leave_captions",
+        "test_echo_list_calls",
+        "test_echo_peek",
+        "test_echo_poke",
+        "test_echo_read_captions",
+    ];
+    assert_eq!(listed.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), names);
+    let schema = &listed[3].input_schema;
     assert_eq!((&schema["properties"]["account"]["type"], &schema["additionalProperties"]), (&json!("string"), &json!(false)));
     // The others say why they are not listed.
     let status = d.registry.call("status", json!({})).await.unwrap();

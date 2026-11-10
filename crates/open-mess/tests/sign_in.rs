@@ -41,6 +41,7 @@ fn state(d: &Daemon) -> Arc<UiState> {
         update: None,
         models: None,
         recorder: None,
+        captions: None,
     })
 }
 

@@ -54,7 +54,8 @@ fn live_call() {
     let engine = Arc::new(|_: &Path, _: Option<&str>, _: &AtomicBool, _: &AtomicU8| -> Result<Transcript, SttError> { Err(SttError::Cancelled) });
     let queue = Arc::new(Queue::start(local.path(), engine, Arc::new(|| Err("live check")), Arc::new(|| None)).unwrap());
     let settings = Box::new(|| Settings { auto: true, microphone: true });
-    let recorder = recorder::start(local.path(), queue, Arc::new(AtomicBool::new(true)), settings, Box::new(|| "ready")).unwrap();
+    let toasts = Arc::new(open_mess::recording::notice::Toasts::new().unwrap());
+    let recorder = recorder::start(local.path(), queue, Arc::new(AtomicBool::new(true)), settings, Box::new(|| "ready"), toasts).unwrap();
 
     wasapi::initialize_mta().ok().unwrap();
     let started = Instant::now();

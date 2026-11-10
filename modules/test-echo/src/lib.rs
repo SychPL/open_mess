@@ -47,6 +47,20 @@
 //! picks the outcome). The others are never exposed: `nudge` writes without naming a conversation,
 //! `Bad-Name` breaks the name rule, `with_account` declares `account`, `loose` takes any property,
 //! and `twin` is declared twice.
+//!
+//! The Teams module's captions tools, faked for the core's captions archive (spec
+//! 2026-11-04-captions-archive): `list_calls` returns what `set-calls` stored for the account
+//! (`{"items"}`, or `{"error"}` to fail); `join_captions` records its arguments (the tool
+//! `captions-log` returns them with the leaves) and starts a session in `{"conversation"}` for
+//! `{"call"}`, live at once, unless `set-join` stored `{"error"}` (the join fails with that text),
+//! `{"state"}` (the session starts in it) or `{"slow": true}` (busy for 1 s first); a session of the
+//! same call going on answers `done`, one of another call in the conversation ends first
+//! (`meeting_ended`). `read_captions` pages a session (by `{"session"}`, else the conversation's
+//! latest) from `{"cursor"}`, 100 cues at most, with `skipped`, and `leave_captions` ends it (`left`). `captions-say`
+//! changes a session: it adds `{"cues"}`, drops the `{"drop"}` oldest, and sets `state`, `reason`,
+//! `captions_on`, `captions_seen`, `threads` and `missed` when given; the session is then found by
+//! each of its `threads` too; with `{"forget": true}` its reads fail, and with `{"fail_reads": n}`
+//! its next n reads. `end-sessions` ends the account's sessions (`update`).
 
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -233,6 +247,26 @@ mod guest {
                 }
             }
             "writes" => json!({ "items": stored("writes").as_array().cloned().unwrap_or_default() }),
+            "list_calls" => {
+                let calls = stored(&format!("calls:{account}"));
+                if let Some(error) = calls.get("error").and_then(Value::as_str) {
+                    return Err(types::ModuleError::Platform(error.to_string()));
+                }
+                json!({ "items": calls.get("items").cloned().unwrap_or_else(|| json!([])) })
+            }
+            "set-calls" => {
+                put(&format!("calls:{account}"), &args)?;
+                json!({})
+            }
+            "set-join" => {
+                put(&format!("join:{account}"), &args)?;
+                json!({})
+            }
+            "join_captions" => captions::join(account, &args)?,
+            "read_captions" => captions::read(account, &args)?,
+            "leave_captions" => captions::leave(account, &args)?,
+            "captions-say" => captions::say(account, &args)?,
+            "captions-log" => json!({ "joins": stored("joins"), "leaves": stored("leaves") }),
             "set-target" => {
                 storage::set(&format!("target:{}", text("conversation")), args_json.as_bytes())
                     .map_err(|_| types::ModuleError::Platform("storage".to_string()))?;
@@ -304,7 +338,20 @@ mod guest {
             description: "Pokes the conversation. It records its arguments as a write.".to_string(),
             ..tool("poke", poke.to_string(), true)
         };
+        let with = |properties: Value, required: &[&str]| {
+            json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}).to_string()
+        };
+        let number = json!({"type": "integer"});
+        let join = with(
+            json!({"conversation": string, "call": string, "language": string, "start_captions": {"type": "boolean"}}),
+            &["conversation", "call"],
+        );
+        let read = with(json!({"conversation": string, "session": string, "cursor": number, "max_bytes": number}), &["conversation"]);
         vec![
+            tool("list_calls", schema(json!({})), false),
+            tool("join_captions", join, true),
+            tool("read_captions", read, false),
+            tool("leave_captions", with(json!({"conversation": string}), &["conversation"]), false),
             tool("peek", peek.clone(), false),
             poke,
             tool("nudge", peek.clone(), true),
@@ -314,6 +361,185 @@ mod guest {
             tool("twin", peek.clone(), false),
             tool("twin", peek, false),
         ]
+    }
+
+    /// Stores `value` as JSON under `key`.
+    fn put(key: &str, value: &Value) -> Result<(), types::ModuleError> {
+        storage::set(key, value.to_string().as_bytes()).map_err(|_| types::ModuleError::Platform("storage".to_string()))
+    }
+
+    /// The fake captions sessions, in storage: `session:<token>`, and the latest of a conversation
+    /// and of a call under `conversation:<account>:<id>` and `call:<account>:<id>`.
+    mod captions {
+        use serde_json::{Value, json};
+
+        use super::bindings::open_mess::module::types;
+        use super::{put, stored};
+
+        /// The most cues of a page.
+        const PAGE: usize = 100;
+
+        fn text<'a>(args: &'a Value, key: &str) -> &'a str {
+            args.get(key).and_then(Value::as_str).unwrap_or_default()
+        }
+
+        fn get<'a>(value: &'a Value, key: &str) -> &'a Value {
+            value.get(key).unwrap_or(&Value::Null)
+        }
+
+        fn set(value: &mut Value, key: &str, to: Value) {
+            if let Some(map) = value.as_object_mut() {
+                map.insert(key.to_string(), to);
+            }
+        }
+
+        fn active(session: &Value) -> bool {
+            matches!(get(session, "state").as_str(), Some("joining" | "live"))
+        }
+
+        fn end(token: &str, reason: &str) -> Result<(), types::ModuleError> {
+            let mut session = stored(&format!("session:{token}"));
+            if active(&session) {
+                set(&mut session, "state", json!("ended"));
+                set(&mut session, "reason", json!(reason));
+                put(&format!("session:{token}"), &session)?;
+            }
+            Ok(())
+        }
+
+        fn push(key: &str, item: Value) -> Result<(), types::ModuleError> {
+            let mut list = stored(key).as_array().cloned().unwrap_or_default();
+            list.push(item);
+            put(key, &Value::from(list))
+        }
+
+        pub fn join(account: &str, args: &Value) -> Result<Value, types::ModuleError> {
+            let (conversation, call) = (text(args, "conversation"), text(args, "call"));
+            if call.is_empty() {
+                return Err(types::ModuleError::InvalidArgs("call is required".to_string()));
+            }
+            push("joins", json!({"account": account, "args": args}))?;
+            let outcome = stored(&format!("join:{account}"));
+            if get(&outcome, "slow") == &json!(true) {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(1) {
+                    std::hint::spin_loop();
+                }
+            }
+            if let Some(error) = get(&outcome, "error").as_str() {
+                return Err(types::ModuleError::Platform(error.to_string()));
+            }
+            let start_captions = args.get("start_captions").and_then(Value::as_bool).unwrap_or(true);
+            if let Some(token) = stored(&format!("call:{account}:{call}")).as_str() {
+                let mut session = stored(&format!("session:{token}"));
+                if active(&session) {
+                    if start_captions {
+                        set(&mut session, "start_captions", json!(true));
+                        put(&format!("session:{token}"), &session)?;
+                    }
+                    return Ok(json!({"state": "done"}));
+                }
+            }
+            if let Some(token) = stored(&format!("conversation:{account}:{conversation}")).as_str() {
+                end(token, "meeting_ended")?;
+            }
+            let count = stored("tokens").as_u64().unwrap_or_default() + 1;
+            put("tokens", &json!(count))?;
+            let token = format!("s{count}");
+            let session = json!({
+                "account": account, "conversation": conversation, "call": call,
+                "state": get(&outcome, "state").as_str().unwrap_or("live"), "reason": null,
+                "captions_on": true, "captions_seen": false, "threads": null, "start_captions": start_captions,
+                "cues": [], "first": 0, "missed": 0,
+            });
+            put(&format!("session:{token}"), &session)?;
+            put(&format!("call:{account}:{call}"), &json!(token))?;
+            put(&format!("conversation:{account}:{conversation}"), &json!(token))?;
+            Ok(json!({"state": "joining"}))
+        }
+
+        fn token(account: &str, args: &Value) -> Option<String> {
+            match args.get("session").and_then(Value::as_str) {
+                Some(token) => Some(token.to_string()),
+                None => stored(&format!("conversation:{account}:{}", text(args, "conversation"))).as_str().map(str::to_string),
+            }
+        }
+
+        pub fn read(account: &str, args: &Value) -> Result<Value, types::ModuleError> {
+            let Some(token) = token(account, args) else {
+                return Ok(json!({"state": "not_joined", "session": null, "next_cursor": 0, "missed": 0, "untrusted": {"cues": []}}));
+            };
+            let mut session = stored(&format!("session:{token}"));
+            if session.is_null() {
+                return Err(types::ModuleError::InvalidArgs("the captions session changed".to_string()));
+            }
+            // Reads that fail for a while, the session going on.
+            let failing = get(&session, "fail_reads").as_u64().unwrap_or_default();
+            if failing > 0 {
+                set(&mut session, "fail_reads", json!(failing - 1));
+                put(&format!("session:{token}"), &session)?;
+                return Err(types::ModuleError::Platform("busy".to_string()));
+            }
+            let first = get(&session, "first").as_u64().unwrap_or_default();
+            let cursor = args.get("cursor").and_then(Value::as_u64);
+            let start = cursor.unwrap_or(0).max(first);
+            let cues: Vec<Value> = get(&session, "cues").as_array().cloned().unwrap_or_default();
+            let page: Vec<Value> = cues.into_iter().skip(usize::try_from(start - first).unwrap_or(usize::MAX)).take(PAGE).collect();
+            let mut result = json!({
+                "state": get(&session, "state"), "session": token, "call": get(&session, "call"),
+                "captions_on": get(&session, "captions_on"), "captions_seen": get(&session, "captions_seen"),
+                "next_cursor": start + page.len() as u64, "missed": get(&session, "missed"),
+                "skipped": cursor.map_or(0, |cursor| first.saturating_sub(cursor)), "reason": get(&session, "reason"),
+                "untrusted": {"cues": page},
+            });
+            if get(&session, "threads").is_array() {
+                set(&mut result, "threads", get(&session, "threads").clone());
+            }
+            Ok(result)
+        }
+
+        pub fn leave(account: &str, args: &Value) -> Result<Value, types::ModuleError> {
+            push("leaves", json!({"account": account, "conversation": text(args, "conversation")}))?;
+            if let Some(token) = token(account, args) {
+                end(&token, "left")?;
+            }
+            Ok(json!({"state": "ended"}))
+        }
+
+        pub fn say(account: &str, args: &Value) -> Result<Value, types::ModuleError> {
+            let Some(token) = token(account, args) else { return Err(types::ModuleError::Platform("no session".to_string())) };
+            let mut session = stored(&format!("session:{token}"));
+            let mut cues = get(&session, "cues").as_array().cloned().unwrap_or_default();
+            cues.extend(args.get("cues").and_then(Value::as_array).cloned().unwrap_or_default());
+            let drop = usize::try_from(args.get("drop").and_then(Value::as_u64).unwrap_or_default()).unwrap_or_default().min(cues.len());
+            cues.drain(..drop);
+            let first = get(&session, "first").as_u64().unwrap_or_default() + drop as u64;
+            set(&mut session, "first", json!(first));
+            set(&mut session, "cues", Value::from(cues));
+            for key in ["state", "reason", "captions_on", "captions_seen", "threads", "missed", "fail_reads"] {
+                if let Some(value) = args.get(key) {
+                    set(&mut session, key, value.clone());
+                }
+            }
+            // A session is found by each of its threads, as by a call that gained a chat.
+            for thread in args.get("threads").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                put(&format!("conversation:{account}:{thread}"), &json!(token))?;
+            }
+            // Forgotten, as by a module that lost track of it: reads of it fail from now on.
+            let forget = args.get("forget") == Some(&json!(true));
+            put(&format!("session:{token}"), if forget { &Value::Null } else { &session })?;
+            Ok(json!({"session": token}))
+        }
+
+        /// The `end-sessions` export: what others see of the account's sessions ends.
+        pub fn end_all(account: &str) {
+            for count in 1..=stored("tokens").as_u64().unwrap_or_default() {
+                let token = format!("s{count}");
+                if get(&stored(&format!("session:{token}")), "account") == &json!(account) {
+                    let _ = end(&token, "update");
+                }
+            }
+        }
     }
 
     /// Appends `account` to the list stored under `key`.
@@ -406,6 +632,7 @@ mod guest {
                     std::hint::spin_loop();
                 }
             }
+            captions::end_all(&account);
             remember("ended", &account);
         }
 

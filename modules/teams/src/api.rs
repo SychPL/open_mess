@@ -16,7 +16,7 @@ use crate::component::bindings::open_mess::module::{http, sign_in, storage};
 use crate::http::HttpRequest;
 use crate::poll;
 use crate::retry::{self, GiveUpReason, Retry};
-use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, MCPS_SCOPE, SEARCH_SCOPE, Session};
+use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, MCPS_SCOPE, RECORDING_SCOPE, SEARCH_SCOPE, Session};
 
 /// The part of the host's call limit (30 s) the module plans with: no wait starts that would end
 /// past it, so a slow service ends a call with an error, not a timeout that unloads the module.
@@ -274,6 +274,23 @@ pub fn conversation(session: &mut Session, req: &HttpRequest, write: bool) -> Re
 /// The IC3 token of Trouter's `user.authenticate`, the chat service's (docs 10.7).
 pub fn chat_token(session: &mut Session) -> Result<String, ModuleError> {
     token(session, CHAT_SCOPE)
+}
+
+/// The token for the calling recording resource the captions bot takes when it is added (docs
+/// 10.8, `initiatorUserToken`).
+pub fn recording_token(session: &mut Session) -> Result<String, ModuleError> {
+    token(session, RECORDING_SCOPE)
+}
+
+/// A command to the captions bot (docs 10.8): the recording resource's token as the bearer and
+/// the skype token. Sent once: a command that fails is tried again later by the session, if at all.
+pub fn bot_command(session: &mut Session, req: &HttpRequest) -> Result<http::Response, ModuleError> {
+    let token = recording_token(session)?;
+    if session.skype(now_ms(), true).is_none() {
+        let authsvc = self::token(session, AUTHSVC_SCOPE)?;
+        reauthorize(session, &authsvc)?;
+    }
+    exchange(&with_skype(session, req)?, Some(&token), false, true)
 }
 
 fn with_skype(session: &Session, req: &HttpRequest) -> Result<HttpRequest, ModuleError> {

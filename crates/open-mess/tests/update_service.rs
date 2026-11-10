@@ -203,6 +203,7 @@ impl Harness {
             update: Some(self.service.clone()),
             models: None,
             recorder: None,
+            captions: None,
         }
     }
 

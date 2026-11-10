@@ -40,6 +40,7 @@ fn state(d: &Daemon) -> UiState {
         update: None,
         models: None,
         recorder: None,
+        captions: None,
     }
 }
 

@@ -862,6 +862,135 @@ note from the step 0b probe (two local `webrtc` 0.14 peers, no Teams involved): 
 reached ICE `connected` and carried framed messages; an offer with an inactive audio transceiver
 stayed in ICE `checking`, so an inactive audio section may need work in the host's WebRTC stack.
 
+### 10.8 Turning captions on, refusals, 1:1 calls (step 0a of the captions archive spec)
+
+**Static analysis, not verified live.** Added 2026-11-05 for step 0a of
+`.specs/2026-11-04-captions-archive.md`, on a newer build than the sections above: package
+`MSTeams_26276.513.5241.9675`, `desktop-assets/hashed-assets` decompressed as described in "Sources
+and method" (ripgrep and bounded reads, no code executed). Chunks: calling core
+`383696-2098d8e277f05e1b.js` (8.9 MB), `calling-pluginless-acd72efe322640b8.js`,
+`calling-electron-80165cea3c2be944.js`, `calling-app-bba740373c983e13.js`,
+`r_data-client-calling-8f185bb5207d976d.js`, `config-prod-381bbe721fce0ca0.js`, config getters
+`166144-caf8b23f3035d73d.js`, header constants `560441-7a93a69d122e7781.js`,
+`services-live-meeting-status-bar-1c9c3116643010dd.js`.
+
+Turning captions on:
+- **CONFIRMED** the GraphQL `startClosedCaptions` resolver (`r_data-client-calling`) sends nothing; it
+  calls the call model's `startClosedCaption` (`383696`, captions mixin). With the bot in the call and
+  its `closedCaptions` mode not `Active` it sends the bot a start command; without the bot it sets
+  `pendingInviteBot` and, once the call is connected, `addBotParticipant()`. When the bot joins later
+  without the mode active, the initiator sends the start command (`PENDING_ON_BOT_JOIN`).
+- **CONFIRMED** `addBotParticipant()` adds the combined recording/transcription bot when
+  `isCombinedBotEnabled()` (`addCombinedRecorderBot`, mode `RecordingAndTranscription`, owner
+  `CombinedClosedCaptions`), else `addParticipant(getBotDefaultMRI(), ...)`. `config-prod` sets
+  `enableCombinedRecordingBot` and `enableCombinedRecordingBotForCCBackedScenario` to true, so with the
+  shipped defaults the combined bot is added. **UNCONFIRMED** whether ECS overrides them at run time.
+- **CONFIRMED** bot MRIs come from `config-prod` by call region (`getCurrentRegionBotMri`): the
+  captions-only bot (`closedCaptionsBotToRegion`) `28:b1902c3e-b9f7-4650-9b23-5772bd429747`, the
+  combined/recording bot (`recordingBotMriToRegion`) `28:bdd75849-e0a6-4cce-8fc1-d7c0d4da43e5`;
+  fallbacks `callingConstants.callRecording.closedCaptionsBotMri` and `.recordingBotMri`. Both are
+  Microsoft service identities, not user data.
+- **CONFIRMED** adding the bot (`calling-pluginless`, `addParticipantsToCall`): `POST` to the
+  conversation's `links.addParticipantAndModality` when a thread is known, else `links.addParticipant`;
+  body (no `payload` envelope) `disableUnmute`, `participants.from {id, displayName, endpointId,
+  participantId, languageId}`, `participants.to [{id, assertedId, displayName, participantId}]`,
+  `participantInvitationData`, `replacementDetails`, `groupContext {id} | null`, `groupChat {threadId,
+  messageId} | null`, `links {addParticipantSuccess, addParticipantFailure}`.
+  `participantInvitationData` is `{botData: {meetingTitle, clientInfo: "Teams-<ring>", callId, threadId,
+  recorderFeatures, mode, iCalUid, consumerType, spokenLanguage, correlationId, initiatorUserToken,
+  exchangeId, meetingOrganizer, language?}}` (`createBotPayload`, `383696`); `initiatorUserToken` is an
+  AAD token carried in the body. On the desktop the same data goes to the native `addParticipantToCall`
+  (**UNCONFIRMED** which link the native stack uses).
+- **CONFIRMED** the start command (`CallingBotRestClient.sendCommand`, `383696`): `POST` to the bot's
+  roster `endpointMetadata.commandUrl`, body `{timestamp, participantMri, participantLegId, action:
+  "start", mode: "transcription", processingModes: ["closedCaptions"], actionParameters: undefined,
+  participantSkypeToken: ""}` - no language. Headers `Content-Type: application/json`, `requestId`
+  (UUID), `X-Microsoft-Skype-Chain-ID` (call id), `Authorization: Bearer <AAD>`, `X-Skypetoken`; when
+  the AAD token fails the skype token is used as the bearer.
+- **CONFIRMED** the AAD token's resource is `4580fd1d-e5a3-4f56-9ad1-aab0e3bf8f76`
+  (`callingConstants.callRecording.resource`, `config-prod`; getter in `166144`), from the normal token
+  provider.
+- **CONFIRMED** spoken language: only `botData.spokenLanguage` is sent, from
+  `getClosedCaptionsLanguage()` - the bot's `endpointMetadata.spokenLanguage`, or a language the user
+  picked before the bot was there, `""` by default; `botData.language` only when the meeting has
+  `allowTranscription`. The start command carries none. **UNCONFIRMED** the service default for `""`
+  (section 10.4 says `en-us`) and whether a `spokenLanguage` given when adding the bot shows the
+  "Meeting language was changed" notice.
+- **CONFIRMED** what others get in data: the bot as a `28:` roster participant, and the initiator's own
+  `endpointMetadata.transcriptionPrefs.closedCaptions` written through `updateEndpointMetadata`; no code
+  reading the latter was found. **UNCONFIRMED** any toast for others (the strings use hashed keys).
+
+Join refusals:
+- **CONFIRMED** end-screen rules (`calling-app`) match `callEndDiagnosticsInfo.callControllerCode` and
+  `callControllerSubCode`: end-to-end encrypted meeting, single device limit = 403 / 4158 (with
+  `call.encryptionDetails.e2eeEnabled`); unsupported client 403 / 6150; media failure 410 / 301999 or
+  463; meeting full 413 when E2EE. 410 / 301999 also ended the probe's legs with
+  `InvalidFinalAnswerMediaDescriptions` ("Live results"), so it means E2EE only with the flag.
+- **CONFIRMED** lobby (`calling-pluginless`): `callAcceptance.controllerName == "lobby"`
+  (`applyLobbyStateIfNeeded`), a roster endpoint with a `lobby` object instead of `call`; endings code 0
+  with subCode 5854 (denied in lobby) or 5855 (timed out), 413 / 5807 (lobby full), 403 / 5354.
+- **CONFIRMED** policy refusals (`calling-pluginless`, table `sr`): 403 with subCode 5448
+  (`PolicyRestriction`), 5723, 5724, 5810 (information barrier), 10005, 10193; 412 / 5204
+  (`InsufficientCapabilities`).
+- **CONFIRMED** captions policy is checked by the client, not by the join: `liveCaptionsEnabledType !==
+  "Disabled"` from the meeting policy settings, the meeting's
+  `meetingDetails.meetingCapability.allowTranscription`; bot failures in
+  `endpointMetadata.runtimeErrors[].errorCode` (`TranscriptRecognitionSessionError` for captions).
+
+1:1 calls and escalation:
+- **CONFIRMED** 1:1 calls are in the user's call store, told apart by shape (`383696` `isOneToOneCall`,
+  and the status bar's "Invalid groupContext - OneToOneCall"): `correlationId`,
+  `conversationController`, `participants[]` (MRIs), `additionalData.participantList[{id,
+  endpointType}]`, `userJoinTime`, optional `paActiveCallDetails`, and no `groupContext`. The item of
+  "Live results" 11 had this key set, so it was most likely a 1:1 call, not a scheduled meeting.
+  Live ("Live results" 20): confirmed, with `participants` as plain MRI strings.
+- **CONFIRMED** an item without `groupContext` is a 1:1 call whose chat the client finds from
+  `participants` (`getConversationWithV2`, `handleRegularCallBanner`).
+- **CONFIRMED** adding a person to a 1:1 call keeps the same call (`handleCallEscalation`): the client
+  finds or creates the group chat of the new member set and calls `addParticipant` on the same call
+  with that `threadId` through `addParticipantAndModality`; the call store then reports the same
+  `correlationId` with a `groupContext` (`isEscalatedToGroupCall`). With
+  `enableDecouplingCallEscalationFromThreadId` the thread may be empty. Live ("Live results" 20): the
+  same `correlationId` and `/conv/<id>`, a `@thread.v2` `groupContext`, and `userJoinTime` turns
+  `null`.
+- **CONFIRMED** a second endpoint of the same user can join a 1:1 call (companion banner: `callInfo
+  {callId: correlationId, callUrl: conversationController}`, join with `conversationUrl` and
+  `conversationId`); the media peer type becomes `EnterpriseMultiParty` instead of
+  `EnterpriseTwoPartyOnlineOnly`, without a thread. **UNCONFIRMED** whether the other party notices the
+  media change.
+
+Call store fields:
+- **CONFIRMED** `correlationId` is the call's id, one per call and shared by the user's endpoints
+  (`getCallId`; passed as `conversationId` into the join; equal to the awareness property's
+  `conversationId`; sent as `X-Microsoft-Skype-Chain-ID`). Push events 115 and 116 carry items of the
+  same shape.
+- **UNCONFIRMED** `userJoinTime` format: only passed through (`callStartTime: userJoinTime`, a GraphQL
+  String). Live ("Live results" 20): an RFC 3339 UTC string with a 6- or 7-digit fraction, `null`
+  after an escalation; whether it changes on a rejoin is unconfirmed.
+- **CONFIRMED** the conversation resource carries the thread in `activeModalities.groupChat {groupId,
+  threadId, messageId, backroomThreadId, streamThreadId, lobbyThreadId}` with `state.conversationType`
+  and `state.isMultiParty` (`calling-pluginless`, `updateGroupChatIds`).
+
+Roster endpoints:
+- **CONFIRMED** `endpoints` is keyed by endpoint id; each has `call {mediaStreams, ...}` or
+  `lobby {mediaStreams}`, `endpointCapabilities`, `participantId`, `clientVersion`, `endpointMetadata`,
+  `endpointType`, `deviceType` and others (`fromRosterEndpoints`); every `mediaStreams[]` item has
+  `type` (`audio`, `audio-teleconferencing`, `video`, `applicationsharing-video`, `data`), `sourceId`,
+  `direction`, `serverMuted`. A data-only leg should have only a `data` stream, while a muted official
+  client still has `audio`. Live ("Live results" 20): the official client has `audio`, `video`,
+  `applicationsharing-video` and `data`; the data-only leg is still **UNCONFIRMED**.
+- **CONFIRMED** `updateEndpointMetadata` is a `PUT` to `links.updateEndpointMetadata` with
+  `{participants: {from: {...}}, endpointMetadata: <object>}`; every endpoint's metadata is in
+  everyone's roster, so a custom marker would reach all participants.
+
+Reading a call without joining:
+- **CONFIRMED** the JS stack never `GET`s a running call's conversation resource: before joining it
+  uses the call store, the thread property `awareness_conversationLiveState`, and a roster-only join
+  (`JoinConversationWithoutCallModality` with `subscribe: true`; `joinOneToOneCallWithoutModality` for
+  shared-line calls). The probe's `GET` of the conversation URL ("Live results" 13) is therefore not
+  client behaviour. **UNCONFIRMED** what native SlimCore does. Live ("Live results" 20): three such
+  reads, one per new or changed store item, all HTTP 200 and not throttled.
+
 ## 11. Local recording (Windows audio)
 
 Added 2026-10-29 for `.specs/2026-10-28-local-transcription.md` (step 0). Nothing here comes from
@@ -1252,6 +1381,9 @@ token, tenant id, user id or account name.
       meeting's `19:meeting_...` thread, so the call store says that the user is in a call, not in
       which meeting: the live captions spec can check "in a call" before joining, and "in this
       meeting" only from the roster after joining (spec 4.1, second path). The store may lag a join.
+      Note 2026-11-05 (10.8): this key set - no `groupContext`, no `meetingInfo`, two participants -
+      is the shape the client takes for a 1:1 call (`isOneToOneCall`); whether the owner's call at that
+      moment was the meeting or a 1:1 call is not known.
     - `GET https://teams.microsoft.com/trap/tokens` with `X-Skypetoken` and `api-version: 2`: HTTP 200,
       top keys `expires` (a number) and `tokens` (one entry, its `realm` a quoted string as 10.7 says).
 
@@ -1372,7 +1504,7 @@ token, tenant id, user id or account name.
     - Call store: the items now have the keys `conversationController`, `correlationId`,
       `groupContext` (`messageId`, `threadId`), `meetingInfo` (`organizerId`, `tenantId`) and
       `userJoinTime`, and `groupContext.threadId` is the chat thread of the call - unlike item 11,
-      where no field held the thread (that was a scheduled meeting; these were a "Meet now" meeting
+      where no field held the thread (taken then for a scheduled meeting, but see the note at item 11; these were a "Meet now" meeting
       and a group chat call). The owner was in 2, then 3 calls at once.
     - The thread property `awareness_conversationLiveState:<n>` was missing on the owner's own
       "Meet now" chat although he was still in that call, so it is not a reliable "call is live"
@@ -1677,8 +1809,8 @@ token, tenant id, user id or account name.
       `conversationController` was the same URL as the `conversationUrl` of the chat's
       `awareness_conversationLiveState` (an https URL on `api.flightproxy.teams.microsoft.com`). A
       `GET` of that URL returns the conversation with the `roster` and `links` (`leave`,
-      `notificationLinks` among them). Item 11 found no `groupContext` on a scheduled meeting on
-      2026-10-29; what differed then is not known.
+      `notificationLinks` among them). Item 11 found no `groupContext` on 2026-10-29 while the
+      owner was in a scheduled meeting; 10.8 reads that item's shape as a 1:1 call (note at item 11).
     - **Join at the call store's URL, callbacks answered late**: HTTP 200 in 0.35-1.4 s; no callback
       was answered while the `POST` was open, and the acceptance with the SDP answer came after it.
       Offer audio `sendonly` with no track plus the data section: the data channel opened, 183
@@ -1744,6 +1876,73 @@ token, tenant id, user id or account name.
       session or after it, and did not show them twice in the roster; the other people, asked by the
       owner, noticed nothing worth mentioning.
 
-All checks in items 1-4 and 7-12 were read-only: no endpoint registration, no property write, no Trouter
+20. **Step 0b of the captions archive spec, series 1: three calls read from the call store**
+    (2026-11-09, the owner's OK in chat, the owner in the official client). The scratch probe
+    (`archiveprobe`, not in the repo) read the call store every 20 s for 72 minutes. For each new or
+    changed item it read the call's conversation once with `GET <conversationController>`. It made
+    no join, no endpoint registration, no Trouter connection and no write, and printed only key
+    names, counts, enum values, booleans and per-run salted tags (equal tags mean equal values).
+    It saw three calls: a 1:1 call, the same call after the owner added a person, and a scheduled
+    meeting.
+    - **A 1:1 call item** has keys `additionalData`, `conversationController`, `correlationId`,
+      `participants` and `userJoinTime`, and no `groupContext`, `meetingInfo` or
+      `paActiveCallDetails`. `participants` holds 2 plain MRI strings, both `8:orgid:`, one of
+      them the owner. `additionalData.participantList` has 2 entries, each with `endpointType`
+      `null`. This is the shape 10.8 read from `isOneToOneCall`, and the shape of item 11.
+    - **Escalation**. About 190 s after the 1:1 call showed up, the owner added a third person:
+      - The tags of `correlationId` and of the `/conv/<id>` in `conversationController` stayed
+        the same.
+      - `groupContext` appeared, with a `@thread.v2` group thread and a one-digit `messageId`.
+      - `meetingInfo` appeared, with `organizerId` and `tenantId`.
+      - `userJoinTime` turned `null`.
+      - `participants` and the roster still held only the first two people at that read (the
+        added person had not joined yet, or the item does not follow).
+      - In the conversation, `state.conversationType` went from `null` to `groupCall`, while
+        `isMultiParty` was true both times (the bot was already in the call).
+      - `activeModalities.groupChat` went from absent to `{messageId, threadId}`, with the same
+        thread as the store's `groupContext.threadId`.
+      - `meetingDetails.meetingCapability.allowTranscription` went from `null` to `true`.
+    - **A scheduled meeting item** has keys `conversationController`, `correlationId`,
+      `groupContext` (a `19:meeting_` thread), `meetingInfo` and `userJoinTime`, and no
+      `participants` or `additionalData`. Its `state.conversationType` is `scheduledMeeting`, and
+      its `activeModalities` also has `lobby`.
+    - **Ids**: `correlationId` is a GUID (36 hex digits and dashes) in every item, and different
+      for the meeting. The `/conv/<id>` of `conversationController` is 22 letters, digits and
+      dashes, and did not change across the escalation. Both fit `^[A-Za-z0-9-]{1,64}$`.
+    - **`userJoinTime`** is an RFC 3339 UTC string with a fraction of 6 or 7 digits: 27 or 28
+      characters, with `T`, `.` and `Z` and no offset. It is `null` after an escalation. Whether it
+      changes when the owner leaves and rejoins did not come up.
+    - **The captions bot**. In all three calls the combined bot (`28:bdd75849-...`, 10.8) was in the
+      roster with captions on, turned on in the official clients (the probe sent nothing). The
+      captions-only bot never appeared. The bot's endpoint:
+      - `mediaStreams` are `audio/recvonly`, `video/recvonly`, `applicationsharing-video/recvonly`
+        and `data/sendrecv`.
+      - `endpointMetadata` has the keys `__platform`, `commandUrl`, `joinTime`, `processingModes`,
+        `product`, `runtimeErrors`, `spokenLanguage`, `textTracks` and `tobeObfuscated`.
+      - `commandUrl` is on `api.flightproxy.teams.microsoft.com`.
+      - `processingModes` has `closedCaptions`, `copilot`, `ephemeralTranscript`, `faceStream`,
+        `realTimeTranscript` and `recording`, each with a `state`.
+      - In the 1:1 call only `closedCaptions` was `Active` (`recording` was `Inactive`), and the
+        language was `pl-pl`. In the meeting both `closedCaptions` and `realTimeTranscript` were
+        `Active`, and the language was `en-us`.
+
+      So a 1:1 call gets the same bot and captions as a meeting.
+    - **Another `28:` participant** was in the meeting: one endpoint with only an `audio/sendrecv`
+      stream and no `endpointMetadata`, so not a captions bot. The captions bot is told apart by
+      its MRI, not by the `28:` prefix.
+    - **The owner's endpoint** (the official client) has `mediaStreams` `audio/sendrecv`,
+      `video/recvonly`, `applicationsharing-video` (`recvonly`, or `sendonly` while sharing the
+      screen) and `data/sendrecv`. Its `endpointMetadata` keys are `holographicCapabilities` and
+      `transcriptionPrefs`. Whether the owner was muted was not noted.
+    - **No E2EE markers** (`e2eeEnabled`, `encryptionDetails`) appeared in any of the three
+      conversations.
+    - **No throttling**: all 204 store reads and 3 conversation reads returned HTTP 200, with no
+      `Retry-After`.
+    - **No stale items**. Between two reads the meeting's item replaced the 1:1 call's item. The
+      meeting's item was gone about 2 minutes after it showed up. There was no stale item like
+      item 11's, so no conversation was read after the owner had left while the item was still in
+      the store.
+
+All checks in items 1-4, 7-12 and 20 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
 status codes, key names, counts, enum values, scope names and service URLs.

@@ -147,7 +147,10 @@ pub fn run() -> Result<(), Error> {
         runtime.block_on(until_stopped(ended, exit));
     }
     // Before the modules go with the process: what others see of their sessions ends (spec
-    // 2026-10-29-live-captions, 4.3).
+    // 2026-10-29-live-captions, 4.3), and no join, the captions archive's either, gets in after it
+    // (spec 2026-11-04-captions-archive, 4.4).
+    let _block = accounts.module_writes().block();
+    runtime.block_on(accounts.module_writes().finished());
     runtime.block_on(accounts.end_sessions(&accounts.modules().handles()));
     let _ = stop.send(());
     runtime.block_on(server).map_err(|err| Error::Io(std::io::Error::other(err)))?
@@ -269,8 +272,33 @@ fn start(
         Some(Arc::new(crate::recording::model::Models::new(&paths.local, base, runtime.handle().clone())))
     });
     let recorder = recorder(&update, registry.queue(), Arc::clone(registry.ui_ready()), &accounts, models.as_ref());
+    let captions = recorder.as_ref().zip(update.as_ref()).map(|((_, toasts), (paths, _))| {
+        use crate::recording::captions::{Archiver, Setup};
+        // Inside the runtime: a toast's "Zatrzymaj" runs there.
+        let _entered = runtime.enter();
+        let free = paths.local.clone();
+        let archiver = Archiver::new(
+            crate::recording::Recordings::new(&paths.local),
+            Setup {
+                accounts: Arc::clone(&accounts),
+                gate: registry.gate().clone(),
+                probation: pending.probation().clone(),
+                ui_ready: Arc::clone(registry.ui_ready()),
+                notices: toasts.clone(),
+                free_disk: Box::new(move || crate::recording::recorder::free_disk(&free)),
+                threads: Arc::clone(registry.threads()),
+            },
+        );
+        attach_archiver(toasts, &archiver);
+        runtime.spawn(Arc::clone(&archiver).run());
+        archiver
+    });
+    let recorder = recorder.map(|(recorder, _)| recorder);
     if let Some(recorder) = &recorder {
         registry.set_recorder(Arc::clone(recorder));
+    }
+    if let Some(archiver) = &captions {
+        registry.set_archiver(Arc::clone(archiver));
     }
     let activity = Arc::new(triggers::Activity::default());
     if probation {
@@ -355,11 +383,27 @@ fn start(
         update,
         models,
         recorder,
+        captions,
     };
     Ok((runtime, listener, registry, ui, admin_token))
 }
 
-/// The recorder of the calls, where they are recorded (Windows, spec 2026-10-28-local-transcription).
+/// What the recording's toasts show and stop: on Windows the toasts, elsewhere nothing.
+#[cfg(windows)]
+type Toasts = Arc<crate::recording::notice::Toasts>;
+#[cfg(not(windows))]
+type Toasts = Arc<dyn crate::recording::captions::Notices>;
+
+#[cfg(windows)]
+fn attach_archiver(toasts: &Toasts, archiver: &Arc<crate::recording::captions::Archiver>) {
+    toasts.attach_archiver(archiver);
+}
+
+#[cfg(not(windows))]
+fn attach_archiver(_toasts: &Toasts, _archiver: &Arc<crate::recording::captions::Archiver>) {}
+
+/// The recorder of the calls and its toasts, where they are recorded (Windows, spec
+/// 2026-10-28-local-transcription); the captions archive shows its toasts with them.
 #[cfg(windows)]
 fn recorder(
     update: &Option<Update>,
@@ -367,7 +411,7 @@ fn recorder(
     ui_ready: Arc<std::sync::atomic::AtomicBool>,
     accounts: &Arc<Accounts>,
     models: Option<&Arc<crate::recording::model::Models>>,
-) -> Option<Arc<crate::recording::recorder::Recorder>> {
+) -> Option<(Arc<crate::recording::recorder::Recorder>, Toasts)> {
     use crate::recording::model::Download;
     use crate::recording::recorder::{self, Settings};
     let ((paths, _), queue, models) = (update.as_ref()?, queue?, Arc::clone(models?));
@@ -387,7 +431,9 @@ fn recorder(
         }
     });
     // ponytail: a recorder whose threads cannot start records nothing; reported once a log sink exists.
-    recorder::start(&paths.local, queue, ui_ready, settings, model).ok()
+    let toasts = Arc::new(crate::recording::notice::Toasts::new().ok()?);
+    let recorder = recorder::start(&paths.local, queue, ui_ready, settings, model, Arc::clone(&toasts)).ok()?;
+    Some((recorder, toasts))
 }
 
 #[cfg(not(windows))]
@@ -397,7 +443,7 @@ fn recorder(
     _ui_ready: Arc<std::sync::atomic::AtomicBool>,
     _accounts: &Arc<Accounts>,
     _models: Option<&Arc<crate::recording::model::Models>>,
-) -> Option<Arc<crate::recording::recorder::Recorder>> {
+) -> Option<(Arc<crate::recording::recorder::Recorder>, Toasts)> {
     None
 }
 

@@ -2,8 +2,10 @@
 //! in; its tools and events go to that module only. Account ids are `<module>:<module_account>`,
 //! where `module_account` is the module's own id for it.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use keyring_core::api::CredentialStore;
 use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, ModuleHandle, SessionState};
@@ -73,7 +75,13 @@ pub struct Accounts {
     module_writes: ModuleWrites,
     /// Held for a whole scan of the modules folder: scans run one after the other.
     scans: tokio::sync::Mutex<()>,
+    /// Runs before the modules end their sessions: the captions archive's last read (spec
+    /// 2026-11-04-captions-archive, 4.4).
+    before_end: OnceLock<BeforeEnd>,
 }
+
+/// What runs before the modules in its argument end their sessions.
+pub type BeforeEnd = Box<dyn Fn(Vec<ModuleHandle>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// The block on the modules' write tools (spec 2026-10-29-live-captions, 4.3). While an update's
 /// phase A or a scan of the modules folder holds one, no module write tool makes an action and no
@@ -153,7 +161,13 @@ impl Accounts {
             attachments: Mutex::new(()),
             module_writes: ModuleWrites::default(),
             scans: tokio::sync::Mutex::new(()),
+            before_end: OnceLock::new(),
         }
+    }
+
+    /// Sets what runs before every end of the modules' sessions; once.
+    pub fn before_end_sessions(&self, hook: BeforeEnd) {
+        let _ = self.before_end.set(hook);
     }
 
     /// The block on the modules' write tools.
@@ -374,8 +388,12 @@ impl Accounts {
     /// Asks each module to end now what other people see of its accounts' sessions (live
     /// captions): `end-sessions` for every account of the module, one at a time, each limited by
     /// the host (spec 2026-10-29-live-captions, 4.3). Before the daemon stops, an update pauses the
-    /// modules' events, or a scan drops a module. A module that fails is passed over.
+    /// modules' events, or a scan drops a module. A module that fails is passed over. The captions
+    /// archive reads its sessions first (spec 2026-11-04-captions-archive, 4.4).
     pub async fn end_sessions(&self, handles: &[ModuleHandle]) {
+        if let Some(hook) = self.before_end.get() {
+            hook(handles.to_vec()).await;
+        }
         let Ok(accounts) = self.list() else { return };
         for handle in handles {
             let Ok(manifest) = handle.manifest() else { continue };

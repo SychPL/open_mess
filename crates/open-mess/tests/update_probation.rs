@@ -666,6 +666,7 @@ fn ui_state(d: &common::Daemon) -> UiState {
         update: None,
         models: None,
         recorder: None,
+        captions: None,
     }
 }
 

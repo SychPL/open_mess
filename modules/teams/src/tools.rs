@@ -44,6 +44,7 @@ pub fn call(account: &str, tool: &str, args_json: &str) -> Result<String, Module
         "react" => react,
         "list_meetings" => list_meetings,
         "get_transcript" => get_transcript,
+        "list_calls" => crate::live::list_calls,
         "join_captions" => crate::live::join,
         "read_captions" => crate::live::read,
         "leave_captions" => crate::live::leave,
@@ -557,9 +558,10 @@ pub fn get_attachment(account: &str, conversation: &str, message: &str, attachme
 
 /// The 1:1 chat with the person whose object id is `other`, if there is one. Its id joins both
 /// object ids in an order not settled yet ("Live results" 5), so both orders are looked up; a chat
-/// is never created. Only `list_conversations` uses it: the id it returns is what the core's
-/// per-conversation permissions apply to, so a person's id never stands in for a conversation.
-fn one_to_one(session: &mut Session, other: &str) -> Result<Option<Conversation>, ModuleError> {
+/// is never created. `list_conversations` and `teams_list_calls` use it: the id it returns is what
+/// the core's per-conversation permissions apply to, so a person's id never stands in for a
+/// conversation.
+pub(crate) fn one_to_one(session: &mut Session, other: &str) -> Result<Option<Conversation>, ModuleError> {
     if other.is_empty() || !other.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         return Err(ModuleError::InvalidArgs("not a person's id".to_string()));
     }
@@ -645,9 +647,13 @@ fn react(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
 }
 
 /// What a write in `conversation` is about (spec 8.6): its title, its members (none for a
-/// channel, which is the target itself) and the text of `message`. Reads only.
+/// channel, which is the target itself) and the text of `message`; for a call without a chat,
+/// `call:<id>`, the call itself (spec 2026-11-04-captions-archive, 4.3). Reads only.
 pub fn describe_target(account: &str, conversation: &str, message: Option<&str>) -> Result<Target, ModuleError> {
     let conversation = conversation_id(conversation)?;
+    if let Some(call) = conversation.strip_prefix("call:") {
+        return api::with_session(account, |session| crate::live::describe_call(session, call));
+    }
     api::with_session(account, |session| {
         let request = chat::one_conversation(&session.directory, conversation);
         let c = chat::decode_conversation(&api::read(session, Service::Chat, &request)?).map_err(api::proto)?;
