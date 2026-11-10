@@ -12,6 +12,7 @@ use keyring_core::api::CredentialStore;
 use open_mess::accounts::Accounts;
 use open_mess::i18n;
 use open_mess::modules::{self, Modules};
+use open_mess::recording::Recordings;
 use open_mess::store::Store;
 use open_mess::tools::Registry;
 use open_mess::ui::sign_in::SignIns;
@@ -161,7 +162,8 @@ pub async fn daemon_in(files: &[(&str, &str)], language: &str) -> Daemon {
     let accounts = accounts(dir.path(), modules, Arc::clone(&credentials));
     let page_accounts = Arc::clone(&accounts);
     tokio::spawn(sign_ins.clone().forward(requests, move |request| sign_in_page::page_allowed(&page_accounts, request)));
-    let registry = Registry::new(Instant::now(), Arc::clone(&accounts));
+    let mut registry = Registry::new(Instant::now(), Arc::clone(&accounts));
+    registry.set_recordings(Recordings::new(&dir.path().join("local")), None);
     Daemon { dir, accounts, registry, events, credentials, sign_ins }
 }
 

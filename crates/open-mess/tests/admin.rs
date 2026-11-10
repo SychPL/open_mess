@@ -38,6 +38,8 @@ fn state(d: &Daemon) -> UiState {
         exit: Arc::default(),
         probation: d.registry.pending().unwrap().probation().clone(),
         update: None,
+        models: None,
+        recorder: None,
     }
 }
 

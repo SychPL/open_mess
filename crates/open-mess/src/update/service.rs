@@ -439,6 +439,7 @@ impl UpdateService {
                 && activity.runs.running() + activity.runs.queued() == 0
                 && activity.triggers.open_batches.load(Ordering::SeqCst) == 0
                 && activity.triggers.delivering.load(Ordering::SeqCst) == 0
+                && !activity.recording.recording()
         };
         self.auto_install_due() && quiet() && self.start_install(true, None).is_ok()
     }
@@ -448,6 +449,9 @@ impl UpdateService {
         let setup = &self.0.setup;
         self.installable()?;
         self.not_held()?;
+        if setup.activity.recording.recording() {
+            return Err(i18n::pick("aktualizacja po końcu nagrania", "the update waits for the call to end").into());
+        }
         let auto = auto || self.auto_install();
         let ready = {
             let mut shared = self.shared();
@@ -497,25 +501,27 @@ impl UpdateService {
         setup.accounts.end_sessions(&activity.modules).await;
         let cancel = self.0.cancel.subscribe();
         // Both phases resume everything themselves when cancelled.
-        if finish_work(&activity, &cancel).await.is_err() {
-            return self.back_to_ready();
+        if let Err(stop) = finish_work(&activity, &cancel).await {
+            return self.stopped(stop.by_recording);
         }
         self.set_state(UpdateState::Phase(Phase::B));
-        if switch(&activity, &cancel).await.is_err() {
-            return self.back_to_ready();
+        if let Err(stop) = switch(&activity, &cancel).await {
+            return self.stopped(stop.by_recording);
         }
-        // Under the lock a cancel takes: one that came after phase B looked is not lost.
-        let launching = {
+        // Under the lock a cancel takes: one that came after phase B looked is not lost. From here
+        // no recording starts (spec 2026-10-28-local-transcription, 4.1).
+        let (launching, cancelled) = {
             let mut shared = self.shared();
-            let go = !*cancel.borrow();
+            let cancelled = *cancel.borrow();
+            let go = !cancelled && activity.recording.start_handover();
             if go {
                 shared.state = UpdateState::Phase(Phase::Launching);
             }
-            go
+            (go, cancelled)
         };
         if !launching {
             resume(&activity).await;
-            return self.back_to_ready();
+            return self.stopped(!cancelled);
         }
         let active = setup.accounts.modules().list().into_iter().filter(|info| info.state == ModuleState::Active).map(|info| info.name).collect();
         // The consent's 10 minutes start now, not at the click (spec 6).
@@ -529,11 +535,23 @@ impl UpdateService {
             // The daemon ends too; the recovery at its next start deals with the stage file.
             Err(err @ UpdateError::StageFileLeft(_)) => self.set_state(UpdateState::Error(err.to_string())),
             Err(err) => {
+                activity.recording.end_handover();
                 resume(&activity).await;
                 state::record_result(&setup.paths, &Outcome::Aborted(err.to_string()));
                 self.back_to_ready();
             }
         }
+    }
+
+    /// Phase A or B stopped: by the user, or by a call recorded meanwhile (spec
+    /// 2026-10-28-local-transcription, 4.8). Then the window says why, and installing on its own
+    /// may start the same release again once the call is over.
+    fn stopped(&self, by_recording: bool) {
+        if by_recording {
+            self.shared().auto_started = None;
+            state::record_result(&self.0.setup.paths, &Outcome::Aborted("a call is being recorded".into()));
+        }
+        self.back_to_ready();
     }
 
     /// The installation stopped and the release is ready again; installing on its own may now be due.

@@ -15,6 +15,7 @@ pub mod modules;
 pub mod paths;
 pub mod pending;
 pub mod permissions;
+pub mod recording;
 pub mod secrets;
 pub mod store;
 pub mod tools;

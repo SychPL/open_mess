@@ -35,9 +35,16 @@ impl Source {
         })
     }
 
+    /// An entry `*.example.com` allows every host under `example.com`, not `example.com` itself.
     fn allows(&self, url: &Url) -> bool {
         let scheme_ok = if self.https_only { url.scheme() == "https" } else { matches!(url.scheme(), "http" | "https") };
-        scheme_ok && url.host_str().is_some_and(|host| self.allowed_hosts.iter().any(|allowed| allowed == host))
+        let host_ok = |host: &str| {
+            self.allowed_hosts.iter().any(|allowed| match allowed.strip_prefix('*') {
+                Some(suffix) => suffix.starts_with('.') && host.len() > suffix.len() && host.ends_with(suffix),
+                None => allowed == host,
+            })
+        };
+        scheme_ok && url.host_str().is_some_and(host_ok)
     }
 }
 
@@ -225,34 +232,71 @@ async fn download_into(client: &reqwest::Client, candidate: &Candidate, public_k
         return Err(UpdateError::Rejected(format!("manifest is for {}, the release tag for {}", manifest.version, candidate.version)));
     }
     for file in &manifest.files {
-        let mut response = get(client, asset_url(candidate, &file.name)?, asset_deadline(file.size)).await?;
-        let part = dir.join(format!("{}.part", file.name));
-        let mut out = std::fs::File::create(&part)?;
-        let (mut hasher, mut size) = (Sha256::new(), 0u64);
-        while let Some(chunk) = response.chunk().await.map_err(network)? {
-            size = size.saturating_add(chunk.len() as u64);
-            if size > file.size {
-                return Err(UpdateError::Rejected(format!("{} is larger than the manifest says", file.name)));
-            }
-            hasher.update(&chunk);
-            out.write_all(&chunk)?;
-        }
-        out.flush()?;
-        drop(out);
-        let sum: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
-        if size != file.size || sum != file.sha256 {
-            return Err(UpdateError::Rejected(format!("{} does not match the manifest", file.name)));
-        }
-        std::fs::rename(&part, dir.join(&file.name))?;
+        let url = asset_url(candidate, &file.name)?;
+        download_file(client, url, &dir.join(&file.name), file.size, &file.sha256, asset_deadline(file.size), &|_| {}).await?;
     }
     std::fs::write(dir.join("manifest.json"), &manifest_bytes)?;
     std::fs::write(dir.join("manifest.json.minisig"), signature)?;
     Ok(Downloaded { version: candidate.version, manifest_sha256: manifest_sha256(&manifest_bytes), dir: dir.to_path_buf() })
 }
 
+/// Downloads `url` to `path` through `<path>.part`: exactly `size` bytes whose SHA-256 is `sha256`,
+/// within `deadline`, or an error. `progress` hears the bytes so far. Only a whole, matching file is
+/// renamed into place; the caller removes a failed `.part` with its folder.
+pub async fn download_file(
+    client: &reqwest::Client,
+    url: &Url,
+    path: &Path,
+    size: u64,
+    sha256: &str,
+    deadline: Duration,
+    progress: &(dyn Fn(u64) + Send + Sync),
+) -> Result<(), UpdateError> {
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut response = get(client, url, deadline).await?;
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let mut out = std::fs::File::create(&part)?;
+    let (mut hasher, mut done) = (Sha256::new(), 0u64);
+    while let Some(chunk) = response.chunk().await.map_err(network)? {
+        done = done.saturating_add(chunk.len() as u64);
+        if done > size {
+            return Err(UpdateError::Rejected(format!("{name} is larger than expected")));
+        }
+        hasher.update(&chunk);
+        out.write_all(&chunk)?;
+        progress(done);
+    }
+    out.flush()?;
+    drop(out);
+    let sum: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    if done != size || sum != sha256 {
+        return Err(UpdateError::Rejected(format!("{name} does not match its checksum")));
+    }
+    std::fs::rename(&part, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_star_entry_allows_the_hosts_under_a_domain_only() {
+        let source = Source {
+            latest: Url::parse("https://huggingface.co/").unwrap(),
+            allowed_hosts: vec!["huggingface.co".into(), "*.hf.co".into()],
+            https_only: true,
+        };
+        let allows = |url: &str| source.allows(&Url::parse(url).unwrap());
+        assert!(allows("https://huggingface.co/x") && allows("https://us.aws.cdn.hf.co/x") && allows("https://cdn-lfs.hf.co/x"));
+        for refused in
+            ["https://hf.co/x", "https://evilhf.co/x", "https://hf.co.evil.example/x", "http://us.aws.cdn.hf.co/x", "https://huggingface.co.evil/x"]
+        {
+            assert!(!allows(refused), "{refused}");
+        }
+    }
 
     #[test]
     fn a_file_gets_a_second_per_256_kib_and_at_most_30_minutes() {

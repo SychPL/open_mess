@@ -33,6 +33,16 @@ const COMMANDS: &[&str] = &[
     "set_auto_install",
     "language",
     "set_language",
+    "model_status",
+    "download_model",
+    "delete_model",
+    "recordings",
+    "set_recording_settings",
+    "show_transcript",
+    "delete_recording",
+    "delete_all_recordings",
+    "retry_recording",
+    "stop_recording",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

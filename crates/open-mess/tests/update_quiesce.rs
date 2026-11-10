@@ -51,6 +51,7 @@ fn activity(d: &common::Daemon, runs: Arc<Runs>, host_events: mpsc::Sender<HostE
         runs,
         modules: d.accounts.modules().handles(),
         host_events,
+        recording: Arc::default(),
     }
 }
 
@@ -149,6 +150,20 @@ async fn phase_a_waits_for_a_running_spawn() {
     let (result, ended) = phase.await.unwrap();
     assert_eq!(result, Ok(()));
     assert!(ended - run_ended < SECOND, "{:?}", ended - run_ended);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recorded_call_stops_phase_a_and_phase_b() {
+    let t = setup().await;
+    let phase = phase_a(&t);
+    sleep(5 * SECOND).await;
+    assert!(t.activity.recording.start_recording());
+    let (result, _) = phase.await.unwrap();
+    assert_eq!(result, Err(Cancelled { by_recording: true }));
+    let switched = quiesce::switch(&t.activity, &t.cancel.subscribe()).await;
+    assert_eq!(switched, Err(Cancelled { by_recording: true }));
+    // Resumed: tool calls are taken again.
+    t.d.registry.call("status", json!({})).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -277,7 +292,7 @@ async fn cancel_resumes_events_and_calls() {
         assert!(!logs().contains("timer 71"), "{}", logs());
         cancel.send_replace(true);
     });
-    assert_eq!(finished, Err(Cancelled));
+    assert_eq!(finished, Err(Cancelled { by_recording: false }));
     assert!(wait_for_log("timer 71").await, "{}", logs());
     // Phase B, kept going by a waiting action: refused calls until the cancel, taken again after.
     assert_eq!(d.registry.call("send", send("hello")).await.unwrap()["state"], "waiting");
@@ -289,7 +304,7 @@ async fn cancel_resumes_events_and_calls() {
         refused
     });
     assert!(is_update_in_progress(&refused));
-    assert_eq!(switched, Err(Cancelled));
+    assert_eq!(switched, Err(Cancelled { by_recording: false }));
     d.registry.call("status", json!({})).await.unwrap();
     assert_eq!(d.registry.call("send", send("again")).await.unwrap()["state"], "waiting");
 }

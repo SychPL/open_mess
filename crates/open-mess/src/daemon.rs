@@ -101,6 +101,7 @@ pub fn run() -> Result<(), Error> {
             runs: Arc::clone(&ui.runs),
             modules: ui.accounts.modules().handles(),
             host_events: ui.host_events.clone(),
+            recording: ui.recorder.as_ref().map(|recorder| recorder.link()).unwrap_or_default(),
         };
         let (registry, exit) = (Arc::clone(&registry), Arc::clone(&exit));
         runtime.spawn(async move {
@@ -250,6 +251,27 @@ fn start(
     let bus = Bus::default();
     let pending = Arc::new(Pending::new(Arc::clone(&accounts)));
     let mut registry = Registry::with_pending(started, Arc::clone(&accounts), Arc::clone(&pending));
+    // In %LOCALAPPDATA%, which only Windows has (spec 2026-10-28-local-transcription, 4.4); elsewhere
+    // the recording tools say they are not supported.
+    if let Some((paths, _)) = &update {
+        use crate::recording::queue;
+        let local = paths.local.clone();
+        let store = Arc::clone(&accounts);
+        // The window's setting: `auto` (or none) lets the model find the language (4.3).
+        let language = Arc::new(move || store.store().get_config("recording.language").ok().flatten().filter(|code| code != "auto"));
+        // ponytail: a queue whose thread cannot start leaves recordings waiting; reported once a log sink exists.
+        let (engine, ready) = queue::whisper(local.clone());
+        let queue = queue::Queue::start(&local, engine, ready, language).ok().map(Arc::new);
+        registry.set_recordings(crate::recording::Recordings::new(&local), queue);
+    }
+    let models = update.as_ref().and_then(|(paths, _)| {
+        let base = url::Url::parse(crate::recording::model::BASE).ok()?;
+        Some(Arc::new(crate::recording::model::Models::new(&paths.local, base, runtime.handle().clone())))
+    });
+    let recorder = recorder(&update, registry.queue(), Arc::clone(registry.ui_ready()), &accounts, models.as_ref());
+    if let Some(recorder) = &recorder {
+        registry.set_recorder(Arc::clone(recorder));
+    }
     let activity = Arc::new(triggers::Activity::default());
     if probation {
         // Before the trigger engine, the approvals and the API run; the probation lets them go.
@@ -302,6 +324,7 @@ fn start(
                 runs: Arc::clone(&runs),
                 modules: Vec::new(),
                 host_events: event_queue.clone(),
+                recording: recorder.as_ref().map(|recorder| recorder.link()).unwrap_or_default(),
             },
             launcher,
             exit: Arc::clone(&exit),
@@ -330,8 +353,52 @@ fn start(
         ui_ready,
         exit,
         update,
+        models,
+        recorder,
     };
     Ok((runtime, listener, registry, ui, admin_token))
+}
+
+/// The recorder of the calls, where they are recorded (Windows, spec 2026-10-28-local-transcription).
+#[cfg(windows)]
+fn recorder(
+    update: &Option<Update>,
+    queue: Option<Arc<crate::recording::queue::Queue>>,
+    ui_ready: Arc<std::sync::atomic::AtomicBool>,
+    accounts: &Arc<Accounts>,
+    models: Option<&Arc<crate::recording::model::Models>>,
+) -> Option<Arc<crate::recording::recorder::Recorder>> {
+    use crate::recording::model::Download;
+    use crate::recording::recorder::{self, Settings};
+    let ((paths, _), queue, models) = (update.as_ref()?, queue?, Arc::clone(models?));
+    let store = Arc::clone(accounts);
+    let settings = Box::new(move || {
+        let store = store.store();
+        let setting = |key: &str| store.get_config(key).ok().flatten();
+        // The automatic mode is off unless the window turned it on (4.6); the microphone is on.
+        Settings { auto: setting("recording.auto").as_deref() == Some("true"), microphone: setting("recording.mic").as_deref() != Some("false") }
+    });
+    let model = Box::new(move || {
+        let view = models.view();
+        match view.download {
+            Download::Running { .. } => "downloading",
+            _ if view.installed.is_none() => "missing",
+            _ => "ready",
+        }
+    });
+    // ponytail: a recorder whose threads cannot start records nothing; reported once a log sink exists.
+    recorder::start(&paths.local, queue, ui_ready, settings, model).ok()
+}
+
+#[cfg(not(windows))]
+fn recorder(
+    _update: &Option<Update>,
+    _queue: Option<Arc<crate::recording::queue::Queue>>,
+    _ui_ready: Arc<std::sync::atomic::AtomicBool>,
+    _accounts: &Arc<Accounts>,
+    _models: Option<&Arc<crate::recording::model::Models>>,
+) -> Option<Arc<crate::recording::recorder::Recorder>> {
+    None
 }
 
 /// Host events waiting for the daemon; a full queue holds the reporting module back.

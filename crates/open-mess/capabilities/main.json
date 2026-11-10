@@ -31,6 +31,16 @@
     "allow-cancel-update",
     "allow-set-auto-install",
     "allow-language",
-    "allow-set-language"
+    "allow-set-language",
+    "allow-model-status",
+    "allow-download-model",
+    "allow-delete-model",
+    "allow-recordings",
+    "allow-set-recording-settings",
+    "allow-show-transcript",
+    "allow-delete-recording",
+    "allow-delete-all-recordings",
+    "allow-retry-recording",
+    "allow-stop-recording"
   ]
 }

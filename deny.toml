@@ -25,6 +25,15 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zbus stack: keyring's Linux store, Linux CI only, unmaintained only" },
     { id = "RUSTSEC-2026-0371", reason = "zbus stack: keyring's Linux store, Linux CI only, unmaintained only" },
     { id = "RUSTSEC-2026-0372", reason = "zbus stack: keyring's Linux store, Linux CI only, unmaintained only" },
+    # candle, the local transcription's model runtime (spec 2026-10-28-local-transcription). Its
+    # matrix kernels (gemm) use the unmaintained paste macro; candle 0.11.0 holds zip at 8, whose
+    # advisories are all about `extract` writing an archive's files to disk. candle reads zip only
+    # for .npz/.pth weights, which open_mess never loads (it reads safetensors), and never extracts.
+    { id = "RUSTSEC-2024-0436", reason = "paste: through candle's gemm kernels, unmaintained only" },
+    { id = "RUSTSEC-2026-0367", reason = "zip extract: candle never extracts, open_mess loads no zip-based weights" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract: candle never extracts, open_mess loads no zip-based weights" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract: candle never extracts, open_mess loads no zip-based weights" },
+    { id = "RUSTSEC-2026-0429", reason = "zip extract: candle never extracts, open_mess loads no zip-based weights" },
 ]
 
 [licenses]

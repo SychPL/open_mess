@@ -25,6 +25,11 @@ doc = false
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+# Local transcription (spec 2026-10-28-local-transcription, 4.3): Whisper in pure Rust, on the CPU,
+# so the build needs no C++ toolchain or GPU SDK.
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
 # RFC 3339 times in the `pending` tool and the local quiet hours of trigger rules; rmcp builds it
 # already, with these features.
 chrono = { version = "0.4.45", default-features = false, features = ["alloc", "clock", "serde"] }
@@ -39,6 +44,8 @@ keyring-core = "1.0.1"
 open-mess-host = { path = "../open-mess-host" }
 # QR codes of sign-in prompts, drawn as SVG for the configuration window.
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+# The transcription's own thread pool, half the cores (recording/stt.rs); candle builds it already.
+rayon = "1.12.0"
 # Loopback API calls, and the release downloads (HTTPS with the system proxy and certificate store,
 # like the module host). The host builds reqwest without a crypto provider; ring is installed by
 # hand (update/fetch.rs).
@@ -58,8 +65,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # Release manifests are signed with minisign (Ed25519); the public key is compiled in.
 minisign-verify = "0.3.0"
+# Whisper's compression-ratio check against looping text (recording/stt.rs); flate2 builds it already.
+miniz_oxide = "0.8.9"
 # Module files and manifests are approved by their SHA-256.
 sha2 = "0.10.9"
+# Free memory before a transcription starts, free disk while recording, Teams' process name
+# (spec 2026-10-28-local-transcription, 4.1, 4.3, 4.4).
+sysinfo = { version = "0.37.2", default-features = false, features = ["disk", "system"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "process", "signal", "sync", "time"] }
 # Sign-in pages' URLs (ui/sign_in_page.rs); the version the module host builds.
@@ -81,6 +93,9 @@ tauri-winrt-notification = "0.8.1"
 # languages (i18n.rs); the version tauri-winrt-notification already builds.
 windows = { version = "0.62.2", features = ["System_UserProfile", "UI_Notifications"] }
 windows-native-keyring-store = "1.1.0"
+# The audio sessions that tell a Teams call (recording/detect.rs) and the call's capture
+# (spec 2026-10-28-local-transcription, 4.1 and 4.2); safe functions over WASAPI.
+wasapi = "0.26.0"
 # Registers the toasts' AppUserModelID for the current user.
 winreg = "0.56.0"
 
