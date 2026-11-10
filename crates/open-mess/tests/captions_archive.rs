@@ -634,6 +634,9 @@ fn read_only(path: &std::path::Path, on: bool) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
+// Windows only: a read-only file stops the state's rename over it there, not on Linux (where
+// open_mess does not run).
+#[cfg(windows)]
 #[tokio::test]
 async fn a_stop_holds_when_its_state_cannot_be_written() {
     let mut a = Archive::new().await;
