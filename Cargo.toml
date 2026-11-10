@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "modules/*", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # 1.89: std::fs::File::try_lock (the daemon's instance lock); 1.88 is also needed by the
 # wit-bindgen toolchain the wasm modules build with.

@@ -4106,7 +4106,7 @@ dependencies = [
 
 [[package]]
 name = "open-mess"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "candle-core",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "open-mess-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4183,7 +4183,7 @@ dependencies = [
 
 [[package]]
 name = "open-mess-teams"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "serde_json",
@@ -4193,7 +4193,7 @@ dependencies = [
 
 [[package]]
 name = "open-mess-test-echo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "wit-bindgen 0.63.0",
@@ -4201,14 +4201,14 @@ dependencies = [
 
 [[package]]
 name = "open-mess-test-hog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "wit-bindgen 0.63.0",
 ]
 
 [[package]]
 name = "open-mess-test-spin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "wit-bindgen 0.63.0",
 ]
@@ -8693,7 +8693,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "minisign",
  "serde_json",
