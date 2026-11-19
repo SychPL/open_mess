@@ -13,12 +13,12 @@ use open_mess_host::{Engine, ModuleContext, Net, SignInPrompts};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::filter::LevelFilter;
 
 use crate::accounts::Accounts;
 use crate::events::Bus;
 use crate::instance::InstanceLock;
-use crate::modules::Modules;
+use crate::modules::{ModuleState, Modules};
 use crate::pending::Pending;
 use crate::store::Store;
 use crate::tools::{GateMode, Registry};
@@ -32,7 +32,7 @@ use crate::update::quiesce::{Activity, Launcher};
 use crate::update::release::RELEASE_KEY;
 use crate::update::service::{self, Setup, UpdateService};
 use crate::update::state::Paths;
-use crate::{Error, api, approval, i18n, paths, secrets, ui};
+use crate::{Error, api, approval, i18n, logfile, paths, secrets, ui};
 
 /// Why the last `om daemon` failed to start, one line, in the data folder. The CLI shows it when
 /// it can't reach the daemon; a successful start deletes it.
@@ -42,25 +42,23 @@ pub const LAST_START_ERROR_FILE: &str = "last-start-error.txt";
 /// tray menu. The tray and the configuration window take the main thread; the API runs on the
 /// runtime's threads.
 pub fn run() -> Result<(), Error> {
-    // Diagnostics only: OPEN_MESS_LOG (error, warn, info, debug or trace) prints the daemon's and
-    // the modules' logs to stderr. Logs carry states, codes and counts, never tokens or message
-    // contents (spec 8.4).
-    if let Some(level) = std::env::var("OPEN_MESS_LOG").ok().and_then(|level| level.parse::<LevelFilter>().ok()) {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        use tracing_subscriber::util::SubscriberInitExt as _;
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
-            .with(log_targets(level))
-            .try_init()
-            .ok();
-    }
     let started = Instant::now();
-    let dir = paths::data_dir()?;
+    // Before anything can fail, even the data folder. The file is opened for each line, so a second
+    // daemon, which logs nothing, never touches it.
+    install_logs(log_dir().as_deref());
+    // What failed, never its text, which may quote the secrets file or a setting.
+    let failed = |err: &Error| tracing::error!(target: "open_mess::daemon", "the daemon did not start: {}", error_kind(err));
+    let dir = paths::data_dir().inspect_err(failed)?;
     let error_file = dir.join(LAST_START_ERROR_FILE);
     let record = |why: &str| drop(std::fs::write(&error_file, format!("{}\n", why.replace(['\r', '\n'], " "))));
-    // First of all: an update's helper may be changing the files, or waiting for this daemon to be
-    // gone (spec 2026-10-27-self-update, 7.6).
-    let update = update()?;
+    // The whole text goes to the error file only.
+    let not_started = |err: &Error| {
+        failed(err);
+        record(&err.to_string());
+    };
+    // An update's helper may be changing the files, or waiting for this daemon to be gone (spec
+    // 2026-10-27-self-update, 7.6).
+    let update = update().inspect_err(not_started)?;
     let mut probation = false;
     if let Some((paths, launcher)) = &update {
         match probation::on_start(paths) {
@@ -83,10 +81,14 @@ pub fn run() -> Result<(), Error> {
         }
     }
     // A second daemon fails here and leaves the running one's error file alone.
-    let _lock = acquire_lock(&dir)?;
+    let _lock = acquire_lock(&dir).inspect_err(|err| {
+        if !matches!(err, Error::AlreadyRunning) {
+            not_started(err)
+        }
+    })?;
     let window = Opener::default();
-    let (runtime, listener, registry, ui, admin_token) =
-        start(&dir, started, &window, probation, update.clone()).inspect_err(|err| record(&err.to_string()))?;
+    let (runtime, listener, registry, ui, admin_token) = start(&dir, started, &window, probation, update.clone()).inspect_err(not_started)?;
+    tracing::info!(target: "open_mess::daemon", version = env!("CARGO_PKG_VERSION"), "the daemon started");
     let _ = std::fs::remove_file(&error_file);
     let exit = Arc::clone(&ui.exit);
     let registry = Arc::new(registry);
@@ -142,6 +144,7 @@ pub fn run() -> Result<(), Error> {
     };
     if let Err(err) = shown {
         // Without the tray and the window the daemon still serves its agents; `om config` says so.
+        tracing::warn!(target: "open_mess::daemon", "the tray and the window did not start: {}", error_kind(&err));
         let _ = writeln!(std::io::stderr(), "{err}");
         runtime.block_on(window.close());
         runtime.block_on(until_stopped(ended, exit));
@@ -153,7 +156,42 @@ pub fn run() -> Result<(), Error> {
     runtime.block_on(accounts.module_writes().finished());
     runtime.block_on(accounts.end_sessions(&accounts.modules().handles()));
     let _ = stop.send(());
-    runtime.block_on(server).map_err(|err| Error::Io(std::io::Error::other(err)))?
+    let served = runtime.block_on(server);
+    tracing::info!(target: "open_mess::daemon", "the daemon stopped");
+    served.map_err(|err| Error::Io(std::io::Error::other(err)))?
+}
+
+/// `%LOCALAPPDATA%\open_mess\logs`, beside the programs (Windows); elsewhere no log file.
+fn log_dir() -> Option<std::path::PathBuf> {
+    cfg!(windows).then(Paths::local_dir).and_then(Result::ok).map(|local| local.join("logs"))
+}
+
+/// The log file in `logs` (spec 2026-11-18-daemon-log-file), and with `OPEN_MESS_LOG` (error,
+/// warn, info, debug or trace) the same targets on stderr, for diagnostics. Logs carry states,
+/// codes and counts, never tokens or message contents (spec 8.4).
+fn install_logs(logs: Option<&Path>) {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let stderr = std::env::var("OPEN_MESS_LOG").ok().and_then(|level| level.parse::<LevelFilter>().ok()).map(|level| {
+        // No internal errors: the layer would eprintln! them, which panics on a closed stderr.
+        let layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false).log_internal_errors(false);
+        layer.with_filter(logfile::targets(level))
+    });
+    // Roaming may be redirected to a share, outside the profile folder.
+    let folders = ["USERPROFILE", "APPDATA", "LOCALAPPDATA"].into_iter().filter_map(|name| Some((std::env::var(name).ok()?, format!("%{name}%"))));
+    let file = logs.map(|logs| logfile::layer(logs, logfile::MAX_FILE, folders.collect()));
+    tracing_subscriber::registry().with(stderr).with(file).try_init().ok();
+}
+
+/// A start error's variant, with the I/O error's kind or the port: what failed, never the text.
+fn error_kind(err: &Error) -> String {
+    match err {
+        Error::Io(io) => format!("Io({:?})", io.kind()),
+        Error::PortInUse(port) => format!("PortInUse({port})"),
+        // A derived Debug starts with the variant's name.
+        other => format!("{other:?}").chars().take_while(char::is_ascii_alphanumeric).collect(),
+    }
 }
 
 /// Ctrl+C, SIGTERM (`docker stop`, Unix), the API ended, or `exit` was notified.
@@ -181,12 +219,6 @@ pub fn listen_ip(listen: Option<&str>, windows: bool) -> Result<Ipv4Addr, Error>
 
 /// An update's folders and what starts its helper.
 type Update = (Paths, Arc<dyn Launcher>);
-
-/// What `OPEN_MESS_LOG` prints: open_mess's own targets only (`open_mess` and `open_mess_host`, by
-/// prefix). A dependency's debug log, like rmcp's, prints whole tool results (Codex review of 0cff6c1).
-fn log_targets(level: LevelFilter) -> Targets {
-    Targets::new().with_target("open_mess", level)
-}
 
 /// None where updates do not install.
 #[cfg(windows)]
@@ -248,6 +280,17 @@ fn start(
         sign_in: SignInPrompts::new(prompts.clone()),
     };
     let modules = runtime.block_on(Modules::scan(&store, &engine, &dir.join("modules"), ctx))?;
+    // Their accounts stay offline until then: a module waiting for approval after an install is
+    // the first thing to look for.
+    for module in modules.list() {
+        match &module.state {
+            // Another file of that name is the module, and has its own line if it does not run.
+            ModuleState::Active | ModuleState::PendingReplacement => {}
+            // Named after its file, which the user named, and its reason is the loader's text.
+            ModuleState::Invalid(_) => tracing::warn!(target: "open_mess::daemon", "a module file is not a valid module"),
+            state => tracing::warn!(target: "open_mess::daemon", module = %module.name, "a module does not run: {state}"),
+        }
+    }
     // After the local API token: from here on keyring-core's default store is the platform one.
     let credentials = open_mess_host::credential_store().map_err(|why| Error::Secrets(keyring_core::Error::PlatformFailure(why.into())))?;
     let accounts = Arc::new(Accounts::new(store, modules, dir.to_path_buf(), credentials));
@@ -262,9 +305,12 @@ fn start(
         let store = Arc::clone(&accounts);
         // The window's setting: `auto` (or none) lets the model find the language (4.3).
         let language = Arc::new(move || store.store().get_config("recording.language").ok().flatten().filter(|code| code != "auto"));
-        // ponytail: a queue whose thread cannot start leaves recordings waiting; reported once a log sink exists.
+        // Recordings wait without the queue's thread; the reason is the system's.
         let (engine, ready) = queue::whisper(local.clone());
-        let queue = queue::Queue::start(&local, engine, ready, language).ok().map(Arc::new);
+        let queue = queue::Queue::start(&local, engine, ready, language)
+            .inspect_err(|err| tracing::warn!(target: "open_mess::daemon", "the transcription queue did not start: {err}"))
+            .ok()
+            .map(Arc::new);
         registry.set_recordings(crate::recording::Recordings::new(&local), queue);
     }
     let models = update.as_ref().and_then(|(paths, _)| {
@@ -430,9 +476,10 @@ fn recorder(
             _ => "ready",
         }
     });
-    // ponytail: a recorder whose threads cannot start records nothing; reported once a log sink exists.
-    let toasts = Arc::new(crate::recording::notice::Toasts::new().ok()?);
-    let recorder = recorder::start(&paths.local, queue, ui_ready, settings, model, Arc::clone(&toasts)).ok()?;
+    // Nothing is recorded without its threads; the reason is the system's.
+    let not_started = |err: &std::io::Error| tracing::warn!(target: "open_mess::daemon", "the recorder did not start: {err}");
+    let toasts = Arc::new(crate::recording::notice::Toasts::new().inspect_err(not_started).ok()?);
+    let recorder = recorder::start(&paths.local, queue, ui_ready, settings, model, Arc::clone(&toasts)).inspect_err(not_started).ok()?;
     Some((recorder, toasts))
 }
 
@@ -493,8 +540,17 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_start_is_logged_by_kind_without_its_text() {
+        let secret = Error::SecretsFile("invalid type: string \"a-token-value\", expected a map".into());
+        assert_eq!(error_kind(&secret), "SecretsFile");
+        assert_eq!(error_kind(&Error::BadConfig("port \"http://om:7341/mcp\"".into())), "BadConfig");
+        assert_eq!(error_kind(&Error::PortInUse(7341)), "PortInUse(7341)");
+        assert_eq!(error_kind(&Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))), "Io(PermissionDenied)");
+    }
+
+    #[test]
     fn diagnostics_print_only_open_mess_logs() {
-        let targets = log_targets(LevelFilter::DEBUG);
+        let targets = logfile::targets(LevelFilter::DEBUG);
         let debug = LevelFilter::DEBUG.into_level().unwrap();
         let error = LevelFilter::ERROR.into_level().unwrap();
         let trace = LevelFilter::TRACE.into_level().unwrap();

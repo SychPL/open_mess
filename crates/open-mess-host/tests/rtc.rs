@@ -233,6 +233,20 @@ async fn an_answer_with_audio_or_without_an_allowed_candidate_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_broken_answer_is_refused_without_quoting_it() {
+    let module = echo().await;
+    let (conn, offer) = open(&module, "main-channel").await;
+    let (peer, answer) = answer(&offer).await;
+    // The SDP parser's own error quotes the line, with the far end's user name; the module logs
+    // what it gets (spec 2026-11-18-daemon-log-file, 4.8).
+    let broken: String =
+        answer.lines().map(|line| if line.starts_with("o=") { "o=JanKowalski 1\r\n".to_string() } else { format!("{line}\r\n") }).collect();
+    let refused = call(&module, "rtc-accept", json!({"conn": conn, "answer": broken})).await;
+    assert_eq!(refused, json!({"error": "network", "why": "the answer is not valid SDP"}));
+    peer.pc.close().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_fifth_connection_is_refused() {
     let module = echo().await;
     let mut conns = Vec::new();

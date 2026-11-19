@@ -479,10 +479,12 @@ impl Connections {
         }
         let (lines, candidates) = check_answer(answer, &open.allowed)?;
         let (sdp, direct) = without_proxied(lines, candidates).await?;
-        let answer = RTCSessionDescription::answer(sdp).map_err(network)?;
+        // Fixed texts: the stack's errors quote the answer's lines (a user name, ICE credentials),
+        // and the module may log what it gets (spec 2026-11-18-daemon-log-file, 4.6).
+        let answer = RTCSessionDescription::answer(sdp).map_err(|_| network("the answer is not valid SDP"))?;
         // Before the answer nothing reaches a far end: ICE has no remote candidate to check.
         open.allowed.pin(&direct);
-        open.pc.set_remote_description(answer).await.map_err(network)?;
+        open.pc.set_remote_description(answer).await.map_err(|_| network("the answer was refused"))?;
         open.answered = true;
         Ok(())
     }

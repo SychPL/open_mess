@@ -561,6 +561,7 @@ mod guest {
         fn manifest() -> types::Manifest {
             storage::set("loaded", b"1").ok();
             host::session("a", host::SessionState::Online);
+            host::log(1, "the manifest's log line");
             types::Manifest {
                 name: "test-echo".to_string(),
                 version: std::hint::black_box(VERSION).trim_end().to_string(),
