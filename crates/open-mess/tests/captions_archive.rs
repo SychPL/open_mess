@@ -259,24 +259,24 @@ async fn a_permanent_refusal_is_a_failed_recording_and_never_tried_again() {
 }
 
 #[tokio::test]
-async fn a_join_answered_meeting_ended_after_the_end_is_no_failure() {
+async fn a_call_kept_after_a_failed_first_join_leaves_no_failed_recording_when_it_ends() {
     let a = Archive::new().await;
+    a.echo("set-join", json!({"error": "media_failed"})).await;
     a.calls(&[("c1", THREAD)]).await;
     a.at(0).await;
-    a.at(5000).await;
-    a.say(THREAD, &[(6000, "Ann", "hello")]).await;
-    a.at(10_000).await;
+    assert!(a.kept().is_empty());
+    // The retry succeeds and the call is kept from then on.
+    a.echo("set-join", json!({})).await;
+    a.at(2 * MINUTE).await;
+    a.at(2 * MINUTE + 5000).await;
+    a.say(THREAD, &[(2 * MINUTE + 6000, "Ann", "hello")]).await;
+    a.at(2 * MINUTE + 10_000).await;
+    // The meeting ends, and the call leaves the list a little later.
     a.echo("captions-say", json!({"conversation": THREAD, "state": "ended", "reason": "meeting_ended"})).await;
-    a.at(15_000).await;
-    assert_eq!(a.kept().iter().map(|(_, meta)| meta.state).collect::<Vec<_>>(), [State::Done]);
-    // Teams still lists the call: it is joined again and the join says the meeting is over.
-    a.echo("set-join", json!({"error": "meeting_ended: the meeting is over"})).await;
-    a.at(15_000 + 2 * MINUTE + 5000).await;
-    assert_eq!(a.joins().await.len(), 2);
-    // The call leaves the list: nothing is written for it.
+    a.at(2 * MINUTE + 15_000).await;
     a.calls(&[]).await;
-    a.at(15_000 + 2 * MINUTE + 30_000).await;
-    a.at(15_000 + 2 * MINUTE + 35_000).await;
+    a.at(2 * MINUTE + 40_000).await;
+    a.at(2 * MINUTE + 45_000).await;
     assert_eq!(a.kept().iter().map(|(_, meta)| meta.state).collect::<Vec<_>>(), [State::Done]);
 }
 

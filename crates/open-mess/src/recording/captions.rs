@@ -124,6 +124,8 @@ struct Live {
     rec: Option<Rec>,
     /// Its recording was left by a daemon that stopped: it ends "interrupted" if the call is gone.
     resumed: bool,
+    /// It has had a recording: a later failed join never makes it "never joined" (4.4).
+    kept: bool,
     /// The token and cursor of the session given up last: a join the module answers with that very
     /// session goes on from there, never writing a cue twice (Codex on d8f68ae).
     previous: Option<(String, u64)>,
@@ -141,6 +143,7 @@ impl Live {
             session: None,
             rec: None,
             resumed: false,
+            kept: false,
             previous: None,
         }
     }
@@ -223,8 +226,7 @@ fn join_outcome(err: &HostError) -> Outcome {
         HostError::Module(ModuleError::Platform(why)) => {
             let code = why.split(|c: char| c == ':' || c.is_whitespace()).next().unwrap_or_default();
             match outcome(code) {
-                // A join answered with the end of the meeting is a normal end, not a failure.
-                Outcome::Rejoin => Outcome::Transient(Reason::ModuleFailed),
+                Outcome::Rejoin | Outcome::Over => Outcome::Transient(Reason::ModuleFailed),
                 known => known,
             }
         }
@@ -588,7 +590,7 @@ impl Archiver {
             let at = rec.at(read);
             rec.gaps.add(at, None, GapReason::Rejoin);
             let mut live = Live::new(rec.meta.conversation.clone().unwrap_or_default(), now);
-            (live.listed, live.joined_at, live.resumed, live.rec) = (None, rec.meta.joined_at, true, Some(rec));
+            (live.listed, live.joined_at, live.resumed, live.kept, live.rec) = (None, rec.meta.joined_at, true, true, Some(rec));
             inner.live.insert(key, live);
         }
     }
@@ -669,7 +671,7 @@ impl Archiver {
                 }
                 // Never joined: the owner sees why (4.4).
                 None => {
-                    if let Some(reason) = live.last_reason {
+                    if let Some(reason) = live.last_reason.filter(|_| !live.kept) {
                         self.give_up(inner, key, live, reason, now);
                     }
                 }
@@ -797,6 +799,7 @@ impl Archiver {
         self.save_rec(&mut rec, now);
         inner.entry(key, now).recording = Some(id.clone());
         live.rec = Some(rec);
+        live.kept = true;
         live.resumed = false;
         tracing::info!(target: "open_mess::captions", "a recording started");
         self.setup.notices.started(&id);
