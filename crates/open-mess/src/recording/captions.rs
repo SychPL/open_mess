@@ -223,7 +223,8 @@ fn join_outcome(err: &HostError) -> Outcome {
         HostError::Module(ModuleError::Platform(why)) => {
             let code = why.split(|c: char| c == ':' || c.is_whitespace()).next().unwrap_or_default();
             match outcome(code) {
-                Outcome::Rejoin | Outcome::Over => Outcome::Transient(Reason::ModuleFailed),
+                // A join answered with the end of the meeting is a normal end, not a failure.
+                Outcome::Rejoin => Outcome::Transient(Reason::ModuleFailed),
                 known => known,
             }
         }
