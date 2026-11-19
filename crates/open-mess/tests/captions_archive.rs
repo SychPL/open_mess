@@ -293,12 +293,32 @@ async fn a_failed_rejoin_that_later_succeeds_leaves_no_failed_recording_when_the
     a.at(15_000).await;
     a.echo("set-join", json!({})).await;
     a.at(15_000 + 2 * MINUTE + 5000).await;
+    a.at(15_000 + 2 * MINUTE + 8000).await;
     a.echo("captions-say", json!({"conversation": THREAD, "state": "ended", "reason": "meeting_ended"})).await;
-    a.at(15_000 + 2 * MINUTE + 10_000).await;
+    a.at(15_000 + 2 * MINUTE + 12_000).await;
     a.calls(&[]).await;
     a.at(15_000 + 2 * MINUTE + 40_000).await;
     a.at(15_000 + 2 * MINUTE + 45_000).await;
     assert_eq!(a.kept().iter().map(|(_, meta)| meta.state).collect::<Vec<_>>(), [State::Done]);
+}
+
+#[tokio::test]
+async fn a_join_that_never_went_live_still_shows_the_earlier_failure() {
+    let a = Archive::new().await;
+    a.echo("set-join", json!({"error": "media_failed"})).await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    // The retry is accepted but the session never goes live; the call goes.
+    a.echo("set-join", json!({"state": "joining"})).await;
+    a.at(2 * MINUTE).await;
+    a.at(2 * MINUTE + 5000).await;
+    a.echo("captions-say", json!({"conversation": THREAD, "state": "ended", "reason": "meeting_ended"})).await;
+    a.at(2 * MINUTE + 10_000).await;
+    a.calls(&[]).await;
+    a.at(2 * MINUTE + 40_000).await;
+    a.at(2 * MINUTE + 45_000).await;
+    let [(_, meta)] = &a.kept()[..] else { panic!("{:?}", a.kept()) };
+    assert_eq!((meta.state, meta.reason), (State::Failed, Some(Reason::MediaFailed)));
 }
 
 #[tokio::test]
