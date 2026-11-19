@@ -6,6 +6,7 @@ use std::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use tracing::field::{Field, Visit};
@@ -60,12 +61,16 @@ impl<S: Subscriber> Layer<S> for FileLayer {
         fields.message.push_str(&fields.rest);
         let mut text = fields.message;
         for (folder, name) in &self.folders {
-            // As Debug writes it (`{e:?}` of a path in a string: `\\`, `\u{a0}`), with forward
-            // slashes, as it is.
-            let debug = format!("{folder:?}");
-            let debug = debug.strip_prefix('"').and_then(|debug| debug.strip_suffix('"')).unwrap_or(folder).to_owned();
-            for form in [debug, folder.replace('\\', "/"), folder.clone()] {
-                text = without(&text, &form, name);
+            // A share also as a verbatim path (`\\?\UNC\server\...`); `C:\...` is inside `\\?\C:\...`.
+            let verbatim = folder.strip_prefix(r"\\").map(|share| format!(r"\\?\UNC\{share}"));
+            for path in verbatim.iter().chain([folder]) {
+                // As Debug writes it (`{e:?}` of a path in a string: `\\`, `\u{a0}`), with forward
+                // slashes, as it is.
+                let debug = format!("{path:?}");
+                let debug = debug.strip_prefix('"').and_then(|debug| debug.strip_suffix('"')).unwrap_or(path).to_owned();
+                for form in [debug, path.replace('\\', "/"), path.clone()] {
+                    text = without(&text, &form, name);
+                }
             }
         }
         let meta = event.metadata();
@@ -78,9 +83,17 @@ impl<S: Subscriber> Layer<S> for FileLayer {
     }
 }
 
-/// The local time, or UTC when Windows cannot give the time zone: chrono unwraps that failure.
+/// The local time, or UTC once Windows could not give the time zone: chrono unwraps that failure,
+/// and the panic's message goes to stderr once, not with every line.
 fn local_now() -> chrono::DateTime<chrono::FixedOffset> {
-    std::panic::catch_unwind(chrono::Local::now).map_or_else(|_| chrono::Utc::now().fixed_offset(), |now| now.fixed_offset())
+    static NO_ZONE: AtomicBool = AtomicBool::new(false);
+    if !NO_ZONE.load(Ordering::Relaxed) {
+        match std::panic::catch_unwind(chrono::Local::now) {
+            Ok(now) => return now.fixed_offset(),
+            Err(_) => NO_ZONE.store(true, Ordering::Relaxed),
+        }
+    }
+    chrono::Utc::now().fixed_offset()
 }
 
 /// `text` with every `what`, in any case like a Windows path, written as `with`.
@@ -377,13 +390,16 @@ mod tests {
             tracing::warn!("storage read failed: Failed({path:?})");
             tracing::warn!("{}", path.replace('\\', "/"));
             tracing::warn!(r"unable to open database file: {roaming}\open_mess\modules\teams.sqlite3");
+            // The same share as a verbatim path (`OPEN_MESS_DATA_DIR` written so).
+            tracing::warn!(r"unable to open database file: \\?\UNC\server\profiles\Łukasz Kowalski\AppData\Roaming\open_mess");
         });
         let file = read(dir.path(), FILE);
         let lines: Vec<&str> = file.lines().collect();
         assert!(lines[0].ends_with(r": unable to open database file: %USERPROFILE%\appdata\local\open_mess\recordings"), "{file}");
         assert!(lines[1].ends_with(r#": storage read failed: Failed("%USERPROFILE%\\AppData\\Local\\open_mess\\recordings")"#), "{file}");
         assert!(lines[3].ends_with(r": unable to open database file: %APPDATA%\open_mess\modules\teams.sqlite3"), "{file}");
-        assert_eq!(lines.len(), 4, "{file}");
+        assert!(lines[4].ends_with(r": unable to open database file: %APPDATA%\open_mess"), "{file}");
+        assert_eq!(lines.len(), 5, "{file}");
         assert!(!file.to_lowercase().contains("łukasz"), "{file}");
     }
 
