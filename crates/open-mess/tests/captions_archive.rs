@@ -281,6 +281,24 @@ async fn a_call_kept_after_a_failed_first_join_leaves_no_failed_recording_when_i
 }
 
 #[tokio::test]
+async fn a_failed_return_after_a_finished_recording_is_still_a_failed_recording() {
+    let a = Archive::new().await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    a.echo("captions-say", json!({"conversation": THREAD, "state": "ended", "reason": "user_left"})).await;
+    a.at(10_000).await;
+    // The user comes back, the join fails and the call goes before the next try: what was lost shows.
+    a.echo("set-join", json!({"error": "media_failed"})).await;
+    a.at(10_000 + 2 * MINUTE + 5000).await;
+    a.calls(&[]).await;
+    a.at(10_000 + 2 * MINUTE + 30_000).await;
+    a.at(10_000 + 2 * MINUTE + 35_000).await;
+    let states: Vec<State> = a.kept().iter().map(|(_, meta)| meta.state).collect();
+    assert!(states.contains(&State::Done) && states.contains(&State::Failed), "{states:?}");
+}
+
+#[tokio::test]
 async fn a_passing_failure_is_tried_again_in_two_minutes_and_refused_three_times() {
     let a = Archive::new().await;
     a.echo("set-join", json!({"error": "media_failed"})).await;
