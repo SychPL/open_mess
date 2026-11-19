@@ -707,6 +707,8 @@ impl Archiver {
             Ok(_) => {
                 tracing::info!(target: "open_mess::captions", "joined a call");
                 self.set_reason(None);
+                // An earlier failure is stale once a join succeeded: only a call never joined shows one (4.4).
+                live.last_reason = None;
                 live.session = Some(Session::default());
             }
             Err(err) => {
@@ -796,8 +798,6 @@ impl Archiver {
         self.save_rec(&mut rec, now);
         inner.entry(key, now).recording = Some(id.clone());
         live.rec = Some(rec);
-        // A reason from before the recording is stale: only a later failure may show (4.4).
-        live.last_reason = None;
         live.resumed = false;
         tracing::info!(target: "open_mess::captions", "a recording started");
         self.setup.notices.started(&id);

@@ -281,6 +281,27 @@ async fn a_call_kept_after_a_failed_first_join_leaves_no_failed_recording_when_i
 }
 
 #[tokio::test]
+async fn a_failed_rejoin_that_later_succeeds_leaves_no_failed_recording_when_the_call_ends() {
+    let a = Archive::new().await;
+    a.calls(&[("c1", THREAD)]).await;
+    a.at(0).await;
+    a.at(5000).await;
+    // The session drops mid-call, the first rejoin fails, the second succeeds into the same recording.
+    a.echo("captions-say", json!({"conversation": THREAD, "state": "ended", "reason": "update"})).await;
+    a.echo("set-join", json!({"error": "media_failed"})).await;
+    a.at(10_000).await;
+    a.at(15_000).await;
+    a.echo("set-join", json!({})).await;
+    a.at(15_000 + 2 * MINUTE + 5000).await;
+    a.echo("captions-say", json!({"conversation": THREAD, "state": "ended", "reason": "meeting_ended"})).await;
+    a.at(15_000 + 2 * MINUTE + 10_000).await;
+    a.calls(&[]).await;
+    a.at(15_000 + 2 * MINUTE + 40_000).await;
+    a.at(15_000 + 2 * MINUTE + 45_000).await;
+    assert_eq!(a.kept().iter().map(|(_, meta)| meta.state).collect::<Vec<_>>(), [State::Done]);
+}
+
+#[tokio::test]
 async fn a_failed_return_after_a_finished_recording_is_still_a_failed_recording() {
     let a = Archive::new().await;
     a.calls(&[("c1", THREAD)]).await;
