@@ -1964,8 +1964,13 @@ token, tenant id, user id or account name.
     - Not seen: `refresh_token_expires_in` was not checked; the refresh token's lifetime and any
       Identity Protection alert are still unknown ("Needs live capture" 2).
 
-    Read-only: no message sent, no endpoint registered. Values printed were limited to statuses,
-    key names, counts and lengths.
+    - **Sending**: `send` to a 1:1 chat of the account holder, at their request, waited for approval
+      (`write` = confirm), was approved through the administrative API (`waiting`, `decide`) and
+      ended `done`; the message was then the chat's latest, `own` true. The chat service took the
+      write with the IC3 token from the refresh token, without an endpoint registration (as item 5).
+
+    One message sent, as above; no endpoint registered. Values printed were limited to statuses, key
+    names, counts and lengths.
 
 All checks in items 1-4, 7-12 and 20 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
