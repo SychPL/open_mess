@@ -433,6 +433,18 @@ impl Host for HostState {
         self.show_code(SignInRequest::Qr { module: self.env.name.clone(), data });
     }
 
+    async fn wam_available(&mut self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.env.without_wam {
+            return false;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if self.env.fake_wam.is_some() {
+            return true;
+        }
+        cfg!(windows)
+    }
+
     async fn open_page(&mut self, url: String, redirect_prefix: String) -> Result<String, SignInError> {
         self.code_done();
         if too_long(&[&url, &redirect_prefix]) {
