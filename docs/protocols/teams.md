@@ -1132,8 +1132,9 @@ Static analysis could not settle these; each needs one redacted capture on the u
 the user present (spec 9.5):
 
 1. ~~WAM with `1fec8e78-...` from a non-MSTeams process~~ - done, accepted (see "Live results").
-2. Embedded WebView2 auth code + PKCE with `1fec8e78-...` and the `nativeclient` redirect: accepted by
-   the tenant's conditional access? Refresh token lifetime?
+2. ~~Auth code + PKCE with `1fec8e78-...` and the `nativeclient` redirect: accepted by the tenant's
+   conditional access?~~ - done, accepted (see "Live results" 21). Still open: the refresh token's
+   lifetime and later Identity Protection alerts.
 3. Device code with `1fec8e78-...` (only with explicit consent, spec 9.5).
 4. ~~The full authz response shape and real `regionGtms` keys~~ - done (see "Live results", item 2).
 5. Which token Trouter allocate and AMS accept from open_mess (the chat service accepts a plain AAD
@@ -1942,6 +1943,29 @@ token, tenant id, user id or account name.
       meeting's item was gone about 2 minutes after it showed up. There was no stale item like
       item 11's, so no conversation was read after the owner had left while the item was still in
       the store.
+
+21. **Sign-in without WAM from a Linux server** (2026-11-20, spec 2026-11-20-teams-sign-in-without-wam
+    step 4; a contributor's own work account, the account holder at the computer and signing in in
+    person). open_mess 0.2.0 plus this change, `om daemon` in a Linux container on a server,
+    signed in through the administrative API (`sign_in_start`, `sign_in_request`, `sign_in_answer`):
+    - **Sign-in page**: `organizations` authorize with `response_type=code`, `response_mode=query`,
+      the `nativeclient` redirect, scope `https://api.spaces.skype.com/.default offline_access openid
+      profile`, PKCE `S256`, `prompt=select_account` and the CP1 `claims`: accepted. The browser ended
+      on `nativeclient?code=...&state=...&session_state=...`; `state` matched.
+    - **Code redemption from the server** (`organizations` token endpoint, no `Origin`): accepted,
+      with a refresh token (about 1.8 KB). authsvc with the new token: accepted, account online.
+    - **Refresh to other audiences** with that refresh token: `https://ic3.teams.office.com`
+      (`list_conversations`: 5 items), the middle tier (`teams_list_meetings`: 29 meetings, all with
+      their chat), `https://outlook.office.com` (search answered; the module's search decoder then
+      failed at `EntitySets[0].ResultSets[0].Results[0].Source.ItemId`, a decoder question for
+      section 6, not a sign-in one). MCPS, the recording resource and SharePoint were not tried.
+    - **Restart**: after `docker restart` the account came back online from the stored refresh token
+      alone (`restore`), without a prompt, and `list_conversations` answered.
+    - Not seen: `refresh_token_expires_in` was not checked; the refresh token's lifetime and any
+      Identity Protection alert are still unknown ("Needs live capture" 2).
+
+    Read-only: no message sent, no endpoint registered. Values printed were limited to statuses,
+    key names, counts and lengths.
 
 All checks in items 1-4, 7-12 and 20 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
