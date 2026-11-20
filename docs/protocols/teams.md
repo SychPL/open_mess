@@ -344,8 +344,13 @@ All **CONFIRMED** in `cmd-trouter-3959f9e7ca693a2a.js` (REA `ev_825293a6...`, cl
 - Headers: `X-ClientType: MicrosoftTeams`, `X-ClientScenario`, `X-Client-UI-Language`,
   `X-AnchorMailbox` (OID/PUID based, `addSubstrateIdHeaders*`), `clientRequestId`.
 - Body: `{"entityRequests":[{"entityType":"...","query":{"queryString":"...","displayQueryString":"..."},"from":0,"size":30,"contentSources":["..."]}],"cvid":"<uuid>","scenario":{"name":"..."}}`;
-  results in `EntitySets[0].ResultSets[0].Results[].Source`. The exact `entityType` and
-  `contentSources` for chat messages (`Message` / `Teams` by the enums) are **UNCONFIRMED**.
+  results in `EntitySets[0].ResultSets[0].Results[].Source`.
+- **CONFIRMED LIVE** (2026-11-20, "Live results" 22): `entityType` `Message`, `contentSources`
+  `["Teams"]`, scenario `powerbar`, `X-AnchorMailbox: Oid:<oid>@<tid>` and the `outlook.office.com`
+  token give HTTP 200. In a result's `Source`: `InternetMessageId` is the chat service's message id,
+  `ClientThreadId` the plain conversation id, `DateTimeReceived` the time, `Preview` the text and
+  `From.EmailAddress` (`Name`, `Address`) the sender. `ItemId` is an object (an Exchange item id), not
+  the message id; `ClientConversationId` has a `;messageid=` suffix in 1:1 chats.
 
 ## 7. Attachments
 
@@ -1150,8 +1155,8 @@ the user present (spec 9.5):
 9. Page size limits and `syncState` semantics for conversations and messages, and that the unread
    rule of section 3.4 matches what the official client shows (a chat marked as unread, then "mark
    all as read"), and which request returns `appConsumptionHorizon`.
-10. Substrate request body for chat messages (`entityType`, `contentSources`) and the
-    `X-AnchorMailbox` format.
+10. ~~Substrate request body for chat messages (`entityType`, `contentSources`) and the
+    `X-AnchorMailbox` format.~~ - done (see "Live results" 22).
 11. AMS image download: header token vs cookie, and which view names exist for received images.
 12. Whether the public `teams.microsoft.com/v2` build differs from the packaged build analysed here
     (fetching the CDN bundle without signing in and diffing it with REA `compare_bundles` is enough).
@@ -1943,6 +1948,36 @@ token, tenant id, user id or account name.
       item 11's, so no conversation was read after the owner had left while the item was still in
       the store.
 
-All checks in items 1-4, 7-12 and 20 were read-only: no endpoint registration, no property write, no Trouter
+22. **Message search through Substrate** (2026-11-20, a contributor's own work account, the account
+    holder present). Read-only: one search query sent through the module's exact request (`POST
+    https://substrate.office.com/search/api/v2/query`, `entityType` `Message`, `contentSources`
+    `["Teams"]`, scenario `powerbar`, `X-ClientType: MicrosoftTeams`, `X-AnchorMailbox:
+    Oid:<oid>@<tid>`, token audience `outlook.office.com`). Values printed were limited to key names,
+    types, lengths and id classes.
+    - HTTP 200. Top-level keys: `ApiVersion`, `SearchTerms`, `EntitySets`, `RestrictedSearchMode`,
+      `Instrumentation` (`TraceId`). `EntitySets[0]` has `EntityType`, `IsPartial`, `Properties`,
+      `QueryId`, `SearchTerms`, `ResultSets`; `ResultSets[0]` has `ContentSources`,
+      `MoreResultsAvailable`, `Properties`, `Provenance`, `QueryId`, `Rank`, `Total`,
+      `TotalWithoutCollapsing`, `Results`.
+    - A result has `Id`, `Provenance`, `ContentSource`, `ReferenceId`, `HitHighlightedSummary`, `Rank`,
+      `SearchKey`, `SortOrderSource`, `Type`, `ResultSearchType`, `ProviderType` and `Source`.
+    - `Source` has `Id`, `SortOrderSource`, `ItemId` (an object `{Id}`: an Exchange item id, not the
+      chat message id), `ImmutableId`, `ClientConversationId`, `ClientThreadId`, `DateTimeCreated`
+      (7 fractional digits), `DateTimeReceived` (`2027-01-15T08:00:00.123Z` form), `DateTimeSent`,
+      `DisplayTo`, `HasAttachments`, `Importance`, `InternetMessageId`, `ParentFolderDisplayName`,
+      `Preview`, `Sender` and `From` (`EmailAddress` with `Name` and `Address`), `Subject` (empty),
+      `ConversationId` (`{Id}`), `MailboxGuids` and `MentionsPreview` (`IsMentioned`); sometimes
+      `AnnouncementTitle`.
+    - `InternetMessageId` is 13 digits and is the chat service's message id: it was among the ids
+      `read_messages` returned for that conversation in 3 of 3 hits checked. It equals
+      `DateTimeReceived` in milliseconds.
+    - `ClientThreadId` is the plain conversation id (`19:...@thread.v2`, `19:...@thread.skype`,
+      `19:..._...@unq.gbl.spaces`). `ClientConversationId` equals it for group chats and channels; for
+      1:1 chats it is `<ClientThreadId>;messageid=<another 13-digit id>`, and that suffix was not the
+      hit's own id (it differed from `InternetMessageId` in every case).
+    - The module's decoder had read `ItemId` as the id and failed on it; it now takes the id from
+      `InternetMessageId` and the conversation from `ClientThreadId`.
+
+All checks in items 1-4, 7-12, 20 and 22 were read-only: no endpoint registration, no property write, no Trouter
 connection. Apart from the slip noted in item 9, values printed during the checks were limited to
 status codes, key names, counts, enum values, scope names and service URLs.
