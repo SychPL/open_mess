@@ -31,6 +31,7 @@ commit.
 | `crates/open-mess/` | the `om` binary: daemon and CLI (library `open_mess` plus `src/main.rs`) |
 | `crates/open-mess/src/daemon.rs` | `om daemon`: start-up order, the last start error, running until Ctrl+C |
 | `crates/open-mess/src/instance.rs` | single-instance lock (`daemon.lock` in the data folder) |
+| `crates/open-mess/src/logfile.rs` | the daemon's log, `%LOCALAPPDATA%\open_mess\logs\open_mess.log`: open_mess's own `info` and above, cleaned, rotated at 4 MiB |
 | `crates/open-mess/src/paths.rs` | the data folder: `%APPDATA%\open_mess`, or `OPEN_MESS_DATA_DIR` |
 | `crates/open-mess/src/store.rs` | SQLite state (`state.sqlite3`): schema migrations, configuration such as the port |
 | `crates/open-mess/src/secrets.rs` | secrets in Windows Credential Manager, starting with the local API token |

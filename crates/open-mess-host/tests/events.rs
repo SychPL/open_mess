@@ -161,6 +161,15 @@ async fn a_crash_closes_the_instances_sockets() {
 }
 
 #[tokio::test]
+async fn the_manifest_call_logs_nothing() {
+    // Its imports reach nothing (storage.rs), its log neither: a module waiting for approval never
+    // writes the daemon's log file.
+    // The manifest runs inside the load, so its log would be in by now.
+    let _module = echo().await;
+    assert!(!logs().contains("the manifest's log line"), "{}", logs());
+}
+
+#[tokio::test]
 async fn timer_fires_once() {
     let module = echo().await;
     assert_eq!(module.call("a", "timer", "{}").await.unwrap(), "{}");

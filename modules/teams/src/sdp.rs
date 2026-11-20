@@ -24,9 +24,18 @@ fn lines(sdp: &str) -> Result<Vec<&str>, ProtoError> {
     Ok(lines)
 }
 
-/// The attribute name of an `a=` line, for errors: never its value, which may hold addresses.
+/// A line's type and an `a=` line's attribute name, for errors (which the module logs): never a
+/// value, which the server chose and may hold addresses, a user name (`o=`) or a phone number (`p=`).
 fn name(line: &str) -> String {
-    line.split([':', ' ']).next().unwrap_or("").chars().take(32).collect()
+    match line.split_once('=') {
+        // A name's own characters only: `a=ice-ufrag=AbCd` names `a=ice-ufrag`.
+        Some(("a", attribute)) => {
+            let attribute: String = attribute.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').take(32).collect();
+            format!("a={attribute}")
+        }
+        Some((kind, _)) if kind.len() == 1 => format!("{kind}="),
+        _ => "(not a line)".to_string(),
+    }
 }
 
 fn unknown(line: &str) -> ProtoError {
@@ -331,6 +340,9 @@ mod tests {
         assert_eq!(from_ms(&ssrc), from_ms(ANSWER));
         let odd = ANSWER.replace("a=sendrecv", "a=foo:1\r\na=bar");
         assert_eq!(from_ms(&odd), Err(incompatible("sdp: unexpected lines a=foo a=bar")));
+        // Never a value: a phone number, a user's name.
+        let values = ANSWER.replace("a=sendrecv", "a=sendrecv\r\np=+12025550123\r\nJan Kowalski\r\na=ice-ufrag=AbCd");
+        assert_eq!(from_ms(&values), Err(incompatible("sdp: unexpected lines p= (not a line) a=ice-ufrag")));
         assert!(from_ms(&"a=x-y\r\n".repeat(MAX_LINES + 1)).is_err());
         assert!(from_ms(&format!("{ANSWER}{}", "a=x-y\r\n".repeat(MAX_SDP / 6))).is_err());
         assert!(from_ms("v=0\r\n").is_err());
