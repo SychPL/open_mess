@@ -838,6 +838,8 @@ impl Archiver {
                 if let Some(rec) = live.rec.take() {
                     self.close(inner, key, rec, now, None, None);
                 }
+                // A normal end: a join failure from before it is stale (a later one still shows).
+                live.last_reason = None;
                 live.next_join = now.saturating_add(RETRY_MS);
             }
             Outcome::Permanent(reason) => self.give_up(inner, key, live, reason, now),
@@ -891,6 +893,10 @@ impl Archiver {
             }
             if page.state == PageState::Joining {
                 return Some((page.state, page.reason));
+            }
+            if page.state == PageState::Live {
+                // A session that went live makes an earlier join failure stale: only a call that never did shows one (4.4).
+                live.last_reason = None;
             }
             if live.rec.is_none() && page.state == PageState::Live && !draining && !self.start_recording(inner, key, live, now) {
                 return None;
