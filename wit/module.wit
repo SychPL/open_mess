@@ -192,6 +192,9 @@ interface sign-in {
     // Windows; without it a call gets its own account's token and an event the module's only one
     // (spec 2026-10-29-live-captions, 5.2).
     wam-token: func(scopes: list<string>, interactive: bool, claims: option<string>, account: option<string>) -> result<string, sign-in-error>;
+    // Whether this host has Windows WAM. Without it `wam-token` always fails and a module signs in
+    // another way (spec 2026-11-20-teams-sign-in-without-wam).
+    wam-available: func() -> bool;
 }
 
 interface host {

@@ -10,6 +10,7 @@ pub mod chat;
 pub mod http;
 pub mod manifest;
 pub mod meetings;
+pub mod oauth;
 pub mod poll;
 pub mod retry;
 pub mod sdp;
