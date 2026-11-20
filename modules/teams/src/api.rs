@@ -1,6 +1,7 @@
-//! The module's way out: tokens from WAM, the sessions kept in memory, and requests through the
-//! host's `http.fetch` with the official client's retry policy, regional redirects and token
-//! refresh (spec 9.1-9.3, docs/protocols/teams.md 1-3 and 8).
+//! The module's way out: tokens from WAM or from the refresh token of the sign-in page, the
+//! sessions kept in memory, and requests through the host's `http.fetch` with the official
+//! client's retry policy, regional redirects and token refresh (spec 9.1-9.3, docs/protocols/teams.md
+//! 1-3 and 8; spec 2026-11-20-teams-sign-in-without-wam).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -12,12 +13,15 @@ use crate::ProtoError;
 use crate::authsvc;
 use crate::component::bindings::open_mess::module::host::{self, SessionState};
 use crate::component::bindings::open_mess::module::types::{AccountInfo, ModuleError};
-use crate::component::bindings::open_mess::module::{http, sign_in, storage};
-use crate::http::HttpRequest;
+use crate::component::bindings::open_mess::module::{http, secrets, sign_in, storage};
+use crate::http::{HttpRequest, SecretString};
+use crate::oauth::{self, OauthError};
 use crate::poll;
 use crate::retry::{self, GiveUpReason, Retry};
-use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, MCPS_SCOPE, RECORDING_SCOPE, SEARCH_SCOPE, Session};
+use crate::session::{self, AUTHSVC_SCOPE, CHAT_SCOPE, Claims, MCPS_SCOPE, RECORDING_SCOPE, SEARCH_SCOPE, Session, Source};
 
+/// The secret key of an account's refresh token (spec 2026-11-20-teams-sign-in-without-wam, 4.3.2).
+const REFRESH_KEY: &str = "refresh-token";
 /// The part of the host's call limit (30 s) the module plans with: no wait starts that would end
 /// past it, so a slow service ends a call with an error, not a timeout that unloads the module.
 const CALL_BUDGET: Duration = Duration::from_secs(20);
@@ -119,27 +123,95 @@ pub fn uuid() -> String {
 /// the module account, so an event (a timer, a socket frame) gets that account's token when there
 /// are several (spec 2026-10-29-live-captions, 5.2); a sign-in names none.
 fn wam(scope: &str, interactive: bool, claims: Option<&str>, account: Option<&str>) -> Result<(String, Claims), ModuleError> {
-    let token = sign_in::wam_token(&[scope.to_string()], interactive, claims, account).map_err(|e| {
-        ModuleError::AuthRequired(match e {
-            sign_in::SignInError::Cancelled => "sign-in was cancelled".to_string(),
-            sign_in::SignInError::TimedOut => "sign-in timed out".to_string(),
-            sign_in::SignInError::Refused(why) | sign_in::SignInError::Blocked(why) => format!("Windows gave no token: {why}"),
-        })
-    })?;
+    let token = sign_in::wam_token(&[scope.to_string()], interactive, claims, account).map_err(|e| sign_in_failed(e, "Windows gave no token"))?;
     let claims = session::claims(&token).ok_or_else(|| ModuleError::Incompatible("the token from Windows names no account".to_string()))?;
     Ok((token, claims))
 }
 
-/// Signs in through WAM, interactively, and checks the account with Teams.
+/// A sign-in prompt that did not give an answer; `refused` starts the text of a refusal.
+fn sign_in_failed(e: sign_in::SignInError, refused: &str) -> ModuleError {
+    ModuleError::AuthRequired(match e {
+        sign_in::SignInError::Cancelled => "sign-in was cancelled".to_string(),
+        sign_in::SignInError::TimedOut => "sign-in timed out".to_string(),
+        sign_in::SignInError::Refused(why) | sign_in::SignInError::Blocked(why) => format!("{refused}: {why}"),
+    })
+}
+
+fn oauth_failed(e: OauthError) -> ModuleError {
+    match e {
+        OauthError::AuthRequired(why) => ModuleError::AuthRequired(why),
+        OauthError::Incompatible(why) => ModuleError::Incompatible(why),
+        OauthError::Platform(why) => ModuleError::Platform(why),
+    }
+}
+
+/// Signs in, interactively, and checks the account with Teams: through WAM, or through the
+/// sign-in page where the host has none.
 pub fn sign_in() -> Result<AccountInfo, ModuleError> {
+    let session = if sign_in::wam_available() { sign_in_wam()? } else { sign_in_page()? };
+    let info = AccountInfo { id: session.account.clone(), display_name: session.name.clone() };
+    keep(session);
+    Ok(info)
+}
+
+fn sign_in_wam() -> Result<Session, ModuleError> {
     let (token, claims) = wam(AUTHSVC_SCOPE, true, None, None)?;
     // The user's time in the WAM dialog does not count against the host's limit (spec 8.3, R4),
     // so it does not count against the budget either.
     begin();
-    let session = establish(token, claims)?;
-    let info = AccountInfo { id: session.account.clone(), display_name: session.name.clone() };
-    keep(session);
-    Ok(info)
+    establish(token, claims, Source::Wam)
+}
+
+/// Authorization code with PKCE through the sign-in page (spec 2026-11-20-teams-sign-in-without-wam,
+/// 4.3.2). The refresh token is kept in the account's secrets: without it the account would not
+/// survive a restart.
+fn sign_in_page() -> Result<Session, ModuleError> {
+    let pkce = oauth::pkce().map_err(oauth_failed)?;
+    let url = oauth::authorize_url(&pkce.challenge, &pkce.state);
+    let answer = sign_in::open_page(&url, oauth::REDIRECT_URI).map_err(|e| sign_in_failed(e, "the sign-in page failed"))?;
+    // The user's time on the page does not count against the budget, as with WAM's dialog.
+    begin();
+    let code = oauth::redirect(&answer, &pkce.state).map_err(oauth_failed)?;
+    let (token, claims, refresh) = token_call(&oauth::code_form(code.expose(), pkce.verifier.expose()), true)?;
+    let refresh = refresh.ok_or_else(|| ModuleError::Incompatible("unexpected server response at refresh_token".to_string()))?;
+    let session = establish(token, claims, Source::Refresh)?;
+    secrets::set(&session.account, REFRESH_KEY, refresh.expose()).map_err(|why| ModuleError::Platform(format!("cannot keep the sign-in: {why}")))?;
+    Ok(session)
+}
+
+/// A request to the token endpoint: the access token, its claims (with an expiry, from the answer
+/// if the token has none) and the refresh token the answer holds. No bearer.
+fn token_call(form: &[u8], need_refresh: bool) -> Result<(String, Claims, Option<SecretString>), ModuleError> {
+    let response = exchange(&oauth::token_request(form.to_vec()), None, false, false)?;
+    let tokens = oauth::token_response(response.status, &response.body, need_refresh).map_err(oauth_failed)?;
+    let token = tokens.access.expose().to_string();
+    let mut claims = session::claims(&token).ok_or_else(|| ModuleError::Incompatible("the token from Microsoft names no account".to_string()))?;
+    if claims.expires_ms.is_none() {
+        claims.expires_ms = tokens.expires_in.map(|secs| now_ms().saturating_add(secs.saturating_mul(1000)));
+    }
+    Ok((token, claims, tokens.refresh))
+}
+
+/// The stored refresh token of `account`.
+fn stored_refresh(account: &str) -> Option<SecretString> {
+    secrets::get(account, REFRESH_KEY).map(SecretString::new)
+}
+
+/// A token for `scope` from the refresh token `stored` of `account`, and its claims (spec
+/// 2026-11-20-teams-sign-in-without-wam, 4.3.4). A new refresh token replaces the stored one.
+fn refresh(account: &str, stored: &SecretString, scope: &str, challenge: Option<&str>) -> Result<(String, Claims), ModuleError> {
+    let form = oauth::refresh_form(stored.expose(), scope, &oauth::merge_claims(challenge));
+    let (token, claims, rotated) = token_call(&form, false)?;
+    if claims.oid != account {
+        return Err(ModuleError::AuthRequired("the stored sign-in belongs to another account".to_string()));
+    }
+    if let Some(rotated) = rotated
+        && secrets::set(account, REFRESH_KEY, rotated.expose()).is_err()
+    {
+        // The old token stays valid for a while; the next refresh tries again.
+        host::log(1, "the new refresh token was not stored");
+    }
+    Ok((token, claims))
 }
 
 /// A session for `account` again, with tokens WAM gives without asking.
@@ -151,6 +223,9 @@ pub fn restore(account: &str) -> Result<(), ModuleError> {
 
 pub fn sign_out(account: &str) {
     SESSIONS.with(|s| s.borrow_mut().remove(account));
+    // The core deletes the account's secrets too; not waiting for it keeps the order of the two
+    // from mattering.
+    secrets::delete(account, REFRESH_KEY);
     storage::delete(&poll::key(account));
 }
 
@@ -188,20 +263,30 @@ pub fn polling_again() {
     }
 }
 
+/// With a stored refresh token the session refreshes from it; without one it asks WAM, and a host
+/// without WAM needs the user to sign in again.
 fn open(account: &str) -> Result<Session, ModuleError> {
+    if let Some(stored) = stored_refresh(account) {
+        let (token, claims) = refresh(account, &stored, AUTHSVC_SCOPE, None)?;
+        return establish(token, claims, Source::Refresh);
+    }
+    if !sign_in::wam_available() {
+        return Err(ModuleError::AuthRequired("sign in again".to_string()));
+    }
     let (token, claims) = wam(AUTHSVC_SCOPE, false, None, Some(account))?;
     if claims.oid != account {
         return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
     }
-    establish(token, claims)
+    establish(token, claims, Source::Wam)
 }
 
 /// The authsvc exchange: Teams accepts the account and names its services (docs 2). Its 404 is
 /// an answer, not a regional redirect.
-fn establish(token: String, claims: Claims) -> Result<Session, ModuleError> {
+fn establish(token: String, claims: Claims, source: Source) -> Result<Session, ModuleError> {
     let auth = authorize(&token)?;
     let expires = claims.expires_ms;
     let mut session = Session::new(claims, auth.directory);
+    session.source = source;
     session.region = auth.region;
     session.keep(AUTHSVC_SCOPE, token, expires);
     session.keep_skype(auth.skype_token, auth.expires_at_ms);
@@ -330,12 +415,22 @@ fn token(session: &mut Session, scope: &str) -> Result<String, ModuleError> {
     }
 }
 
-/// A new token from WAM, silently, for the session's own account only.
+/// A new token for the session's own account only, silently: from WAM, or by the stored refresh
+/// token, as the session's source says.
 fn renew(session: &mut Session, scope: &str, claims: Option<&str>) -> Result<String, ModuleError> {
-    let (token, c) = wam(scope, false, claims, Some(&session.account))?;
-    if c.oid != session.account {
-        return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
-    }
+    let (token, c) = match session.source {
+        Source::Wam => {
+            let (token, c) = wam(scope, false, claims, Some(&session.account))?;
+            if c.oid != session.account {
+                return Err(ModuleError::AuthRequired("Windows now signs in another account".to_string()));
+            }
+            (token, c)
+        }
+        Source::Refresh => {
+            let stored = stored_refresh(&session.account).ok_or_else(|| ModuleError::AuthRequired("sign in again".to_string()))?;
+            refresh(&session.account, &stored, scope, claims)?
+        }
+    };
     session.keep(scope, token.clone(), c.expires_ms);
     Ok(token)
 }

@@ -80,6 +80,15 @@ pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Where a session's tokens come from (spec 2026-11-20-teams-sign-in-without-wam, 4.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Windows WAM, silently.
+    Wam,
+    /// The refresh token in the account's secrets.
+    Refresh,
+}
+
 pub struct Session {
     /// The account id: the user's object id.
     pub account: String,
@@ -87,6 +96,7 @@ pub struct Session {
     pub upn: Option<String>,
     pub tenant: Option<String>,
     pub directory: ServiceDirectory,
+    pub source: Source,
     /// authsvc's `region` and `partition`.
     pub region: Option<(String, String)>,
     /// Scope, token and when it expires. SharePoint's scope is the organization's origin, so
@@ -109,6 +119,7 @@ impl Session {
             upn: claims.upn,
             tenant: claims.tenant,
             directory,
+            source: Source::Wam,
             region: None,
             tokens: Vec::new(),
             skype: None,
