@@ -1,7 +1,7 @@
 # open_mess - logowanie Teams bez WAM (etap 2 wtyczki Paperclip)
 
 Data: 2026-11-20
-Status: R1, przejrzany przez autora (bez Codex i GLM: autor nie ma tych narzędzi; review właściciela w PR)
+Status: R2, przejrzany przez autora (bez Codex i GLM: autor nie ma tych narzędzi; review właściciela w PR); kroki 1-4 zrobione, test na żywo 2026-11-20 (`docs/protocols/teams.md`, "Live results" 21)
 Powiązane: `.specs/2026-11-03-paperclip-plugin.md` (rozdz. 3.3, 6), `.specs/2026-10-26-open-mess-design.md` (8.3, 8.4, 9.1, 9.5), `docs/protocols/teams.md` (1.1, 1.3, 1.4, "Needs live capture" 2), `wit/module.wit`, `modules/teams/src/{api,session,manifest}.rs`, `crates/open-mess-host/src/{wam,sign_in,bindings}.rs`.
 
 ## 1. Cel
@@ -180,3 +180,5 @@ Każde ma test, który bez zmiany nie przechodzi.
 ## Changelog rund
 
 R1: pierwsza wersja.
+
+R2: poprawiony wektor RFC 7636 w 7.2; test na żywo (krok 4) zrobiony - logowanie, odświeżenie na IC3, middle tier i `outlook.office.com`, odtworzenie po restarcie; MCPS, zasób nagrań i SharePoint nie sprawdzone na żywo.
