@@ -1,7 +1,7 @@
 # open_mess - plik logu demona
 
 Data: 2026-11-18
-Status: po R10 (limit rund z AGENTS.md): GLM APPROVE od R4 do R10, Codex REJECT w R10 (2x P2 + P3: dwa wdrożone, jeden w rejestrze rebutali); czeka na decyzję właściciela
+Status: zatwierdzony przez właściciela 2026-11-20 ("Tak, push i PR wszystko") po R10 (limit rund z AGENTS.md): GLM APPROVE od R4 do R10, Codex REJECT w R10 (2x P2 + P3: dwa wdrożone, jeden w rejestrze rebutali)
 Powiązane: `.specs/2026-10-26-open-mess-design.md` (8.4 "Logi nie zawierają tokenów, ciasteczek ani treści wiadomości"), `.specs/2026-10-29-live-captions.md` (krok 5: skąd `OPEN_MESS_LOG`), `.specs/2026-11-04-captions-archive.md` (zdarzenia `open_mess::captions`).
 
 ## 1. Cel
@@ -191,3 +191,4 @@ Bez nowych zależności i cech w `Cargo.toml`.
 - R9: Codex REJECT (1x P2, 1x P3), GLM APPROVE (1x P3); wszystko wdrożone. `warn` dla każdego modułu, który po skanie nie działa, z jego stanem (`Invalid` tylko jako rodzaj), z testem procesu (Codex); `\n` przed wierszem po urwanym wierszu, z testem (Codex, P3); `APPDATA` i `LOCALAPPDATA` zamieniane jak `USERPROFILE`, bo przekierowany polityką Roaming leży poza profilem (GLM, P3).
 - R10: Codex REJECT (2x P2, 1x P3), GLM APPROVE (siódmy raz z rzędu, R4-R10). Wdrożone: plik `Invalid` w logu bez nazwy pliku (Codex); bez wiersza dla `PendingReplacement` (Codex, P3). Odrzucone: tekst `rusqlite` na stderr przy `OPEN_MESS_LOG` - sprzed specu, rejestr rebutali. Limit 10 rund z AGENTS.md wyczerpany: bez R11, decyzja o specu należy do właściciela.
 - Recenzja commita efacd4e (Codex REJECT: P2 + 2x P3, GLM APPROVE): udział także w postaci `\\?\UNC\...` (Codex, P2); po panice chrono czas UTC bez ponownej próby, komunikat paniki raz (Codex, P3). Bez zmiany: urwany w środku znak UTF-8 zostaje w pliku przed `\n` (Codex, P3) - Notatnik i edytory czytają taki plik, a naprawa wymagałaby obcinania bajtów, które mógł dopisać drugi demon.
+- 2026-11-20: właściciel zatwierdził spec po R10 bez kolejnej rundy ("Tak, push i PR wszystko"), razem z wypchnięciem gałęzi i PR.
