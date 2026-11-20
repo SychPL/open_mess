@@ -551,8 +551,10 @@ async fn mentions_from_recent_messages() {
 async fn search_posts_to_substrate() {
     let teams = Teams::signed_in().await;
     let hit = json!({"Source": {
-        "ItemId": "item-1",
+        "ItemId": {"Id": "synthetic-item"},
+        "InternetMessageId": "1800000000123",
         "ClientConversationId": GROUP,
+        "ClientThreadId": GROUP,
         "DateTimeReceived": "2027-01-15T08:00:00Z",
         "Preview": "the synthetic budget",
         "From": {"EmailAddress": {"Name": "Synthetic Person Two", "Address": "person.two@synthetic.example"}},
@@ -562,7 +564,7 @@ async fn search_posts_to_substrate() {
         .on(move |s| (s.path == "/search/api/v2/query").then(|| Reply::json(json!({"EntitySets": [{"ResultSets": [{"Results": [hit.clone()]}]}]}))));
     let result = teams.call("search", json!({"query": "budget", "limit": 5})).await.unwrap();
     let expected = json!({
-        "id": "item-1",
+        "id": "1800000000123",
         "conversation": GROUP,
         "sent_at": "2027-01-15T08:00:00Z",
         "edited": false,
