@@ -23,14 +23,18 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 /// A module built by `cargo xtask ci` (the wasm build runs before the tests), found from this test
-/// binary: `<target>[/<triple>]/<profile>/deps/<test>.exe`, the module
-/// `<target>/wasm32-wasip2/<profile>/<name>.wasm`.
+/// binary: `<target>[/<triple>]/<profile>/deps/<test>.exe`, or with the build-dir layout of Cargo
+/// 1.100 `<target>/<profile>/build/<package>/<hash>/out/<test>`; the module is
+/// `<target>/wasm32-wasip2/<profile>/<name>.wasm`. The profile is the first folder above the binary
+/// that has such a module beside it.
 pub fn wasm(name: &str) -> PathBuf {
     let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe.parent().and_then(|deps| deps.parent()).unwrap();
-    let relative = PathBuf::from("wasm32-wasip2").join(profile_dir.file_name().unwrap()).join(format!("{name}.wasm"));
-    let found = profile_dir.ancestors().map(|dir| dir.join(&relative)).find(|path| path.exists());
-    found.unwrap_or_else(|| panic!("{} is missing; build the modules first (cargo xtask ci)", relative.display()))
+    let file = format!("{name}.wasm");
+    let found = exe.ancestors().skip(1).find_map(|profile| {
+        let relative = PathBuf::from("wasm32-wasip2").join(profile.file_name()?).join(&file);
+        profile.ancestors().map(|dir| dir.join(&relative)).find(|path| path.exists())
+    });
+    found.unwrap_or_else(|| panic!("wasm32-wasip2/<profile>/{file} is missing; build the modules first (cargo xtask ci)"))
 }
 
 pub fn echo() -> Vec<u8> {

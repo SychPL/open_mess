@@ -180,6 +180,158 @@ async fn restore_sets_account_states() {
     assert_eq!(states, expected.map(|(id, state)| (id.to_string(), state.to_string())));
 }
 
+/// How many times test-echo was asked to restore `account`.
+async fn restores(d: &common::Daemon, account: &str) -> usize {
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    let ended: Value = serde_json::from_str(&echo.call("a", "ended", "{}").await.unwrap()).unwrap();
+    ended["restored"].as_array().unwrap().iter().filter(|restored| *restored == account).count()
+}
+
+fn state(d: &common::Daemon, id: &str) -> String {
+    d.accounts.get(id).unwrap().unwrap().state
+}
+
+/// Waits up to 10 s for `done`.
+async fn eventually(mut done: impl AsyncFnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done().await {
+        assert!(Instant::now() < deadline, "timed out");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn offline_accounts_are_restored_again() {
+    let d = daemon(&[ECHO]).await;
+    // test-echo restores "known", asks "other" to sign in again, fails "flaky" once and "down"
+    // every time.
+    for id in ["known", "other", "flaky", "down"] {
+        d.accounts.add("test-echo", info(id)).unwrap();
+    }
+    d.accounts.add("gone", info("x")).unwrap();
+    d.accounts.restore().await.unwrap();
+    assert_eq!((state(&d, "test-echo:flaky"), state(&d, "test-echo:down")), ("offline".into(), "offline".into()));
+
+    let retry = tokio::spawn({
+        let accounts = Arc::clone(&d.accounts);
+        async move { accounts.retry_offline(&[Duration::from_millis(10), Duration::from_millis(10), Duration::from_secs(3600)]).await }
+    });
+    eventually(async || state(&d, "test-echo:flaky") == "online" && restores(&d, "down").await == 3).await;
+    // "down" waits an hour now; the online and auth-required accounts were never restored again.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let counts = [restores(&d, "known").await, restores(&d, "other").await, restores(&d, "flaky").await, restores(&d, "down").await];
+    assert_eq!(counts, [1, 1, 2, 3]);
+    let states: Vec<String> = ["test-echo:known", "test-echo:other", "test-echo:flaky", "test-echo:down", "gone:x"].map(|id| state(&d, id)).into();
+    assert_eq!(states, ["online", "auth-required", "online", "offline", "offline"]);
+    retry.abort();
+}
+
+#[tokio::test]
+async fn an_account_back_online_starts_the_waits_over() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("down")).unwrap();
+    d.accounts.restore().await.unwrap();
+    let retry = tokio::spawn({
+        let accounts = Arc::clone(&d.accounts);
+        async move { accounts.retry_offline(&[Duration::from_millis(10), Duration::from_secs(3600)]).await }
+    });
+    // One round failed: the next one would come in an hour.
+    eventually(async || restores(&d, "down").await == 2).await;
+    // The account comes back (a sign-in) and drops offline again: it is tried within a look.
+    d.accounts.set_state("test-echo", "down", SessionState::Online).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    d.accounts.set_state("test-echo", "down", SessionState::Offline).unwrap();
+    eventually(async || restores(&d, "down").await == 3).await;
+    retry.abort();
+}
+
+#[tokio::test]
+async fn offline_accounts_wait_for_the_module_write_block() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("flaky")).unwrap();
+    d.accounts.restore().await.unwrap();
+    let block = d.accounts.module_writes().block();
+    let retry = tokio::spawn({
+        let accounts = Arc::clone(&d.accounts);
+        async move { accounts.retry_offline(&[Duration::from_millis(10)]).await }
+    });
+    // An update or a scan holds the block: no restore meanwhile.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((state(&d, "test-echo:flaky"), restores(&d, "flaky").await), ("offline".into(), 1));
+    drop(block);
+    eventually(async || state(&d, "test-echo:flaky") == "online").await;
+    retry.abort();
+}
+
+// Several threads: the module's busy call must not hold up the test's own timers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_block_taken_during_a_round_waits_for_it() {
+    let d = daemon(&[ECHO]).await;
+    // test-echo fails the first restore of "flaky", and the round's one succeeds.
+    d.accounts.add("test-echo", info("flaky")).unwrap();
+    d.accounts.restore().await.unwrap();
+    // test-echo is busy for 1 s describing conversation "slow", so the round's restore waits in
+    // its queue.
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    let busy = tokio::spawn(async move { echo.describe_target("a", "slow", None).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let retry = tokio::spawn({
+        let accounts = Arc::clone(&d.accounts);
+        async move { accounts.retry_offline(&[Duration::from_millis(10), Duration::from_secs(3600)]).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An update blocks the writes now: it waits for the round as for an approved write, so the
+    // round's restore is done before the update ends the modules' sessions.
+    assert_eq!(state(&d, "test-echo:flaky"), "offline");
+    let block = d.accounts.module_writes().block();
+    d.accounts.module_writes().finished().await;
+    assert_eq!(state(&d, "test-echo:flaky"), "online");
+    drop(block);
+    let _ = busy.await;
+    retry.abort();
+}
+
+#[tokio::test]
+async fn a_crash_restores_offline_accounts_too() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("known")).unwrap();
+    d.accounts.add("test-echo", info("down")).unwrap();
+    d.accounts.restore().await.unwrap();
+    tokio::spawn(Arc::clone(&d.accounts).restore_after_crashes());
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    assert!(echo.call("a", "trap", "{}").await.is_err());
+    // An offline account may have live sessions from a session opened on demand: the new
+    // instance leaves what the crashed one left of them.
+    eventually(async || restores(&d, "known").await == 2 && restores(&d, "down").await == 2).await;
+}
+
+#[tokio::test]
+async fn a_restore_that_crashes_the_module_is_not_run_again_at_once() {
+    let d = daemon(&[ECHO]).await;
+    d.accounts.add("test-echo", info("known")).unwrap();
+    d.accounts.restore().await.unwrap();
+    tokio::spawn(Arc::clone(&d.accounts).restore_after_crashes());
+    // test-echo crashes on restoring "crash".
+    d.accounts.add("test-echo", info("crash")).unwrap();
+    d.accounts.set_state("test-echo", "crash", SessionState::Offline).unwrap();
+    let retry = tokio::spawn({
+        let accounts = Arc::clone(&d.accounts);
+        async move { accounts.retry_offline(&[Duration::from_millis(10), Duration::from_secs(3600)]).await }
+    });
+    // The restore after the crash brings back "known"; "crash" runs again at most once (when that
+    // restore starts before the crash's answer is in), then waits for its next round. Without
+    // that, the module would crash over and over: the good restores of "known" keep resetting
+    // the crashes in a row that stop it.
+    eventually(async || restores(&d, "known").await >= 2).await;
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let crashes = echo.crashes_since_load();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(crashes <= 2 && echo.crashes_since_load() == crashes, "{crashes} crashes, then {}", echo.crashes_since_load());
+    assert_eq!(state(&d, "test-echo:crash"), "offline");
+    retry.abort();
+}
+
 #[tokio::test]
 async fn module_errors_over_the_api() {
     let d = daemon(&[ECHO]).await;
@@ -229,8 +381,8 @@ async fn secrets_left_behind_keep_the_account() {
     cred.set_error(keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))));
 
     assert!(d.accounts.remove("test-echo:a").await.is_err());
-    // The account stays, signed out.
-    assert_eq!(d.accounts.get("test-echo:a").unwrap().unwrap().state, "offline");
+    // The account stays, marked: no restore signs it in again, and removing it can be run again.
+    assert_eq!(d.accounts.get("test-echo:a").unwrap().unwrap().state, "removing");
     // Removing again works once the store does.
     d.accounts.remove("test-echo:a").await.unwrap();
     assert!(d.accounts.get("test-echo:a").unwrap().is_none());

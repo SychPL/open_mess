@@ -326,9 +326,10 @@ fn start(
     runtime.spawn({
         let (accounts, restored) = (Arc::clone(&accounts), Arc::clone(registry.accounts_restored()));
         async move {
-            // ponytail: a failed restore leaves the stored states; reported once a log sink exists.
             let _ = accounts.restore().await;
             restored.store(true, Ordering::SeqCst);
+            // Accounts left offline are restored again, from now on.
+            accounts.retry_offline(&crate::accounts::RETRY_OFFLINE).await;
         }
     });
     pending.recover()?;
