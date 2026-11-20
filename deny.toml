@@ -28,6 +28,10 @@ ignore = [
     # candle, the local transcription's model runtime (spec 2026-10-28-local-transcription). Its
     # matrix kernels (gemm) use the unmaintained paste macro.
     { id = "RUSTSEC-2024-0436", reason = "paste: through candle's gemm kernels, unmaintained only" },
+    # chrono: RFC 3339 times and the local quiet hours of trigger rules. rmcp, the MCP server,
+    # requires it in every release up to 3.11, so no dependency tree of open_mess is without it;
+    # the advisory is about maintenance, not a vulnerability.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: required by rmcp, unmaintained only" },
 ]
 
 [licenses]
