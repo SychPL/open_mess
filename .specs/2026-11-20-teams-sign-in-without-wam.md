@@ -136,7 +136,7 @@ Każde ma test, który bez zmiany nie przechodzi.
 
 1. Host: `wam-available` = `false` poza Windows; `true` z fałszywym WAM; `false` z `Engine::without_wam()`.
 2. `oauth.rs`:
-   - wektor z RFC 7636 dodatek B (`dBjftJeZ4CVP-mJ92aRL0qNpEX6O3ixsbN8gxZ8l5bE` -> `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`);
+   - wektor z RFC 7636 dodatek B (`dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk` -> `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`);
    - verifier: 43 znaki z alfabetu base64url, dwa kolejne różne;
    - adres autoryzacji: urząd, wszystkie parametry, `redirect_uri` dokładnie `nativeclient`;
    - przekierowanie: dobry `code`; zły `state`; `error` z `AADSTS` (opis z adresem e-mail nie trafia do błędu); brak `code`;
