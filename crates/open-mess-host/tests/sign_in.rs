@@ -204,3 +204,22 @@ async fn scope_patterns_cover_one_label_of_an_allowed_host() {
     // None of the refused ones reached Windows.
     assert_eq!(asked.lock().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn wam_available_follows_the_host() {
+    let available = |engine: Engine| async move {
+        let echo = engine.load(&wasm("open_mess_test_echo"), context()).await.unwrap();
+        echo.call("a", "wam-available", "{}").await.unwrap()
+    };
+    // A real build has WAM on Windows only.
+    let real = Engine::with_limits(limits::for_tests()).unwrap();
+    assert_eq!(available(real).await, format!(r#"{{"available":{}}}"#, cfg!(windows)));
+    let fake: open_mess_host::FakeWam = std::sync::Arc::new(|_, _, _| Ok("token".to_string()));
+    let with_fake = Engine::with_limits(limits::for_tests()).unwrap().with_fake_wam(fake.clone());
+    assert_eq!(available(with_fake).await, r#"{"available":true}"#);
+    // `without_wam` drops a fake set before it, and a fake set after it brings WAM back.
+    let without = Engine::with_limits(limits::for_tests()).unwrap().with_fake_wam(fake.clone()).without_wam();
+    assert_eq!(available(without).await, r#"{"available":false}"#);
+    let back = Engine::with_limits(limits::for_tests()).unwrap().without_wam().with_fake_wam(fake);
+    assert_eq!(available(back).await, r#"{"available":true}"#);
+}

@@ -31,8 +31,8 @@
 //! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
 //! named after any other. `wam-token` asks WAM for `{"scopes"}` and returns `{"token"}` or
-//! `{"error"}`. `rtc-open` opens a media connection with the data channel `{"label"}` and returns
-//! `{"conn", "offer"}`; `rtc-accept` gives connection `{"conn"}` the answer `{"answer"}` and returns
+//! `{"error"}`; `wam-available` returns `{"available"}`. `rtc-open` opens a media connection with
+//! the data channel `{"label"}` and returns `{"conn", "offer"}`; `rtc-accept` gives connection `{"conn"}` the answer `{"answer"}` and returns
 //! `{}`; both return `{"error", "why"}` instead when refused, and `rtc-close` closes `{"conn"}`. The
 //! manifest's media range is 52.112.0.0/14; data channel batches and states go to `host.log`. The
 //! `end-sessions` and `restore` exports append their account to the storage keys "ended" and
@@ -166,6 +166,7 @@ mod guest {
                     Err(e) => json!({ "error": sign_in_error(&e) }),
                 }
             }
+            "wam-available" => json!({ "available": sign_in::wam_available() }),
             "peeks" => json!({ "count": stored("peeks").as_u64().unwrap_or_default() }),
             "peek" => {
                 let count = stored("peeks").as_u64().unwrap_or_default() + 1;
