@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ui::UiState;
-use crate::ui::commands::{self, AccountDto, AnswerDto};
+use crate::ui::commands::{self, AccountDto, AnswerDto, RuleDto};
 
 #[derive(Clone)]
 struct Admin {
@@ -138,6 +138,15 @@ async fn call(State(admin): State<Admin>, Path(command): Path<String>, body: Byt
         },
         "clear_permission_override" => match parse::<Override>(args) {
             Ok(Override { account, conversation }) => answer(commands::clear_permission_override(ui, &account, &conversation)),
+            Err(bad) => error(StatusCode::BAD_REQUEST, bad),
+        },
+        "rules" => answer(commands::rules(ui)),
+        "put_rule" => match parse::<RuleDto>(args) {
+            Ok(rule) => answer(commands::put_rule(ui, rule).map(|warning| json!({ "warning": warning }))),
+            Err(bad) => error(StatusCode::BAD_REQUEST, bad),
+        },
+        "delete_rule" => match parse::<Id>(args) {
+            Ok(Id { id }) => answer(commands::delete_rule(ui, &id)),
             Err(bad) => error(StatusCode::BAD_REQUEST, bad),
         },
         "waiting" => Json(commands::waiting(ui)).into_response(),
