@@ -315,7 +315,7 @@ fn read_messages(session: &mut Session, args: &Value) -> Result<Value, ModuleErr
 fn search(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let query = required(args, "query")?;
     let size = u32::try_from(limit(args, 30)).unwrap_or(30);
-    // `Oid:<oid>@<tenant>`, the format of the client's `addSubstrateIdHeaders` (to be confirmed live).
+    // `Oid:<oid>@<tenant>`, the format of the client's `addSubstrateIdHeaders` (confirmed live, docs/protocols/teams.md "Live results" 22).
     let anchor = format!("Oid:{}@{}", session.account, session.tenant.as_deref().unwrap_or_default());
     let request = search::request(query, size, &anchor, &api::uuid());
     let hits = search::decode(&api::read(session, Service::Search, &request)?).map_err(api::proto)?;

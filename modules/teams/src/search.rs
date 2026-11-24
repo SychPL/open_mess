@@ -1,7 +1,7 @@
 //! Message search through Substrate (docs/protocols/teams.md 6): the request and the result
 //! decoder. The entity type, content source, scenario, anchor format and result fields are
-//! UNCONFIRMED until a live capture (F2b); an answer in another shape is incompatible, nothing is
-//! guessed.
+//! CONFIRMED live (docs/protocols/teams.md "Live results" 22); an answer in another shape is
+//! incompatible, nothing is guessed.
 
 use serde_json::{Value, json};
 
@@ -13,9 +13,11 @@ const QUERY_URL: &str = "https://substrate.office.com/search/api/v2/query";
 
 /// One message found. No `Debug`: it carries message text.
 pub struct Hit {
-    /// `Source.ItemId`.
+    /// `Source.InternetMessageId`, the chat service's message id. `Source.ItemId` is an Exchange
+    /// item id (an object), not this.
     pub id: String,
-    /// `Source.ClientConversationId`, the chat service's conversation id.
+    /// `Source.ClientThreadId`, the chat service's conversation id. `ClientConversationId` is the
+    /// same for group chats and channels, but carries a `;messageid=` suffix in 1:1 chats.
     pub conversation: String,
     /// `Source.DateTimeReceived`.
     pub sent_ms: i64,
@@ -76,8 +78,8 @@ fn hit(result: &Value, path: &str) -> Result<Hit, ProtoError> {
     let received = req_str(source, &path, "DateTimeReceived")?;
     let address = obj(obj(source, &path, "From")?, &path, "EmailAddress")?;
     Ok(Hit {
-        id: req_str(source, &path, "ItemId")?.to_string(),
-        conversation: req_str(source, &path, "ClientConversationId")?.to_string(),
+        id: req_str(source, &path, "InternetMessageId")?.to_string(),
+        conversation: req_str(source, &path, "ClientThreadId")?.to_string(),
         sent_ms: time::iso8601_ms(received).ok_or_else(|| incompatible(&format!("{path}.DateTimeReceived")))?,
         text: opt_str(source, &path, "Preview")?.unwrap_or_default().to_string(),
         sender_name: opt_str(address, &path, "Name")?.map(str::to_string),
@@ -99,18 +101,56 @@ mod tests {
         assert_eq!((body["entityRequests"][0]["size"].as_u64(), body["cvid"].as_str()), (Some(30), Some("c-1")));
     }
 
+    /// The live shape (key names and types as captured), with synthetic values.
+    fn live_hit(message_id: &str, thread: &str, conversation: &str, received: &str) -> Value {
+        json!({
+            "Id": "synthetic-result",
+            "ReferenceId": "synthetic-ref",
+            "HitHighlightedSummary": "the <c0>synthetic</c0> budget",
+            "Rank": 1,
+            "Type": "Message",
+            "Source": {
+                "Id": "synthetic-source",
+                "ItemId": {"Id": "synthetic"},
+                "ClientConversationId": conversation,
+                "ClientThreadId": thread,
+                "DateTimeCreated": "2027-01-15T08:00:00.1234567Z",
+                "DateTimeReceived": received,
+                "DateTimeSent": "2027-01-15T08:00:00.1234567Z",
+                "HasAttachments": false,
+                "InternetMessageId": message_id,
+                "Preview": "synthetic text",
+                "Sender": {"EmailAddress": {"Name": "Synthetic Person", "Address": "p@synthetic.example"}},
+                "From": {"EmailAddress": {"Name": "Synthetic Person", "Address": "p@synthetic.example"}},
+                "Subject": "",
+                "ConversationId": {"Id": "synthetic-conversation"},
+                "MailboxGuids": ["00000000-0000-0000-0000-000000000003"],
+                "MentionsPreview": {"IsMentioned": false},
+            },
+        })
+    }
+
     #[test]
-    fn decodes_hits_unconfirmed_shape() {
-        let body = json!({"EntitySets": [{"ResultSets": [{"Results": [
-            {"Source": {"ItemId": "i-1", "ClientConversationId": "19:a@thread.v2", "DateTimeReceived": "2027-01-15T08:00:00Z",
-                        "Preview": "synthetic text", "From": {"EmailAddress": {"Name": "Synthetic Person", "Address": "p@synthetic.example"}}}},
-            {"Source": {"ItemId": "i-2", "ClientConversationId": "19:b@thread.v2", "DateTimeReceived": "2027-01-15T08:00:01.5Z"}},
+    fn decodes_hits_live_shape() {
+        let direct = "19:00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002@unq.gbl.spaces";
+        let group = "19:synthetic@thread.v2";
+        let mut bare = live_hit("1800000000124", group, group, "2027-01-15T08:00:01.5Z");
+        if let Some(source) = bare.get_mut("Source").and_then(Value::as_object_mut) {
+            source.remove("Preview");
+            source.insert("From".to_string(), json!({"EmailAddress": {}}));
+        }
+        let body = json!({"ApiVersion": "v2", "EntitySets": [{"EntityType": "Message", "ResultSets": [{"Results": [
+            live_hit("1800000000123", direct, &format!("{direct};messageid=1799999999000"), "2027-01-15T08:00:00.123Z"),
+            bare,
         ]}]}]});
         let hits = decode(body.to_string().as_bytes()).unwrap();
         assert_eq!(hits.len(), 2);
-        assert_eq!((hits[0].id.as_str(), hits[0].conversation.as_str(), hits[0].sent_ms), ("i-1", "19:a@thread.v2", 1_800_000_000_000));
+        // The id is the message id, the conversation the plain thread id (not the 1:1 `;messageid=` form).
+        assert_eq!((hits[0].id.as_str(), hits[0].conversation.as_str(), hits[0].sent_ms), ("1800000000123", direct, 1_800_000_000_123));
         assert_eq!((hits[0].text.as_str(), hits[0].sender_name.as_deref()), ("synthetic text", Some("Synthetic Person")));
-        assert_eq!((hits[1].text.as_str(), hits[1].sender_address.as_deref()), ("", None));
+        assert_eq!(hits[0].sender_address.as_deref(), Some("p@synthetic.example"));
+        assert_eq!((hits[1].id.as_str(), hits[1].conversation.as_str()), ("1800000000124", group));
+        assert_eq!((hits[1].text.as_str(), hits[1].sender_name.as_deref(), hits[1].sender_address.as_deref()), ("", None, None));
         // No hits at all is an empty list.
         assert!(decode(br#"{"EntitySets": [{"ResultSets": [{}]}]}"#).unwrap().is_empty());
     }
@@ -119,7 +159,18 @@ mod tests {
     fn other_shapes_are_incompatible() {
         for (body, path) in [
             (r#"{}"#, "EntitySets"),
-            (r#"{"EntitySets": [{"ResultSets": [{"Results": [{"Source": {"ItemId": "i"}}]}]}]}"#, "DateTimeReceived"),
+            (
+                r#"{"EntitySets": [{"ResultSets": [{"Results": [{"Source": {"InternetMessageId": "1", "ClientThreadId": "t"}}]}]}]}"#,
+                "DateTimeReceived",
+            ),
+            (
+                r#"{"EntitySets": [{"ResultSets": [{"Results": [{"Source": {"ItemId": {"Id": "x"}, "ClientThreadId": "t", "DateTimeReceived": "2027-01-15T08:00:00Z"}}]}]}]}"#,
+                "InternetMessageId",
+            ),
+            (
+                r#"{"EntitySets": [{"ResultSets": [{"Results": [{"Source": {"InternetMessageId": "1", "ClientConversationId": "t", "DateTimeReceived": "2027-01-15T08:00:00Z"}}]}]}]}"#,
+                "ClientThreadId",
+            ),
             (r#"{"EntitySets": [{"ResultSets": [{"Results": [{}]}]}]}"#, "Source"),
             (r#"{"EntitySets": [{"ResultSets": 3}]}"#, "ResultSets"),
         ] {
