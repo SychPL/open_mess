@@ -183,7 +183,7 @@ async fn trigger_rules_are_listed_saved_and_deleted() {
         "quiet_ms": 60000,
         "max_delay_ms": 300000
     });
-    let (status, body) = post(addr, ADMIN, "/admin/put_rule", rule).await;
+    let (status, body) = post(addr, ADMIN, "/admin/put_rule", rule.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     // Writing needs confirmation by default, so there is no warning about agents writing alone.
     assert_eq!(body, json!({"warning": null}));
@@ -199,6 +199,22 @@ async fn trigger_rules_are_listed_saved_and_deleted() {
     // A rule for an account open_mess doesn't have is refused, like in the window.
     let (status, body) = post(addr, ADMIN, "/admin/put_rule", json!({"id": "r2", "account": "nobody:x", "enabled": true, "condition": {"type": "direct"}, "action": {"type": "channel", "fallback_spawn": null}, "quiet_hours": null, "max_per_hour": 6, "quiet_ms": 60000, "max_delay_ms": 300000})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A rule that starts a program is never set here, even with a program that exists: it would run
+    // in the open-mess container, next to the module secrets.
+    let program = json!({"program": std::env::current_exe().unwrap(), "args": [], "working_dir": null});
+    for action in [
+        json!({"type": "spawn", "program": program["program"], "args": [], "working_dir": null}),
+        json!({"type": "channel", "fallback_spawn": program}),
+    ] {
+        let mut rule = rule.clone();
+        rule["id"] = json!("r3");
+        rule["action"] = action;
+        let (status, body) = post(addr, ADMIN, "/admin/put_rule", rule).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("starts a program"), "{body}");
+    }
+    assert_eq!(post(addr, ADMIN, "/admin/rules", json!({})).await.1.as_array().unwrap().len(), 1);
 
     assert_eq!(post(addr, ADMIN, "/admin/delete_rule", json!({"id": "r1"})).await.0, StatusCode::OK);
     assert_eq!(post(addr, ADMIN, "/admin/rules", json!({})).await.1, json!([]));
