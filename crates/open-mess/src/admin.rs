@@ -16,8 +16,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::triggers::rules::Action;
 use crate::ui::UiState;
-use crate::ui::commands::{self, AccountDto, AnswerDto};
+use crate::ui::commands::{self, AccountDto, AnswerDto, RuleDto};
 
 #[derive(Clone)]
 struct Admin {
@@ -140,6 +141,20 @@ async fn call(State(admin): State<Admin>, Path(command): Path<String>, body: Byt
             Ok(Override { account, conversation }) => answer(commands::clear_permission_override(ui, &account, &conversation)),
             Err(bad) => error(StatusCode::BAD_REQUEST, bad),
         },
+        "rules" => answer(commands::rules(ui)),
+        "put_rule" => match parse::<RuleDto>(args) {
+            // A rule's program would run in the open-mess container, with the module secrets the
+            // Paperclip side must never reach (spec 2026-11-03-paperclip-plugin, 8).
+            Ok(rule) if starts_a_program(&rule.rule.action) => {
+                error(StatusCode::BAD_REQUEST, "a rule that starts a program is not set over the administrative API".to_string())
+            }
+            Ok(rule) => answer(commands::put_rule(ui, rule).map(|warning| json!({ "warning": warning }))),
+            Err(bad) => error(StatusCode::BAD_REQUEST, bad),
+        },
+        "delete_rule" => match parse::<Id>(args) {
+            Ok(Id { id }) => answer(commands::delete_rule(ui, &id)),
+            Err(bad) => error(StatusCode::BAD_REQUEST, bad),
+        },
         "waiting" => Json(commands::waiting(ui)).into_response(),
         "decide" => match parse::<Decide>(args) {
             Ok(Decide { action, approve }) => answer(commands::decide(ui, &action, approve).await),
@@ -179,6 +194,10 @@ fn sign_in_start(admin: &Admin, start: SignInStart) -> Response {
         drop(active);
     });
     Json(json!({"started": true})).into_response()
+}
+
+fn starts_a_program(action: &Action) -> bool {
+    matches!(action, Action::Spawn(_) | Action::Channel { fallback_spawn: Some(_) })
 }
 
 fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
