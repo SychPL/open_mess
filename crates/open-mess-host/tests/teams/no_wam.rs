@@ -30,7 +30,9 @@ const CODE: &str = "synthetic-code";
 
 /// The module's secrets live in keyring-core's default store, which a container does not have in
 /// the form the daemon uses: one in-memory store for the whole test process. The tests do not
-/// share an account, so they do not share secrets.
+/// share an account, so they do not share secrets. The tests with WAM run in the same process, but
+/// with WAM the module never reaches the secrets (`with_wam_the_secrets_are_left_alone`), so none
+/// of them sets up Windows' own store meanwhile.
 fn mock_secrets() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap()));
@@ -302,4 +304,21 @@ async fn sign_in_page_answer_for_another_state_is_refused_without_a_token_reques
     assert_eq!(error, ModuleError::AuthRequired("the sign-in answer is not for this sign-in".to_string()));
     assert!(teams.fake.seen().is_empty(), "the code of another sign-in is never redeemed");
     assert_eq!(teams.stored_refresh_token(), None);
+}
+
+#[tokio::test]
+async fn with_wam_the_secrets_are_left_alone() {
+    mock_secrets();
+    let (data, fake, wam, oid) = (tempfile::tempdir().unwrap(), Fake::start().await, fake::Wam::new(), account());
+    wam.set_account(&oid, ME_NAME);
+    let secret = || keyring_core::get_default_store().unwrap().build("open_mess/module/teams", &format!("{oid}/refresh-token"), None).unwrap();
+    secret().set_password("rt-0").unwrap();
+    let (module, _events) = crate::load(&fake, &wam, data.path(), None, None).await;
+    module.restore(&oid).await.unwrap();
+    module.sign_out(&oid).await.unwrap();
+    // WAM gave the token, as before the sign-in page existed: a refresh token in the secrets is
+    // neither used nor deleted.
+    assert_eq!(wam.calls().len(), 1);
+    assert!(fake.requests(TOKEN_PATH).is_empty());
+    assert_eq!(secret().get_password().unwrap(), "rt-0");
 }

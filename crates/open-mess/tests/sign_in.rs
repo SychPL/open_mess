@@ -425,8 +425,12 @@ async fn failed_sign_in_adds_nothing() {
     let page = prompt(&state, "page").await;
     commands::sign_in_answer(&state, page.id, AnswerDto::Cancelled).unwrap();
     assert!(signing_in.await.unwrap().is_err());
-    // A page that names no account.
+    // A page that names no account: not added, so the module's session of it and its secrets go
+    // (a refresh token kept by the sign-in does not stay behind an account nobody can remove).
     assert!(sign_in_as(&state, None, "").await.is_err());
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    let records: serde_json::Value = serde_json::from_str(&echo.call("a", "ended", "{}").await.unwrap()).unwrap();
+    assert_eq!(records["signed-out"], serde_json::json!([""]));
     // An account that is not there, or a module that does not run.
     assert!(commands::sign_in_start(&state, "test-echo", Some("test-echo:nobody")).await.is_err());
     assert!(commands::sign_in_start(&state, "nope", None).await.unwrap_err().contains("nie działa"));

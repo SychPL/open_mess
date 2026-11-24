@@ -282,7 +282,12 @@ impl Accounts {
                 other_account.to_owned()
             }
         } else {
-            return self.add(module, info);
+            match self.add(module, info.clone()) {
+                Ok(account) => return Ok(account),
+                // Not added (an id it refuses, a state database that refuses the write): an
+                // account open_mess does not have loses its session and secrets below.
+                Err(err) => err.to_string(),
+            }
         };
         match self.get(&format!("{module}:{}", info.id))? {
             // Another account open_mess has: the module now holds its session, so it is online

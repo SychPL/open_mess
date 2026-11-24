@@ -214,7 +214,7 @@ fn refresh(account: &str, stored: &SecretString, scope: &str, challenge: Option<
     Ok((token, claims))
 }
 
-/// A session for `account` again, with tokens WAM gives without asking.
+/// A session for `account` again, with tokens WAM or the stored refresh token give without asking.
 pub fn restore(account: &str) -> Result<(), ModuleError> {
     let session = open(account)?;
     keep(session);
@@ -224,8 +224,10 @@ pub fn restore(account: &str) -> Result<(), ModuleError> {
 pub fn sign_out(account: &str) {
     SESSIONS.with(|s| s.borrow_mut().remove(account));
     // The core deletes the account's secrets too; not waiting for it keeps the order of the two
-    // from mattering.
-    secrets::delete(account, REFRESH_KEY);
+    // from mattering. With WAM there is no refresh token, and the secrets are not touched.
+    if !sign_in::wam_available() {
+        secrets::delete(account, REFRESH_KEY);
+    }
     storage::delete(&poll::key(account));
 }
 
@@ -263,15 +265,13 @@ pub fn polling_again() {
     }
 }
 
-/// With a stored refresh token the session refreshes from it; without one it asks WAM, and a host
-/// without WAM needs the user to sign in again.
+/// With WAM the session asks WAM, as before the sign-in page existed; without it the session
+/// refreshes from the stored refresh token, and without one the user has to sign in again.
 fn open(account: &str) -> Result<Session, ModuleError> {
-    if let Some(stored) = stored_refresh(account) {
+    if !sign_in::wam_available() {
+        let stored = stored_refresh(account).ok_or_else(|| ModuleError::AuthRequired("sign in again".to_string()))?;
         let (token, claims) = refresh(account, &stored, AUTHSVC_SCOPE, None)?;
         return establish(token, claims, Source::Refresh);
-    }
-    if !sign_in::wam_available() {
-        return Err(ModuleError::AuthRequired("sign in again".to_string()));
     }
     let (token, claims) = wam(AUTHSVC_SCOPE, false, None, Some(account))?;
     if claims.oid != account {

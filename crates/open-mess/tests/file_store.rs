@@ -61,6 +61,22 @@ fn a_write_over_the_limit_fails_and_changes_nothing() {
     assert_eq!(entry.get_password().unwrap(), "small");
 }
 
+/// A write that fails half way (here the disk is full) leaves no copy of the secrets beside the
+/// file (spec 2026-11-20-teams-sign-in-without-wam, 4.5.2).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_write_leaves_no_copy_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileStore::open(dir.path()).unwrap();
+    let entry = store.build("s", "u", None).unwrap();
+    entry.set_password("small").unwrap();
+    let temp = dir.path().join(format!("{FILE}.tmp"));
+    std::os::unix::fs::symlink("/dev/full", &temp).unwrap();
+    assert!(entry.set_password("refresh token").is_err());
+    assert!(std::fs::symlink_metadata(&temp).is_err(), "the half-written copy is gone");
+    assert_eq!(entry.get_password().unwrap(), "small");
+}
+
 #[test]
 fn writes_at_once_lose_nothing() {
     let dir = tempfile::tempdir().unwrap();

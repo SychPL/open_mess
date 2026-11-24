@@ -476,6 +476,11 @@ impl Host for HostState {
         }
         // Refused before anything touches Windows (or the tests' fake) or the credential store.
         allowed(self.env.wam.as_ref(), &self.env.hosts, &scopes)?;
+        // A host without WAM in the tests never reaches Windows' own.
+        #[cfg(any(test, feature = "test-support"))]
+        if self.env.without_wam {
+            return Err(SignInError::Refused("Windows account sign-in exists only on Windows".to_string()));
+        }
         #[cfg(any(test, feature = "test-support"))]
         if let Some(wam) = &self.env.fake_wam {
             return wam(&scopes, interactive, claims.as_deref()).map_err(SignInError::Refused);
