@@ -142,6 +142,11 @@ impl secrets::Host for HostState {
 impl host::Host for HostState {
     /// 0 error, 1 warn, 2 info, 3 debug, anything higher trace.
     async fn log(&mut self, level: u8, mut message: String) {
+        // The manifest call, before the module has a name (runtime.rs): like its other imports its
+        // log reaches nothing, so a module still waiting for approval never writes the daemon's log.
+        if self.env.name.is_empty() {
+            return;
+        }
         message.truncate(message.floor_char_boundary(limits::MAX_LOG_MESSAGE));
         let module = self.env.name.as_str();
         match level {

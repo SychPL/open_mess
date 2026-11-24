@@ -24,9 +24,15 @@ pub struct Paths {
 impl Paths {
     /// The running daemon's folders.
     pub fn current() -> Result<Paths, Error> {
+        let local = Paths::local_dir()?;
+        Ok(Paths { data: paths::data_dir()?, local })
+    }
+
+    /// `%LOCALAPPDATA%\open_mess` alone: the daemon's log goes there even without a data folder.
+    pub fn local_dir() -> Result<PathBuf, Error> {
         let local =
             std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty()).ok_or_else(|| Error::BadConfig("LOCALAPPDATA is not set".into()))?;
-        Ok(Paths { data: paths::data_dir()?, local: PathBuf::from(local).join("open_mess") })
+        Ok(PathBuf::from(local).join("open_mess"))
     }
 
     /// `om.exe`, and the helper `om.update.exe`.
