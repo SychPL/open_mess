@@ -156,9 +156,13 @@ impl NoWam {
 
     /// The refresh token in the account's secrets, read the way the host stores it.
     fn stored_refresh_token(&self) -> Option<String> {
-        let store = keyring_core::get_default_store().unwrap();
-        store.build("open_mess/module/teams", &format!("{}/refresh-token", self.oid), None).unwrap().get_password().ok()
+        refresh_secret(&self.oid).get_password().ok()
     }
+}
+
+/// The refresh token secret of `oid`, where the host keeps it.
+fn refresh_secret(oid: &str) -> keyring_core::Entry {
+    keyring_core::get_default_store().unwrap().build("open_mess/module/teams", &format!("{oid}/refresh-token"), None).unwrap()
 }
 
 /// Takes the sign-in page prompt and answers it as the redirect would: with `state` (the page's
@@ -321,4 +325,20 @@ async fn with_wam_the_secrets_are_left_alone() {
     assert_eq!(wam.calls().len(), 1);
     assert!(fake.requests(TOKEN_PATH).is_empty());
     assert_eq!(secret().get_password().unwrap(), "rt-0");
+}
+
+#[tokio::test]
+async fn a_refresh_does_not_bring_back_a_secret_removed_meanwhile() {
+    let teams = NoWam::signed_in().await;
+    let (idp, chat, oid) = (teams.idp.clone(), conversations_page(Vec::new()), teams.oid.clone());
+    // The account is removed while Microsoft answers the refresh: its secrets go first.
+    teams.fake.on(move |s| {
+        if s.path == TOKEN_PATH {
+            refresh_secret(&oid).delete_credential().unwrap();
+        }
+        idp.answer(s).or_else(|| chat(s))
+    });
+    teams.call("list_conversations", json!({})).await.unwrap();
+    assert_eq!(teams.token_requests().len(), 2);
+    assert_eq!(teams.stored_refresh_token(), None, "the rotated token is not stored again");
 }

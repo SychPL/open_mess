@@ -198,14 +198,18 @@ fn stored_refresh(account: &str) -> Option<SecretString> {
 }
 
 /// A token for `scope` from the refresh token `stored` of `account`, and its claims (spec
-/// 2026-11-20-teams-sign-in-without-wam, 4.3.4). A new refresh token replaces the stored one.
+/// 2026-11-20-teams-sign-in-without-wam, 4.3.4). A new refresh token replaces the stored one, but
+/// only while it is still the one this refresh used: an account removed meanwhile (its secret
+/// deleted) or signed in again (a newer token) keeps what it has.
 fn refresh(account: &str, stored: &SecretString, scope: &str, challenge: Option<&str>) -> Result<(String, Claims), ModuleError> {
     let form = oauth::refresh_form(stored.expose(), scope, &oauth::merge_claims(challenge));
     let (token, claims, rotated) = token_call(&form, false)?;
     if claims.oid != account {
         return Err(ModuleError::AuthRequired("the stored sign-in belongs to another account".to_string()));
     }
+    let unchanged = || stored_refresh(account).is_some_and(|now| now.expose() == stored.expose());
     if let Some(rotated) = rotated
+        && unchanged()
         && secrets::set(account, REFRESH_KEY, rotated.expose()).is_err()
     {
         // The old token stays valid for a while; the next refresh tries again.
