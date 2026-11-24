@@ -1,7 +1,7 @@
 # open_mess - logowanie Teams bez WAM (etap 2 wtyczki Paperclip)
 
 Data: 2026-11-20
-Status: R11, zatwierdzony (Codex i GLM, runda R10; rundy R1-R2 autora były bez nich); kroki 1-3 zrobione; krok 4 (test na żywo 2026-11-20, `docs/protocols/teams.md`, "Live results" 21) zrobiony dla logowania, odtworzenia po restarcie, IC3, middle tier i `outlook.office.com`; MCPS, zasób nagrań i SharePoint czekają na próbę na żywo ("Needs live capture" 2)
+Status: R12, zatwierdzony (Codex i GLM, runda R10; rundy R1-R2 autora były bez nich); kroki 1-3 zrobione; krok 4 (test na żywo 2026-11-20, `docs/protocols/teams.md`, "Live results" 21) zrobiony dla logowania, odtworzenia po restarcie, IC3, middle tier i `outlook.office.com`; MCPS, zasób nagrań i SharePoint czekają na próbę na żywo ("Needs live capture" 2)
 Powiązane: `.specs/2026-11-03-paperclip-plugin.md` (rozdz. 3.3, 6, 8), `.specs/2026-10-26-open-mess-design.md` (8.3, 8.4, 9.1, 9.5), `.specs/2026-11-18-account-restore-retry.md`, `docs/protocols/teams.md` (1.1, 1.3, 1.4, "Needs live capture" 2), `wit/module.wit`, `modules/teams/src/{api,session,manifest}.rs`, `crates/open-mess-host/src/{wam,sign_in,bindings,secrets}.rs`, `crates/open-mess/src/accounts.rs`.
 
 ## 1. Cel
@@ -86,7 +86,7 @@ Moduł obsługuje jedno wywołanie naraz (`actor.rs`), więc póki strona czeka 
 
 `Session` dostaje pole `source: Source { Wam, Refresh }`. `renew` i `open` wybierają drogę:
 
-- `open(account)` (restore, przeładowana instancja): z WAM (`wam-available` = true) -> WAM jak dziś, bez sięgania do sekretów; bez WAM -> sekret `refresh-token` konta i odświeżenie na `AUTHSVC_SCOPE`, źródło `Refresh`. Bez WAM i bez sekretu -> `auth-required("sign in again")`: rdzeń zapisuje wtedy stan `auth-required` (`restore_where`), a ponawianie kont `offline` (`.specs/2026-11-18-account-restore-retry.md`, PR #17, jeszcze nie w `main`) go nie bierze, więc nie ma pętli. Błąd sieci przy odświeżeniu to `platform` -> `offline`, dokładnie jak nieudany `restore` z WAM: z PR #17 konto wraca samo, bez niego wraca jak dziś (restart, `restore_after_crashes`, ponowne logowanie). Ten spec nie zmienia, co rdzeń robi z kontem `offline`.
+- `open(account)` (restore, przeładowana instancja): z WAM (`wam-available` = true) -> WAM jak dziś, bez sięgania do sekretów; bez WAM -> sekret `refresh-token` konta i odświeżenie na `AUTHSVC_SCOPE`, źródło `Refresh`. Bez WAM i bez sekretu -> `auth-required("sign in again")`: rdzeń zapisuje wtedy stan `auth-required` (`restore_where`), a ponawianie kont `offline` (`.specs/2026-11-18-account-restore-retry.md`, PR #17, w `main` od 6115087) go nie bierze, więc nie ma pętli. Błąd sieci przy odświeżeniu to `platform` -> `offline`, dokładnie jak nieudany `restore` z WAM, i konto wraca samo przez to ponawianie. Ten spec nie zmienia, co rdzeń robi z kontem `offline`.
 - Droga WAM nie czyta ani nie usuwa żadnego sekretu, więc na Windows nic się nie zmienia (ani wywołania Menedżera poświadczeń, ani testy z fałszywym WAM).
 - `renew(session, scope, claims)`: `Wam` -> jak dziś; `Refresh` -> 4.3.4.
 - Sprawdzenie `oid` nowego tokenu z kontem sesji zostaje w obu drogach.
@@ -235,3 +235,5 @@ R9 (Codex R8: REJECT, GLM R8: APPROVE bez nowych zastrzeżeń): rejestr rebutali
 R10 (Codex R9: REJECT, GLM R9: APPROVE bez zastrzeżeń): 4.1 - nowy moduł Teams wymaga hosta z `wam-available` (na open_mess 0.2.0 się nie załaduje; kolejność wdrożenia); rozdz. 3 - zgoda przy ręcznej podmianie pliku a zgoda zapisywana przez aktualizator przy podpisanym wydaniu (Codex P3).
 
 R11 (Codex R10: APPROVE, GLM R10: APPROVE): tylko sformułowania z dwóch P3 Codex (zgoda na nowy plik a `rescan_modules` w działającym demonie; co zostaje w sekretach po nieudanym zapisie rotacji), bez kolejnej rundy.
+
+R12 (P3 Codex z review commitu a15b119): PR #17 jest już w `main` (6115087), gałąź go zawiera; 4.3.3 bez "jeszcze nie w `main`". Rejestr B9 opisuje stan z rundy R3 i zostaje.
