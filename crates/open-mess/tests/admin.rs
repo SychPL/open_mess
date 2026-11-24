@@ -167,3 +167,56 @@ async fn a_sign_in_starts_at_once_and_reports_its_result() {
         assert_eq!((result["state"].as_str(), result["account"]["id"].as_str()), (Some("done"), Some("test-echo:a1")), "{result}");
     }
 }
+
+#[tokio::test]
+async fn trigger_rules_are_listed_saved_and_deleted() {
+    let (addr, _stop, d) = serve(true).await;
+    d.accounts.add("test-echo", common::info("a")).unwrap();
+    let rule = json!({
+        "id": "r1",
+        "account": "test-echo:a",
+        "enabled": true,
+        "condition": {"type": "conversation", "id": "c1"},
+        "action": {"type": "channel", "fallback_spawn": null},
+        "quiet_hours": null,
+        "max_per_hour": 6,
+        "quiet_ms": 60000,
+        "max_delay_ms": 300000
+    });
+    let (status, body) = post(addr, ADMIN, "/admin/put_rule", rule.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Writing needs confirmation by default, so there is no warning about agents writing alone.
+    assert_eq!(body, json!({"warning": null}));
+
+    let (status, body) = post(addr, ADMIN, "/admin/rules", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rules = body.as_array().unwrap();
+    assert_eq!(rules.len(), 1, "{body}");
+    assert_eq!(rules[0]["id"], "r1");
+    assert_eq!(rules[0]["condition"], json!({"type": "conversation", "id": "c1"}));
+    assert!(rules[0]["counters"].is_object(), "{body}");
+
+    // A rule for an account open_mess doesn't have is refused, like in the window.
+    let (status, body) = post(addr, ADMIN, "/admin/put_rule", json!({"id": "r2", "account": "nobody:x", "enabled": true, "condition": {"type": "direct"}, "action": {"type": "channel", "fallback_spawn": null}, "quiet_hours": null, "max_per_hour": 6, "quiet_ms": 60000, "max_delay_ms": 300000})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A rule that starts a program is never set here, even with a program that exists: it would run
+    // in the open-mess container, next to the module secrets.
+    let program = json!({"program": std::env::current_exe().unwrap(), "args": [], "working_dir": null});
+    for action in [
+        json!({"type": "spawn", "program": program["program"], "args": [], "working_dir": null}),
+        json!({"type": "channel", "fallback_spawn": program}),
+    ] {
+        let mut rule = rule.clone();
+        rule["id"] = json!("r3");
+        rule["action"] = action;
+        let (status, body) = post(addr, ADMIN, "/admin/put_rule", rule).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("starts a program"), "{body}");
+    }
+    assert_eq!(post(addr, ADMIN, "/admin/rules", json!({})).await.1.as_array().unwrap().len(), 1);
+
+    assert_eq!(post(addr, ADMIN, "/admin/delete_rule", json!({"id": "r1"})).await.0, StatusCode::OK);
+    assert_eq!(post(addr, ADMIN, "/admin/rules", json!({})).await.1, json!([]));
+    assert_eq!(post(addr, ADMIN, "/admin/delete_rule", json!({"id": "r1"})).await.0, StatusCode::BAD_REQUEST);
+}

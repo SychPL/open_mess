@@ -150,7 +150,9 @@ Komendy to istniejące funkcje `ui/commands.rs`, bez nowej logiki. Wynik `Err(St
 - `waiting`, `decide {action, approve}`;
 - `sign_in_start {module, account?}`, `sign_in_request`, `sign_in_answer {id, answer}`, `sign_in_result`.
 
-Wszystkie przechodzą przez te same blokady co w oknie (`changes_allowed` w trakcie aktualizacji, której na serwerze i tak nie ma). Wyzwalacze i reszta okna wejdą w późniejszym etapie, jeśli właściciel ich zechce.
+Wszystkie przechodzą przez te same blokady co w oknie (`changes_allowed` w trakcie aktualizacji, której na serwerze i tak nie ma). Reszta okna wejdzie w późniejszym etapie, jeśli właściciel jej zechce.
+
+Dopisane po etapie 1 (2026-11-24, z PR kontrybutora): reguły wyzwalaczy (8.7 projektu), `rules`, `put_rule {RuleDto}` (zwraca `{"warning": ...}`), `delete_rule {id}`. Reguła, która uruchamia program (`spawn` albo `channel` z `fallback_spawn`), dostaje przez API administracyjne 400: program działałby w kontenerze `open-mess`, obok sekretów modułu, więc częściowo zaufany kontener Paperclip mógłby nim wynieść tokeny Teams (rozdz. 8). Takie reguły ustawia tylko okno, a na serwerze go nie ma.
 
 **Logowanie bez okna:**
 - `sign_in_start` uruchamia logowanie w tle i od razu zwraca `{"started": true}`. Drugie logowanie w tym czasie dostaje błąd, jak w oknie.
@@ -325,3 +327,5 @@ R5 (GLM zatwierdził):
 - `stop_grace_period: 60s` w compose, dłuższy niż `CALL_TIMEOUT` (Codex P2).
 - Opis `send` bez odesłania wyłącznie do powiadomienia Windows (Codex P3).
 - Generowanie narzędzi wtyczki przez xtask; odmowa niezatwierdzonej strony to ta sama techniczna odmowa co na Windows, filtr na każdej platformie (GLM P3).
+
+Po wdrożeniu (2026-11-24): reguły wyzwalaczy w API administracyjnym bez reguł uruchamiających program (5.4).

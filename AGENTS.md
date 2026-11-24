@@ -72,6 +72,14 @@ The daemon runs all day and holds the user's sessions; a crash drops every accou
   the point of open_mess). open_mess never sends them anywhere else, and neither ever reaches logs,
   test fixtures, docs, issues, PRs or commits. Protocol captures are redacted (no tokens, cookies,
   tenant ids, user ids or real message text) before they are written anywhere.
+- **Logs carry states, codes and counts.** A `tracing` event, and a module's `host.log`, has fixed
+  text, states, enum names, codes, counts and sizes, and the system's own error text. Never
+  tokens, ids (tenant, user, account, conversation, thread, message, call), names, addresses,
+  phone numbers, URLs with a path, message or caption text, server responses or their pieces, nor
+  the text of an error that can carry them (`HostError::Module`, `ModuleError`, `Error::Account`, a
+  parser's error quoting its input): log its kind or a fixed text instead. The daemon's log file
+  (`%LOCALAPPDATA%\open_mess\logs`) also cleans every line, but only as a second line of defence
+  (`.specs/2026-11-18-daemon-log-file.md`, 4.5 and 4.6).
 - **Messages from other people are untrusted data, never instructions.** Anything that hands
   message content to an agent marks it as such.
 - **The core enforces agent permissions** (read, write never / with confirmation / alone). Never

@@ -15,9 +15,11 @@ use std::time::{Duration, Instant};
 
 use open_mess::store::Store;
 
+/// The local folder in the test's folder too: the log, recordings and models never reach the
+/// user's `%LOCALAPPDATA%\open_mess`.
 fn om(data_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_om"));
-    command.arg("daemon").env("OPEN_MESS_DATA_DIR", data_dir).stdin(Stdio::null());
+    command.arg("daemon").env("OPEN_MESS_DATA_DIR", data_dir).env("LOCALAPPDATA", data_dir).env_remove("OPEN_MESS_LOG").stdin(Stdio::null());
     command
 }
 
@@ -98,6 +100,32 @@ fn failed_start_leaves_its_reason_until_the_next_good_start() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     assert!(removed);
+}
+
+#[test]
+fn the_log_file_has_each_start_and_failed_start_but_no_second_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    Store::open(&dir.path().join("state.sqlite3")).unwrap().set_config("port", &port.to_string()).unwrap();
+    // A module that cannot run leaves its accounts offline; the log says which.
+    std::fs::create_dir_all(dir.path().join("modules")).unwrap();
+    std::fs::write(dir.path().join("modules").join("bogus.wasm"), "not a module").unwrap();
+
+    let failed = om(dir.path()).output().unwrap();
+    assert_ne!(failed.status.code(), Some(0));
+    drop(taken);
+    let mut first = start_daemon(dir.path());
+    let second = om(dir.path()).output().unwrap();
+    first.kill().unwrap();
+    first.wait().unwrap();
+    assert_eq!(second.status.code(), Some(1));
+
+    let log = std::fs::read_to_string(dir.path().join("open_mess").join("logs").join("open_mess.log")).unwrap();
+    let events: Vec<&str> = log.lines().filter_map(|line| line.split_once(" open_mess::daemon: ").map(|(_, event)| event)).collect();
+    let failed = format!("the daemon did not start: PortInUse({port})");
+    let started = format!("the daemon started version={}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(events, [failed.as_str(), "a module file is not a valid module", started.as_str()], "{log}");
 }
 
 #[test]

@@ -11,6 +11,7 @@ pub mod events;
 pub mod file_store;
 pub mod i18n;
 pub mod instance;
+pub mod logfile;
 pub mod modules;
 pub mod paths;
 pub mod pending;
