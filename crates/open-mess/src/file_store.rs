@@ -72,9 +72,13 @@ impl FileStore {
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&temp).map_err(failure)?;
-        file.write_all(&json).and_then(|()| file.sync_all()).map_err(failure)?;
+        let written = file.write_all(&json).and_then(|()| file.sync_all());
         drop(file);
-        std::fs::rename(&temp, &self.0.path).map_err(failure)?;
+        // A write that failed leaves no copy of the secrets beside the file.
+        if let Err(err) = written.and_then(|()| std::fs::rename(&temp, &self.0.path)) {
+            std::fs::remove_file(&temp).ok();
+            return Err(failure(err));
+        }
         // The rename survives a power cut only once the folder is on disk too.
         #[cfg(unix)]
         if let Some(dir) = self.0.path.parent() {

@@ -8,6 +8,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 mod fake;
+mod no_wam;
 
 use std::net::SocketAddr;
 use std::path::Path;

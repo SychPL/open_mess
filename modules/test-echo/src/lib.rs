@@ -34,13 +34,13 @@
 //! page is Microsoft's own sign-in page (for the manual check of the sign-in window); `sign-out` reports the
 //! account offline; `get-attachment` downloads an `http://` attachment id and returns fixed bytes
 //! named after any other. `wam-token` asks WAM for `{"scopes"}` and returns `{"token"}` or
-//! `{"error"}`. `rtc-open` opens a media connection with the data channel `{"label"}` and returns
-//! `{"conn", "offer"}`; `rtc-accept` gives connection `{"conn"}` the answer `{"answer"}` and returns
+//! `{"error"}`; `wam-available` returns `{"available"}`. `rtc-open` opens a media connection with
+//! the data channel `{"label"}` and returns `{"conn", "offer"}`; `rtc-accept` gives connection `{"conn"}` the answer `{"answer"}` and returns
 //! `{}`; both return `{"error", "why"}` instead when refused, and `rtc-close` closes `{"conn"}`. The
 //! manifest's media range is 52.112.0.0/14; data channel batches and states go to `host.log`. The
-//! `end-sessions` and `restore` exports append their account to the storage keys "ended" and
-//! "restored", which the tool `ended` returns as `{"ended", "restored"}`; `end-sessions` of account
-//! "slow" is busy for 2 s first.
+//! `end-sessions`, `restore` and `sign-out` exports append their account to the storage keys
+//! "ended", "restored" and "signed-out", which the tool `ended` returns as `{"ended", "restored",
+//! "signed-out"}`; `end-sessions` of account "slow" is busy for 2 s first.
 //!
 //! Extra tools (the manifest's, for the core's registry): `peek` reads; it returns two items, one in
 //! `{"conversation"}` (else "c1") and one in "c2", one item without a conversation and some
@@ -169,6 +169,7 @@ mod guest {
                     Err(e) => json!({ "error": sign_in_error(&e) }),
                 }
             }
+            "wam-available" => json!({ "available": sign_in::wam_available() }),
             "peeks" => json!({ "count": stored("peeks").as_u64().unwrap_or_default() }),
             "peek" => {
                 let count = stored("peeks").as_u64().unwrap_or_default() + 1;
@@ -204,7 +205,7 @@ mod guest {
                 rtc::close(args.get("conn").and_then(Value::as_u64).and_then(|c| u32::try_from(c).ok()).unwrap_or_default());
                 json!({})
             }
-            "ended" => json!({ "ended": stored("ended"), "restored": stored("restored") }),
+            "ended" => json!({ "ended": stored("ended"), "restored": stored("restored"), "signed-out": stored("signed-out") }),
             "trap" => std::process::abort(),
             // Opens a socket, stays busy while the server's frames pile up, then sends 40 frames.
             "ws-burst" => match websocket::open(&text("url"), &[]) {
@@ -635,6 +636,7 @@ mod guest {
         }
 
         fn sign_out(account: String) {
+            remember("signed-out", &account);
             host::session(&account, host::SessionState::Offline);
         }
 

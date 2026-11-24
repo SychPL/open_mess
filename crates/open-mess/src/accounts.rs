@@ -292,21 +292,28 @@ impl Accounts {
                 other_account.to_owned()
             }
         } else {
-            return self.add(module, info);
+            match self.add(module, info.clone()) {
+                Ok(account) => return Ok(account),
+                // Not added (an id it refuses, a state database that refuses the write): an
+                // account open_mess does not have loses its session and secrets below.
+                Err(err) => err.to_string(),
+            }
         };
         match self.get(&format!("{module}:{}", info.id))? {
-            // Another account open_mess has: the module now holds its session, so it is online
-            // (unless it is being removed).
-            Some(other) if refusal == other_account => {
-                self.renew(&other.id, &info.display_name)?;
-                return Err(Error::Account(match lang {
-                    Lang::Pl => format!("{other_account} (zalogowano ponownie konto {})", other.id),
-                    Lang::En => format!("{other_account} (signed in account {} again)", other.id),
-                }));
+            // Another account open_mess has: the module now holds its session, so it is online.
+            Some(other) if other.state != REMOVING => {
+                if refusal == other_account {
+                    self.renew(&other.id, &info.display_name)?;
+                    return Err(Error::Account(match lang {
+                        Lang::Pl => format!("{other_account} (zalogowano ponownie konto {})", other.id),
+                        Lang::En => format!("{other_account} (signed in account {} again)", other.id),
+                    }));
+                }
             }
-            Some(_) => {}
-            // One open_mess does not have: its session and the secrets the module kept go.
-            None => {
+            // One open_mess does not have, or one being removed (its removal may have deleted the
+            // secrets before the module kept new ones, and skips the sign-out of a module turned
+            // off meanwhile): its session and the secrets the module kept go.
+            _ => {
                 let _ = handle.sign_out(&info.id).await;
                 let (credentials, data_dir, module, account) = (Arc::clone(&self.credentials), self.data_dir.clone(), module.to_owned(), info.id);
                 let deleted =

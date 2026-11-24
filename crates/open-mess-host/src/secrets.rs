@@ -54,8 +54,11 @@ pub(crate) fn set(store: &CredentialStore, storage: &mut Storage, module: &str, 
         return Err(format!("at most {} secrets per module", limits::MAX_SECRETS));
     };
     entry.set_password(value).map_err(|e| {
-        // A name for a secret that was never written does not take a place.
-        if new {
+        // A name for a secret that was never written does not take a place. A store may have
+        // written it all the same (open_mess's secrets file is in place when syncing its folder
+        // fails), so it goes first; one that stays keeps its name, so the account's removal
+        // still finds it.
+        if new && matches!(entry.delete_credential(), Ok(()) | Err(keyring_core::Error::NoEntry)) {
             storage.remove_secret(account, key).ok();
         }
         e.to_string()
@@ -176,6 +179,14 @@ mod tests {
         cred.set_error(keyring_core::Error::TooLong("password".to_string(), 2560));
         assert!(set(&*store, &mut storage, "m", "acct", "k", "too long").is_err());
         // Not recorded: recording it now finds it new.
+        assert_eq!(storage.add_secret("acct", "k").unwrap(), Some(true));
+        storage.remove_secret("acct", "k").unwrap();
+        // A store that wrote the secret before it failed (the secrets file in place, its folder
+        // not synced) does not keep it: the module was told it is not there.
+        entry.set_password("written anyway").unwrap();
+        cred.set_error(keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("sync"))));
+        assert!(set(&*store, &mut storage, "m", "acct", "k", "v").is_err());
+        assert_eq!(get(&*store, "m", "acct", "k"), None);
         assert_eq!(storage.add_secret("acct", "k").unwrap(), Some(true));
         // A delete the store refuses keeps the name; one that works forgets it.
         set(&*store, &mut storage, "m", "acct", "k", "v").unwrap();

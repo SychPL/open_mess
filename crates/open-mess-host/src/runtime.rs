@@ -164,6 +164,9 @@ pub(crate) struct ModuleEnv {
     pub(crate) events: mpsc::Sender<HostEvent>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fake_wam: Option<crate::FakeWam>,
+    /// Test support: `wam-available` is false, whatever the platform.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) without_wam: bool,
     /// Test support: the longest delay a timer gets, in milliseconds.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) timer_cap: Option<u32>,
@@ -242,6 +245,8 @@ pub struct Engine {
     #[cfg(any(test, feature = "test-support"))]
     fake_wam: Option<crate::FakeWam>,
     #[cfg(any(test, feature = "test-support"))]
+    without_wam: bool,
+    #[cfg(any(test, feature = "test-support"))]
     timer_cap: Option<u32>,
 }
 
@@ -261,6 +266,16 @@ impl Engine {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_fake_wam(mut self, wam: crate::FakeWam) -> Engine {
         self.fake_wam = Some(wam);
+        self.without_wam = false;
+        self
+    }
+
+    /// Test support: modules loaded from now on find no WAM, on every platform: `wam-available` is
+    /// false and a fake WAM set before is dropped.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn without_wam(mut self) -> Engine {
+        self.fake_wam = None;
+        self.without_wam = true;
         self
     }
 
@@ -297,6 +312,8 @@ impl Engine {
             limits,
             #[cfg(any(test, feature = "test-support"))]
             fake_wam: None,
+            #[cfg(any(test, feature = "test-support"))]
+            without_wam: false,
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: None,
         })
@@ -340,6 +357,8 @@ impl Engine {
             #[cfg(any(test, feature = "test-support"))]
             fake_wam: None,
             #[cfg(any(test, feature = "test-support"))]
+            without_wam: false,
+            #[cfg(any(test, feature = "test-support"))]
             timer_cap: None,
             sign_in: sign_in.clone(),
             wam: None,
@@ -365,6 +384,8 @@ impl Engine {
             events,
             #[cfg(any(test, feature = "test-support"))]
             fake_wam: self.fake_wam.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            without_wam: self.without_wam,
             #[cfg(any(test, feature = "test-support"))]
             timer_cap: self.timer_cap,
             sign_in,
