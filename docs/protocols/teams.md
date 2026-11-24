@@ -1185,8 +1185,8 @@ the user present (spec 9.5):
 
 ## Live results
 
-Captured on the user's corporate account with the user present (spec 9.5). Nothing here contains a
-token, tenant id, user id or account name.
+Captured on the user's corporate account with the user present (spec 9.5), except where an item
+names another account. Nothing here contains a token, tenant id, user id or account name.
 
 1. **WAM from a non-MSTeams process - accepted** (2026-10-26). An unpackaged Rust console program
    (`windows` crate 0.62, scratch probe, not in the repo) asked WAM for a token:
