@@ -2,10 +2,12 @@
 //! in; its tools and events go to that module only. Account ids are `<module>:<module_account>`,
 //! where `module_account` is the module's own id for it.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use keyring_core::api::CredentialStore;
 use open_mess_host::{AccountInfo, Attachment, HostError, ModuleError, ModuleHandle, SessionState};
@@ -24,6 +26,10 @@ use crate::tools::{ToolError, shared};
 const MAX_ACCOUNT_ID: usize = 256;
 /// Display names are cut to this many characters.
 const MAX_DISPLAY_NAME: usize = 256;
+/// The waits before the restores of accounts left offline: 1, 2, 5 and then every 15 minutes
+/// (spec 2026-11-18-account-restore-retry).
+pub const RETRY_OFFLINE: [Duration; 4] =
+    [Duration::from_secs(60), Duration::from_secs(2 * 60), Duration::from_secs(5 * 60), Duration::from_secs(15 * 60)];
 /// The state of an account being removed: no tool reaches it, no module report changes it, and a
 /// removal cut short (the daemon stopped) can be run again.
 pub const REMOVING: &str = "removing";
@@ -75,6 +81,8 @@ pub struct Accounts {
     module_writes: ModuleWrites,
     /// Held for a whole scan of the modules folder: scans run one after the other.
     scans: tokio::sync::Mutex<()>,
+    /// See [`Accounts::stuck`].
+    stuck_restores: Mutex<HashSet<String>>,
     /// Runs before the modules end their sessions: the captions archive's last read (spec
     /// 2026-11-04-captions-archive, 4.4).
     before_end: OnceLock<BeforeEnd>,
@@ -129,7 +137,8 @@ impl ModuleWrites {
             }
             started
         });
-        started.then_some(RunningWrite(self))
+        // Lazily: a guard made and dropped for a refused start would end a running write's count.
+        started.then(|| RunningWrite(self))
     }
 }
 
@@ -161,6 +170,7 @@ impl Accounts {
             attachments: Mutex::new(()),
             module_writes: ModuleWrites::default(),
             scans: tokio::sync::Mutex::new(()),
+            stuck_restores: Mutex::new(HashSet::new()),
             before_end: OnceLock::new(),
         }
     }
@@ -388,7 +398,7 @@ impl Accounts {
         self.end_sessions(&stopped).await;
         drop(stopped);
         drop(block);
-        self.restore_where(|module| changed.iter().any(|name| name == module)).await?;
+        self.restore_where(|account| changed.contains(&account.module)).await?;
         Ok(changed)
     }
 
@@ -433,40 +443,90 @@ impl Accounts {
                     && handle.state() != open_mess_host::ModuleState::Disabled
                     && let Ok(manifest) = handle.manifest()
                 {
-                    // ponytail: a failed restore leaves the stored states, as at the daemon's start.
-                    let _ = self.restore_where(|module| module == manifest.name).await;
+                    // A restore that crashes the module each time does not run again after each
+                    // crash (spec 2026-11-18-account-restore-retry, 3.4).
+                    let offline = state_name(SessionState::Offline);
+                    let stuck = |account: &Account| account.state == offline && self.stuck().contains(&account.id);
+                    let _ = self.restore_where(|account| account.module == manifest.name && !stuck(account)).await;
                 }
             }
         }
     }
 
-    /// Restores the sessions of the accounts of the modules `module` picks.
-    async fn restore_where(&self, module: impl Fn(&str) -> bool) -> Result<(), Error> {
+    /// Restores the accounts left offline again, with longer and longer waits (spec
+    /// 2026-11-18-account-restore-retry): after n rounds in a row that left an account offline, the
+    /// n-th of `delays`, the last one over and over. It looks every first delay; a look that finds
+    /// no account offline starts the waits over. Only accounts whose module is active; an online
+    /// account is never restored again here. Runs while the daemon does.
+    pub async fn retry_offline(&self, delays: &[Duration]) {
+        let (Some(&tick), Some(&last)) = (delays.first(), delays.last()) else { return };
+        let offline = |account: &Account| account.state == state_name(SessionState::Offline) && self.modules.handle(&account.module).is_some();
+        let any_offline = || self.list().is_ok_and(|accounts| accounts.iter().any(offline));
+        let (mut failed, mut waited) = (0, Duration::ZERO);
+        loop {
+            tokio::time::sleep(tick).await;
+            waited = waited.saturating_add(tick);
+            if !any_offline() {
+                (failed, waited) = (0, Duration::ZERO);
+                continue;
+            }
+            if waited < delays.get(failed).copied().unwrap_or(last) {
+                continue;
+            }
+            // A scan restores the modules it changed itself. An update or a scan holding the write
+            // block is not disturbed, and one that starts now waits for this round as for a write.
+            let _scan = self.scans.lock().await;
+            let Some(_round) = self.module_writes.start() else { continue };
+            waited = Duration::ZERO;
+            let _ = self.restore_where(&offline).await;
+            failed = if any_offline() { failed.saturating_add(1) } else { 0 };
+        }
+    }
+
+    /// Restores the sessions of the accounts `pick` picks.
+    async fn restore_where(&self, pick: impl Fn(&Account) -> bool) -> Result<(), Error> {
         let mut restores = JoinSet::new();
-        for account in self.list()?.into_iter().filter(|account| account.state != REMOVING && module(&account.module)) {
+        for account in self.list()?.into_iter().filter(|account| account.state != REMOVING && pick(account)) {
             match self.modules.handle(&account.module) {
                 Some(handle) => {
                     restores.spawn(async move {
-                        let state = match handle.restore(&account.module_account).await {
-                            Ok(()) => SessionState::Online,
-                            Err(HostError::Module(ModuleError::AuthRequired(_))) => SessionState::AuthRequired,
-                            Err(_) => SessionState::Offline,
-                        };
-                        (account, handle, state)
+                        let answer = handle.restore(&account.module_account).await;
+                        (account, handle, answer)
                     });
                 }
                 None => self.set_state(&account.module, &account.module_account, SessionState::Offline)?,
             }
         }
         while let Some(restored) = restores.join_next().await {
+            let Ok((account, handle, answer)) = restored else { continue };
             // A module replaced meanwhile has its own restore; this one's answer is out of date.
-            if let Ok((account, handle, state)) = restored
-                && self.modules.handle(&account.module).is_some_and(|current| current.same(&handle))
-            {
-                self.set_state(&account.module, &account.module_account, state)?;
+            if !self.modules.handle(&account.module).is_some_and(|current| current.same(&handle)) {
+                continue;
             }
+            if matches!(answer, Err(HostError::Timeout | HostError::Crashed(_))) {
+                self.stuck().insert(account.id.clone());
+            } else {
+                self.stuck().remove(&account.id);
+            }
+            let state = match answer {
+                Ok(()) => SessionState::Online,
+                Err(HostError::Module(ModuleError::AuthRequired(_))) => SessionState::AuthRequired,
+                Err(err) => {
+                    // The module's text is untrusted and may name people: only its kind.
+                    tracing::warn!(target: "open_mess::accounts", module = %account.module, kind = error_kind(&err), "an account's session was not restored");
+                    SessionState::Offline
+                }
+            };
+            self.set_state(&account.module, &account.module_account, state)?;
         }
         Ok(())
+    }
+
+    /// The accounts whose last restore crashed their module (timed out or trapped). The restore
+    /// after a crash passes over those still offline: it would crash the module again and again
+    /// (`retry_offline` tries them later).
+    fn stuck(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.stuck_restores.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Writes an attachment downloaded for the account, unless the account is gone or being
@@ -484,8 +544,9 @@ impl Accounts {
     /// its module; then the module signs it out, after every call already queued for it (a module
     /// runs its calls in order, and no time limit here cuts that wait short, so a queued restore
     /// cannot store a token after the secrets are gone); then its secrets go, and last its
-    /// permissions, pending actions, trigger rules, row and attachments. A removal cut short keeps the marked row, so it can be run again; secrets that
-    /// cannot be deleted leave the account signed out (offline).
+    /// permissions, pending actions, trigger rules, row and attachments. A removal cut short (the
+    /// daemon stopped, or the secrets could not be deleted) keeps the marked row, so it can be run
+    /// again, and no restore signs the account in again meanwhile.
     pub async fn remove(&self, id: &str) -> Result<(), Error> {
         let account = self.get(id)?.ok_or_else(|| Error::Account(format!("unknown account {id:?}")))?;
         self.store().conn().execute("UPDATE accounts SET state = ?2 WHERE id = ?1", [id, REMOVING])?;
@@ -500,7 +561,6 @@ impl Accounts {
             .await
             .unwrap_or_else(|err| Err(err.to_string()));
         if let Err(why) = deleted {
-            self.store().conn().execute("UPDATE accounts SET state = ?2 WHERE id = ?1", [id, state_name(SessionState::Offline)])?;
             return Err(Error::Account(format!("cannot delete the account's secrets: {why}")));
         }
         let _saving = self.attachments.lock().unwrap_or_else(PoisonError::into_inner);
@@ -520,6 +580,19 @@ impl Accounts {
     }
 }
 
+/// What kind of error a restore failed with, for the log.
+fn error_kind(err: &HostError) -> &'static str {
+    match err {
+        HostError::Load(_) => "load",
+        HostError::Timeout => "timeout",
+        HostError::Crashed(_) => "crashed",
+        HostError::Closed => "closed",
+        HostError::Module(ModuleError::Platform(_)) => "platform",
+        HostError::Module(ModuleError::Incompatible(_)) => "incompatible",
+        HostError::Module(_) => "module",
+    }
+}
+
 fn account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account { id: row.get(0)?, module: row.get(1)?, module_account: row.get(2)?, display_name: row.get(3)?, state: row.get(4)? })
 }
@@ -531,6 +604,18 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_refused_start_leaves_the_running_writes_counted() {
+        let writes = ModuleWrites::default();
+        let running = writes.start().unwrap();
+        let _block = writes.block();
+        assert!(writes.start().is_none());
+        // The write let in before the block still runs: the block's holder waits for it.
+        assert!(tokio::time::timeout(Duration::from_millis(100), writes.finished()).await.is_err());
+        drop(running);
+        writes.finished().await;
+    }
 
     #[tokio::test]
     async fn an_account_being_removed_is_not_signed_in_again() {
