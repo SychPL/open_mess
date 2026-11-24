@@ -18,7 +18,10 @@
 //! `[id, name]` pairs, `{"text"}` for any message, `{"title"}`), else participant "p1" (Pat),
 //! "message <id>" and the title "Echo <conversation>"; for conversation "slow" it is busy for 1 s
 //! first.
-//! The `restore` export succeeds only for account "known"; the `sign-in` export shows a device code,
+//! The `restore` export succeeds only for account "known", fails with a platform error for account
+//! "down" and for the first restore of account "flaky" (its later ones succeed), crashes the module
+//! for account "crash", and asks for a sign-in for any other; the `sign-in` export shows a device
+//! code,
 //! then opens the page `https://login.example.com/start` with the redirect prefix
 //! `https://login.example.com/done` and signs in the account named by the redirect's `account=`
 //! parameter (a sign-in error ends it as a platform error naming the case); after the tool
@@ -615,10 +618,19 @@ mod guest {
             Ok(types::AccountInfo { id: id.to_string(), display_name: format!("Echo {id}") })
         }
 
-        // Only account "known" has a session, so tests can tell restore from sign-out.
+        // Only account "known" has a session, so tests can tell restore from sign-out; "flaky" and
+        // "down" fail as a network error would, "flaky" only its first time; "crash" crashes the
+        // module.
         fn restore(account: String) -> Result<(), types::ModuleError> {
             remember("restored", &account);
-            if account == "known" { Ok(()) } else { Err(types::ModuleError::AuthRequired(account)) }
+            let tries = stored("restored").as_array().map_or(0, |list| list.iter().filter(|a| a.as_str() == Some(&account)).count());
+            match account.as_str() {
+                "known" => Ok(()),
+                "flaky" if tries > 1 => Ok(()),
+                "flaky" | "down" => Err(types::ModuleError::Platform("no network".to_string())),
+                "crash" => std::process::abort(),
+                _ => Err(types::ModuleError::AuthRequired(account)),
+            }
         }
 
         fn sign_out(account: String) {
