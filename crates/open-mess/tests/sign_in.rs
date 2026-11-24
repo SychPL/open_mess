@@ -417,6 +417,24 @@ async fn what_changed_during_a_sign_in_is_respected() {
 }
 
 #[tokio::test]
+async fn a_sign_in_that_ends_during_a_removal_leaves_no_session_or_secret() {
+    let d = daemon(&[ECHO]).await;
+    let state = state(&d);
+    sign_in_as(&state, None, "a").await.unwrap();
+    let (signing_in, page) = page_open(&state, Some("test-echo:a")).await;
+    // A removal under way whose sign-out did not reach the module (turned off meanwhile) and
+    // whose secrets are gone already: only the row is left.
+    let db = rusqlite::Connection::open(d.dir.path().join("state.sqlite3")).unwrap();
+    db.execute("UPDATE accounts SET state = ?1 WHERE id = 'test-echo:a'", [open_mess::accounts::REMOVING]).unwrap();
+    finish(&state, page, "a");
+    assert!(signing_in.await.unwrap().unwrap_err().contains("usunięto"));
+    // The session the module kept goes, with the secrets it may have kept.
+    let echo = d.accounts.modules().handle("test-echo").unwrap();
+    let records: serde_json::Value = serde_json::from_str(&echo.call("a", "ended", "{}").await.unwrap()).unwrap();
+    assert_eq!(records["signed-out"], serde_json::json!(["a"]));
+}
+
+#[tokio::test]
 async fn failed_sign_in_adds_nothing() {
     let d = daemon(&[ECHO]).await;
     let state = state(&d);
