@@ -95,6 +95,10 @@ used. Those facts cite chunk name and the module or function they sit in instead
   classic native-client redirect: an embedded WebView2 can run authorization code + PKCE against it
   and intercept the navigation to that URL to read `code`. No loopback (`http://localhost`) redirect
   appears anywhere for either client id - **UNCONFIRMED** that one is registered; assume not.
+  **CONFIRMED** live ("Live results" 21): authorization code + PKCE (`S256`) against it with the
+  `organizations` authority, the code redeemed at `organizations/oauth2/v2.0/token` from another
+  machine without an `Origin` header, a refresh token issued (no `refresh_token_expires_in`: not a SPA
+  registration), and `grant_type=refresh_token` with another audience's `scope` answered.
 - **CONFIRMED** the web client id's redirect URI is `${origin}/${redirectUrlPath}` =
   `https://teams.microsoft.com/v2` (`msal2-service-2ffcc69e...`: `redirectUri:U(t,s)` with
   `U=(n,e)=>`${n.origin}/${e}``, config `redirectUrlPath: "v2"`), authority
@@ -1134,7 +1138,8 @@ the user present (spec 9.5):
 1. ~~WAM with `1fec8e78-...` from a non-MSTeams process~~ - done, accepted (see "Live results").
 2. ~~Auth code + PKCE with `1fec8e78-...` and the `nativeclient` redirect: accepted by the tenant's
    conditional access?~~ - done, accepted (see "Live results" 21). Still open: the refresh token's
-   lifetime and later Identity Protection alerts.
+   lifetime, later Identity Protection alerts, and a refresh to the audiences not tried yet (MCPS,
+   the recording resource, the organization's SharePoint).
 3. Device code with `1fec8e78-...` (only with explicit consent, spec 9.5).
 4. ~~The full authz response shape and real `regionGtms` keys~~ - done (see "Live results", item 2).
 5. Which token Trouter allocate and AMS accept from open_mess (the chat service accepts a plain AAD
@@ -1947,7 +1952,12 @@ token, tenant id, user id or account name.
 21. **Sign-in without WAM from a Linux server** (2026-11-20, spec 2026-11-20-teams-sign-in-without-wam
     step 4; a contributor's own work account, the account holder at the computer and signing in in
     person). open_mess 0.2.0 plus this change, `om daemon` in a Linux container on a server,
-    signed in through the administrative API (`sign_in_start`, `sign_in_request`, `sign_in_answer`):
+    signed in through the administrative API (`sign_in_start`, `sign_in_request`, `sign_in_answer`).
+    An earlier manual probe by the owner (2026-11-03, spec 2026-11-03-paperclip-plugin 3.3: browser on
+    the owner's computer, code redeemed and refreshed from a datacenter server) had the same answers:
+    redemption HTTP 200 with a refresh token and no `refresh_token_expires_in`, an access token of
+    about 70 minutes, a refresh to `https://ic3.teams.office.com/.default` HTTP 200 (`scp`
+    `Teams.AccessAsUser.All`), authsvc and the conversation list HTTP 200.
     - **Sign-in page**: `organizations` authorize with `response_type=code`, `response_mode=query`,
       the `nativeclient` redirect, scope `https://api.spaces.skype.com/.default offline_access openid
       profile`, PKCE `S256`, `prompt=select_account` and the CP1 `claims`: accepted. The browser ended
