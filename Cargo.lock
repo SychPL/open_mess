@@ -4111,7 +4111,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "open-mess"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "candle-core",
@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "open-mess-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "open-mess-teams"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flate2",
  "getrandom 0.3.4",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "open-mess-test-echo"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
  "wit-bindgen 0.63.0",
@@ -4208,14 +4208,14 @@ dependencies = [
 
 [[package]]
 name = "open-mess-test-hog"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wit-bindgen 0.63.0",
 ]
 
 [[package]]
 name = "open-mess-test-spin"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wit-bindgen 0.63.0",
 ]
@@ -8700,7 +8700,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "minisign",
  "serde_json",
