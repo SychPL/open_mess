@@ -4,6 +4,8 @@
 //! message POST or PUT and the `emotions` property, the only one `chat::property_write` allows
 //! (spec 9.2).
 
+use std::time::Duration;
+
 use serde_json::{Value, json};
 
 use crate::api::{self, Service};
@@ -82,8 +84,15 @@ fn kind_name(kind: ConversationKind) -> &'static str {
 /// Walks the conversations updated since `start_ms`, newest first, while `keep` returns true,
 /// within `MAX_PAGES` and the call's time, leaving out the service's feeds ([`chat::is_feed`]). With `partial`, a later page that fails ends the walk
 /// with what the earlier ones gave (a listing); without, it is an error (unread, mentions and the
-/// poll must not pass a failure off as "nothing there").
-fn conversations(session: &mut Session, start_ms: i64, partial: bool, mut keep: impl FnMut(Conversation) -> bool) -> Result<(), ModuleError> {
+/// poll must not pass a failure off as "nothing there"). A partial walk also stops while `reserve`
+/// of the call's time is left, for the work the caller does after it.
+fn conversations(
+    session: &mut Session,
+    start_ms: i64,
+    partial: bool,
+    reserve: Duration,
+    mut keep: impl FnMut(Conversation) -> bool,
+) -> Result<(), ModuleError> {
     let mut link: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let request = chat::list_conversations(&session.directory, link.as_deref(), start_ms).map_err(api::proto)?;
@@ -108,7 +117,7 @@ fn conversations(session: &mut Session, start_ms: i64, partial: bool, mut keep: 
             Some(_) if !empty && !api::has_time() && !partial => {
                 return Err(ModuleError::Platform("Teams answers too slowly; try again later".to_string()));
             }
-            Some(next) if !empty && api::has_time() => link = Some(next),
+            Some(next) if !empty && api::has_time_beyond(if partial { reserve } else { Duration::ZERO }) => link = Some(next),
             _ => return Ok(()),
         }
     }
@@ -158,7 +167,7 @@ fn message_item(m: &Message, me: &str) -> Value {
 }
 
 /// The conversation's topic. A 1:1 chat has none: the other person's name from their last message
-/// stands in; [`name_direct_chats`] names the others when a query needs it.
+/// stands in; [`name_direct_chats`] names the others from their history when a query needs it.
 fn title(c: &Conversation, me: &str) -> Option<String> {
     let other = || c.last_message.as_ref().filter(|m| m.sender_id != me).and_then(|m| m.sender_name.clone());
     c.title.clone().or_else(|| if c.kind == ConversationKind::Direct { other() } else { None })
@@ -177,7 +186,10 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
         return Ok(json!({ "items": items }));
     }
     let mut found = Vec::new();
-    conversations(session, 1, true, |c| {
+    // On an account with many conversations the walk alone can take the whole call: a query keeps
+    // time for naming the 1:1 chats, which are what a query by a person's name looks for.
+    let reserve = if query.is_some() { NAMING_TIME } else { Duration::ZERO };
+    conversations(session, 1, true, reserve, |c| {
         if kind.is_none_or(|k| k == kind_name(c.kind)) {
             let title = title(&c, &me);
             found.push((c, title));
@@ -192,27 +204,31 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
     Ok(json!({ "items": items }))
 }
 
-/// 1:1 chats named from their members a query looks at, at most this many a call.
+/// 1:1 chats named from their history a query looks at, at most this many a call.
 const MAX_NAMED: usize = 50;
+/// The part of the call a query keeps for naming 1:1 chats after the conversation list.
+const NAMING_TIME: Duration = Duration::from_secs(8);
 
 /// Names the 1:1 chats the list leaves nameless (the user's own message is the last one) from
-/// their members, newest first, within [`MAX_NAMED`] and the call's time, so a query by the other
-/// person's name finds them. A chat whose members may not be read stays nameless; members in a
-/// shape the module does not know end the call as incompatible (spec 9.3).
+/// the other person's newest message on the chat's first page, newest chats first, within
+/// [`MAX_NAMED`] and the call's time, so a query by the other person's name finds them. The
+/// members list has no names (docs/protocols/teams.md, "Live results" 7). A chat whose first page
+/// has nothing from the other person, or may not be read, stays nameless; a page in a shape the
+/// module does not know ends the call as incompatible (spec 9.3).
 fn name_direct_chats(session: &mut Session, found: &mut [(Conversation, Option<String>)], me: &str) -> Result<(), ModuleError> {
     let nameless = found.iter_mut().filter(|(c, title)| title.is_none() && c.kind == ConversationKind::Direct);
     for (c, title) in nameless.take(MAX_NAMED) {
         if !api::has_time() {
             break;
         }
-        let request = chat::members(&session.directory, &c.id);
+        let request = chat::read_messages(&session.directory, &c.id, None, PAGE_SIZE, None).map_err(api::proto)?;
         match api::read(session, Service::Chat, &request) {
             Ok(body) => {
-                let members = chat::decode_members(&body).map_err(api::proto)?;
-                *title = members.into_iter().find(|m| m.id != me).and_then(|m| m.name);
+                let page = chat::decode_messages(&body).map_err(api::proto)?;
+                *title = page.items.into_iter().find(|m| m.sender_id != me).and_then(|m| m.sender_name);
             }
             Err(e @ (ModuleError::AuthRequired(_) | ModuleError::Incompatible(_))) => return Err(e),
-            Err(_) => {}
+            Err(_) => host::log(1, "a 1:1 chat's messages could not be read; it stays nameless"),
         }
     }
     Ok(())
@@ -230,7 +246,7 @@ fn conversation_item(c: &Conversation, title: Option<String>) -> Value {
 fn unread(session: &mut Session, _args: &Value) -> Result<Value, ModuleError> {
     let me = session.me();
     let mut items = Vec::new();
-    conversations(session, 1, false, |c| {
+    conversations(session, 1, false, Duration::ZERO, |c| {
         // A conversation without a message has nothing to read.
         if c.last_message_id.is_none() && c.horizons.last_message_ms.is_none() {
             return true;
@@ -256,7 +272,7 @@ fn mentions(session: &mut Session, args: &Value) -> Result<Value, ModuleError> {
     let since = since(args)?.unwrap_or_else(|| api::now_ms().saturating_sub(MENTIONS_DEFAULT_MS));
     let me = session.me();
     let mut active = Vec::new();
-    conversations(session, since, false, |c| {
+    conversations(session, since, false, Duration::ZERO, |c| {
         if c.horizons.last_message_ms.is_some_and(|t| t > since) {
             active.push(c.id);
         }
@@ -769,7 +785,7 @@ pub fn poll(account: &str) -> Result<(), ModuleError> {
         let mut state = storage::get(&key).and_then(|bytes| PollState::decode(&bytes)).unwrap_or_else(fallback);
         let me = session.me();
         let mut changed = Vec::new();
-        conversations(session, state.start_ms(), false, |c| {
+        conversations(session, state.start_ms(), false, Duration::ZERO, |c| {
             if state.changed(&c) {
                 changed.push(c);
             }

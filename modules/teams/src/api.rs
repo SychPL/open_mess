@@ -58,7 +58,12 @@ pub fn background() {
 
 /// Whether the call's budget has time left for more requests.
 pub fn has_time() -> bool {
-    DEADLINE.get().is_none_or(|deadline| Instant::now() < deadline)
+    has_time_beyond(Duration::ZERO)
+}
+
+/// Whether the call's budget has time left for more requests with `reserve` still kept for later.
+pub fn has_time_beyond(reserve: Duration) -> bool {
+    DEADLINE.get().is_none_or(|deadline| Instant::now() + reserve < deadline)
 }
 
 /// Waits `ms` if that ends within the budget.
