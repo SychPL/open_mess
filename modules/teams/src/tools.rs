@@ -158,7 +158,7 @@ fn message_item(m: &Message, me: &str) -> Value {
 }
 
 /// The conversation's topic. A 1:1 chat has none: the other person's name from their last message
-/// stands in; [`name_direct_chats`] names the others when a query needs it.
+/// stands in; [`name_direct_chats`] names the others from their history when a query needs it.
 fn title(c: &Conversation, me: &str) -> Option<String> {
     let other = || c.last_message.as_ref().filter(|m| m.sender_id != me).and_then(|m| m.sender_name.clone());
     c.title.clone().or_else(|| if c.kind == ConversationKind::Direct { other() } else { None })
@@ -192,27 +192,29 @@ fn list_conversations(session: &mut Session, args: &Value) -> Result<Value, Modu
     Ok(json!({ "items": items }))
 }
 
-/// 1:1 chats named from their members a query looks at, at most this many a call.
+/// 1:1 chats named from their history a query looks at, at most this many a call.
 const MAX_NAMED: usize = 50;
 
 /// Names the 1:1 chats the list leaves nameless (the user's own message is the last one) from
-/// their members, newest first, within [`MAX_NAMED`] and the call's time, so a query by the other
-/// person's name finds them. A chat whose members may not be read stays nameless; members in a
-/// shape the module does not know end the call as incompatible (spec 9.3).
+/// the other person's newest message on the chat's first page, newest chats first, within
+/// [`MAX_NAMED`] and the call's time, so a query by the other person's name finds them. The
+/// members list has no names (docs/protocols/teams.md, "Live results" 7). A chat whose first page
+/// has nothing from the other person, or may not be read, stays nameless; a page in a shape the
+/// module does not know ends the call as incompatible (spec 9.3).
 fn name_direct_chats(session: &mut Session, found: &mut [(Conversation, Option<String>)], me: &str) -> Result<(), ModuleError> {
     let nameless = found.iter_mut().filter(|(c, title)| title.is_none() && c.kind == ConversationKind::Direct);
     for (c, title) in nameless.take(MAX_NAMED) {
         if !api::has_time() {
             break;
         }
-        let request = chat::members(&session.directory, &c.id);
+        let request = chat::read_messages(&session.directory, &c.id, None, PAGE_SIZE, None).map_err(api::proto)?;
         match api::read(session, Service::Chat, &request) {
             Ok(body) => {
-                let members = chat::decode_members(&body).map_err(api::proto)?;
-                *title = members.into_iter().find(|m| m.id != me).and_then(|m| m.name);
+                let page = chat::decode_messages(&body).map_err(api::proto)?;
+                *title = page.items.into_iter().find(|m| m.sender_id != me).and_then(|m| m.sender_name);
             }
             Err(e @ (ModuleError::AuthRequired(_) | ModuleError::Incompatible(_))) => return Err(e),
-            Err(_) => {}
+            Err(_) => host::log(1, "a 1:1 chat's messages could not be read; it stays nameless"),
         }
     }
     Ok(())

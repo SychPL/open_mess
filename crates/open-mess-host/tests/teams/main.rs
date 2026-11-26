@@ -333,32 +333,51 @@ async fn list_conversations_maps_kinds() {
 async fn a_direct_chat_the_user_wrote_last_in_is_found_by_name() {
     let teams = Teams::signed_in().await;
     let members_path = format!("/api/chatsvc/emea/v1/threads/{DIRECT}/members");
-    let members = json!({"members": [{"id": ME, "friendlyName": ME_NAME}, {"id": OTHER, "friendlyName": "Synthetic Person Two"}]});
-    let list =
-        vec![conversation(DIRECT, None, Some(numbered(101, DIRECT, ME, "<p>see you</p>"))), conversation(GROUP, Some("Synthetic group"), None)];
-    let path = members_path.clone();
+    let history_path = messages_path(DIRECT);
+    let last = numbered(103, DIRECT, ME, "<p>see you</p>");
+    let history = vec![last.clone(), numbered(102, DIRECT, ME, "<p>ok</p>"), numbered(101, DIRECT, OTHER, "<p>hi</p>")];
+    let list = vec![conversation(DIRECT, None, Some(last.clone())), conversation(GROUP, Some("Synthetic group"), None)];
+    // The members list as the service sends it: ids, no names ("Live results" 7).
+    let members = json!({"members": [{"id": ME, "role": "Admin"}, {"id": OTHER, "role": "Admin"}]});
+    let (path, members_at) = (history_path.clone(), members_path.clone());
     teams.fake.on(move |s| {
         if s.path == CHAT_PATH {
             Some(Reply::json(page("conversations", list.clone(), None)))
+        } else if s.path == path {
+            Some(Reply::json(page("messages", history.clone(), None)))
         } else {
-            (s.path == path).then(|| Reply::json(members.clone()))
+            (s.path == members_at).then(|| Reply::json(members.clone()))
         }
     });
-    // The list names the chat after no one: its members do.
+    // The list names the chat after no one: the other person's message further back does.
     let found = teams.call("list_conversations", json!({"query": "person two"})).await.unwrap();
     assert_eq!(ids(&found, "id"), [DIRECT]);
     assert_eq!(found["items"][0]["untrusted"], json!({"title": "Synthetic Person Two"}));
+    assert!(teams.fake.requests(&members_path).is_empty());
     // Without a query nothing more is asked for.
-    let asked = teams.fake.requests(&members_path).len();
+    let asked = teams.fake.requests(&history_path).len();
     assert_eq!(ids(&teams.call("list_conversations", json!({})).await.unwrap(), "id"), [DIRECT, GROUP]);
-    assert_eq!(teams.fake.requests(&members_path).len(), asked);
-    // Members in a shape the module does not know: an explicit error, not a chat silently left out.
-    let list = vec![conversation(DIRECT, None, Some(numbered(101, DIRECT, ME, "<p>see you</p>")))];
+    assert_eq!(teams.fake.requests(&history_path).len(), asked);
+    // A first page with nothing from the other person, or one that may not be read, leaves the
+    // chat nameless.
+    for answer in [Some(page("messages", vec![last.clone()], None)), None] {
+        let (list, path) = (vec![conversation(DIRECT, None, Some(last.clone()))], history_path.clone());
+        teams.fake.on(move |s| {
+            if s.path == CHAT_PATH {
+                Some(Reply::json(page("conversations", list.clone(), None)))
+            } else {
+                (s.path == path).then(|| answer.clone().map_or_else(|| Reply::status(403), Reply::json))
+            }
+        });
+        assert!(ids(&teams.call("list_conversations", json!({"query": "person two"})).await.unwrap(), "id").is_empty());
+    }
+    // A page in a shape the module does not know: an explicit error, not a chat silently left out.
+    let list = vec![conversation(DIRECT, None, Some(last))];
     teams.fake.on(move |s| {
         if s.path == CHAT_PATH {
             Some(Reply::json(page("conversations", list.clone(), None)))
         } else {
-            (s.path == members_path).then(|| Reply::json(json!({"roster": []})))
+            (s.path == history_path).then(|| Reply::json(json!({"roster": []})))
         }
     });
     let unknown = teams.call("list_conversations", json!({"query": "person two"})).await;
