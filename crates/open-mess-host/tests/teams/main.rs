@@ -385,6 +385,39 @@ async fn a_direct_chat_the_user_wrote_last_in_is_found_by_name() {
 }
 
 #[tokio::test]
+async fn a_query_keeps_time_to_name_direct_chats() {
+    // The module's whole budget runs out here, so the host's call limit is the daemon's (30 s), as
+    // `load` gives it with a trouter; nothing in this test opens one.
+    let data = tempfile::tempdir().unwrap();
+    let (fake, wam) = (Fake::start().await, Wam::new());
+    let (module, events) = load(&fake, &wam, data.path(), None, Some(fake.addr)).await;
+    module.sign_in().await.unwrap();
+    let teams = Teams { module, events, fake, wam, _data: data };
+    let next = format!("{CHAT}/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=older");
+    // Five 1:1 chats the user wrote last in, each with the other person's message further back.
+    let chats: Vec<String> =
+        (1..=5).map(|i| format!("19:00000000-0000-0000-0000-00000000000{i}_00000000-0000-0000-0000-000000000002@unq.gbl.spaces")).collect();
+    let newest: Vec<Value> = chats.iter().map(|id| conversation(id, None, Some(numbered(102, id, ME, "<p>see you</p>")))).collect();
+    let histories: Vec<(String, Value)> = chats
+        .iter()
+        .map(|id| (messages_path(id), page("messages", vec![numbered(102, id, ME, "<p>see you</p>"), numbered(101, id, OTHER, "<p>hi</p>")], None)))
+        .collect();
+    // A slow service and pages without end: without time kept for naming, the walk takes nearly
+    // the whole call and leaves room for a chat or two.
+    let slow = Duration::from_millis(900);
+    teams.fake.on(move |s| {
+        if s.path == CHAT_PATH {
+            let items = if s.query.contains("syncState=older") { vec![conversation(GROUP, Some("Synthetic group"), None)] } else { newest.clone() };
+            Some(Reply::json(page("conversations", items, Some(&next))).delayed(slow))
+        } else {
+            histories.iter().find(|(path, _)| s.path == *path).map(|(_, history)| Reply::json(history.clone()).delayed(slow))
+        }
+    });
+    let found = teams.call("list_conversations", json!({"query": "person two"})).await.unwrap();
+    assert_eq!(ids(&found, "id"), chats);
+}
+
+#[tokio::test]
 async fn a_failing_later_page_keeps_what_was_found() {
     let teams = Teams::signed_in().await;
     let next = format!("{CHAT}/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=50&startTime=1&syncState=two");
