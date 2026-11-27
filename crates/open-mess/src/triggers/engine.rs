@@ -22,12 +22,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveTime;
+use rusqlite::OptionalExtension;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
-use super::rules::{self, Condition, Rule};
+use super::rules::{self, Action, Condition, Rule};
 use super::{Activity, Counters};
 use crate::accounts::{Accounts, REMOVING};
 use crate::events::{Bus, Event};
@@ -150,6 +151,8 @@ struct Engine<D> {
 }
 
 struct Open {
+    /// Last Codex-related edit, tracked also while the rule currently uses a legacy action.
+    codex_revision: i64,
     /// Its number, under which its messages are remembered until it goes out.
     id: i64,
     batch: Batch,
@@ -214,11 +217,16 @@ impl<D: Delivery> Engine<D> {
             return;
         }
         let hash = seen_hash(account, conversation, &message.id);
-        let fired: Vec<Rule> = {
+        let fired = self.matching(account, conversation, &message, &hash, mentions_me, direct);
+        self.collect(account, conversation, message, &hash, fired);
+    }
+
+    fn matching(&self, account: &str, conversation: &str, message: &BatchedMessage, hash: &str, mentions_me: bool, direct: bool) -> Vec<(Rule, i64)> {
+        {
             let store = self.accounts.store();
             // ponytail: every rule is read for every message; index them by account if rules get many.
             let Ok(rules) = rules::list(&store) else {
-                return;
+                return Vec::new();
             };
             let fired = rules.into_iter().filter(|rule| {
                 rule.enabled
@@ -232,13 +240,35 @@ impl<D: Delivery> Engine<D> {
             });
             let fired: Vec<Rule> = fired.collect();
             if fired.is_empty() || !readable(&store, account, conversation) {
-                return;
+                return Vec::new();
             }
-            fired.into_iter().filter(|rule| !seen(&store, &rule.id, &hash)).collect()
-        };
+            fired
+                .into_iter()
+                .filter(|rule| !seen(&store, &rule.id, hash))
+                .filter_map(|rule| rules::revision(&store, &rule.id).ok().map(|revision| (rule, revision)))
+                .collect()
+        }
+    }
+
+    fn collect(&mut self, account: &str, conversation: &str, message: BatchedMessage, hash: &str, fired: Vec<(Rule, i64)>) {
         let now = Instant::now();
-        for rule in fired {
+        for (rule, codex_revision) in fired {
+            let accounts = Arc::clone(&self.accounts);
+            let store = accounts.store();
+            if rules::revision(&store, &rule.id).ok() != Some(codex_revision) {
+                // The UI changed a Codex-related setting after matching but before collection.
+                let _ = remember(&store, &rule.id, account, hash, 0);
+                let _ = store.conn().execute("UPDATE trigger_seen SET batch=NULL WHERE rule=?1 AND message=?2", rusqlite::params![rule.id, hash]);
+                self.counters.count(&rule.id, |c| &mut c.dropped_queue);
+                continue;
+            }
             let key = (rule.id.clone(), conversation.to_owned());
+            if self.open.get(&key).is_some_and(|open| open.codex_revision != codex_revision)
+                && let Some(old) = self.open.remove(&key)
+            {
+                let _ = store.conn().execute("UPDATE trigger_seen SET batch=NULL WHERE rule=?1 AND batch=?2", rusqlite::params![rule.id, old.id]);
+                self.counters.count(&rule.id, |c| &mut c.dropped_queue);
+            }
             let new = !self.open.contains_key(&key);
             let cost = message.bytes() + if new { account.len() + conversation.len() } else { 0 };
             if (new && self.open.len() >= MAX_OPEN) || !self.make_room(&key, cost) {
@@ -249,6 +279,7 @@ impl<D: Delivery> Engine<D> {
                 self.batches = self.batches.wrapping_add(1);
             }
             let open = self.open.entry(key).or_insert_with(|| Open {
+                codex_revision,
                 id: self.batches,
                 batch: Batch {
                     account: account.to_owned(),
@@ -276,8 +307,7 @@ impl<D: Delivery> Engine<D> {
             let batch = open.id;
             // Handled from here on, even if pushed out of its batch later or dropped with it.
             // ponytail: a failed write only means a message reported again may wake the rule again.
-            let store = self.accounts.store();
-            let _ = remember(&store, &rule.id, account, &hash, batch);
+            let _ = remember(&store, &rule.id, account, hash, batch);
             // Also between batches, which a flood of messages may keep open for minutes.
             self.remembered = self.remembered.wrapping_add(1);
             if self.remembered.is_multiple_of(PRUNE_EVERY) {
@@ -322,22 +352,43 @@ impl<D: Delivery> Engine<D> {
         let due: Vec<(String, String)> = self.open.iter().filter(|(_, open)| open.due() <= now).map(|(key, _)| key.clone()).collect();
         for key in due {
             if let Some(open) = self.open.remove(&key) {
-                self.flush(&key.0, open.id, open.batch, now);
+                self.flush(&key.0, open.id, open.batch, now, open.codex_revision);
             }
         }
     }
 
     /// Hands a batch to its rule's action, unless the rule, the account or the read permission is
     /// gone by now, or quiet hours or the hourly cap stop it.
-    fn flush(&mut self, rule_id: &str, id: i64, batch: Batch, now: Instant) {
-        {
+    fn flush(&mut self, rule_id: &str, id: i64, batch: Batch, now: Instant, expected_revision: i64) {
+        let rule = {
+            let accounts = Arc::clone(&self.accounts);
+            let store = accounts.store();
+            let current = current_rule_in(&store, rule_id, &batch.account, &batch.conversation);
+            if current.is_some() && rules::revision(&store, rule_id).ok() != Some(expected_revision) {
+                let _ = store.conn().execute("UPDATE trigger_seen SET batch=NULL WHERE rule=?1 AND batch=?2", rusqlite::params![rule_id, id]);
+                self.counters.count(rule_id, |c| &mut c.dropped_queue);
+                return;
+            }
+            if let Some(rule) = current.as_ref().filter(|rule| matches!(rule.action, Action::Codex { .. })) {
+                if in_quiet_hours(rule.quiet_hours, (self.local_time)()) {
+                    let _ = store.conn().execute("UPDATE trigger_seen SET batch=NULL WHERE batch=?1 AND rule=?2", rusqlite::params![id, rule.id]);
+                    self.counters.count(&rule.id, |c| &mut c.dropped_quiet_hours);
+                } else {
+                    match super::outbox::enqueue(&store, rule, id, &batch, i64::try_from(now_ms()).unwrap_or(i64::MAX)) {
+                        Ok(true) => self.counters.count(&rule.id, |c| &mut c.codex_queued),
+                        Ok(false) => {}
+                        Err(_) => self.counters.count(&rule.id, |c| &mut c.dropped_queue),
+                    }
+                }
+                return;
+            }
             // Its messages are handled now, whatever happens to it, and a daemon stopping from here
             // on does not bring them back. ponytail: failed writes are tried again with the next batch.
-            let store = self.accounts.store();
             let _ = store.conn().execute("UPDATE trigger_seen SET batch = NULL WHERE batch = ?1", [id]);
             let _ = forget_old(&store);
-        }
-        let Some(rule) = current_rule(&self.accounts, rule_id, &batch.account, &batch.conversation) else {
+            current
+        };
+        let Some(rule) = rule else {
             return;
         };
         if in_quiet_hours(rule.quiet_hours, (self.local_time)()) {
@@ -388,10 +439,10 @@ impl<D: Delivery> Engine<D> {
 }
 
 /// A batch handed to its action, counted from the engine letting it go until the action returns.
-struct Delivering(Arc<Activity>);
+pub(crate) struct Delivering(Arc<Activity>);
 
 impl Delivering {
-    fn new(activity: &Arc<Activity>) -> Delivering {
+    pub(crate) fn new(activity: &Arc<Activity>) -> Delivering {
         activity.delivering.fetch_add(1, Ordering::SeqCst);
         Delivering(Arc::clone(activity))
     }
@@ -409,12 +460,17 @@ impl Drop for Delivering {
 /// for the account, the account is known and not being removed, and the agent may read the
 /// conversation. Asked again right before a batch reaches an agent.
 pub(crate) fn current_rule(accounts: &Accounts, rule_id: &str, account: &str, conversation: &str) -> Option<Rule> {
-    if !known(accounts, account) {
+    let store = accounts.store();
+    current_rule_in(&store, rule_id, account, conversation)
+}
+
+pub(super) fn current_rule_in(store: &Store, rule_id: &str, account: &str, conversation: &str) -> Option<Rule> {
+    let state: Option<String> = store.conn().query_row("SELECT state FROM accounts WHERE id=?1", [account], |row| row.get(0)).optional().ok()?;
+    if !state.is_some_and(|state| state != REMOVING) {
         return None;
     }
-    let store = accounts.store();
-    let rule = rules::get(&store, rule_id).ok()??;
-    (rule.enabled && rule.account == account && readable(&store, account, conversation)).then_some(rule)
+    let rule = rules::get(store, rule_id).ok()??;
+    (rule.enabled && rule.account == account && readable(store, account, conversation)).then_some(rule)
 }
 
 /// Whether the account exists and is not being removed; the bus still carries events of accounts
@@ -459,7 +515,7 @@ fn forget_old(store: &Store) -> Result<(), rusqlite::Error> {
 }
 
 /// Whether `now` falls in the quiet hours; a window that starts later than it ends wraps midnight.
-fn in_quiet_hours(hours: Option<(NaiveTime, NaiveTime)>, now: NaiveTime) -> bool {
+pub(crate) fn in_quiet_hours(hours: Option<(NaiveTime, NaiveTime)>, now: NaiveTime) -> bool {
     match hours {
         Some((start, end)) if start <= end => start <= now && now < end,
         Some((start, end)) => start <= now || now < end,
@@ -469,4 +525,171 @@ fn in_quiet_hours(hours: Option<(NaiveTime, NaiveTime)>, now: NaiveTime) -> bool
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Recorder(AtomicUsize);
+    impl Delivery for Recorder {
+        async fn deliver(&self, _rule: Rule, _batch: Batch) -> DeliveryResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            DeliveryResult::Delivered
+        }
+    }
+    fn local_time() -> NaiveTime {
+        NaiveTime::from_hms_opt(12, 0, 0).unwrap()
+    }
+    fn test_engine(accounts: Arc<Accounts>) -> Engine<Recorder> {
+        Engine {
+            accounts,
+            delivery: Arc::new(Recorder(AtomicUsize::new(0))),
+            counters: Counters::default(),
+            activity: Arc::default(),
+            local_time,
+            open: HashMap::new(),
+            sent: Arc::default(),
+            remembered: 0,
+            batches: 0,
+        }
+    }
+    fn add(engine: &mut Engine<Recorder>, id: &str) {
+        engine.add(
+            "teams:test",
+            "conversation_test",
+            BatchedMessage { id: id.into(), sender: "sender_test".into(), at_ms: now_ms(), untrusted: None },
+            false,
+            true,
+        );
+    }
+    fn row_count(accounts: &Accounts) -> i64 {
+        accounts.store().conn().query_row("SELECT COUNT(*) FROM codex_deliveries", [], |r| r.get(0)).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collecting_codex_target_a_to_b_to_a_is_never_rerouted() {
+        let (_dir, accounts) = super::super::outbox::tests::test_accounts().await;
+        let mut engine = test_engine(accounts.clone());
+        add(&mut engine, "collected");
+        let original = rules::get(&accounts.store(), "r").unwrap().unwrap();
+        let mut changed = original.clone();
+        changed.action = Action::Codex { thread_id: "thread_b".into() };
+        rules::save_fixture(&accounts.store(), &changed).unwrap();
+        rules::save_fixture(&accounts.store(), &original).unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        engine.flush_due();
+        assert_eq!(row_count(&accounts), 1);
+        assert!(engine.open.is_empty());
+        let bus = Bus::default();
+        let task = spawn(&bus, accounts.clone(), engine.delivery.clone(), Counters::default(), Arc::default(), local_time);
+        assert!(seen(&accounts.store(), "r", &seen_hash("teams:test", "conversation_test", "collected")));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn matching_new_message_starts_fresh_after_a_codex_condition_edit() {
+        let (_dir, accounts) = super::super::outbox::tests::test_accounts().await;
+        let mut engine = test_engine(accounts.clone());
+        add(&mut engine, "old");
+        let mut rule = rules::get(&accounts.store(), "r").unwrap().unwrap();
+        rule.condition = Condition::From { senders: vec!["sender_test".into()] };
+        rules::save_fixture(&accounts.store(), &rule).unwrap();
+        add(&mut engine, "new");
+        tokio::time::advance(Duration::from_secs(61)).await;
+        engine.flush_due();
+        assert_eq!(row_count(&accounts), 2);
+        let metadata: String =
+            accounts.store().conn().query_row("SELECT metadata FROM codex_deliveries WHERE state='pending'", [], |r| r.get(0)).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        let ids = decoded.get("messages").unwrap().as_array().unwrap().iter().map(|m| m.get("id").unwrap().as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ids, ["new"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transitions_into_and_out_of_codex_discard_only_the_old_batch() {
+        let (_dir, accounts) = super::super::outbox::tests::test_accounts().await;
+        let mut engine = test_engine(accounts.clone());
+        add(&mut engine, "old_codex");
+        let original = rules::get(&accounts.store(), "r").unwrap().unwrap();
+        let mut channel = original.clone();
+        channel.action = Action::Channel { fallback_spawn: None };
+        rules::save_fixture(&accounts.store(), &channel).unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        engine.flush_due();
+        assert_eq!(engine.delivery.0.load(Ordering::SeqCst), 0);
+        add(&mut engine, "old_channel");
+        rules::save_fixture(&accounts.store(), &original).unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        engine.flush_due();
+        assert_eq!(row_count(&accounts), 1);
+        assert!(engine.open.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_to_codex_to_legacy_invalidates_the_original_legacy_batch() {
+        let (_dir, accounts) = super::super::outbox::tests::test_accounts().await;
+        let original = rules::get(&accounts.store(), "r").unwrap().unwrap();
+        let mut legacy = original.clone();
+        legacy.action = Action::Channel { fallback_spawn: None };
+        rules::save_fixture(&accounts.store(), &legacy).unwrap();
+        let mut engine = test_engine(accounts.clone());
+        add(&mut engine, "old_legacy");
+        rules::save_fixture(&accounts.store(), &original).unwrap();
+        rules::save_fixture(&accounts.store(), &legacy).unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        engine.flush_due();
+        tokio::task::yield_now().await;
+        assert_eq!(engine.delivery.0.load(Ordering::SeqCst), 0);
+        assert!(engine.open.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pure_legacy_edits_preserve_the_existing_collecting_behavior() {
+        let (_dir, accounts) = super::super::outbox::tests::test_accounts().await;
+        let mut legacy = rules::get(&accounts.store(), "r").unwrap().unwrap();
+        legacy.action = Action::Channel { fallback_spawn: None };
+        rules::save_fixture(&accounts.store(), &legacy).unwrap();
+        let mut engine = test_engine(accounts.clone());
+        add(&mut engine, "legacy");
+        legacy.condition = Condition::From { senders: vec!["sender_test".into()] };
+        rules::save_fixture(&accounts.store(), &legacy).unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        engine.flush_due();
+        tokio::task::yield_now().await;
+        assert_eq!(engine.delivery.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configuration_edit_between_matching_and_collection_cannot_rebind_the_message() {
+        let (_dir, accounts) = super::super::outbox::tests::test_accounts().await;
+        let mut engine = test_engine(accounts.clone());
+        let message = BatchedMessage { id: "interleaved".into(), sender: "sender_test".into(), at_ms: now_ms(), untrusted: None };
+        let hash = seen_hash("teams:test", "conversation_test", &message.id);
+        let snapshot = engine.matching("teams:test", "conversation_test", &message, &hash, false, true);
+        assert_eq!(snapshot.len(), 1);
+        let mut changed = rules::get(&accounts.store(), "r").unwrap().unwrap();
+        changed.condition = Condition::From { senders: vec!["excluded_sender".into()] };
+        changed.action = Action::Codex { thread_id: "different_thread".into() };
+        rules::save_fixture(&accounts.store(), &changed).unwrap();
+        engine.collect("teams:test", "conversation_test", message, &hash, snapshot);
+        assert!(engine.open.is_empty());
+        assert!(seen(&accounts.store(), "r", &hash));
+        assert_eq!(row_count(&accounts), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configuration_edit_before_flush_cannot_pass_a_stale_generation_check() {
+        let (_dir, accounts) = super::super::outbox::tests::test_accounts().await;
+        let mut engine = test_engine(accounts.clone());
+        add(&mut engine, "interleaved_flush");
+        let open = engine.open.remove(&("r".into(), "conversation_test".into())).unwrap();
+        let mut changed = rules::get(&accounts.store(), "r").unwrap().unwrap();
+        changed.action = Action::Codex { thread_id: "different_thread".into() };
+        rules::save_fixture(&accounts.store(), &changed).unwrap();
+        engine.flush("r", open.id, open.batch, Instant::now(), open.codex_revision);
+        assert_eq!(row_count(&accounts), 1);
+        assert!(seen(&accounts.store(), "r", &seen_hash("teams:test", "conversation_test", "interleaved_flush")));
+    }
 }

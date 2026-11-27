@@ -91,6 +91,11 @@ Lokalne API nasłuchuje wyłącznie na `127.0.0.1`, wymaga losowego tokenu Beare
 - **CLI**: polecenia generowane z tego samego rejestru narzędzi co MCP, więc nazwy, parametry i wyniki są identyczne. Wynik domyślnie czytelny dla człowieka, `--json` dla skryptów.
 - **Okno konfiguracji**: sekcja 8.8.
 
+Codex desktop extension (2026-11-26): the existing Codex MCP setup remains valid. Delivery
+into a selected desktop conversation is a separate, opt-in trigger action configured only
+in the window; it adds no MCP routing/configuration tools. Its contract is
+[Codex desktop triggers](2026-11-26-codex-desktop-triggers.md).
+
 ### 8.3 Moduły WASM
 
 Decyzja projektowa: WebAssembly Component Model (np. `wasmtime`), kontrakt opisany w WIT. Powody: stabilny kontrakt niezależny od wersji kompilatora, izolacja (moduł robi tylko to, na co pozwoli rdzeń), awaria modułu nie kładzie demona, moduły można pisać w dowolnym języku kompilowanym do WASM. Koszt: silnik WASM powiększa `om.exe` o około 10-15 MB. DLL odrzucone: brak stabilnego ABI w Rust, brak izolacji, awaria kładzie cały proces.
@@ -181,6 +186,13 @@ Warunki: DM do użytkownika, wzmianka, nowa wiadomość w wybranej rozmowie, wia
 Akcje:
 1. **Wpis do otwartej sesji Claude Code** przez kanał MCP (`notifications/claude/channel`, z deklaracją możliwości `experimental: { "claude/channel": {} }` - mechanizm używany przez wtyczkę Telegram, potwierdzony dla transportu stdio). Jeśli kanał nie działa przez transport HTTP, budujący dodaje cienki most stdio (`om mcp-stdio`), który tylko przekazuje komunikaty do demona. Claude Code sam uruchamia most jako swój serwer MCP (stdio) i kończy go razem z sesją; most niczego nie uruchamia, tylko przekazuje komunikaty - po jednym na sesję z włączonymi kanałami. Gdy demon zniknie albo się zrestartuje, most ponawia połączenie z lokalnym API z rosnącym odstępem; do tego czasu narzędzia w tej sesji zwracają czytelny błąd "demon niedostępny" zamiast cicho milczeć (recenzja R9). To jedyny wyjątek od zasady jednego procesu (sekcja 6): bez logiki platform, bez sesji kont, bez własnego stanu. Claude Code dostarcza kanały tylko do sesji uruchomionych z włączonymi kanałami (flaga przy starcie; dla serwera spoza listy zatwierdzonych wtyczek prawdopodobnie tryb deweloperski) - to akceptowalne, okno konfiguracji pokazuje gotowe polecenie startu. Gdy takich sesji jest kilka, powiadomienie dostaje ostatnio aktywna (bez duplikatów); gdy nie ma żadnej, działa akcja 2, jeśli reguła ją ma. Decyzja projektowa (pytanie z przeglądu dokumentu).
 2. **Uruchomienie agenta od zera** gdy nie ma sesji: demon uruchamia skonfigurowany program (np. `claude -p` albo Codex) ze stałą listą argumentów ustaloną w regule, bezpośrednio, bez powłoki. Treść zdarzenia nigdy nie jest wklejana do polecenia ani argumentów: trafia do programu przez stdin albo jako ścieżka do pliku z treścią, oznaczoną jako niezaufana. Takie pliki leżą w katalogu tymczasowym demona, mają limit rozmiaru i są usuwane po zakończeniu uruchomienia, a pozostałości (np. po awarii demona) są usuwane przy jego starcie (recenzje R5 i R6). Proces korzysta z MCP/CLI na tych samych zasadach co każdy inny wywołujący (8.6). Decyzja projektowa (recenzja R1).
+
+3. **Existing Codex desktop conversation (experimental, Windows)**: the daemon delivers to an
+explicit existing conversation through the installed desktop's local interface. It uses a
+durable metadata-only queue and no permanent helper process. Desktop acceptance is separate
+from agent completion. Delivery states, retry/receipt bounds, permission revalidation and
+configuration invalidation follow [Codex desktop triggers](2026-11-26-codex-desktop-triggers.md);
+the existing Channel and Spawn actions retain their behavior.
 
 Zabezpieczenia (decyzje projektowe):
 - grupowanie: zdarzenia z jednej rozmowy są zbierane i wysyłane jako jedno powiadomienie po chwili ciszy, ale nie później niż po ustalonym maksymalnym czasie od pierwszego zdarzenia, nawet jeśli rozmowa nie cichnie (recenzja R4),

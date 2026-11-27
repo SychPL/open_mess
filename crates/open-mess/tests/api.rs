@@ -3,6 +3,8 @@
 // Test helpers outside #[test] functions aren't covered by clippy.toml's test allowances.
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -132,7 +134,7 @@ async fn status_over_api() {
     assert!(body["uptime_seconds"].is_u64());
     assert_eq!(body["modules"], json!([]));
     assert_eq!(body["accounts"], json!([]));
-    assert_eq!(body["triggers"], json!({"channel_sessions": 0, "counters": {"lagged": 0, "rules": {}}}));
+    assert_eq!(body["triggers"], json!({"channel_sessions": 0, "counters": {"lagged": 0, "rules": {}}, "codex_deliveries": {}}));
 }
 
 #[tokio::test]
@@ -181,6 +183,58 @@ async fn status_over_mcp() {
     assert_eq!(keys(&mcp), keys(&api));
     assert_eq!(mcp["version"], api["version"]);
     client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn codex_queue_counts_cross_the_real_http_and_mcp_boundaries_without_routing_tools() {
+    use open_mess::triggers::engine::{Batch, BatchedMessage};
+    use open_mess::triggers::rules::{Action, Condition, Rule};
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let daemon = common::daemon(&[]).await;
+    let store = common::store(daemon.dir.path());
+    store
+        .conn()
+        .execute(
+            "INSERT INTO accounts(id,module,module_account,display_name,state) VALUES('synthetic:test','unloaded','test','Synthetic','offline')",
+            [],
+        )
+        .unwrap();
+    let rule = Rule::new("synthetic-rule", "synthetic:test", Condition::Direct, Action::Codex { thread_id: "synthetic_thread".into() });
+    let batch = Batch {
+        account: rule.account.clone(),
+        conversation: "synthetic-conversation".into(),
+        kind: "direct",
+        count: 1,
+        first_ms: 1,
+        last_ms: 1,
+        messages: vec![BatchedMessage { id: "synthetic-message".into(), sender: "synthetic-sender".into(), at_ms: 1, untrusted: None }],
+    };
+    open_mess::triggers::outbox::enqueue(&store, &rule, 1, &batch, 1).unwrap();
+    let listener = open_mess::api::bind(0).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(open_mess::api::serve(listener, TOKEN.into(), Arc::new(daemon.registry), Opener::default(), async {
+        let _ = stopped.await;
+    }));
+    let response = reqwest::Client::new().post(format!("http://{addr}/api/call/status")).bearer_auth(TOKEN).json(&json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let http: Value = response.json().await.unwrap();
+    assert_eq!(http.pointer("/triggers/codex_deliveries"), Some(&json!({"pending":1})));
+    let transport =
+        StreamableHttpClientTransport::from_config(StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")).auth_header(TOKEN));
+    let client = ClientConfig::default().serve(transport).await.unwrap();
+    let tools = client.list_all_tools().await.unwrap();
+    assert!(tools.iter().any(|t| t.name == "status"));
+    assert!(!tools.iter().any(|t| ["check_codex_destination", "codex_deliveries", "resolve_codex_delivery"].contains(&t.name.as_ref())));
+    let result = client.call_tool(CallToolRequestParams::new("status")).await.unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let mcp = result.structured_content.unwrap();
+    assert_eq!(mcp.pointer("/triggers/codex_deliveries"), http.pointer("/triggers/codex_deliveries"));
+    let counts = mcp.pointer("/triggers/codex_deliveries").unwrap().to_string();
+    assert!(!counts.contains("synthetic_thread"));
+    client.cancel().await.unwrap();
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
 }
 
 #[tokio::test]

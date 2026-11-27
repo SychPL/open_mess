@@ -360,6 +360,7 @@ fn start(
         let counters = registry.trigger_counters().clone();
         let runs = Runs::new(dir.join("runs"), spawn::RUN_TIMEOUT, counters.clone());
         let actions = Actions { accounts: Arc::clone(&accounts), sessions: registry.channel_sessions().clone(), runs: Arc::clone(&runs) };
+        triggers::outbox::spawn(Arc::clone(&accounts), Arc::clone(&activity), counters.clone());
         triggers::engine::spawn(&bus, Arc::clone(&accounts), Arc::new(actions), counters, Arc::clone(&activity), || chrono::Local::now().time());
         runs
     };

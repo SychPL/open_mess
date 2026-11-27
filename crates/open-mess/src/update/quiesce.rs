@@ -65,6 +65,7 @@ pub struct Cancelled {
 /// Phase A: pauses the modules and waits until the work they started is done and 60 s passed with
 /// no delivery and no tool call, at most 30 minutes. Tool calls keep working meanwhile.
 pub async fn finish_work(activity: &Activity, cancel: &watch::Receiver<bool>) -> Result<(), Cancelled> {
+    activity.triggers.codex_paused.store(true, Ordering::SeqCst);
     for module in &activity.modules {
         // Returns once no event handler runs; a module that is gone runs none either.
         let _ = module.pause_events().await;
@@ -145,6 +146,7 @@ fn stopped(activity: &Activity, cancel: &watch::Receiver<bool>) -> Option<bool> 
 
 /// Back to work: tool calls are taken and the modules get their events again.
 pub async fn resume(activity: &Activity) {
+    activity.triggers.codex_paused.store(false, Ordering::SeqCst);
     activity.gate.set(GateMode::Open);
     for module in &activity.modules {
         let _ = module.resume_events().await;
