@@ -4,7 +4,7 @@ What problem does this solve and what behaves differently now? Link the issue.
 
 ## Spec
 
-`.specs/<slug>.md`, reviewed by Codex and GLM: final round and verdicts (or "not needed: trivial change").
+`.specs/<slug>.md`, reviewed by a model other than its author (name it): final round and verdicts (or "not needed: trivial change").
 
 ## Tests
 
@@ -12,7 +12,7 @@ Which tests cover this, and do they fail without the change? Paste the `cargo xt
 
 ## Commit reviews
 
-Every commit reviewed by Codex and GLM and reconciled (`.reviews/<sha>.processed`). List P1/P2 findings and how each was resolved.
+Every commit reviewed by a model other than its author, of a similar class (name the reviewers; Codex and GLM by default), and reconciled (`.reviews/<sha>.processed`). List P1/P2 findings and how each was resolved.
 
 ## Coexistence (platform modules only)
 

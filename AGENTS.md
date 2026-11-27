@@ -111,20 +111,32 @@ secrets or the module contract) starts as a spec in `.specs/<slug>.md`:
   reason, so it is not argued again,
 - a **round changelog** at the bottom: `R<n>: fixed ...`.
 
-**Every spec is reviewed by Codex and GLM** before implementation:
-`scripts/review/review-spec.sh .specs/<slug>.md <round>`. Fix every admissible P1/P2 (or add a
-rebuttal), then run the next round. Stop when both approve, or when both reviewers report only
-P3 for two rounds in a row. Ten rounds at most; after that, ask the owner. A dead reviewer (exit
-2) is a hard stop: report it, don't skip it.
+**Every spec is reviewed by another model** before implementation (see "Who reviews"). With the
+default reviewers: `scripts/review/review-spec.sh .specs/<slug>.md <round>`. Fix every admissible
+P1/P2 (or add a rebuttal), then run the next round. Stop when every reviewer approves, or when
+every reviewer reports only P3 for two rounds in a row. Ten rounds at most; after that, ask the
+owner. A dead reviewer (exit 2) is a hard stop: report it, don't skip it.
+
+### Who reviews
+
+Specs and commits are reviewed by at least one model that is **not the model that wrote them**
+and is of a similar class: a current top coding model of another family, not a small or fast
+variant, and not a second session of the author's own model. The repository's scripts use Codex
+and GLM, and whoever has both runs both. Whoever lacks access to them uses any other model that
+meets the rule, gives it the same prompt (`scripts/review/prompts/`) and read-only access, and
+names the reviewing model in the verdict file and in the pull request. A review by the author's
+own model does not count.
 
 ## Commits and reviews
 
 - **`cargo xtask ci` is green before every commit** (fmt, clippy with `-D warnings`, tests).
   A commit that changes only Markdown files (specs, docs) skips it: cargo checks none of them.
   Commit after every piece of work that builds.
-- **Every commit is reviewed by Codex and GLM.** `cargo xtask hooks` (once per clone) enables
-  `.githooks/post-commit`, which sends the commit to both reviewers in the background; verdicts
-  land in `.reviews/<sha>-codex.txt` and `.reviews/<sha>-glm.txt`. Before pushing, reconcile
+- **Every commit is reviewed by another model** ("Who reviews"). `cargo xtask hooks` (once per
+  clone) enables `.githooks/post-commit`, which sends the commit to the default reviewers, Codex
+  and GLM, in the background; verdicts land in `.reviews/<sha>-codex.txt` and
+  `.reviews/<sha>-glm.txt` (another reviewer: `.reviews/<sha>-<reviewer>.txt`, in the same format,
+  ending with a `VERDICT:` line). Before pushing, reconcile
   every commit: fix each P1/P2 in a follow-up commit or record why it is rejected, then write
   `.reviews/<sha>.processed` with a one-line resolution. A verdict without a `VERDICT:` line means
   the reviewer failed: re-run it (`rm .reviews/<sha>.patch` then
