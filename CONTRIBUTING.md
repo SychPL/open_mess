@@ -96,9 +96,15 @@ Every spec and every commit is reviewed by at least one model other than the one
 of a similar class: a current top coding model of another family, not a small or fast variant
 (AGENTS.md, "Who reviews"). The scripts here use Codex and GLM; if you have both, run both. If you
 don't, use any other model that meets the rule: give it the prompt from `scripts/review/prompts/`
-and read-only access, save its verdict as `.reviews/<sha>-<reviewer>.txt` (for a spec,
-`.specs/review/<slug>-<reviewer>-r<round>.txt`) ending with a `VERDICT:` line, and name the model
-in the pull request.
+(with `@SHA@` or `@SPEC@` filled in) and read-only access, save its verdict as
+`.reviews/<sha>-<reviewer>.txt` (for a spec, `.specs/review/<slug>-<reviewer>-r<round>.txt`)
+ending with a `VERDICT:` line, and name the model in the pull request. The commit prompt reads the
+diff from `.reviews/<sha>.patch`, which the hook does not write when the default tools are
+missing; write it yourself first:
+
+```bash
+mkdir -p .reviews && git show --stat --patch <sha> > .reviews/<sha>.patch
+```
 
 For the default reviewers, enable the hook once per clone:
 
@@ -119,6 +125,9 @@ The review tooling needs Windows with:
 
 `scripts/review/run-reviewer.ps1` times out a stuck reviewer and retries it. GLM falls back from
 `glm-5.3` to `glm-5.3-flash`; Codex has no fallback, so a Codex review is always done by Codex.
+A verdict from the `flash` fallback is better than none, but it is a fast variant and does not
+satisfy the rule alone: when it is the only verdict from a model other than the author (Codex
+wrote the change, or Codex is missing), get one more from a model of the author's class.
 Reviewers only get read-only tools: they read untrusted diffs and must not be able to run
 commands or change files. Without these tools the hook prints a notice and skips the review:
 review the commits with another model as described above, or, if you have none, say so in the

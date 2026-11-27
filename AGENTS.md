@@ -125,7 +125,9 @@ variant, and not a second session of the author's own model. The repository's sc
 and GLM, and whoever has both runs both. Whoever lacks access to them uses any other model that
 meets the rule, gives it the same prompt (`scripts/review/prompts/`) and read-only access, and
 names the reviewing model in the verdict file and in the pull request. A review by the author's
-own model does not count.
+own model does not count, and neither does one by a small or fast variant alone: when GLM's
+verdict came from its `flash` fallback and no other reviewer of the author's class is left
+(Codex wrote the change, or is missing), get one more verdict that meets the rule.
 
 ## Commits and reviews
 
