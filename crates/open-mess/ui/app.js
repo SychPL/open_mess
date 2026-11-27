@@ -856,6 +856,7 @@ function channelText() {
 
 function actionText(action) {
   if (action.type === "spawn") return tr("uruchom program: ", "start a program: ") + spawnText(action);
+  if (action.type === "codex") return tr("rozmowa Codexa: ", "Codex conversation: ") + action.thread_id;
   const fallback = action.fallback_spawn ? tr("; bez sesji uruchom: ", "; without a session start: ") + spawnText(action.fallback_spawn) : "";
   return channelText() + fallback;
 }
@@ -948,8 +949,28 @@ function ruleForm(accounts, existing, done) {
   condition.addEventListener("change", showCondition);
   showCondition();
 
-  const action = select([["channel", channelText()], ["spawn", tr("uruchom program", "start a program")]], rule.action.type);
+  const action = select([["channel", channelText()], ["codex", tr("wybrana rozmowa Codexa", "a specific Codex conversation")], ["spawn", tr("uruchom program", "start a program")]], rule.action.type);
   const spawn = spawnFields(rule.action.type === "spawn" ? rule.action : rule.action.fallback_spawn);
+  const codexThread = input("text", rule.action.thread_id || "");
+  codexThread.maxLength = 128;
+  const codex = el("div");
+  const codexStatus = el("p", "", "muted");
+  codexStatus.id = "codex-destination-status-" + rule.id;
+  codexThread.setAttribute("aria-describedby", codexStatus.id);
+  codexStatus.setAttribute("role", "status");
+  const codexHelp = el("p", tr("Poproś Codexa o identyfikator rozmowy, do której mają trafiać zdarzenia, i wklej go tutaj. To nie tworzy nowej rozmowy. Obsługa jest eksperymentalna; możesz zapisać regułę także przy zamkniętym Codexie.", "Ask Codex for the ID of the conversation that should receive events, then paste it here. This does not create a new conversation. Support is experimental; you can save the rule while Codex is closed."), "muted");
+  codex.append(field(tr("Identyfikator rozmowy Codexa:", "Codex conversation ID:"), codexThread), codexHelp,
+    button(tr("Sprawdź rozmowę", "Check conversation"), async () => {
+      codexStatus.textContent = tr("Sprawdzanie rozmowy...", "Checking conversation...");
+      codexThread.disabled = true;
+      try {
+        await call("check_codex_destination", { thread_id: codexThread.value.trim() });
+        codexStatus.textContent = tr("Rozmowa jest dostępna. Nie wysłano wiadomości testowej.", "The conversation is available. No test message was sent.");
+      } catch (error) {
+        codexStatus.textContent = String(error);
+      } finally { codexThread.disabled = false; }
+    }), codexStatus);
+  codexThread.addEventListener("input", () => { codexStatus.textContent = ""; codexThread.removeAttribute("aria-invalid"); });
   const fallbackNote = el(
     "p",
     tr("Gdy nie ma otwartej sesji z kanałami, reguła uruchomi program poniżej (zostaw pusty, żeby nic nie robić).", "When no session with channels is open, the rule starts the program below (leave it empty to do nothing)."),
@@ -957,6 +978,8 @@ function ruleForm(accounts, existing, done) {
   );
   const showAction = () => {
     fallbackNote.hidden = action.value !== "channel";
+    spawn.node.hidden = action.value === "codex";
+    codex.hidden = action.value !== "codex";
   };
   action.addEventListener("change", showAction);
   showAction();
@@ -980,6 +1003,7 @@ function ruleForm(accounts, existing, done) {
     field(tr("Akcja:", "Action:"), action),
     fallbackNote,
     spawn.node,
+    codex,
     quietRow,
     field(tr("Najwyżej pobudek na godzinę:", "Wake-ups per hour, at most:"), perHour),
     field(tr("Wyślij po tylu sekundach ciszy w rozmowie:", "Send after this many seconds of quiet in the conversation:"), quietSeconds),
@@ -998,7 +1022,15 @@ function ruleForm(accounts, existing, done) {
             ? { type: "from", senders: values }
             : { type: condition.value };
       const program = spawn.read();
-      const actionDto = action.value === "spawn" ? Object.assign({ type: "spawn" }, program || { program: "", args: [], working_dir: null }) : { type: "channel", fallback_spawn: program };
+      if (action.value === "codex" && !/^[A-Za-z0-9_-]{1,128}$/.test(codexThread.value.trim())) {
+        codexStatus.textContent = tr("Podaj identyfikator rozmowy: od 1 do 128 liter, cyfr, łączników lub podkreśleń.", "Enter a conversation ID: 1 to 128 letters, digits, hyphens or underscores.");
+        codexThread.setAttribute("aria-invalid", "true");
+        codexThread.focus();
+        return;
+      }
+      codexThread.removeAttribute("aria-invalid");
+      const actionDto = action.value === "codex" ? { type: "codex", thread_id: codexThread.value.trim() }
+        : action.value === "spawn" ? Object.assign({ type: "spawn" }, program || { program: "", args: [], working_dir: null }) : { type: "channel", fallback_spawn: program };
       const warning = await call("put_rule", {
         rule: {
           id: rule.id,
@@ -1028,7 +1060,7 @@ async function renderTriggers() {
   root.append(
     el(
       "p",
-      tr("Reguła budzi agenta, gdy ktoś napisze do Ciebie: wpisem do otwartej sesji Claude Code albo uruchomieniem programu. Twoje własne wiadomości nigdy jej nie uruchamiają, a rozmowy, których agent nie może czytać, są pomijane. Treść od innych osób agent dostaje jako dane niezaufane.", "A rule wakes an agent when someone writes to you: with a message to an open Claude Code session or by starting a program. Your own messages never set it off, and conversations the agent may not read are skipped. The agent gets what other people wrote as untrusted data."),
+      tr("Reguła budzi agenta, gdy ktoś napisze do Ciebie: w sesji Claude Code, w wybranej rozmowie Codexa albo przez uruchomienie programu. Twoje własne wiadomości nigdy jej nie uruchamiają, a rozmowy, których agent nie może czytać, są pomijane. Treść od innych osób agent dostaje jako dane niezaufane.", "A rule wakes an agent when someone writes to you: in a Claude Code session, a specific Codex conversation, or by starting a program. Your own messages never set it off, and conversations the agent may not read are skipped. The agent gets what other people wrote as untrusted data."),
       "muted",
     ),
   );
@@ -1040,6 +1072,11 @@ async function renderTriggers() {
     root.append(button(tr("Dodaj regułę", "Add rule"), () => editor.replaceChildren(ruleForm(accounts, null, close)), "primary"));
   }
   root.append(editor);
+  const unresolved = el("div");
+  root.append(
+    button(tr("Nierozstrzygnięte dostarczenia do Codexa", "Unresolved Codex deliveries"), () => renderCodexDeliveries(unresolved, null)),
+    unresolved,
+  );
   if (rules.length === 0) root.append(el("p", tr("Nie ma jeszcze żadnej reguły.", "No rules yet."), "muted"));
   for (const rule of rules) {
     const card = el("div", null, "card");
@@ -1077,9 +1114,16 @@ async function renderTriggers() {
         [tr("Akcja", "Action"), actionText(rule.action)],
         [tr("Cisza nocna", "Quiet hours"), quiet],
         [tr("Limity", "Limits"), limits],
-        [tr("Od startu demona", "Since the daemon started"), tr("dostarczone: ", "delivered: ") + counters.delivered + (dropped.length ? tr("; pominięte - ", "; dropped - ") + dropped.join(", ") : "")],
+        [tr("Od startu demona", "Since the daemon started"), (rule.action.type === "codex"
+          ? tr("dodane do kolejki: ", "queued: ") + counters.codex_queued + tr("; przyjęte przez Codexa: ", "; accepted by Codex: ") + counters.codex_accepted
+          : tr("dostarczone: ", "delivered: ") + counters.delivered) + (dropped.length ? tr("; pominięte - ", "; dropped - ") + dropped.join(", ") : "")],
       ]),
     );
+    if (rule.action.type === "codex") {
+      const deliveries = el("div");
+      card.append(el("p", tr("Przyjęcie przez Codexa nie oznacza ukończenia pracy przez agenta. Niepewne dostarczenia nie są ponawiane automatycznie.", "Acceptance by Codex does not mean the agent finished its work. Uncertain deliveries are not retried automatically."), "muted"),
+        button(tr("Pokaż dostarczenia", "Show deliveries"), () => renderCodexDeliveries(deliveries, rule.id)), deliveries);
+    }
     if (counters.failed_to_start > 0) {
       const times = plural(counters.failed_to_start, { one: "raz", few: "razy", many: "razy" }, { one: "time", other: "times" });
       card.append(
@@ -1120,6 +1164,45 @@ async function renderTriggers() {
     }),
   );
   root.append(setup);
+}
+
+/** Delivery metadata only; opening this panel never sends or retries a message. */
+async function renderCodexDeliveries(root, ruleId, cursor = null, moreButton = null) {
+  const states = {
+    pending: tr("oczekuje na dostarczenie", "waiting for delivery"),
+    sending: tr("wysyłanie do Codexa", "sending to Codex"),
+    accepted_by_codex: tr("przyjęte przez Codexa", "accepted by Codex"),
+    uncertain: tr("wynik niepewny, bez automatycznej ponownej wysyłki", "uncertain result, no automatic resend"),
+    failed: tr("dostarczenie nieudane", "delivery failed"),
+    voided: tr("anulowane", "voided"),
+    expired: tr("wygasło po 24 godzinach", "expired after 24 hours"),
+  };
+  root.setAttribute("aria-busy", "true");
+  try {
+    const page = await call("codex_deliveries", { rule_id: ruleId, cursor });
+    if (!cursor) root.replaceChildren();
+    if (moreButton) moreButton.remove();
+    if (!page.items.length && !cursor) root.append(el("p", tr("Nie ma dostarczeń w tym widoku.", "No deliveries in this view."), "muted"));
+    for (const record of page.items) {
+      const row = el("div", null, "card");
+      row.append(el("p", new Date(record.created_ms).toLocaleString(lang) + ": " + (states[record.state] || record.state)));
+      row.append(details([[tr("Pierwotna rozmowa Codexa", "Original Codex conversation"), record.thread_id]]));
+      if (["uncertain", "failed"].includes(record.state)) {
+        row.append(el("p", tr("Sprawdź rozmowę w Codexie. Jeśli zdarzenie dotarło, oznacz je jako przyjęte. Odrzucenie zamyka rekord i nie wysyła go ponownie.", "Check the Codex conversation. If the event arrived, mark it accepted. Dismissing closes the record without sending it again."), "muted"));
+        for (const [resolution, label] of [["accept", tr("Oznacz jako przyjęte", "Mark accepted")], ["dismiss", tr("Odrzuć rekord", "Dismiss record")]]) {
+          row.append(button(label, async () => {
+            await call("resolve_codex_delivery", { id: record.id, resolution });
+            await renderCodexDeliveries(root, ruleId);
+          }));
+        }
+      }
+      root.append(row);
+    }
+    if (page.next) {
+      const more = button(tr("Pokaż starsze dostarczenia", "Show older deliveries"), () => renderCodexDeliveries(root, ruleId, page.next, more));
+      root.append(more);
+    }
+  } finally { root.setAttribute("aria-busy", "false"); }
 }
 
 function megabytes(bytes) {

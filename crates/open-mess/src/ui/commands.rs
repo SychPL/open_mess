@@ -794,6 +794,54 @@ pub fn delete_rule(state: &UiState, id: &str) -> Result<(), String> {
     }
 }
 
+/// Read-only check of the exact Codex destination, never a message or agent run.
+pub async fn check_codex_destination(thread_id: &str) -> Result<(), String> {
+    use crate::triggers::codex::{self, Failure};
+    codex::check(thread_id).await.map_err(|failure| {
+        match failure {
+            Failure::Offline => i18n::pick("Otwórz Codex i sprawdź identyfikator rozmowy.", "Open Codex and check the conversation ID."),
+            Failure::Ambiguous => i18n::pick(
+                "Pasuje więcej niż jedna instancja Codexa. Zamknij dodatkową instancję.",
+                "More than one Codex instance matches. Close the extra instance.",
+            ),
+            Failure::Unsupported => i18n::pick("Dostarczanie do Codexa działa tylko w Windows.", "Codex delivery is supported only on Windows."),
+            Failure::Rejected => i18n::pick(
+                "Podaj identyfikator rozmowy: od 1 do 128 liter, cyfr, łączników lub podkreśleń.",
+                "Enter a conversation ID: 1 to 128 letters, digits, hyphens or underscores.",
+            ),
+            _ => i18n::pick(
+                "Nie udało się sprawdzić rozmowy. Ta wersja interfejsu Codexa może być nieobsługiwana.",
+                "Could not check the conversation. This Codex interface version may be unsupported.",
+            ),
+        }
+        .to_owned()
+    })
+}
+
+/// Bounded delivery metadata shown in the trigger's configuration panel.
+pub fn codex_deliveries(
+    state: &UiState,
+    rule_id: Option<&str>,
+    cursor: Option<&crate::triggers::outbox::Cursor>,
+) -> Result<crate::triggers::outbox::Page, String> {
+    crate::triggers::outbox::page(&state.accounts.store(), rule_id, cursor).map_err(text)
+}
+
+/// Reconciles a terminal uncertain/failed result on the user's explicit window action.
+pub fn resolve_codex_delivery(state: &UiState, id: &str, resolution: &str) -> Result<(), String> {
+    changes_allowed(state)?;
+    if id.len() != 32 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(i18n::pick("Nieprawidłowy identyfikator dostarczenia.", "Invalid delivery ID.").into());
+    }
+    crate::triggers::outbox::resolve(&state.accounts.store(), id, resolution).map_err(|_| {
+        i18n::pick(
+            "Można rozstrzygnąć tylko niepewne lub nieudane dostarczenie. Odśwież listę.",
+            "Only an uncertain or failed delivery can be resolved. Refresh the list.",
+        )
+        .to_owned()
+    })
+}
+
 /// The program a spawn action starts, chosen in a file dialog: its full path, or None.
 pub async fn pick_program() -> Result<Option<String>, String> {
     pick_file().await

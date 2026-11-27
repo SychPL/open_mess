@@ -89,6 +89,8 @@ pub enum Action {
     Channel { fallback_spawn: Option<Spawn> },
     /// A program started for the batch.
     Spawn(Spawn),
+    /// A specific existing Codex desktop conversation; configured only by the user.
+    Codex { thread_id: String },
 }
 
 /// A program and its fixed arguments, started directly, never through a shell. Nothing from a
@@ -117,17 +119,65 @@ pub fn get(store: &Store, id: &str) -> Result<Option<Rule>, Error> {
     row.map(parse).transpose()
 }
 
+/// A monotonic configuration generation; switching A to B and back still invalidates old batches.
+pub(crate) fn revision(store: &Store, id: &str) -> Result<i64, Error> {
+    let value: i64 = store.conn().query_row("SELECT revision FROM trigger_rules WHERE id=?1", [id], |row| row.get(0))?;
+    if value < 0 {
+        return Err(Error::BadConfig("invalid trigger configuration revision".into()));
+    }
+    Ok(value)
+}
+
+fn codex_revision_counter(store: &Store) -> Result<i64, Error> {
+    store
+        .get_config("trigger_revision")?
+        .unwrap_or_else(|| "0".into())
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| Error::BadConfig("invalid trigger configuration revision".into()))
+}
+
+fn next_codex_revision(store: &Store) -> Result<i64, Error> {
+    let next = codex_revision_counter(store)?.checked_add(1).ok_or_else(|| Error::BadConfig("trigger configuration revision exhausted".into()))?;
+    store.set_config("trigger_revision", &next.to_string())?;
+    Ok(next)
+}
+
 /// Saves a rule, new or changed, after checking it. Returns [`AUTONOMOUS_WARNING`] when agents it
 /// wakes could write without approval; the rule is saved anyway.
 pub fn put(store: &Store, rule: &Rule) -> Result<Option<&'static str>, Error> {
     validate(rule)?;
+    save(store, rule)
+}
+
+fn save(store: &Store, rule: &Rule) -> Result<Option<&'static str>, Error> {
     let json = serde_json::to_string(rule).map_err(|err| Error::BadConfig(err.to_string()))?;
+    let tx = store.conn().unchecked_transaction()?;
+    let previous_rule = get(store, &rule.id)?;
+    let changed = previous_rule.as_ref() != Some(rule);
+    let codex_change = changed
+        && (matches!(rule.action, Action::Codex { .. }) || previous_rule.as_ref().is_some_and(|old| matches!(old.action, Action::Codex { .. })));
+    let generation = if codex_change {
+        next_codex_revision(store)?
+    } else if previous_rule.is_some() {
+        revision(store, &rule.id)?
+    } else {
+        codex_revision_counter(store)?
+    };
     let created_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
     store.conn().execute(
-        "INSERT INTO trigger_rules (id, account, rule, enabled, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT (id) DO UPDATE SET account = excluded.account, rule = excluded.rule, enabled = excluded.enabled",
-        (&rule.id, &rule.account, &json, rule.enabled, created_ms),
+        "INSERT INTO trigger_rules (id, account, rule, enabled, created_ms,revision) VALUES (?1, ?2, ?3, ?4, ?5,?6)
+         ON CONFLICT (id) DO UPDATE SET account = excluded.account, rule = excluded.rule, enabled = excluded.enabled,revision=excluded.revision",
+        (&rule.id, &rule.account, &json, rule.enabled, created_ms, generation),
     )?;
+    if codex_change {
+        // This also preserves discarded collecting-batch suppression if the daemon restarts
+        // before the in-memory engine observes the configuration change.
+        store.conn().execute("UPDATE trigger_seen SET batch=NULL WHERE rule=?1", [&rule.id])?;
+    }
+    super::outbox::void_changed_rule(store, rule)?;
+    tx.commit()?;
     let autonomous = match &rule.condition {
         Condition::Conversation { id } => permissions::effective(store, &rule.account, Some(id))?.write == Write::Autonomous,
         _ => permissions::autonomous_anywhere(store, &rule.account)?,
@@ -135,10 +185,24 @@ pub fn put(store: &Store, rule: &Rule) -> Result<Option<&'static str>, Error> {
     Ok(autonomous.then_some(AUTONOMOUS_WARNING))
 }
 
+#[cfg(test)]
+pub(super) fn save_fixture(store: &Store, rule: &Rule) -> Result<Option<&'static str>, Error> {
+    save(store, rule)
+}
+
 /// Deletes a rule; false when there was none.
 pub fn delete(store: &Store, id: &str) -> Result<bool, Error> {
-    store.conn().execute("DELETE FROM trigger_seen WHERE rule = ?1", [id])?;
-    Ok(store.conn().execute("DELETE FROM trigger_rules WHERE id = ?1", [id])? > 0)
+    let tx = store.conn().unchecked_transaction()?;
+    store.conn().execute("UPDATE codex_deliveries SET state='voided',reason='rule_deleted' WHERE rule=?1 AND state='pending'", [id])?;
+    if get(store, id)?.is_some_and(|rule| matches!(rule.action, Action::Codex { .. })) {
+        next_codex_revision(store)?;
+        store.conn().execute("UPDATE trigger_seen SET batch=NULL WHERE rule=?1", [id])?;
+    } else {
+        store.conn().execute("DELETE FROM trigger_seen WHERE rule = ?1", [id])?;
+    }
+    let deleted = store.conn().execute("DELETE FROM trigger_rules WHERE id = ?1", [id])? > 0;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 fn parse((id, account, json, enabled): (String, String, String, bool)) -> Result<Rule, Error> {
@@ -162,6 +226,15 @@ fn validate(rule: &Rule) -> Result<(), Error> {
     let spawn = match &rule.action {
         Action::Channel { fallback_spawn } => fallback_spawn.as_ref(),
         Action::Spawn(spawn) => Some(spawn),
+        Action::Codex { thread_id } => {
+            if !super::codex::valid_thread(thread_id) {
+                return bad("the Codex conversation id must be 1 to 128 letters, digits, hyphens or underscores");
+            }
+            if !cfg!(windows) {
+                return bad("Codex desktop delivery is supported only on Windows");
+            }
+            None
+        }
     };
     if let Some(spawn) = spawn {
         if !spawn.program.is_absolute() || !spawn.program.is_file() {

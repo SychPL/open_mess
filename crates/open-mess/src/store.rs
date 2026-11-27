@@ -41,6 +41,18 @@ const MIGRATIONS: &[&str] = &[
     // The user's one-time install consent (update/consent.rs): one row, replaced by each click.
     "CREATE TABLE update_consent (version TEXT NOT NULL, manifest_sha256 TEXT NOT NULL, clicked_ms INTEGER NOT NULL,
          launched_ms INTEGER, used_ms INTEGER);",
+    // Codex delivery keeps metadata only, never message bodies or rendered agent prompts.
+    "CREATE TABLE codex_deliveries (id TEXT PRIMARY KEY, rule TEXT NOT NULL, account TEXT NOT NULL,
+         conversation TEXT NOT NULL, thread_id TEXT NOT NULL, rule_hash TEXT NOT NULL, metadata TEXT NOT NULL,
+         bytes INTEGER NOT NULL, state TEXT NOT NULL, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+         next_ms INTEGER NOT NULL, retries INTEGER NOT NULL DEFAULT 0, reason TEXT);
+     CREATE INDEX codex_delivery_due ON codex_deliveries(state, next_ms, created_ms);
+     CREATE TABLE codex_delivery_messages (rule TEXT NOT NULL, account TEXT NOT NULL, conversation TEXT NOT NULL,
+         message TEXT NOT NULL, delivery TEXT NOT NULL, PRIMARY KEY(rule, account, conversation, message));
+     CREATE INDEX codex_message_delivery ON codex_delivery_messages(delivery);
+     CREATE TABLE codex_delivery_reservations (rule TEXT NOT NULL, delivery TEXT NOT NULL, at_ms INTEGER NOT NULL);
+     CREATE INDEX codex_reservation_time ON codex_delivery_reservations(rule, at_ms);
+     ALTER TABLE trigger_rules ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Configuration and state in `state.sqlite3`.

@@ -84,17 +84,23 @@ pub fn autonomous_anywhere(store: &Store, account: &str) -> Result<bool, Error> 
 
 /// Sets the permissions of an account (`conversation` None) or of one of its conversations.
 pub fn set(store: &Store, account: &str, conversation: Option<&str>, read: bool, write: Write) -> Result<(), Error> {
+    let tx = store.conn().unchecked_transaction()?;
     store.conn().execute(
         "INSERT INTO permissions (account, conversation, read, write) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (account, conversation) DO UPDATE SET read = excluded.read, write = excluded.write",
         (account, conversation.unwrap_or_default(), read, write.name()),
     )?;
+    crate::triggers::outbox::void_unreadable(store, account)?;
+    tx.commit()?;
     Ok(())
 }
 
 /// Removes a conversation's own permissions; the account's apply to it again.
 pub fn clear_override(store: &Store, account: &str, conversation: &str) -> Result<(), Error> {
+    let tx = store.conn().unchecked_transaction()?;
     store.conn().execute("DELETE FROM permissions WHERE account = ?1 AND conversation = ?2 AND conversation <> ''", (account, conversation))?;
+    crate::triggers::outbox::void_unreadable(store, account)?;
+    tx.commit()?;
     Ok(())
 }
 

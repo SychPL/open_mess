@@ -445,6 +445,13 @@ impl Registry {
     /// What the `status` tool answers; the daemon's own check during an update's probation reads it
     /// too (spec 2026-10-27-self-update, 7.2).
     pub fn status(&self) -> Result<Value, ToolError> {
+        let codex = self
+            .accounts
+            .as_ref()
+            .map(|accounts| crate::triggers::outbox::counts(&accounts.store()))
+            .transpose()
+            .map_err(failed)?
+            .unwrap_or_default();
         let (modules, accounts) = match &self.accounts {
             None => (Vec::new(), Vec::new()),
             Some(accounts) => {
@@ -479,7 +486,7 @@ impl Registry {
             "uptime_seconds": self.started.elapsed().as_secs(),
             "modules": modules,
             "accounts": accounts,
-            "triggers": {"channel_sessions": self.sessions.len(), "counters": self.triggers.to_json()},
+            "triggers": {"channel_sessions": self.sessions.len(), "counters": self.triggers.to_json(), "codex_deliveries": codex},
             "ui_ready": self.ui_ready.load(Ordering::SeqCst),
             "accounts_restored": self.accounts_restored.load(Ordering::SeqCst),
             "update": self.update.as_ref().map(UpdateService::status),

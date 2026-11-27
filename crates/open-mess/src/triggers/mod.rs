@@ -8,12 +8,14 @@
 //! `untrusted`, with the shared tools' notice (spec 8.5).
 
 pub mod channel;
+pub mod codex;
 pub mod engine;
+pub mod outbox;
 pub mod rules;
 pub mod spawn;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
@@ -49,6 +51,8 @@ impl Delivery for Actions {
                 spawn::deliver(&self.runs, &rule.id, program, &batch, self.still_allowed(&rule.id, &batch))
             }
             Action::Channel { fallback_spawn: None } => DeliveryResult::NoSession,
+            // The engine admits Codex batches transactionally before any asynchronous work.
+            Action::Codex { .. } => DeliveryResult::NoSession,
         }
     }
 }
@@ -145,11 +149,17 @@ pub struct Activity {
     /// While true the engine collects batches but hands none over. Set it with `send_replace`:
     /// `send` changes nothing while no engine listens.
     pub hold: watch::Sender<bool>,
+    /// Updates pause durable retries separately, while ordinary open batches may still drain.
+    pub codex_paused: AtomicBool,
 }
 
 /// What happened to the batches of one rule since the daemon started, for `status`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct RuleCounters {
+    pub codex_queued: u64,
+    pub codex_accepted: u64,
+    pub codex_uncertain: u64,
+    pub codex_failed: u64,
     pub delivered: u64,
     /// Past the rule's deliveries per hour.
     pub dropped_rate: u64,

@@ -53,6 +53,36 @@ claude --mcp-config open-mess-channel.json --dangerously-load-development-channe
 (`--dangerously-load-development-channels` is how Claude Code loads channels outside its approved
 list during its research preview of channels.)
 
+## Codex desktop triggers (experimental)
+
+In builds containing this integration, a trigger can target an existing Codex desktop
+conversation directly. Under Settings > Triggers choose **a specific Codex conversation**
+and paste its conversation ID. Ask Codex for the ID of the intended conversation; a title
+is not an ID. **Check conversation** performs a read-only check, not a test message. The
+existing Codex MCP configuration remains under Integrations.
+
+The daemon keeps pending event metadata while Codex is unavailable and retries while the
+rule and read permission remain valid, for up to 24 hours. It fetches message content only
+for delivery; this is not a message archive. If historical lookup is bounded before a
+message is found, the event explicitly says that its content is unavailable.
+
+**Accepted by Codex** means the desktop accepted the event, not that the agent completed
+work or replied in Teams. A result that may already have reached Codex is **uncertain**
+and is never automatically resent. Inspect the conversation, then mark the record accepted
+or dismiss it under **Show deliveries**. Neither action sends another message. Replay
+protection is bounded to seven days and 50,000 metadata receipts, with explicit queue limits.
+**Unresolved Codex deliveries** remains available after a rule changes or is removed.
+Each record shows its original conversation; **Show older deliveries** opens the next
+bounded page, so recent accepted records cannot hide older unresolved work.
+
+This Windows-only adapter uses the installed desktop's local interface. An incompatible
+desktop update is reported rather than silently switching conversations. Existing Claude
+channels, spawn actions and messenger tools keep their current behavior. No extra permanent
+process, Node installation or timer polling Teams is required.
+
+Design and verification: [Codex trigger specification](.specs/2026-11-26-codex-desktop-triggers.md),
+[acceptance scenarios](specs/codex-desktop.feature), [desktop protocol](docs/protocols/codex.md).
+
 ## Why
 
 Agent integrations for messengers today are bolted onto other apps: you copy tokens out of a

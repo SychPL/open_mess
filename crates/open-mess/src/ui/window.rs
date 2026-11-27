@@ -53,6 +53,9 @@ pub(super) fn run(runtime: &Runtime, state: UiState, opener: Opener, quit: impl 
             ipc::rules,
             ipc::put_rule,
             ipc::delete_rule,
+            ipc::check_codex_destination,
+            ipc::codex_deliveries,
+            ipc::resolve_codex_delivery,
             ipc::pick_program,
             ipc::channel_setup,
             ipc::update_status,
@@ -302,6 +305,25 @@ mod ipc {
     #[tauri::command(rename_all = "snake_case")]
     pub async fn delete_rule(state: State<'_, UiState>, id: String) -> Result<(), String> {
         commands::delete_rule(&state, &id)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn check_codex_destination(thread_id: String) -> Result<(), String> {
+        commands::check_codex_destination(&thread_id).await
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn codex_deliveries(
+        state: State<'_, UiState>,
+        rule_id: Option<String>,
+        cursor: Option<crate::triggers::outbox::Cursor>,
+    ) -> Result<crate::triggers::outbox::Page, String> {
+        commands::codex_deliveries(&state, rule_id.as_deref(), cursor.as_ref())
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn resolve_codex_delivery(state: State<'_, UiState>, id: String, resolution: String) -> Result<(), String> {
+        commands::resolve_codex_delivery(&state, &id, &resolution)
     }
 
     #[tauri::command(rename_all = "snake_case")]

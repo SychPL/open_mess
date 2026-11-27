@@ -572,6 +572,11 @@ impl Accounts {
             store.conn().execute("DELETE FROM pending WHERE account = ?1", [id])?;
             store.conn().execute("DELETE FROM trigger_rules WHERE account = ?1", [id])?;
             store.conn().execute("DELETE FROM trigger_seen WHERE account = ?1", [id])?;
+            store
+                .conn()
+                .execute("DELETE FROM codex_delivery_reservations WHERE delivery IN (SELECT id FROM codex_deliveries WHERE account=?1)", [id])?;
+            store.conn().execute("DELETE FROM codex_delivery_messages WHERE account=?1", [id])?;
+            store.conn().execute("DELETE FROM codex_deliveries WHERE account=?1", [id])?;
             store.conn().execute("DELETE FROM accounts WHERE id = ?1", [id])?;
         }
         // Best effort: a file an agent still has open stays until the attachments' retention.
